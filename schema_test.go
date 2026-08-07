@@ -33,10 +33,7 @@ import (
 // ---------- schema_test.go ----------
 
 func TestCanonical(t *testing.T) {
-	s, err := Parse(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`)
 	got := string(s.Canonical())
 	if !strings.Contains(got, `"name":"r"`) {
 		t.Errorf("canonical form missing name: %s", got)
@@ -86,10 +83,7 @@ func TestCanonicalStripsLogicalType(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := mustParse(t, tt.schema)
 			got := string(s.Canonical())
 			if got != tt.want {
 				t.Errorf("got  %s\nwant %s", got, tt.want)
@@ -148,10 +142,7 @@ func TestCanonicalNormalizesArrayItemsAndMapValues(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := mustParse(t, tt.schema)
 			if got := string(s.Canonical()); got != tt.want {
 				t.Errorf("got  %s\nwant %s", got, tt.want)
 			}
@@ -166,10 +157,7 @@ func TestCanonicalNormalizesArrayItemsAndMapValues(t *testing.T) {
 //	-589620603366471059 (Java signed-int64). The fingerprint can only match
 //	when array items are canonicalized per [PRIMITIVES].
 func TestFingerprintArrayItemsMatchesSpecVector(t *testing.T) {
-	s, err := Parse(`{ "items":{"type":"null"}, "type":"array"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `{ "items":{"type":"null"}, "type":"array"}`)
 	if got := string(s.Canonical()); got != `{"type":"array","items":"null"}` {
 		t.Fatalf("canonical: got %s", got)
 	}
@@ -182,10 +170,7 @@ func TestFingerprintArrayItemsMatchesSpecVector(t *testing.T) {
 }
 
 func TestFingerprint(t *testing.T) {
-	s, err := Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	fp := s.Fingerprint(sha256.New())
 	if len(fp) != 32 {
 		t.Fatalf("expected 32 bytes, got %d", len(fp))
@@ -373,10 +358,7 @@ func TestParseFixedStringSizeINTEGERS(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatalf("Parse failed: %v", err)
-			}
+			s := mustParse(t, tt.schema)
 			if s == nil {
 				t.Fatal("nil schema")
 			}
@@ -477,10 +459,7 @@ func TestParseFloatDefaultFromString(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatalf("Parse failed: %v", err)
-			}
+			s := mustParse(t, tt.schema)
 			if s == nil {
 				t.Fatal("nil schema")
 			}
@@ -695,10 +674,7 @@ func TestParseFlatFieldFormat(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatalf("Parse failed: %v", err)
-			}
+			s := mustParse(t, tt.schema)
 			if s == nil {
 				t.Fatal("nil schema")
 			}
@@ -771,10 +747,7 @@ func TestParseFlatFieldNotTriggeredForPrimitives(t *testing.T) {
 		{"name":"y","type":"string"},
 		{"name":"z","type":"double"}
 	]}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatalf("Parse failed: %v", err)
-	}
+	s := mustParse(t, schema)
 	if s == nil {
 		t.Fatal("nil schema")
 	}
@@ -1288,9 +1261,7 @@ func TestBuildComplexUnknownLogicalIgnored(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var got int32
-	if _, err := s.Decode(dst, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, dst, &got)
 	if got != 42 {
 		t.Errorf("got %d, want 42", got)
 	}
@@ -1384,10 +1355,7 @@ func TestNameValidation(t *testing.T) {
 	t.Run("fullname detection", func(t *testing.T) {
 		// Fullnames (dot-separated) must be detected so namespace
 		// handling works correctly.
-		s, err := Parse(`{"type":"record","name":"com.example.MyRecord","fields":[{"name":"x","type":"int"}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
+		s := mustParse(t, `{"type":"record","name":"com.example.MyRecord","fields":[{"name":"x","type":"int"}]}`)
 		canon := string(s.Canonical())
 		if canon == "" {
 			t.Fatal("expected non-empty canonical form")
@@ -1508,10 +1476,7 @@ func TestEmptyNamespace(t *testing.T) {
 			]}}
 		]
 	}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	s := mustParse(t, schema)
 	canon := string(s.Canonical())
 	// The child should not have com.example prefix because namespace was
 	// explicitly cleared.
@@ -1801,10 +1766,7 @@ func TestFieldLevelLogicalType_RoundTrip(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s, err := Parse(tc.schema)
-			if err != nil {
-				t.Fatalf("parse failed: %v", err)
-			}
+			s := mustParse(t, tc.schema)
 
 			// The first record field's effective logicalType must match
 			// the field-level annotation, regardless of whether the
@@ -1915,9 +1877,7 @@ func TestFieldLevelLogicalType_RoundTripValue(t *testing.T) {
 				t.Fatalf("encode time.Time into flat-form schema: %v", err)
 			}
 			var got Row
-			if _, err := s.Decode(data, &got); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
+			mustDecode(t, s, data, &got)
 			if !got.TS.Equal(tc.want) {
 				t.Fatalf("round-trip mismatch: got %v, want %v", got.TS, tc.want)
 			}
@@ -1930,12 +1890,9 @@ func TestFieldLevelLogicalType_RoundTripValue(t *testing.T) {
 // closer-to-the-type annotation wins so that an explicit author choice
 // is never overridden by an outer scope.
 func TestFieldLevelLogicalType_NestedAnnotationWins(t *testing.T) {
-	s, err := Parse(`{"type":"record","name":"R","fields":[
+	s := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"ts","type":{"type":"long","logicalType":"timestamp-micros"},"logicalType":"timestamp-millis"}
 	]}`)
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
 	got := effectiveLogicalType(firstFieldNode(s))
 	if got != "timestamp-micros" {
 		t.Fatalf("nested annotation must win; got %q, want timestamp-micros", got)
@@ -2030,9 +1987,7 @@ func TestFieldLevelLogicalType_DecimalRoundTrip(t *testing.T) {
 				t.Fatalf("encode *big.Rat into flat-form schema: %v", err)
 			}
 			var got Row
-			if _, err := s.Decode(data, &got); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
+			mustDecode(t, s, data, &got)
 			if got.Amt == nil || got.Amt.Cmp(want) != 0 {
 				t.Fatalf("round-trip mismatch: got %v, want %v", got.Amt, want)
 			}
@@ -2072,10 +2027,7 @@ func TestFieldLevelLogicalType_CanonicalDoesNotDuplicate(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s, err := Parse(tc.schema)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, tc.schema)
 			canon := string(s.Canonical())
 			if c := strings.Count(canon, `"logicalType"`); c > 1 {
 				t.Fatalf("canonical form must contain logicalType at most once, got %d:\n  %s", c, canon)
@@ -2206,12 +2158,9 @@ func TestFieldLevelLogicalType_EncodeJSONMatchesNested(t *testing.T) {
 // matching branch; subsequent branches are unchanged. Validation downstream
 // will catch base-type mismatches, but the lift itself remains predictable.
 func TestFieldLevelLogicalType_MultiNonNullUnion(t *testing.T) {
-	s, err := Parse(`{"type":"record","name":"R","fields":[
+	s := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"v","type":["null","long","string"],"logicalType":"timestamp-millis"}
 	]}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
 	node := firstFieldNode(s)
 	if node == nil || node.kind != "union" {
 		t.Fatalf("expected union, got %+v", node)
@@ -2335,9 +2284,7 @@ func TestFieldLevelLogicalType_OneCricketeerRoundTrip(t *testing.T) {
 			"cannot use time.Time with Avro type long", err)
 	}
 	var got record
-	if _, err := s.Decode(enc, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, enc, &got)
 	if !got.Time.Equal(want.Time) {
 		t.Fatalf("time: got %v, want %v", got.Time, want.Time)
 	}
@@ -2369,12 +2316,9 @@ func TestFieldLevelLogicalType_OneCricketeerRoundTrip(t *testing.T) {
 // because branch 1 already has its own `date` annotation, and branch
 // 2 remains plain `string`.
 func TestFieldLevelLogicalType_UnionPreAnnotatedFirstBranch(t *testing.T) {
-	s, err := Parse(`{"type":"record","name":"R","fields":[
+	s := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"v","type":["null",{"type":"int","logicalType":"date"},"string"],"logicalType":"uuid"}
 	]}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
 	node := firstFieldNode(s)
 	if node == nil || node.kind != "union" {
 		t.Fatalf("expected union, got %+v", node)
@@ -2452,12 +2396,9 @@ func TestFieldLevelLogicalType_MismatchSoftDrops(t *testing.T) {
 // was silently dropped at JSON-parse time, before validateLogical
 // ever saw it; unknownLogical would always be empty.
 func TestFieldLevelLogicalType_LiftedUnknownLogicalPreserved(t *testing.T) {
-	s, err := Parse(`{"type":"record","name":"R","fields":[
+	s := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"ts","type":"long","logicalType":"io.debezium.time.Timestamp"}
 	]}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
 	node := firstFieldNode(s)
 	if node == nil {
 		t.Fatal("no first field node")
@@ -2657,9 +2598,7 @@ func TestRegression_BareNameRefBindsInScopeBeforeNullNamespace(t *testing.T) {
 				t.Fatalf("encode with in-scope shape for r: %v", err)
 			}
 			var got outer
-			if _, err := s.Decode(wire, &got); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
+			mustDecode(t, s, wire, &got)
 			if got != in {
 				t.Fatalf("round-trip: got %+v want %+v", got, in)
 			}
@@ -2691,10 +2630,7 @@ func TestRegression_MetadataDefaultBindsInScopeNameRef(t *testing.T) {
 		{"name":"a","type":{"type":"enum","name":"Inner","symbols":["A","B"]}},
 		{"name":"b","type":{"type":"fixed","name":"Inner","namespace":"","size":1}},
 		{"name":"r","type":"Inner","default":"A"}]}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	s := mustParse(t, schema)
 	d := s.Root().Fields[2].Default
 	// In-scope binding resolves r to the enum com.x.Inner: the default is
 	// the symbol string "A", not the fixed branch's 1-codepoint []byte.
@@ -2729,10 +2665,7 @@ func TestRegression_MetadataDefaultShortNameCollisionWalkOrder(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			s, err := Parse(c.schema)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
+			s := mustParse(t, c.schema)
 			var d any
 			for _, f := range s.Root().Fields {
 				if f.Name == "r" {
@@ -2810,18 +2743,10 @@ func TestMatrix_AliasAcceptsAnyString(t *testing.T) {
 	t.Run("alias resolution still renames", func(t *testing.T) {
 		writer := MustParse(`{"type":"record","name":"R","fields":[{"name":"old","type":"long"}]}`)
 		reader := MustParse(`{"type":"record","name":"R","fields":[{"name":"new","type":"long","aliases":["old"]}]}`)
-		b, err := writer.Encode(map[string]any{"old": int64(7)})
-		if err != nil {
-			t.Fatal(err)
-		}
-		resolved, err := Resolve(writer, reader)
-		if err != nil {
-			t.Fatalf("resolve: %v", err)
-		}
+		b := mustEncode(t, writer, map[string]any{"old": int64(7)})
+		resolved := mustResolve(t, writer, reader)
 		var got map[string]any
-		if _, err := resolved.Decode(b, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, resolved, b, &got)
 		if got["new"] != int64(7) {
 			t.Errorf("alias rename failed: got %v", got)
 		}
@@ -2856,10 +2781,7 @@ func TestSchemaNodeRoundTrip(t *testing.T) {
 		},
 	}
 
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 
 	got := s.Root()
 
@@ -2897,10 +2819,7 @@ func TestSchemaNodePrimitives(t *testing.T) {
 	for _, prim := range []string{"null", "boolean", "int", "long", "float", "double", "string", "bytes"} {
 		t.Run(prim, func(t *testing.T) {
 			node := &SchemaNode{Type: prim}
-			s, err := node.Schema()
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := mustNodeSchema(t, node)
 			got := s.Root()
 			if got.Type != prim {
 				t.Errorf("got %q, want %q", got.Type, prim)
@@ -2925,10 +2844,7 @@ func TestSchemaNodeLogicalTypes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.logical, func(t *testing.T) {
 			node := &SchemaNode{Type: tt.base, LogicalType: tt.logical}
-			s, err := node.Schema()
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := mustNodeSchema(t, node)
 			got := s.Root()
 			if got.LogicalType != tt.logical {
 				t.Errorf("logicalType: got %q, want %q", got.LogicalType, tt.logical)
@@ -2944,10 +2860,7 @@ func TestSchemaNodeDecimal(t *testing.T) {
 		Precision:   10,
 		Scale:       2,
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 	got := s.Root()
 	if got.Precision != 10 {
 		t.Errorf("precision: got %d, want 10", got.Precision)
@@ -2963,10 +2876,7 @@ func TestSchemaNodeEnum(t *testing.T) {
 		Name:    "Color",
 		Symbols: []string{"RED", "GREEN", "BLUE"},
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 	got := s.Root()
 	if !reflect.DeepEqual(got.Symbols, []string{"RED", "GREEN", "BLUE"}) {
 		t.Errorf("symbols: got %v", got.Symbols)
@@ -2983,10 +2893,7 @@ func TestSchemaNodeEmptyRecord(t *testing.T) {
 		Type: "record",
 		Name: "Empty",
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 	got := s.Canonical()
 	want := `{"name":"Empty","type":"record","fields":[]}`
 	if string(got) != want {
@@ -3023,10 +2930,7 @@ func TestSchemaNodeEmptyRecordNested(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s, err := tc.node.Schema()
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := mustNodeSchema(t, &tc.node)
 			canon := string(s.Canonical())
 			if !strings.Contains(canon, `"fields":[]`) {
 				t.Errorf("canonical missing 'fields':[]: %s", canon)
@@ -3089,10 +2993,7 @@ func TestSchemaNodeCanonicalOrder(t *testing.T) {
 			{Name: "a", Type: SchemaNode{Type: "int"}},
 		},
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 	got := string(s.Canonical())
 	want := `{"name":"ns.Ordered","type":"record","fields":[{"name":"a","type":"int"}]}`
 	if got != want {
@@ -3106,10 +3007,7 @@ func TestSchemaNodeFixed(t *testing.T) {
 		Name: "Hash",
 		Size: 32,
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 	got := s.Root()
 	if got.Size != 32 {
 		t.Errorf("size: got %d, want 32", got.Size)
@@ -3121,10 +3019,7 @@ func TestSchemaNodeArray(t *testing.T) {
 		Type:  "array",
 		Items: &SchemaNode{Type: "string"},
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 	got := s.Root()
 	if got.Items == nil || got.Items.Type != "string" {
 		t.Errorf("items: got %+v", got.Items)
@@ -3136,10 +3031,7 @@ func TestSchemaNodeMap(t *testing.T) {
 		Type:   "map",
 		Values: &SchemaNode{Type: "int"},
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 	got := s.Root()
 	if got.Values == nil || got.Values.Type != "int" {
 		t.Errorf("values: got %+v", got.Values)
@@ -3162,10 +3054,7 @@ func TestSchemaNodeNestedRecords(t *testing.T) {
 			{Name: "z", Type: SchemaNode{Type: "long"}},
 		},
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 
 	// Verify encode/decode works.
 	type Inner struct {
@@ -3177,14 +3066,9 @@ func TestSchemaNodeNestedRecords(t *testing.T) {
 		Z     int64 `avro:"z"`
 	}
 	v := Outer{Inner: Inner{X: 1, Y: "hello"}, Z: 42}
-	data, err := s.Encode(&v)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &v)
 	var got Outer
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got != v {
 		t.Errorf("got %+v, want %+v", got, v)
 	}
@@ -3212,10 +3096,7 @@ func TestSchemaNodeFourLevelWithReuse(t *testing.T) {
 			{Name: "b", Type: SchemaNode{Type: "Inner"}}, // reference
 		},
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 	got := s.Root()
 	// Field "b" should be a reference to "Inner".
 	if got.Fields[1].Type.Type != "Inner" {
@@ -3234,10 +3115,7 @@ func TestSchemaNodeCustomProps(t *testing.T) {
 		}],
 		"connect.name": "com.example.Event"
 	}`
-	s, err := Parse(schemaJSON)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schemaJSON)
 	got := s.Root()
 	if got.Props["connect.name"] != "com.example.Event" {
 		t.Errorf("record prop: got %q", got.Props["connect.name"])
@@ -3256,10 +3134,7 @@ func TestSchemaNodeFieldProps(t *testing.T) {
 			"connect.name": "io.debezium.time.Timestamp"
 		}]
 	}`
-	s, err := Parse(schemaJSON)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schemaJSON)
 	got := s.Root()
 	if got.Fields[0].Props["connect.name"] != "io.debezium.time.Timestamp" {
 		t.Errorf("field prop: got %q", got.Fields[0].Props["connect.name"])
@@ -3278,10 +3153,7 @@ func TestSchemaNodeFieldAliases(t *testing.T) {
 			},
 		},
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 	got := s.Root()
 	if len(got.Fields[0].Aliases) != 1 || got.Fields[0].Aliases[0] != "old_name" {
 		t.Errorf("aliases: got %v", got.Fields[0].Aliases)
@@ -3300,10 +3172,7 @@ func TestSchemaNodeFieldDoc(t *testing.T) {
 			},
 		},
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 	got := s.Root()
 	if got.Fields[0].Doc != "the x coordinate" {
 		t.Errorf("doc: got %q", got.Fields[0].Doc)
@@ -3343,10 +3212,7 @@ func TestSchemaNodeEncodeDecodeRoundTrip(t *testing.T) {
 			}},
 		},
 	}
-	s, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNodeSchema(t, node)
 
 	type Product struct {
 		Name     string           `avro:"name"`
@@ -3360,14 +3226,9 @@ func TestSchemaNodeEncodeDecodeRoundTrip(t *testing.T) {
 		Tags:     []string{"sale", "new"},
 		Metadata: map[string]int32{"stock": 42},
 	}
-	data, err := s.Encode(&p)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &p)
 	var got Product
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got.Name != p.Name || got.Price != p.Price {
 		t.Errorf("got %+v, want %+v", got, p)
 	}
@@ -3391,10 +3252,7 @@ func TestRootFromParsedSchema(t *testing.T) {
 			{"name": "extra", "type": ["null", "string"], "default": null, "aliases": ["old_extra"]}
 		]
 	}`
-	s, err := Parse(schemaJSON)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schemaJSON)
 	got := s.Root()
 
 	if got.Type != "record" {
@@ -3470,10 +3328,7 @@ func TestSchemaNodeAliasesEnumDefaultOrderRoundTrip(t *testing.T) {
 			{"name": "tags", "type": {"type": "array", "items": "string"}, "order": "ignore"}
 		]
 	}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	root := s.Root()
 
 	// Record aliases
@@ -3500,10 +3355,7 @@ func TestSchemaNodeAliasesEnumDefaultOrderRoundTrip(t *testing.T) {
 
 	// Round-trip: SchemaNode → Schema → Root
 	node := s.Root()
-	s2, err := node.Schema()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s2 := mustNodeSchema(t, node)
 	root2 := s2.Root()
 	if len(root2.Aliases) != 2 {
 		t.Errorf("round-trip aliases lost: %v", root2.Aliases)
@@ -3526,10 +3378,7 @@ func TestSchemaNodeCustomPropsExtended(t *testing.T) {
 			{"name": "x", "type": "int", "custom.field": true}
 		]
 	}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	root := s.Root()
 	if root.Props["custom.tag"] != "hello" {
 		t.Errorf("record props: %v", root.Props)
@@ -3565,9 +3414,7 @@ func TestSchemaNodeDedupNamedTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out map[string]any
-	if _, err := s.Decode(enc, &out); err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, s, enc, &out)
 	a, _ := out["a"].([16]byte)
 	b, _ := out["b"].([16]byte)
 	if a[0] != 1 || b[0] != 2 {
@@ -5062,14 +4909,8 @@ func TestCheckCompatibility(t *testing.T) {
 
 func TestNamesMatchUnqualified(t *testing.T) {
 	// Same unqualified name, different namespaces should be compatible.
-	reader, err := Parse(`{"type":"record","name":"R","namespace":"com.a","fields":[{"name":"x","type":"int"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer, err := Parse(`{"type":"record","name":"R","namespace":"com.b","fields":[{"name":"x","type":"int"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustParse(t, `{"type":"record","name":"R","namespace":"com.a","fields":[{"name":"x","type":"int"}]}`)
+	writer := mustParse(t, `{"type":"record","name":"R","namespace":"com.b","fields":[{"name":"x","type":"int"}]}`)
 	if err := CheckCompatibility(writer, reader); err != nil {
 		t.Fatalf("expected compatible by unqualified name, got %v", err)
 	}
@@ -5484,15 +5325,10 @@ var addrVal = map[string]any{"street": "main"}
 // SchemaCache.Parse call.
 func TestNodeRefSchema_CacheCrossParse(t *testing.T) {
 	var c SchemaCache
-	if _, err := c.Parse(addrDef); err != nil {
-		t.Fatal(err)
-	}
-	person, err := c.Parse(`{"type":"record","name":"com.example.Person","fields":[
+	mustCacheParse(t, &c, addrDef)
+	person := mustCacheParse(t, &c, `{"type":"record","name":"com.example.Person","fields":[
 		{"name":"home","type":"com.example.Address"},
 		{"name":"work","type":"com.example.Address"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
 	root := person.Root()
 
 	// Control: the first occurrence carries the spliced definition and
@@ -5622,10 +5458,7 @@ func TestNodeRefSchema_EditedTypeIgnoresStaleStamp(t *testing.T) {
 		root := MustParse(twoNamed).Root()
 		rec := root // the whole record defines "Dec" locally
 		rec.Fields[1].Type.Type = "Dec"
-		sub, err := rec.Schema()
-		if err != nil {
-			t.Fatalf("Schema(): %v", err)
-		}
+		sub := mustNodeSchema(t, rec)
 		if !bytes.Equal(sub.Canonical(), MustParse(twoNamed).Canonical()) {
 			t.Fatalf("locally-defined name drifted: %s", sub.Canonical())
 		}
@@ -5730,9 +5563,7 @@ func TestNodeRefSchema_ConvertsOffTheRootExpression(t *testing.T) {
 	innerVal := map[string]any{"x": int64(7)}
 
 	// The root itself, off the call expression.
-	if _, err := s.Root().Schema(); err != nil {
-		t.Fatalf("Root().Schema(): %v", err)
-	}
+	mustNodeSchema(t, s.Root())
 	// Reached through SchemaField.Type, a VALUE field: the definition
 	// site, the bare name reference, and a reference one level deeper in
 	// a union branch (Branches is a []SchemaNode, so its elements are
@@ -5880,9 +5711,7 @@ func TestNodeRefSchemaMatrix(t *testing.T) {
 				}
 				def := k.def(defN, "")
 				var c SchemaCache
-				if _, err := c.Parse(def); err != nil {
-					t.Fatal(err)
-				}
+				mustCacheParse(t, &c, def)
 				enclosing, err := c.Parse(build("", "", defN2ref(defN), defN2ref(defN)))
 				if err != nil {
 					t.Fatal(err)
@@ -6527,15 +6356,10 @@ func callerNodeStructures() []callerNodeStructure {
 			build: func(t *testing.T) *Schema {
 				t.Helper()
 				var c SchemaCache
-				if _, err := c.Parse(inner); err != nil {
-					t.Fatal(err)
-				}
-				s, err := c.Parse(`{"type":"record","name":"x.y.Outer","fields":[
+				mustCacheParse(t, &c, inner)
+				s := mustCacheParse(t, &c, `{"type":"record","name":"x.y.Outer","fields":[
 					{"name":"a","type":"x.y.Inner"},
 					{"name":"b","type":"x.y.Inner"}]}`)
-				if err != nil {
-					t.Fatal(err)
-				}
 				return s
 			},
 			pick: func(r SchemaNode) SchemaNode { return r.Fields[1].Type },
@@ -7291,10 +7115,7 @@ func TestRegression_NamedBytesPropsRebuildCodepointForm(t *testing.T) {
 	type namedBytes []byte
 	build := func(t *testing.T, v any) any {
 		t.Helper()
-		s, err := (&SchemaNode{Type: "int", Props: map[string]any{"x": v}}).Schema()
-		if err != nil {
-			t.Fatalf("Schema(): %v", err)
-		}
+		s := mustNodeSchema(t, (&SchemaNode{Type: "int", Props: map[string]any{"x": v}}))
 		return s.Root().Props["x"]
 	}
 
@@ -7366,12 +7187,9 @@ func TestRegression_NamedBytesFieldDefaultValue(t *testing.T) {
 	type namedBytes []byte
 	build := func(t *testing.T, v any) *Schema {
 		t.Helper()
-		s, err := (&SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+		s := mustNodeSchema(t, (&SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
 			{Name: "b", Type: SchemaNode{Type: "bytes"}, Default: v},
-		}}).Schema()
-		if err != nil {
-			t.Fatalf("Schema(): %v", err)
-		}
+		}}))
 		return s
 	}
 
@@ -7669,10 +7487,7 @@ func TestMatrix_TreeValueGoTypes(t *testing.T) {
 		// The String() render of a rebuilt schema is type-blind too.
 		render := func(t *testing.T, v any) string {
 			t.Helper()
-			s, err := (&SchemaNode{Type: "int", Props: map[string]any{"x": v}}).Schema()
-			if err != nil {
-				t.Fatalf("Schema(): %v", err)
-			}
+			s := mustNodeSchema(t, (&SchemaNode{Type: "int", Props: map[string]any{"x": v}}))
 			return s.String()
 		}
 		control := render(t, map[string]any{"k": "v"})
@@ -9020,10 +8835,7 @@ func TestMatrix_AliasResolutionCensus(t *testing.T) {
 						}
 						// Accepted cells must actually read: encode with the
 						// writer, decode through the resolved schema.
-						wire, err := writer.Encode(value[kind])
-						if err != nil {
-							t.Fatalf("encode: %v", err)
-						}
+						wire := mustEncode(t, writer, value[kind])
 						var got any
 						if _, err := resolved.Decode(wire, &got); err != nil {
 							t.Fatalf("resolved decode: %v", err)
@@ -9414,22 +9226,13 @@ func recvTypeName(e ast.Expr) string {
 
 func TestSingleObjectRoundTrip(t *testing.T) {
 	t.Run("null", func(t *testing.T) {
-		s, err := Parse(`"null"`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		encoded, err := s.AppendSingleObject(nil, (*int)(nil))
-		if err != nil {
-			t.Fatalf("AppendSingleObject: %v", err)
-		}
+		s := mustParse(t, `"null"`)
+		encoded := mustAppendSingleObject(t, s, nil, (*int)(nil))
 		if encoded[0] != 0xC3 || encoded[1] != 0x01 {
 			t.Fatalf("bad magic: [%#x, %#x]", encoded[0], encoded[1])
 		}
 		var got *int
-		rest, err := s.DecodeSingleObject(encoded, &got)
-		if err != nil {
-			t.Fatalf("DecodeSingleObject: %v", err)
-		}
+		rest := mustDecodeSingleObject(t, s, encoded, &got)
 		if len(rest) != 0 {
 			t.Fatalf("unexpected remaining bytes: %d", len(rest))
 		}
@@ -9452,15 +9255,9 @@ func TestSingleObjectRoundTrip(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
+			s := mustParse(t, tt.schema)
 
-			encoded, err := s.AppendSingleObject(nil, tt.val)
-			if err != nil {
-				t.Fatalf("AppendSingleObject: %v", err)
-			}
+			encoded := mustAppendSingleObject(t, s, nil, tt.val)
 
 			if len(encoded) < 10 {
 				t.Fatalf("encoded too short: %d", len(encoded))
@@ -9470,10 +9267,7 @@ func TestSingleObjectRoundTrip(t *testing.T) {
 			}
 
 			var got any
-			rest, err := s.DecodeSingleObject(encoded, &got)
-			if err != nil {
-				t.Fatalf("DecodeSingleObject: %v", err)
-			}
+			rest := mustDecodeSingleObject(t, s, encoded, &got)
 			if len(rest) != 0 {
 				t.Fatalf("unexpected remaining bytes: %d", len(rest))
 			}
@@ -9561,10 +9355,7 @@ func TestSingleObjectBadMagic(t *testing.T) {
 }
 
 func TestSingleObjectShortBuffer(t *testing.T) {
-	s, err := Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 
 	for _, n := range []int{0, 1, 5, 9} {
 		data := make([]byte, n)
@@ -9583,10 +9374,7 @@ func TestSingleObjectShortBuffer(t *testing.T) {
 
 func TestSingleObjectFingerprintMatchesSpec(t *testing.T) {
 	// Verify the fingerprint bytes are little-endian CRC-64-AVRO.
-	s, err := Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 
 	h := NewRabin()
 	h.Write(s.Canonical())
@@ -9809,9 +9597,7 @@ func TestSchemaCacheMultipleRefs(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var decoded any
-	if _, err := parent.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, parent, binary, &decoded)
 	m := decoded.(map[string]any)
 	addr := m["address"].(map[string]any)
 	if addr["city"] != "Springfield" {
@@ -9872,9 +9658,7 @@ func TestSchemaCacheNestedRefs(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var decoded any
-	if _, err := top.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, top, binary, &decoded)
 	m := decoded.(map[string]any)
 	owner := m["phone"].(map[string]any)["owner"].(map[string]any)
 	if owner["lastname"] != "Smith" {
@@ -10002,9 +9786,7 @@ func TestSchemaCacheJSONRoundtrip(t *testing.T) {
 	input := `{"name":"redpanda","telephone":{"number":12341234,"identifier":"home"}}`
 
 	var native any
-	if err := json.Unmarshal([]byte(input), &native); err != nil {
-		t.Fatal(err)
-	}
+	mustUnmarshal(t, []byte(input), &native)
 
 	binary, err := parent.Encode(native)
 	if err != nil {
@@ -10044,16 +9826,13 @@ func TestSchemaCacheJSONRoundtrip(t *testing.T) {
 func TestSchemaCacheEnum(t *testing.T) {
 	cache := &SchemaCache{}
 
-	_, err := cache.Parse(`{
+	mustCacheParse(t, cache, `{
 		"type": "enum",
 		"name": "Color",
 		"symbols": ["RED", "GREEN", "BLUE"]
 	}`)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	s, err := cache.Parse(`{
+	s := mustCacheParse(t, cache, `{
 		"type": "record",
 		"name": "Item",
 		"fields": [
@@ -10061,19 +9840,11 @@ func TestSchemaCacheEnum(t *testing.T) {
 			{"name": "color", "type": "Color"}
 		]
 	}`)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	input := map[string]any{"name": "shirt", "color": "GREEN"}
-	binary, err := s.Encode(input)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	binary := mustEncode(t, s, input)
 	var decoded any
-	if _, err := s.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, binary, &decoded)
 	m := decoded.(map[string]any)
 	if m["color"] != "GREEN" {
 		t.Errorf("color: got %v", m["color"])
@@ -10160,9 +9931,7 @@ func TestSchemaCacheDiamondDependency(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var decoded any
-	if _, err := schemaA.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, schemaA, binary, &decoded)
 	m := decoded.(map[string]any)
 	bd := m["b"].(map[string]any)["d"].(map[string]any)
 	if bd["id"] != int32(1) {
@@ -10212,9 +9981,7 @@ func TestSchemaCacheDiamondEnum(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var decoded any
-	if _, err := s.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, binary, &decoded)
 	if decoded.(map[string]any)["color"] != "RED" {
 		t.Errorf("color: got %v", decoded.(map[string]any)["color"])
 	}
@@ -10260,9 +10027,7 @@ func TestSchemaCacheDiamondFixed(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var decoded any
-	if _, err := s.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, binary, &decoded)
 	got := decoded.(map[string]any)["hash"].([]byte)
 	if got[0] != 0xAB {
 		t.Errorf("hash[0]: got %x", got[0])
@@ -10306,9 +10071,7 @@ func TestSchemaCacheFailedParseThenRetry(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var decoded any
-	if _, err := s.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, binary, &decoded)
 	if decoded.(map[string]any)["f"].(map[string]any)["x"] != int32(7) {
 		t.Errorf("f.x: got %v", decoded.(map[string]any)["f"])
 	}
@@ -10339,9 +10102,7 @@ func TestSchemaCacheDiamondWhitespace(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var decoded any
-	if _, err := s.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, binary, &decoded)
 	if decoded.(map[string]any)["x"] != int32(42) {
 		t.Errorf("x: got %v", decoded.(map[string]any)["x"])
 	}
@@ -10367,9 +10128,7 @@ func TestSchemaCacheDiamondKeyOrder(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var decoded any
-	if _, err := s.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, binary, &decoded)
 	if decoded.(map[string]any)["x"] != int32(99) {
 		t.Errorf("x: got %v", decoded.(map[string]any)["x"])
 	}
@@ -10416,9 +10175,7 @@ func TestSchemaCacheFieldOrderPreserved(t *testing.T) {
 
 	// Verify the original still decodes correctly.
 	var decoded any
-	if _, err := s1.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s1, binary, &decoded)
 	m := decoded.(map[string]any)
 	if m["a"] != int32(1) {
 		t.Errorf("a: got %v", m["a"])
@@ -10475,25 +10232,17 @@ func TestSchemaCacheConflictingDefinition(t *testing.T) {
 func TestSchemaCacheZeroValue(t *testing.T) {
 	// A zero-value SchemaCache should work.
 	var c SchemaCache
-	s, err := c.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Encode(int32(42)); err != nil {
-		t.Fatal(err)
-	}
+	s := mustCacheParse(t, &c, `"int"`)
+	mustEncode(t, s, int32(42))
 }
 
 func TestSchemaCacheConcurrent(t *testing.T) {
 	cache := &SchemaCache{}
-	_, err := cache.Parse(`{
+	mustCacheParse(t, cache, `{
 		"type": "record",
 		"name": "Base",
 		"fields": [{"name": "id", "type": "int"}]
 	}`)
-	if err != nil {
-		t.Fatal(err)
-	}
 	const goroutines = 8
 	errs := make(chan error, goroutines)
 	for range goroutines {
@@ -10684,12 +10433,8 @@ func TestRegression_SchemaCacheLocalShadowNotSplicedFromCache(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.order, func(t *testing.T) {
 			var c SchemaCache
-			if _, err := c.Parse(`{"type":"record","name":"T","fields":[{"name":"x","type":"int"}]}`); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := c.Parse(`{"type":"record","name":"U","fields":[{"name":"u","type":"int"}]}`); err != nil {
-				t.Fatal(err)
-			}
+			mustCacheParse(t, &c, `{"type":"record","name":"T","fields":[{"name":"x","type":"int"}]}`)
+			mustCacheParse(t, &c, `{"type":"record","name":"U","fields":[{"name":"u","type":"int"}]}`)
 			localDef := `{"name":"a","type":{"type":"record","name":"T","fields":[{"name":"y","type":"string"}]}}`
 			bareRef := `{"name":"b","type":"T"}`
 			danglingU := `{"name":"c","type":"U"}`
@@ -10744,9 +10489,7 @@ func TestRegression_SchemaCacheLocalShadowNotSplicedFromCache(t *testing.T) {
 // describe the full schema. Encode/Decode are unaffected throughout.
 func TestRegression_SchemaCacheLaxNameStickyNotDangling(t *testing.T) {
 	var c SchemaCache
-	if _, err := c.Parse(`{"type":"record","name":"bad-name","fields":[{"name":"x","type":"int"}]}`, WithLaxNames(nil)); err != nil {
-		t.Fatal(err)
-	}
+	mustCacheParse(t, &c, `{"type":"record","name":"bad-name","fields":[{"name":"x","type":"int"}]}`, WithLaxNames(nil))
 	s, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"bad-name"}]}`)
 	if err != nil {
 		t.Fatalf("strict parse referencing a lax-defined cached type: %v", err)
@@ -10758,9 +10501,7 @@ func TestRegression_SchemaCacheLaxNameStickyNotDangling(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var back map[string]any
-	if _, err := s.Decode(wire, &back); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, wire, &back)
 
 	// String()/Canonical() are self-contained: the bad-name body is present,
 	// and they re-parse with WithLaxNames (a lax name needs it, cache or not).
@@ -10852,10 +10593,7 @@ type cacheSurfaceImage struct {
 
 func cacheSurfaces(t *testing.T, s *Schema, sample any) cacheSurfaceImage {
 	t.Helper()
-	b, err := s.AppendSingleObject(nil, sample)
-	if err != nil {
-		t.Fatalf("AppendSingleObject: %v", err)
-	}
+	b := mustAppendSingleObject(t, s, nil, sample)
 	return cacheSurfaceImage{
 		canonical: string(s.Canonical()),
 		fp:        fmt.Sprintf("%x", s.Fingerprint(NewRabin())),
@@ -10970,10 +10708,7 @@ func TestRegression_MetadataNameTableIgnoresStrayKeyDef(t *testing.T) {
 		"stray_then_real": {strayCarrier, realDef, refWithDefault},
 	} {
 		t.Run(name, func(t *testing.T) {
-			s, err := Parse(`{"type":"record","name":"R","fields":[` + strings.Join(order, ",") + `]}`)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, `{"type":"record","name":"R","fields":[`+strings.Join(order, ",")+`]}`)
 			var f3 *SchemaField
 			root := s.Root()
 			for i := range root.Fields {
@@ -11381,10 +11116,7 @@ func TestRegression_RenderDedupIgnoresStrayDefinitions(t *testing.T) {
 			{"name":"b","type":` + real + `},
 			{"name":"a","type":` + carrier(real) + `}]}`)
 		root := s.Root()
-		rb, err := root.Schema()
-		if err != nil {
-			t.Fatalf("rebuild: %v", err)
-		}
+		rb := mustNodeSchema(t, root)
 		if strings.Contains(rb.String(), `"items":"R"`) {
 			t.Errorf("stray definition rewritten to a reference: %s", rb.String())
 		}
@@ -11670,10 +11402,7 @@ func TestRegression_StrayBodyDefaultNormalization(t *testing.T) {
 		t.Errorf("double default in a stray body: got %T %v, want float64(1.5)", stray.Fields[1].Default, stray.Fields[1].Default)
 	}
 	root := s.Root()
-	rb, err := root.Schema()
-	if err != nil {
-		t.Fatalf("rebuild: %v", err)
-	}
+	rb := mustNodeSchema(t, root)
 	if !strings.Contains(rb.String(), `"default":"abc"`) || !strings.Contains(rb.String(), `"default":1.5`) {
 		t.Errorf("stray-body defaults did not re-emit their written images: %s", rb.String())
 	}
@@ -12294,26 +12023,14 @@ func TestDoSBattery_C10b_FieldLookupBreadth(t *testing.T) {
 // must stay linear in it.
 func TestDoSBattery_C10c_WideRecordSurfaces(t *testing.T) {
 	text := breadthLongFields("f", nil, false)(breadthN)
-	s, err := Parse(text)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
+	s := mustParse(t, text)
 	val := make(map[string]any, breadthN)
 	for i := range breadthN {
 		val[fmt.Sprintf("f%d", i)] = int64(i)
 	}
-	wire, err := s.Encode(val)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	jsonWire, err := s.EncodeJSON(val)
-	if err != nil {
-		t.Fatalf("encode json: %v", err)
-	}
-	soe, err := s.AppendSingleObject(nil, val)
-	if err != nil {
-		t.Fatalf("single object: %v", err)
-	}
+	wire := mustEncode(t, s, val)
+	jsonWire := mustEncodeJSON(t, s, val)
+	soe := mustAppendSingleObject(t, s, nil, val)
 
 	wantAcceptUnder(t, "Encode/wide-record", breadthBound, func() error {
 		_, err := s.Encode(val)
@@ -13008,10 +12725,7 @@ func TestInvariant_SharedSchemaNodeWalkedOnce(t *testing.T) {
 					// comment: a cell whose schema contains no container
 					// asking for a per-element minimum never enters the walk,
 					// so it would measure nothing whatever the walk did.
-					parsed, err := Parse(build(dagCostDepth))
-					if err != nil {
-						t.Fatalf("parse: %v", err)
-					}
+					parsed := mustParse(t, build(dagCostDepth))
 					if got := schemaAsksMinBytes(parsed.node); got != tr.walks {
 						t.Fatalf("trigger %q is registered as walks=%v but the parsed schema %s a container that asks for a per-element minimum",
 							tr.name, tr.walks, map[bool]string{true: "contains", false: "does not contain"}[got])
@@ -13140,10 +12854,7 @@ func TestInvariant_DagMinBytesIsExactAtScale(t *testing.T) {
 			if want >= maxSchemaMagnitude {
 				t.Fatalf("cell is above the saturation ceiling, so it measures the clamp instead")
 			}
-			s, err := Parse(dagNested(c.levels, c.fan))
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, dagNested(c.levels, c.fan))
 			if got := schemaMinBytes(s.node); got != want {
 				t.Errorf("minimum is %d, want %d (%d fields per level, %d levels, ints at the bottom); "+
 					"a walk that re-descends per reference cannot reach the bottom within its visit budget "+
@@ -13203,10 +12914,7 @@ func TestInvariant_MemoAgreesWithUnmemoizedWalk(t *testing.T) {
 	}
 	for _, c := range corpus {
 		t.Run(c.name, func(t *testing.T) {
-			s, err := Parse(c.schema)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, c.schema)
 			var walk func(n *schemaNode, seen map[*schemaNode]bool)
 			walk = func(n *schemaNode, seen map[*schemaNode]bool) {
 				if n == nil || seen[n] {
@@ -13256,18 +12964,12 @@ func TestInvariant_MinBytesSelfReadable(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			s, err := Parse(c.schema)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, c.schema)
 			val := c.val
 			if val == nil {
 				val = buildZeroValue(t, s.node)
 			}
-			b, err := s.Encode(val)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
+			b := mustEncode(t, s, val)
 			var out any
 			if _, err := s.Decode(b, &out); err != nil {
 				t.Errorf("this package encoded %d bytes its own bound then refused: %v", len(b), err)
@@ -13560,10 +13262,7 @@ func TestInvariant_CyclicWalkCostIsBoundedByWork(t *testing.T) {
 		t.Run(tr.name, func(t *testing.T) {
 			// Same trigger claim the depth cells check: a shape that reaches
 			// no caller of the walk measures nothing whatever the walk does.
-			parsed, err := Parse(tr.wrap(dagWideSCC(dagWideLevels, 2, 8)))
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			parsed := mustParse(t, tr.wrap(dagWideSCC(dagWideLevels, 2, 8)))
 			if got := schemaAsksMinBytes(parsed.node); got != tr.walks {
 				t.Fatalf("trigger %q is registered as walks=%v but the parsed schema %s a container that asks for a per-element minimum",
 					tr.name, tr.walks, map[bool]string{true: "contains", false: "does not contain"}[got])
@@ -16806,20 +16505,12 @@ func TestRegression_FixedSizeZeroWire(t *testing.T) {
 }
 
 func TestRegression_FixedSizeZeroArrayBounded(t *testing.T) {
-	s, err := Parse(`{"type":"array","items":{"type":"fixed","name":"F","size":0}}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"array","items":{"type":"fixed","name":"F","size":0}}`)
 
 	// A legitimate small array of zero-byte items round-trips.
-	enc, err := s.AppendEncode(nil, [][]byte{{}, {}, {}})
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	enc := mustAppendEncode(t, s, nil, [][]byte{{}, {}, {}})
 	var got [][]byte
-	if _, err := s.Decode(enc, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, enc, &got)
 	if len(got) != 3 {
 		t.Fatalf("got %d items, want 3", len(got))
 	}
@@ -16850,9 +16541,7 @@ func TestRegression_SchemaForZeroLenByteArrayField(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var out R
-	if _, err := s.Decode(enc, &out); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, enc, &out)
 	if out.B != 7 {
 		t.Errorf("round-trip: got %+v", out)
 	}
@@ -17265,10 +16954,7 @@ func TestRegression_UnionForwardRefTaggedNamesResolved(t *testing.T) {
 	// (a) binary TaggedUnions decode envelope: full name on both schemas.
 	envelope := func(s *Schema) any {
 		t.Helper()
-		wire, err := s.AppendEncode(nil, val)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		wire := mustAppendEncode(t, s, nil, val)
 		var out any
 		if _, err := s.Decode(wire, &out, TaggedUnions()); err != nil {
 			t.Fatalf("decode tagged: %v", err)
@@ -17338,10 +17024,7 @@ func TestRegression_UnionForwardRefTagLogicalNamesResolved(t *testing.T) {
 		G [4]byte  `avro:"g"`
 	}
 	val := rec{F: &[4]byte{0, 0, 0, 1}, G: [4]byte{0, 0, 0, 2}}
-	wire, err := s.AppendEncode(nil, val)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	wire := mustAppendEncode(t, s, nil, val)
 	var out any
 	if _, err := s.Decode(wire, &out, TaggedUnions(), TagLogicalTypes()); err != nil {
 		t.Fatalf("decode tag-logical: %v", err)

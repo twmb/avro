@@ -295,14 +295,8 @@ func javaMatrixCheck(t *testing.T, rt func(*testing.T, string, []byte) (bool, []
 	schemaJSON string, vin any,
 ) {
 	t.Helper()
-	s, err := avro.Parse(schemaJSON)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	w1, err := s.AppendEncode(nil, vin)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	s := mustParse(t, schemaJSON)
+	w1 := mustAppendEncode(t, s, nil, vin)
 	ok, _, binOut, errMsg := rt(t, schemaJSON, w1)
 	if !ok {
 		t.Fatalf("Java could not round-trip twmb's bytes: %s\nschema: %s\nwire: %x", errMsg, schemaJSON, w1)
@@ -467,23 +461,12 @@ func TestDifferentialJavaJSONForm(t *testing.T) {
 			t.Run(fr.label+"/"+cx.label, func(t *testing.T) {
 				u := &uniq{}
 				schemaJSON := cx.schema(fr.schema(u), fr.kind, u)
-				s, err := avro.Parse(schemaJSON)
-				if err != nil {
-					t.Fatalf("Parse: %v", err)
-				}
+				s := mustParse(t, schemaJSON)
 				vin := cx.wrap(fr.values[0])
-				w1, err := s.AppendEncode(nil, vin, avro.TaggedUnions())
-				if err != nil {
-					t.Fatalf("encode: %v", err)
-				}
+				w1 := mustAppendEncode(t, s, nil, vin, avro.TaggedUnions())
 				var a1 any
-				if _, err := s.Decode(w1, &a1, avro.TaggedUnions()); err != nil {
-					t.Fatalf("decode: %v", err)
-				}
-				j1, err := s.AppendEncodeJSON(nil, a1, avro.TaggedUnions())
-				if err != nil {
-					t.Fatalf("encodeJSON: %v", err)
-				}
+				mustDecode(t, s, w1, &a1, avro.TaggedUnions())
+				j1 := mustAppendEncodeJSON(t, s, nil, a1, avro.TaggedUnions())
 				ok, javaJSON, _, errMsg := rt(t, schemaJSON, w1)
 				if !ok {
 					t.Fatalf("Java rt: %s", errMsg)

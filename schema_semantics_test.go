@@ -2046,10 +2046,7 @@ func TestMatrix_ReservedKeyDuplicateSpellings(t *testing.T) {
 // to the structural field.
 func TestMatrix_ReservedKeyDuplicateExactMalformed(t *testing.T) {
 	t.Parallel()
-	s, err := avro.Parse(`{"type":"int","items":12,"ITEMS":"int"}`)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"int","items":12,"ITEMS":"int"}`)
 	root := s.Root()
 	if root.Items != nil {
 		t.Errorf("malformed exact-key body must not surface structurally: %+v", root.Items)
@@ -2086,10 +2083,7 @@ func TestRegression_ReservedDupValidVariantPreserved(t *testing.T) {
 	}, int32(1), "int", ""}
 	checkReservedDupCell(t, carrier.build(`,"ITEMS":"long"`), carrier, "ITEMS", "long", "")
 	// The structural slot carries the exact key's body, not the variant's.
-	s, err := avro.Parse(`{"type":"int","items":"int","ITEMS":"long"}`)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"int","items":"int","ITEMS":"long"}`)
 	root := s.Root()
 	if root.Items == nil || root.Items.Type != "int" {
 		t.Errorf("structural Items = %+v; want the exact key's body (int)", root.Items)
@@ -2103,14 +2097,8 @@ func TestRegression_ReservedDupValidVariantPreserved(t *testing.T) {
 func TestRegression_ReservedDupParseMetadataPropsParity(t *testing.T) {
 	t.Parallel()
 	var captured map[string]any
-	s, err := avro.Parse(`{"type":"int","name":"x","NAME":12}`,
-		avro.WithCustomType(propsCaptureCustom("int", "", &captured)))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if _, err := s.AppendEncode(nil, int32(5)); err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	s := mustParse(t, `{"type":"int","name":"x","NAME":12}`, avro.WithCustomType(propsCaptureCustom("int", "", &captured)))
+	mustAppendEncode(t, s, nil, int32(5))
 	rootProps := s.Root().Props
 	want := map[string]any{"NAME": int64(12)}
 	if !reflect.DeepEqual(rootProps, want) {
@@ -2127,11 +2115,8 @@ func TestRegression_ReservedDupParseMetadataPropsParity(t *testing.T) {
 // rebuild.
 func TestRegression_FieldReservedDupVariantPreserved(t *testing.T) {
 	t.Parallel()
-	s, err := avro.Parse(`{"type":"record","name":"FR","fields":[
+	s := mustParse(t, `{"type":"record","name":"FR","fields":[
 		{"name":"f","type":"int","doc":"d","DOC":12}]}`)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
 	f := s.Root().Fields[0]
 	if f.Doc != "d" {
 		t.Errorf("Doc = %q; want the exact spelling's body", f.Doc)
@@ -2140,10 +2125,7 @@ func TestRegression_FieldReservedDupVariantPreserved(t *testing.T) {
 		t.Errorf(`Props["DOC"] = %#v; want 12 (case-variant field reserved-key spelling preserved)`, got)
 	}
 	root := s.Root()
-	rb, err := root.Schema()
-	if err != nil {
-		t.Fatalf("rebuild: %v", err)
-	}
+	rb := mustNodeSchema(t, root)
 	if got := rb.Root().Fields[0].Props["DOC"]; !reflect.DeepEqual(got, int64(12)) {
 		t.Errorf(`rebuild Props["DOC"] = %#v; want 12`, got)
 	}
@@ -2354,9 +2336,7 @@ func TestRegression_CaseVariantNamingKeyInert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if _, err := s.AppendEncode(nil, map[string]any{"f": int32(1)}); err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	mustAppendEncode(t, s, nil, map[string]any{"f": int32(1)})
 	root := s.Root()
 	if root.Name != "R" || root.Namespace != "" {
 		t.Errorf("Name=%q Namespace=%q; a NAMESPACE case-variant must not scope the type", root.Name, root.Namespace)
@@ -2417,10 +2397,7 @@ func TestRegression_CaseVariantNamingKeyInert(t *testing.T) {
 // because the key is simply not a reserved key.
 func TestRegression_CaseVariantStrayBodyStaysProp(t *testing.T) {
 	t.Parallel()
-	s, err := avro.Parse(`{"type":"int","ITEMS":"long"}`)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"int","ITEMS":"long"}`)
 	root := s.Root()
 	if root.Items != nil {
 		t.Errorf("Items = %+v; a case-variant key must not surface structurally", root.Items)
@@ -2431,10 +2408,7 @@ func TestRegression_CaseVariantStrayBodyStaysProp(t *testing.T) {
 
 	// The exact-lowercase stray keeps its structural surfacing (the
 	// boundary-1 control: the stray routing is about placement, not case).
-	s2, err := avro.Parse(`{"type":"int","items":"long"}`)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	s2 := mustParse(t, `{"type":"int","items":"long"}`)
 	root2 := s2.Root()
 	if root2.Items == nil || root2.Items.Type != "long" {
 		t.Errorf("exact-case stray items lost its structural surfacing: %+v", root2.Items)
@@ -2450,10 +2424,7 @@ func TestRegression_CaseVariantStrayBodyStaysProp(t *testing.T) {
 // by the rebuild.
 func TestRegression_FieldCaseVariantKeyInert(t *testing.T) {
 	t.Parallel()
-	s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int","DEFAULT":7}]}`)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"f","type":"int","DEFAULT":7}]}`)
 	f := s.Root().Fields[0]
 	if f.HasDefault {
 		t.Errorf("HasDefault = true; a DEFAULT case-variant must not set a default")
@@ -2904,12 +2875,9 @@ func TestMatrix_BogusLogicalStrayKeysSurfaceAsProps(t *testing.T) {
 	}
 
 	t.Run("reference-decimal-precision", func(t *testing.T) {
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"F","type":{"type":"fixed","name":"Fx","size":4}},
 			{"name":"b","type":{"type":"Fx","logicalType":"decimal","precision":3}}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
 		ref := s.Root().Fields[1].Type
 		if ref.Precision != 0 {
 			t.Errorf("reference node consumed stray precision into Precision=%d; want 0", ref.Precision)
@@ -2961,18 +2929,10 @@ func TestMatrix_BogusLogicalStrayKeysSurfaceAsProps(t *testing.T) {
 				return v, nil
 			},
 		}
-		s, err := avro.Parse(`{"type":"int","logicalType":"decimal","precision":3}`, avro.WithCustomType(ct))
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
-		enc, err := s.AppendEncode(nil, int32(7))
-		if err != nil {
-			t.Fatalf("AppendEncode: %v", err)
-		}
+		s := mustParse(t, `{"type":"int","logicalType":"decimal","precision":3}`, avro.WithCustomType(ct))
+		enc := mustAppendEncode(t, s, nil, int32(7))
 		var out any
-		if _, err := s.Decode(enc, &out); err != nil {
-			t.Fatalf("Decode: %v", err)
-		}
+		mustDecode(t, s, enc, &out)
 		if sawPrecision != 0 || sawScale != 0 {
 			t.Errorf("callback saw Precision=%d/Scale=%d; want 0/0 (Props-only)", sawPrecision, sawScale)
 		}
@@ -3180,10 +3140,7 @@ func TestMatrix_FieldDecimalConsumedMalformedParamReject(t *testing.T) {
 // Valid-int unconsumed pair: observable on SchemaField.Props, the String()
 // render, and the rebuild — the surfaces the malformed forms must match.
 func TestRegression_FieldPrecisionValidUnconsumedSurfacesInProps(t *testing.T) {
-	s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int","precision":3}]}`)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"f","type":"int","precision":3}]}`)
 	f := s.Root().Fields[0]
 	if got := f.Props["precision"]; got != int64(3) {
 		t.Errorf("SchemaField.Props[precision] = %#v; want int64(3)", got)
@@ -3192,10 +3149,7 @@ func TestRegression_FieldPrecisionValidUnconsumedSurfacesInProps(t *testing.T) {
 		t.Errorf("String() dropped the unconsumed field precision: %s", s.String())
 	}
 	root := s.Root()
-	rb, err := root.Schema()
-	if err != nil {
-		t.Fatalf("rebuild: %v", err)
-	}
+	rb := mustNodeSchema(t, root)
 	if got := rb.Root().Fields[0].Props["precision"]; got != int64(3) {
 		t.Errorf("rebuild Props[precision] = %#v; want int64(3)", got)
 	}
@@ -3685,10 +3639,7 @@ func TestRegression_StrayFieldsElementPrecisionRouting(t *testing.T) {
 	t.Run("unconsumed-element-shape-ok", func(t *testing.T) {
 		// Carrier is a PRIMITIVE: a container kind carrying another kind's
 		// defining key is the exclusivity hard-reject, a different rule.
-		s, err := avro.Parse(`{"type":"int","fields":[{"name":"f","type":"int","precision":"x"}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
+		s := mustParse(t, `{"type":"int","fields":[{"name":"f","type":"int","precision":"x"}]}`)
 		n := s.Root()
 		if _, ok := n.Props["fields"]; ok {
 			t.Errorf("shape-OK stray fields leaked into Props: %#v", n.Props)
@@ -3701,10 +3652,7 @@ func TestRegression_StrayFieldsElementPrecisionRouting(t *testing.T) {
 		}
 	})
 	t.Run("consumed-element-still-malformed", func(t *testing.T) {
-		s, err := avro.Parse(`{"type":"int","fields":[{"name":"f","type":"bytes","logicalType":"decimal","precision":"x"}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
+		s := mustParse(t, `{"type":"int","fields":[{"name":"f","type":"bytes","logicalType":"decimal","precision":"x"}]}`)
 		n := s.Root()
 		if len(n.Fields) != 0 {
 			t.Errorf("malformed-element stray fields surfaced structurally: %#v", n.Fields)
@@ -4024,9 +3972,7 @@ func TestMatrix_StrayBodyShapeRouting(t *testing.T) {
 					t.Fatalf("encode: %v", err)
 				}
 				var out map[string]any
-				if _, err := s.Decode(enc, &out); err != nil {
-					t.Fatalf("decode: %v", err)
-				}
+				mustDecode(t, s, enc, &out)
 				root := s.Root()
 				rb, err := root.Schema()
 				if err != nil {
@@ -4138,10 +4084,7 @@ func TestDifferentialFastavroStrayBodyShapes(t *testing.T) {
 
 func TestRegression_StrayAliasesMalformedNotStructurallySurfaced(t *testing.T) {
 	t.Parallel()
-	s, err := avro.Parse(`{"type":"int","aliases":["a",1]}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"int","aliases":["a",1]}`)
 	n := s.Root()
 	if _, ok := n.Props["aliases"]; !ok {
 		t.Fatalf("malformed stray aliases not in Props: %#v", n.Props)
@@ -4153,10 +4096,7 @@ func TestRegression_StrayAliasesMalformedNotStructurallySurfaced(t *testing.T) {
 
 func TestRegression_StraySymbolsMalformedNotStructurallySurfaced(t *testing.T) {
 	t.Parallel()
-	s, err := avro.Parse(`{"type":"int","symbols":["a",1]}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"int","symbols":["a",1]}`)
 	n := s.Root()
 	if _, ok := n.Props["symbols"]; !ok {
 		t.Fatalf("malformed stray symbols not in Props: %#v", n.Props)
@@ -4168,10 +4108,7 @@ func TestRegression_StraySymbolsMalformedNotStructurallySurfaced(t *testing.T) {
 
 func TestRegression_StraySizeMalformedNotStructurallySurfaced(t *testing.T) {
 	t.Parallel()
-	s, err := avro.Parse(`{"type":"int","size":3.7}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"int","size":3.7}`)
 	n := s.Root()
 	if _, ok := n.Props["size"]; !ok {
 		t.Fatalf("malformed stray size not in Props: %#v", n.Props)
@@ -4353,10 +4290,7 @@ func TestMatrix_EmptyAliasesStayDropped(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			s := avro.MustParse(c.src)
 			root := s.Root()
-			rb, err := root.Schema()
-			if err != nil {
-				t.Fatalf("rebuild: %v", err)
-			}
+			rb := mustNodeSchema(t, root)
 			if strings.Contains(rb.String(), `"aliases"`) {
 				t.Errorf("an empty alias list survived where the kind BINDS the key; Apache Avro's condition there is non-empty: %s", rb)
 			}
@@ -4372,10 +4306,7 @@ func TestMatrix_EmptyAliasesStayDropped(t *testing.T) {
 		t.Run("control/"+c.name, func(t *testing.T) {
 			s := avro.MustParse(c.src)
 			root := s.Root()
-			rb, err := root.Schema()
-			if err != nil {
-				t.Fatalf("rebuild: %v", err)
-			}
+			rb := mustNodeSchema(t, root)
 			if !strings.Contains(rb.String(), `"aliases"`) {
 				t.Errorf("the non-empty control lost the aliases too, so the drop above is not about the body: %s", rb)
 			}
@@ -5096,10 +5027,7 @@ func TestMatrix_TypeLevelDefaultOrderSurviveTheRebuild(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			s, err := avro.Parse(c.src)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
+			s := mustParse(t, c.src)
 			n := c.node(*s.Root())
 			got, ok := n.Props[c.key]
 			if !ok {
@@ -5109,10 +5037,7 @@ func TestMatrix_TypeLevelDefaultOrderSurviveTheRebuild(t *testing.T) {
 				t.Errorf("Props[%q] = %#v (%T), want %#v", c.key, got, got, c.val)
 			}
 			root := s.Root()
-			rb, err := root.Schema()
-			if err != nil {
-				t.Fatalf("rebuild: %v", err)
-			}
+			rb := mustNodeSchema(t, root)
 			if !strings.Contains(rb.String(), `"`+c.key+`"`) {
 				t.Errorf("the rebuild dropped the as-written %q: %s", c.key, rb)
 			}
@@ -5130,11 +5055,8 @@ func TestMatrix_TypeLevelDefaultOrderSurviveTheRebuild(t *testing.T) {
 // {default, doc, name, order, type, aliases}). Without this the type-level
 // routing could be "fixed" by routing everywhere.
 func TestRegression_FieldLevelDefaultOrderStayConsumed(t *testing.T) {
-	s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+	s := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int","default":3,"order":"descending"}]}`)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
 	f := s.Root().Fields[0]
 	if !f.HasDefault || f.Default != int32(3) {
 		t.Errorf("field default not consumed: HasDefault=%v Default=%#v", f.HasDefault, f.Default)
@@ -5190,10 +5112,7 @@ var docBodiesNonString = []string{`5`, `[]`, `null`, `{"a":1}`, `true`}
 func TestMatrix_NonStringDocDroppedAtBothLevels(t *testing.T) {
 	for _, body := range docBodiesNonString {
 		t.Run("type-level/"+body, func(t *testing.T) {
-			s, err := avro.Parse(`{"type":"int","doc":` + body + `}`)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
+			s := mustParse(t, `{"type":"int","doc":`+body+`}`)
 			n := s.Root()
 			if n.Doc != "" {
 				t.Errorf("Doc = %q, want empty: a non-text body cannot become documentation", n.Doc)
@@ -5201,10 +5120,7 @@ func TestMatrix_NonStringDocDroppedAtBothLevels(t *testing.T) {
 			if _, ok := n.Props["doc"]; ok {
 				t.Errorf(`"doc" reached Props: %#v — the key is bound on every kind, so Props is not its surface`, n.Props)
 			}
-			rb, err := n.Schema()
-			if err != nil {
-				t.Fatalf("rebuild: %v", err)
-			}
+			rb := mustNodeSchema(t, n)
 			if strings.Contains(rb.String(), `"doc"`) {
 				t.Errorf("the rebuild emitted a doc that never landed: %s", rb)
 			}
@@ -5219,11 +5135,8 @@ func TestMatrix_NonStringDocDroppedAtBothLevels(t *testing.T) {
 		})
 
 		t.Run("field-level/"+body, func(t *testing.T) {
-			s, err := avro.Parse(`{"type":"record","name":"R","fields":[
-				{"name":"f","type":"int","doc":` + body + `}]}`)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
+			s := mustParse(t, `{"type":"record","name":"R","fields":[
+				{"name":"f","type":"int","doc":`+body+`}]}`)
 			f := s.Root().Fields[0]
 			if f.Doc != "" {
 				t.Errorf("SchemaField.Doc = %q, want empty", f.Doc)
@@ -5232,10 +5145,7 @@ func TestMatrix_NonStringDocDroppedAtBothLevels(t *testing.T) {
 				t.Errorf(`"doc" reached SchemaField.Props: %#v — FIELD_RESERVED binds it, so Props is not its surface`, f.Props)
 			}
 			hostRoot := s.Root()
-			rb, err := hostRoot.Schema()
-			if err != nil {
-				t.Fatalf("rebuild: %v", err)
-			}
+			rb := mustNodeSchema(t, hostRoot)
 			if strings.Contains(rb.String(), `"doc"`) {
 				t.Errorf("the rebuild emitted a field doc that never landed: %s", rb)
 			}
@@ -5430,10 +5340,7 @@ func TestMatrix_LogicalTypeValueTypes(t *testing.T) {
 
 	for _, c := range cells {
 		t.Run("type_level_"+c.name, func(t *testing.T) {
-			s, err := avro.Parse(`{"type":"int","logicalType":` + c.val + `}`)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, `{"type":"int","logicalType":`+c.val+`}`)
 			n := s.Root()
 			if n.LogicalType != c.wantField {
 				t.Errorf("LogicalType = %q, want %q", n.LogicalType, c.wantField)
@@ -5467,10 +5374,7 @@ func TestMatrix_LogicalTypeValueTypes(t *testing.T) {
 				}
 			}
 			// The rebuild preserves the attribute (on LogicalType or Props).
-			rb, err := n.Schema()
-			if err != nil {
-				t.Fatalf("rebuild: %v", err)
-			}
+			rb := mustNodeSchema(t, n)
 			rn := rb.Root()
 			if rn.LogicalType != c.wantField {
 				t.Errorf("rebuild LogicalType = %q, want %q", rn.LogicalType, c.wantField)
@@ -5485,10 +5389,7 @@ func TestMatrix_LogicalTypeValueTypes(t *testing.T) {
 			}
 		})
 		t.Run("field_level_"+c.name, func(t *testing.T) {
-			s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int","logicalType":` + c.val + `}]}`)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"f","type":"int","logicalType":`+c.val+`}]}`)
 			f := s.Root().Fields[0]
 			// Field-level logicalType always rides in SchemaField.Props
 			// as-written on the metadata surface (the wire-side lift onto
@@ -5742,24 +5643,16 @@ func TestMatrix_NamedFixedLogicalTaggedUnionName(t *testing.T) {
 			}
 
 			// JSON encode emits the expected key.
-			jb, err := s.EncodeJSON(c.input, opts...)
-			if err != nil {
-				t.Fatalf("EncodeJSON: %v", err)
-			}
+			jb := mustEncodeJSON(t, s, c.input, opts...)
 			if got := keyOf(t, jb); got != c.wantKey {
 				t.Errorf("EncodeJSON tagged key: got %q, want %q (%s)", got, c.wantKey, jb)
 			}
 
 			// Binary decode into *any wraps under the SAME key — binary↔JSON
 			// uniformity for the tagged-union name.
-			wire, err := s.Encode(c.input)
-			if err != nil {
-				t.Fatalf("Encode: %v", err)
-			}
+			wire := mustEncode(t, s, c.input)
 			var decoded any
-			if _, err := s.Decode(wire, &decoded, opts...); err != nil {
-				t.Fatalf("Decode: %v", err)
-			}
+			mustDecode(t, s, wire, &decoded, opts...)
 			m, ok := decoded.(map[string]any)
 			if !ok {
 				t.Fatalf("decoded not a tagged map: %#v", decoded)
@@ -7980,9 +7873,7 @@ func TestRegression_EnumRefWrapperDefaultInert(t *testing.T) {
 	}
 	t.Run("cache-splice", func(t *testing.T) {
 		var c avro.SchemaCache
-		if _, err := c.Parse(`{"type":"enum","name":"E2","symbols":["A","B"]}`); err != nil {
-			t.Fatal(err)
-		}
+		mustCacheParse(t, &c, `{"type":"enum","name":"E2","symbols":["A","B"]}`)
 		s, err := c.Parse(`{"type":"record","name":"R2","fields":[{"name":"f","type":{"type":"E2","default":"B"}}]}`)
 		if err != nil {
 			t.Fatalf("cache parse: %v", err)
@@ -8588,10 +8479,7 @@ func TestInvariant_UnionTagOwnerIsUniquePerSchema(t *testing.T) {
 	)
 	for _, sc := range schemas {
 		t.Run(sc, func(t *testing.T) {
-			s, err := avro.Parse(sc)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, sc)
 			root := s.Root()
 			if root.Type != "union" {
 				t.Fatalf("expected a union, got %q", root.Type)
@@ -8762,10 +8650,7 @@ func TestMatrix_UnionTagTierAcrossConsumers(t *testing.T) {
 	}
 	for _, c := range cells {
 		t.Run(c.tier+"/"+c.tag, func(t *testing.T) {
-			s, err := avro.Parse(c.schema)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, c.schema)
 			tagged := map[string]any{c.tag: c.value}
 
 			_, binErr := s.Encode(tagged)
@@ -8819,9 +8704,7 @@ func TestMatrix_ForwardRefFieldDefaultEncodes(t *testing.T) {
 			t.Fatalf("encode (arr default fills): %v", err)
 		}
 		out := map[string]any{}
-		if _, err := s.Decode(buf, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, buf, &out)
 		arr, _ := out["arr"].([]any)
 		if len(arr) != 1 {
 			t.Fatalf("arr default: got %#v, want one element", out["arr"])
@@ -8844,9 +8727,7 @@ func TestMatrix_ForwardRefFieldDefaultEncodes(t *testing.T) {
 			t.Fatalf("encode (m default fills): %v", err)
 		}
 		out := map[string]any{}
-		if _, err := s.Decode(buf, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, buf, &out)
 		m, _ := out["m"].(map[string]any)
 		inner, _ := m["k"].(map[string]any)
 		if inner == nil || inner["v"].(int32) != 3 {
@@ -8881,9 +8762,7 @@ func TestMatrix_ForwardRefFieldDefaultEncodes(t *testing.T) {
 			t.Fatalf("encode (a default fills): %v", err)
 		}
 		out := map[string]any{}
-		if _, err := s.Decode(buf, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, buf, &out)
 		a, _ := out["a"].(map[string]any)
 		x, _ := a["x"].(map[string]any)
 		if x == nil || x["y"].(int64) != 7 {
@@ -8916,14 +8795,9 @@ func TestMatrix_ForwardRefFieldDefaultEncodes(t *testing.T) {
 			{"name":"m","type":{"type":"map","values":"Inner"},"default":{"k":{"v":3}}}
 		]}`)
 		decodeM := func(s *avro.Schema) any {
-			buf, err := s.AppendEncode(nil, map[string]any{"l": map[string]any{"v": 0}})
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
+			buf := mustAppendEncode(t, s, nil, map[string]any{"l": map[string]any{"v": 0}})
 			out := map[string]any{}
-			if _, err := s.Decode(buf, &out); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
+			mustDecode(t, s, buf, &out)
 			return out["m"]
 		}
 		if a, b := decodeM(fwd), decodeM(bwd); !reflect.DeepEqual(a, b) {
@@ -8971,10 +8845,7 @@ func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
 		// kids = [ R{tag:9,kids:[]} ] = count 1 (0x02), item tag=9 (0x12),
 		// item kids empty (0x00), array terminator (0x00). The pre-fix bug
 		// dropped the inner kids and outer terminator, emitting 0x02021200.
-		buf, err := s.AppendEncode(nil, map[string]any{"tag": int32(1)})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		buf := mustAppendEncode(t, s, nil, map[string]any{"tag": int32(1)})
 		if got, want := buf, []byte{0x02, 0x02, 0x12, 0x00, 0x00}; !reflect.DeepEqual(got, want) {
 			t.Errorf("default-filled wire = %x, want %x", got, want)
 		}
@@ -8988,10 +8859,7 @@ func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
 		}
 		// Binary Encode must match what EncodeJSON (runtime re-encode, already
 		// correct) produces for the same default-fill.
-		jb, err := s.EncodeJSON(map[string]any{"tag": int32(1)})
-		if err != nil {
-			t.Fatalf("EncodeJSON: %v", err)
-		}
+		jb := mustEncodeJSON(t, s, map[string]any{"tag": int32(1)})
 		if want := `{"tag":1,"kids":[{"tag":9,"kids":[]}]}`; string(jb) != want {
 			t.Errorf("EncodeJSON = %s, want %s", jb, want)
 		}
@@ -9150,10 +9018,7 @@ func TestRegression_NameRefEnumUnionDefaultMetadata(t *testing.T) {
 	// wireBranchByte encodes a record omitting the union field so its default
 	// fills, then returns the union branch index byte the wire chose.
 	wireBranchByte := func(t *testing.T, s *avro.Schema, omitField string, present map[string]any) byte {
-		buf, err := s.AppendEncode(nil, present)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		buf := mustAppendEncode(t, s, nil, present)
 		// The enum-typed "def" field encodes first as a single ordinal byte
 		// (0x00 for symbol "A"); the union field's default follows.
 		return buf[1]
@@ -9235,9 +9100,7 @@ func TestRegression_ForwardRefUnionBranchAllPaths(t *testing.T) {
 		t.Fatalf("binary encode: %v", err)
 	}
 	var binOut rec
-	if _, err := s.Decode(bin, &binOut); err != nil {
-		t.Fatalf("binary decode: %v", err)
-	}
+	mustDecode(t, s, bin, &binOut)
 	if !reflect.DeepEqual(in, binOut) {
 		t.Fatalf("binary round-trip: got %+v want %+v", binOut, in)
 	}
@@ -9248,18 +9111,14 @@ func TestRegression_ForwardRefUnionBranchAllPaths(t *testing.T) {
 		t.Fatalf("json encode: %v", err)
 	}
 	var jsOut rec
-	if err := s.DecodeJSON(js, &jsOut); err != nil {
-		t.Fatalf("json decode: %v", err)
-	}
+	mustDecodeJSON(t, s, js, &jsOut)
 	if !reflect.DeepEqual(in, jsOut) {
 		t.Fatalf("json round-trip: got %+v want %+v", jsOut, in)
 	}
 
 	// Schema resolution / compatibility must not nil-panic on the writer's
 	// forward-ref union branch.
-	if _, err := avro.Resolve(s, s); err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
+	mustResolve(t, s, s)
 	if err := avro.CheckCompatibility(s, s); err != nil {
 		t.Fatalf("CheckCompatibility: %v", err)
 	}
@@ -9399,9 +9258,7 @@ func TestNegativeZeroIntegerLiteralResidual(t *testing.T) {
 	binWire, _ := s.Encode(map[string]any{})
 	jsonWire, _ := s.AppendEncodeJSON(nil, map[string]any{})
 	var got map[string]any
-	if err := s.DecodeJSON(jsonWire, &got); err != nil {
-		t.Fatalf("decodeJSON: %v", err)
-	}
+	mustDecodeJSON(t, s, jsonWire, &got)
 	reBin, _ := s.Encode(got)
 	if string(binWire) != string(reBin) {
 		t.Errorf("integer -0: binary (%x) and JSON-roundtrip (%x) wire diverge", binWire, reBin)
@@ -9414,10 +9271,7 @@ func TestNegativeZeroIntegerLiteralResidual(t *testing.T) {
 // stable through a Root().Schema() rebuild.
 func TestRegression_NegativeZeroFloat32AndProps(t *testing.T) {
 	t.Run("float32_field", func(t *testing.T) {
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":-0.0}]}`)
-		if err != nil {
-			t.Fatalf("parse: %v", err)
-		}
+		s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":-0.0}]}`)
 		def, ok := s.Root().Fields[0].Default.(float32)
 		if !ok {
 			t.Fatalf("Default is %T, want float32", s.Root().Fields[0].Default)
@@ -9432,10 +9286,7 @@ func TestRegression_NegativeZeroFloat32AndProps(t *testing.T) {
 	})
 
 	t.Run("props_neg_zero", func(t *testing.T) {
-		s, err := avro.Parse(`{"type":"record","name":"R","namespace":"ns","x":-0.0,"fields":[]}`)
-		if err != nil {
-			t.Fatalf("parse: %v", err)
-		}
+		s := mustParse(t, `{"type":"record","name":"R","namespace":"ns","x":-0.0,"fields":[]}`)
 		f, ok := s.Root().Props["x"].(float64)
 		if !ok {
 			t.Fatalf("Props[x] is %T, want float64", s.Root().Props["x"])
@@ -9444,10 +9295,7 @@ func TestRegression_NegativeZeroFloat32AndProps(t *testing.T) {
 			t.Errorf("Props negative zero lost its sign: %v", f)
 		}
 		root := s.Root()
-		s2, err := root.Schema()
-		if err != nil {
-			t.Fatalf("rebuild: %v", err)
-		}
+		s2 := mustNodeSchema(t, root)
 		f2, ok := s2.Root().Props["x"].(float64)
 		if !ok || !math.Signbit(f2) {
 			t.Errorf("rebuilt Props[x] = %v (%T), sign lost", s2.Root().Props["x"], s2.Root().Props["x"])
@@ -9771,12 +9619,9 @@ func TestMatrix_FlatFieldLiftLogicals(t *testing.T) {
 // nested form).
 func TestMatrix_FlatFieldLiftNameRefDefaults(t *testing.T) {
 	t.Run("sibling-fixed", func(t *testing.T) {
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"F","type":"fixed","size":4},
 			{"name":"F2","type":"F","default":"abcd"}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
 		b, ok := s.Root().Fields[1].Default.([]byte)
 		if !ok || string(b) != "abcd" {
 			t.Fatalf("F2 default = %T(%v), want []byte(abcd)", s.Root().Fields[1].Default, s.Root().Fields[1].Default)
@@ -9785,12 +9630,9 @@ func TestMatrix_FlatFieldLiftNameRefDefaults(t *testing.T) {
 	t.Run("sibling-enum", func(t *testing.T) {
 		// Contract row: an enum default is already the member string on
 		// both surfaces; the lift must leave it exactly as written.
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"E","type":"enum","symbols":["A","B"]},
 			{"name":"E2","type":"E","default":"A"}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
 		if got, ok := s.Root().Fields[1].Default.(string); !ok || got != "A" {
 			t.Fatalf("E2 default = %T(%v), want string A", s.Root().Fields[1].Default, s.Root().Fields[1].Default)
 		}
@@ -9798,24 +9640,18 @@ func TestMatrix_FlatFieldLiftNameRefDefaults(t *testing.T) {
 	t.Run("diamond", func(t *testing.T) {
 		// The flat definition lives inside one nested record; a second
 		// nested record references it by name with a default.
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"s1","type":{"type":"record","name":"Sub1","fields":[
 				{"name":"F","type":"fixed","size":4}]}},
 			{"name":"s2","type":{"type":"record","name":"Sub2","fields":[
 				{"name":"f","type":"F","default":"wxyz"}]}}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
 		f := s.Root().Fields[1].Type.Fields[0]
 		b, ok := f.Default.([]byte)
 		if !ok || string(b) != "wxyz" {
 			t.Fatalf("diamond ref default = %T(%v), want []byte(wxyz)", f.Default, f.Default)
 		}
 		root := s.Root()
-		rebuilt, err := root.Schema()
-		if err != nil {
-			t.Fatalf("Root().Schema(): %v", err)
-		}
+		rebuilt := mustNodeSchema(t, root)
 		if !bytes.Equal(rebuilt.Canonical(), s.Canonical()) {
 			t.Fatal("canonical mismatch")
 		}
@@ -9931,11 +9767,8 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 		// A nested type OBJECT is already a definition; a stray field-level
 		// defining key alongside it is a custom field property on both
 		// sides, never a lift input.
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"e","type":{"type":"enum","name":"X","symbols":["A"]},"symbols":["B","C"]}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
 		f := s.Root().Fields[0]
 		if f.Type.Name != "X" || len(f.Type.Symbols) != 1 {
 			t.Fatalf("nested type mangled: %+v", f.Type)
@@ -9944,10 +9777,7 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 			t.Fatalf("stray field-level symbols missing from Props: %v", f.Props)
 		}
 		root := s.Root()
-		rebuilt, err := root.Schema()
-		if err != nil {
-			t.Fatalf("Root().Schema(): %v", err)
-		}
+		rebuilt := mustNodeSchema(t, root)
 		if !bytes.Equal(rebuilt.Canonical(), s.Canonical()) {
 			t.Fatal("canonical mismatch")
 		}
@@ -9956,12 +9786,9 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 		// A name reference with a stray defining key is a reference plus a
 		// custom field property on both sides — "MyEnum" is not a liftable
 		// kind name.
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"d","type":{"type":"enum","name":"MyEnum","symbols":["B"]}},
 			{"name":"e","type":"MyEnum","symbols":["Z"]}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
 		f := s.Root().Fields[1]
 		if f.Type.Type != "MyEnum" {
 			t.Fatalf("reference field type = %+v, want bare MyEnum ref", f.Type)
@@ -9970,20 +9797,14 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 			t.Fatalf("stray symbols missing from Props: %v", f.Props)
 		}
 		root := s.Root()
-		rebuilt, err := root.Schema()
-		if err != nil {
-			t.Fatalf("Root().Schema(): %v", err)
-		}
+		rebuilt := mustNodeSchema(t, root)
 		if !bytes.Equal(rebuilt.Canonical(), s.Canonical()) {
 			t.Fatal("canonical mismatch")
 		}
 	})
 	t.Run("primitive-type-never-lifts", func(t *testing.T) {
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"p","type":"int","symbols":["A"]}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
 		f := s.Root().Fields[0]
 		if f.Type.Type != "int" {
 			t.Fatalf("field type = %+v, want int", f.Type)
@@ -9992,10 +9813,7 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 			t.Fatalf("stray symbols missing from Props: %v", f.Props)
 		}
 		root := s.Root()
-		rebuilt, err := root.Schema()
-		if err != nil {
-			t.Fatalf("Root().Schema(): %v", err)
-		}
+		rebuilt := mustNodeSchema(t, root)
 		if !bytes.Equal(rebuilt.Canonical(), s.Canonical()) {
 			t.Fatal("canonical mismatch")
 		}
@@ -10005,11 +9823,8 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 		// unnamed flat kind the wire parser drops it, and the metadata
 		// walker preserves it as-written in the field's Props (the parser
 		// ignores it on re-parse, so the rebuild is canonical-stable).
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"a","type":"array","items":"int","namespace":"x.y"}]}`)
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
 		f := s.Root().Fields[0]
 		if f.Type.Type != "array" || f.Type.Items == nil {
 			t.Fatalf("lifted array: %+v", f.Type)
@@ -10018,10 +9833,7 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 			t.Fatalf("field Props[namespace] = %v, want x.y", got)
 		}
 		root := s.Root()
-		rebuilt, err := root.Schema()
-		if err != nil {
-			t.Fatalf("Root().Schema(): %v", err)
-		}
+		rebuilt := mustNodeSchema(t, root)
 		if !bytes.Equal(rebuilt.Canonical(), s.Canonical()) {
 			t.Fatal("canonical mismatch")
 		}
@@ -10033,19 +9845,13 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 // encode, but the schema itself round-trips), and the lifted node plus its
 // rebuild carry the empty list faithfully.
 func TestMatrix_FlatFieldLiftDegenerate(t *testing.T) {
-	s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"E","type":"enum","symbols":[]}]}`)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"E","type":"enum","symbols":[]}]}`)
 	f := s.Root().Fields[0]
 	if f.Type.Type != "enum" || f.Type.Name != "E" || f.Type.Symbols == nil || len(f.Type.Symbols) != 0 {
 		t.Fatalf("lifted empty enum: %+v", f.Type)
 	}
 	root := s.Root()
-	rebuilt, err := root.Schema()
-	if err != nil {
-		t.Fatalf("Root().Schema(): %v", err)
-	}
+	rebuilt := mustNodeSchema(t, root)
 	if !bytes.Equal(rebuilt.Canonical(), s.Canonical()) {
 		t.Fatalf("canonical mismatch:\n %s\n %s", rebuilt.Canonical(), s.Canonical())
 	}
@@ -10109,9 +9915,7 @@ func TestTagContract_FieldNameMapping(t *testing.T) {
 	}
 
 	var got R
-	if _, err := s.Decode(structWire, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, structWire, &got)
 	if got.Renamed != 7 || got.Plain != 9 {
 		t.Errorf("decode round-trip: got %+v, want {7 9}", got)
 	}
@@ -10136,9 +9940,7 @@ func TestTagContract_ExcludeField(t *testing.T) {
 	}
 
 	var got R
-	if _, err := s.Decode(structWire, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, structWire, &got)
 	if got.Kept != 7 {
 		t.Errorf("decode kept: got %d want 7", got.Kept)
 	}
@@ -10178,9 +9980,7 @@ func TestTagContract_Inline(t *testing.T) {
 	}
 
 	var got Outer
-	if _, err := s.Decode(structWire, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, structWire, &got)
 	if got.I.A != 1 || got.I.B != 2 || got.C != 3 {
 		t.Errorf("inline decode round-trip: got %+v, want {{1 2} 3}", got)
 	}
@@ -10439,9 +10239,7 @@ func TestRuntimeTagOptionsStillFire(t *testing.T) {
 			t.Fatalf("encode: %v", err)
 		}
 		var got R
-		if _, err := s.Decode(wire, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, wire, &got)
 		if got.F != "kept" {
 			t.Fatalf("plain default field corrupted: got %q want %q", got.F, "kept")
 		}
@@ -10535,9 +10333,7 @@ func TestMatrix_SchemaForRoundTrippableTextStillBuilds(t *testing.T) {
 			t.Fatalf("encode: %v", err)
 		}
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 		if got.V.S != "hi" {
 			t.Fatalf("round-trip: got %q want %q", got.V.S, "hi")
 		}
@@ -10549,9 +10345,7 @@ func TestMatrix_SchemaForRoundTrippableTextStillBuilds(t *testing.T) {
 			t.Fatalf("a string-KIND type round-trips via the kind fallback and must build: %v", err)
 		}
 		assertStringField(t, s)
-		if _, err := s.Encode(&R{V: "x"}); err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		mustEncode(t, s, &R{V: "x"})
 	})
 	t.Run("byte-slice-decode-only", func(t *testing.T) {
 		type R struct{ V sfBytesDecodeOnly }
@@ -10565,9 +10359,7 @@ func TestMatrix_SchemaForRoundTrippableTextStillBuilds(t *testing.T) {
 			t.Fatalf("encode: %v", err)
 		}
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 	})
 	t.Run("net.IP-both-directions", func(t *testing.T) {
 		type R struct{ IP net.IP }
@@ -10581,9 +10373,7 @@ func TestMatrix_SchemaForRoundTrippableTextStillBuilds(t *testing.T) {
 			t.Fatalf("encode: %v", err)
 		}
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 		if !in.IP.Equal(got.IP) {
 			t.Fatalf("net.IP round-trip: got %v want %v", got.IP, in.IP)
 		}
@@ -10868,10 +10658,7 @@ func censusResolve(t *testing.T, dropSchema string) *avro.Schema {
 		{"name":"drop","type":` + dropSchema + `},
 		{"name":"keep","type":"int"}]}`)
 	r := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
-	res, err := avro.Resolve(w, r)
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
+	res := mustResolve(t, w, r)
 	return res
 }
 
@@ -11964,10 +11751,7 @@ func TestMatrix_EncodeErrorIdentityCensus(t *testing.T) {
 			GoType:   reflect.TypeOf(myStr("")),
 			Encode:   func(v any, _ *avro.SchemaNode) (any, error) { return nil, boom },
 		}
-		s, err := avro.Parse(`"string"`, avro.WithCustomType(ct))
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, `"string"`, avro.WithCustomType(ct))
 		_, errB := s.Encode(myStr("x"))
 		_, errJ := s.EncodeJSON(myStr("x"))
 		if !errors.Is(errB, boom) || !errors.Is(errJ, boom) {
@@ -12463,16 +12247,11 @@ func TestInvariant_OCFBlockCapsStayReaderOnly(t *testing.T) {
 	// bound still WRITES it, because the bound governs reading.
 	s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"b","type":"bytes"}]}`)
 	var buf bytes.Buffer
-	w, err := ocf.NewWriter(&buf, s)
-	if err != nil {
-		t.Fatalf("writer: %v", err)
-	}
+	w := mustNewWriter(t, &buf, s)
 	if err := w.Encode(map[string]any{"b": bytes.Repeat([]byte{0x01}, 1<<20)}); err != nil {
 		t.Fatalf("the block-size cap is reader-only by design; the writer must not enforce it: %v", err)
 	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
+	mustClose(t, w)
 	// The matching reader bound then refuses that file — the exception is a
 	// working reader-side bound, not an absent one.
 	if _, err := ocf.NewReader(bytes.NewReader(buf.Bytes()), ocf.WithMaxBlockBytes(1<<10)); err == nil {
@@ -12843,9 +12622,7 @@ func TestRegression_RootSchemaEmitterLinearOnDeepNesting(t *testing.T) {
 	}
 	root := s.Root()
 	t0 := time.Now()
-	if _, err := root.Schema(); err != nil {
-		t.Fatalf("Root().Schema(): %v", err)
-	}
+	mustNodeSchema(t, root)
 	if d, bound := time.Since(t0), raceRelaxed(500*time.Millisecond); d > bound {
 		t.Errorf("Root().Schema() of a %d-deep record chain took %v; want <%v (O(depth*subtree) regression in toJSONWalk)", depth, d, bound)
 	}
@@ -12870,10 +12647,7 @@ func TestMatrix_FieldNameErrorEchoBounded(t *testing.T) {
 	hugeNameSchema := func(t *testing.T) *avro.Schema {
 		t.Helper()
 		huge := strings.Repeat("A", hostileLen)
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"` + huge + `","type":"int"}]}`)
-		if err != nil {
-			t.Fatalf("parse: %v", err)
-		}
+		s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"`+huge+`","type":"int"}]}`)
 		return s
 	}
 	assertBounded := func(t *testing.T, err error) {
@@ -12905,10 +12679,7 @@ func TestMatrix_FieldNameErrorEchoBounded(t *testing.T) {
 	})
 	t.Run("json decode alias collision echoes two wire keys", func(t *testing.T) {
 		huge := strings.Repeat("B", hostileLen)
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","aliases":["` + huge + `"],"type":"int"}]}`)
-		if err != nil {
-			t.Fatalf("parse: %v", err)
-		}
+		s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"f","aliases":["`+huge+`"],"type":"int"}]}`)
 		var out map[string]any
 		assertBounded(t, s.DecodeJSON([]byte(`{"f":1,"`+huge+`":2}`), &out))
 	})

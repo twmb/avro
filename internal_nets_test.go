@@ -1544,10 +1544,7 @@ func TestCensus_Q2_DefinitionFullnameAgreement(t *testing.T) {
 			if cell.lax {
 				opts = append(opts, WithLaxNames(func(string) error { return nil }))
 			}
-			s, err := Parse(text, opts...)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
+			s := mustParse(t, text, opts...)
 			compiled := s.node.fields[0].node.name
 
 			root := s.Root()
@@ -2931,10 +2928,7 @@ func TestCensus_Q8_GrammarGuardIsSchemaForScoped(t *testing.T) {
 	// The runtime mapper takes it as a field name and binds nothing unless
 	// the schema happens to carry that name — no grammar error either way.
 	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
-	wire, err := s.Encode(map[string]any{"a": int32(1)})
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	wire := mustEncode(t, s, map[string]any{"a": int32(1)})
 	var got skipSuffixNamed
 	if _, err := s.Decode(wire, &got); err != nil {
 		t.Errorf("the runtime mapper must not enforce tag grammar, but it errored: %v", err)
@@ -4047,10 +4041,7 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 		return err
 	})
 	// Resolved-decode path carries its own depth bump (resolve.go:400).
-	resolved, err := Resolve(s, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolved := mustResolve(t, s, s)
 	wantRejectIs(t, "Decode/resolved/recursive-wire", errTooDeep, func() error {
 		var n any
 		_, err := resolved.Decode(wire, &n)
@@ -4059,10 +4050,7 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 	// Skip path: a reader that drops `next` must still bound the skip of the
 	// writer's deep subtree (skipRecord/skipUnion via the same sl.depth).
 	reader := MustParse(`{"type":"record","name":"Node","fields":[{"name":"value","type":"int"}]}`)
-	skipResolved, err := Resolve(s, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	skipResolved := mustResolve(t, s, reader)
 	wantRejectIs(t, "Decode/skip/recursive-wire", errTooDeep, func() error {
 		var n struct {
 			Value int32 `avro:"value"`
@@ -4125,10 +4113,7 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 		_, err := s.AppendSingleObject(nil, cyc)
 		return err
 	})
-	soeHdr, err := s.AppendSingleObject(nil, map[string]any{"value": int32(0), "next": nil})
-	if err != nil {
-		t.Fatal(err)
-	}
+	soeHdr := mustAppendSingleObject(t, s, nil, map[string]any{"value": int32(0), "next": nil})
 	soeDeep := append(soeHdr[:10:10], wire...) // 2-byte magic + 8-byte fingerprint, then deep body
 	wantRejectIs(t, "DecodeSingleObject/recursive-wire", errTooDeep, func() error {
 		var n any
@@ -4229,10 +4214,7 @@ func TestDoSBattery_C2_LargeCountLength(t *testing.T) {
 	// checkArrayBlockBounds.
 	arrRec := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":"int"}},{"name":"keep","type":"int"}]}`)
 	arrRecReader := MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
-	skipArr, err := Resolve(arrRec, arrRecReader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	skipArr := mustResolve(t, arrRec, arrRecReader)
 	wantReject(t, "Decode/skip-array-huge-count", func() error {
 		var v struct {
 			Keep int32 `avro:"keep"`
@@ -6754,10 +6736,7 @@ func FuzzCustomTypeRoundTrip(f *testing.F) {
 		func(w Wrapped, _ *SchemaNode) (int32, error) { return int32(w.V), nil },
 		func(v int32, _ *SchemaNode) (Wrapped, error) { return Wrapped{V: int(v)}, nil },
 	)
-	s, err := Parse(`"int"`, WithCustomType(ct))
-	if err != nil {
-		f.Fatal(err)
-	}
+	s := mustParse(f, `"int"`, WithCustomType(ct))
 
 	f.Add(int32(0))
 	f.Add(int32(-1))
@@ -6795,10 +6774,7 @@ func FuzzConcurrentEncodeDecode(f *testing.F) {
 		A int32  `avro:"a"`
 		B string `avro:"b"`
 	}
-	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
-	if err != nil {
-		f.Fatal(err)
-	}
+	s := mustParse(f, `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
 
 	f.Add(int32(1), "x", uint8(4))
 	f.Add(int32(0), "", uint8(8))
@@ -6865,10 +6841,7 @@ func FuzzTimeDateEdgeCases(f *testing.F) {
 	}
 	parsed := make([]*Schema, len(schemas))
 	for i, s := range schemas {
-		p, err := Parse(s)
-		if err != nil {
-			f.Fatal(err)
-		}
+		p := mustParse(f, s)
 		parsed[i] = p
 	}
 
@@ -6946,10 +6919,7 @@ func FuzzDepthBounds(f *testing.F) {
 		{"name":"value","type":"int"},
 		{"name":"next","type":["null","Node"]}
 	]}`
-	rs, err := Parse(recursiveSchema)
-	if err != nil {
-		f.Fatal(err)
-	}
+	rs := mustParse(f, recursiveSchema)
 	type node struct {
 		Value int32 `avro:"value"`
 		Next  *node `avro:"next"`
@@ -6959,30 +6929,12 @@ func FuzzDepthBounds(f *testing.F) {
 	// every iteration without exercising anything the first iteration
 	// didn't — the per-exec-cost class that starves fuzz workers into
 	// missing the coordinator's -fuzztime shutdown deadline.
-	resolvedSame, err := Resolve(rs, rs)
-	if err != nil {
-		f.Fatal(err)
-	}
-	rdrSchema, err := Parse(`{"type":"record","name":"Node","fields":[{"name":"value","type":"int"}]}`)
-	if err != nil {
-		f.Fatal(err)
-	}
-	resolvedDrop, err := Resolve(rs, rdrSchema)
-	if err != nil {
-		f.Fatal(err)
-	}
-	arrSchema, err := Parse(`{"type":"array","items":"int"}`)
-	if err != nil {
-		f.Fatal(err)
-	}
-	intS, err := Parse(`"int"`)
-	if err != nil {
-		f.Fatal(err)
-	}
-	nullableS, err := Parse(`["null","int"]`)
-	if err != nil {
-		f.Fatal(err)
-	}
+	resolvedSame := mustResolve(f, rs, rs)
+	rdrSchema := mustParse(f, `{"type":"record","name":"Node","fields":[{"name":"value","type":"int"}]}`)
+	resolvedDrop := mustResolve(f, rs, rdrSchema)
+	arrSchema := mustParse(f, `{"type":"array","items":"int"}`)
+	intS := mustParse(f, `"int"`)
+	nullableS := mustParse(f, `["null","int"]`)
 
 	f.Fuzz(func(t *testing.T, nesting, arrayCount, schemaDepth uint16, mode uint8) {
 		// Hard caps to keep individual fuzz iterations bounded. The depth
@@ -8048,21 +8000,12 @@ func BenchmarkSerializeGeneric(b *testing.B) {
 		},
 	}
 
-	s, err := Parse(benchSuperheroSchema)
-	if err != nil {
-		b.Fatal(err)
-	}
-	dst, err := s.AppendEncode(nil, super)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, benchSuperheroSchema)
+	dst := mustAppendEncode(b, s, nil, super)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		dst, err = s.AppendEncode(dst[:0], super)
-		if err != nil {
-			b.Fatal(err)
-		}
+		dst = mustAppendEncode(b, s, dst[:0], super)
 	}
 }
 
@@ -8079,115 +8022,74 @@ func BenchmarkParseSchema(b *testing.B) {
 		]}`
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if _, err := Parse(schema); err != nil {
-				b.Fatal(err)
-			}
+			mustParse(b, schema)
 		}
 	})
 	b.Run("Complex", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if _, err := Parse(benchSuperheroSchema); err != nil {
-				b.Fatal(err)
-			}
+			mustParse(b, benchSuperheroSchema)
 		}
 	})
 }
 
 func BenchmarkMapEncode(b *testing.B) {
-	s, err := Parse(`{"type":"map","values":"string"}`)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, `{"type":"map","values":"string"}`)
 	m := map[string]string{
 		"key1": "value1", "key2": "value2", "key3": "value3",
 		"key4": "value4", "key5": "value5",
 	}
-	dst, err := s.AppendEncode(nil, m)
-	if err != nil {
-		b.Fatal(err)
-	}
+	dst := mustAppendEncode(b, s, nil, m)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		dst, err = s.AppendEncode(dst[:0], m)
-		if err != nil {
-			b.Fatal(err)
-		}
+		dst = mustAppendEncode(b, s, dst[:0], m)
 	}
 }
 
 func BenchmarkMapDecode(b *testing.B) {
-	s, err := Parse(`{"type":"map","values":"string"}`)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, `{"type":"map","values":"string"}`)
 	m := map[string]string{
 		"key1": "value1", "key2": "value2", "key3": "value3",
 		"key4": "value4", "key5": "value5",
 	}
-	encoded, err := s.AppendEncode(nil, m)
-	if err != nil {
-		b.Fatal(err)
-	}
+	encoded := mustAppendEncode(b, s, nil, m)
 	var out map[string]string
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		out = nil
-		if _, err = s.Decode(encoded, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, encoded, &out)
 	}
 	_ = out
 }
 
 func BenchmarkEnumEncode(b *testing.B) {
-	s, err := Parse(`{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE","YELLOW"]}`)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, `{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE","YELLOW"]}`)
 	val := "GREEN"
-	dst, err := s.AppendEncode(nil, val)
-	if err != nil {
-		b.Fatal(err)
-	}
+	dst := mustAppendEncode(b, s, nil, val)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		dst, err = s.AppendEncode(dst[:0], val)
-		if err != nil {
-			b.Fatal(err)
-		}
+		dst = mustAppendEncode(b, s, dst[:0], val)
 	}
 }
 
 func BenchmarkEnumDecode(b *testing.B) {
-	s, err := Parse(`{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE","YELLOW"]}`)
-	if err != nil {
-		b.Fatal(err)
-	}
-	encoded, err := s.AppendEncode(nil, "GREEN")
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, `{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE","YELLOW"]}`)
+	encoded := mustAppendEncode(b, s, nil, "GREEN")
 	var out string
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		out = ""
-		if _, err = s.Decode(encoded, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, encoded, &out)
 	}
 	_ = out
 }
 
 func BenchmarkLargeArrayEncode(b *testing.B) {
-	s, err := Parse(benchSuperheroSchema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, benchSuperheroSchema)
 	hero := benchNewSuperhero()
 	powers := make([]*Superpower, 100)
 	for i := range powers {
@@ -8200,25 +8102,16 @@ func BenchmarkLargeArrayEncode(b *testing.B) {
 		}
 	}
 	hero.Powers = powers
-	dst, err := s.AppendEncode(nil, hero)
-	if err != nil {
-		b.Fatal(err)
-	}
+	dst := mustAppendEncode(b, s, nil, hero)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		dst, err = s.AppendEncode(dst[:0], hero)
-		if err != nil {
-			b.Fatal(err)
-		}
+		dst = mustAppendEncode(b, s, dst[:0], hero)
 	}
 }
 
 func BenchmarkLargeArrayDecode(b *testing.B) {
-	s, err := Parse(benchSuperheroSchema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, benchSuperheroSchema)
 	hero := benchNewSuperhero()
 	powers := make([]*Superpower, 100)
 	for i := range powers {
@@ -8231,18 +8124,13 @@ func BenchmarkLargeArrayDecode(b *testing.B) {
 		}
 	}
 	hero.Powers = powers
-	encoded, err := s.AppendEncode(nil, hero)
-	if err != nil {
-		b.Fatal(err)
-	}
+	encoded := mustAppendEncode(b, s, nil, hero)
 	var out Superhero
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		out = Superhero{}
-		if _, err = s.Decode(encoded, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, encoded, &out)
 	}
 }
 
@@ -8259,7 +8147,7 @@ func BenchmarkStringHeavyEncode(b *testing.B) {
 		S9  string `avro:"s9"`
 		S10 string `avro:"s10"`
 	}
-	s, err := Parse(`{"type":"record","name":"strings","fields":[
+	s := mustParse(b, `{"type":"record","name":"strings","fields":[
 		{"name":"s1","type":"string"},
 		{"name":"s2","type":"string"},
 		{"name":"s3","type":"string"},
@@ -8271,9 +8159,6 @@ func BenchmarkStringHeavyEncode(b *testing.B) {
 		{"name":"s9","type":"string"},
 		{"name":"s10","type":"string"}
 	]}`)
-	if err != nil {
-		b.Fatal(err)
-	}
 	input := &StringRecord{
 		S1: strings.Repeat("hello ", 20), S2: strings.Repeat("world ", 20),
 		S3: strings.Repeat("avro ", 20), S4: strings.Repeat("bench ", 20),
@@ -8281,17 +8166,11 @@ func BenchmarkStringHeavyEncode(b *testing.B) {
 		S7: strings.Repeat("schema ", 20), S8: strings.Repeat("encode ", 20),
 		S9: strings.Repeat("decode ", 20), S10: strings.Repeat("string ", 20),
 	}
-	dst, err := s.AppendEncode(nil, input)
-	if err != nil {
-		b.Fatal(err)
-	}
+	dst := mustAppendEncode(b, s, nil, input)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		dst, err = s.AppendEncode(dst[:0], input)
-		if err != nil {
-			b.Fatal(err)
-		}
+		dst = mustAppendEncode(b, s, dst[:0], input)
 	}
 }
 
@@ -8308,7 +8187,7 @@ func BenchmarkStringHeavyDecode(b *testing.B) {
 		S9  string `avro:"s9"`
 		S10 string `avro:"s10"`
 	}
-	s, err := Parse(`{"type":"record","name":"strings","fields":[
+	s := mustParse(b, `{"type":"record","name":"strings","fields":[
 		{"name":"s1","type":"string"},
 		{"name":"s2","type":"string"},
 		{"name":"s3","type":"string"},
@@ -8320,9 +8199,6 @@ func BenchmarkStringHeavyDecode(b *testing.B) {
 		{"name":"s9","type":"string"},
 		{"name":"s10","type":"string"}
 	]}`)
-	if err != nil {
-		b.Fatal(err)
-	}
 	input := &StringRecord{
 		S1: strings.Repeat("hello ", 20), S2: strings.Repeat("world ", 20),
 		S3: strings.Repeat("avro ", 20), S4: strings.Repeat("bench ", 20),
@@ -8330,100 +8206,59 @@ func BenchmarkStringHeavyDecode(b *testing.B) {
 		S7: strings.Repeat("schema ", 20), S8: strings.Repeat("encode ", 20),
 		S9: strings.Repeat("decode ", 20), S10: strings.Repeat("string ", 20),
 	}
-	encoded, err := s.AppendEncode(nil, input)
-	if err != nil {
-		b.Fatal(err)
-	}
+	encoded := mustAppendEncode(b, s, nil, input)
 	var out StringRecord
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		out = StringRecord{}
-		if _, err = s.Decode(encoded, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, encoded, &out)
 	}
 }
 
 func BenchmarkDecodeAny(b *testing.B) {
-	s, err := Parse(benchSuperheroSchema)
-	if err != nil {
-		b.Fatal(err)
-	}
-	encoded, err := s.Encode(benchSuperheroValue)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, benchSuperheroSchema)
+	encoded := mustEncode(b, s, benchSuperheroValue)
 	var out any
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err = s.Decode(encoded, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, encoded, &out)
 	}
 }
 
 func BenchmarkDecodeAnyTaggedUnions(b *testing.B) {
-	s, err := Parse(benchSuperheroSchema)
-	if err != nil {
-		b.Fatal(err)
-	}
-	encoded, err := s.Encode(benchSuperheroValue)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, benchSuperheroSchema)
+	encoded := mustEncode(b, s, benchSuperheroValue)
 	var out any
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err = s.Decode(encoded, &out, TaggedUnions()); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, encoded, &out, TaggedUnions())
 	}
 }
 
 func BenchmarkEncodeJSON(b *testing.B) {
-	s, err := Parse(benchSuperheroSchema)
-	if err != nil {
-		b.Fatal(err)
-	}
-	encoded, err := s.Encode(benchSuperheroValue)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, benchSuperheroSchema)
+	encoded := mustEncode(b, s, benchSuperheroValue)
 	var native any
-	if _, err := s.Decode(encoded, &native); err != nil {
-		b.Fatal(err)
-	}
+	mustDecode(b, s, encoded, &native)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err = s.EncodeJSON(native); err != nil {
-			b.Fatal(err)
-		}
+		mustEncodeJSON(b, s, native)
 	}
 }
 
 func BenchmarkEncodeJSONTagged(b *testing.B) {
-	s, err := Parse(benchSuperheroSchema)
-	if err != nil {
-		b.Fatal(err)
-	}
-	encoded, err := s.Encode(benchSuperheroValue)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, benchSuperheroSchema)
+	encoded := mustEncode(b, s, benchSuperheroValue)
 	var native any
-	if _, err := s.Decode(encoded, &native); err != nil {
-		b.Fatal(err)
-	}
+	mustDecode(b, s, encoded, &native)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err = s.EncodeJSON(native, TaggedUnions()); err != nil {
-			b.Fatal(err)
-		}
+		mustEncodeJSON(b, s, native, TaggedUnions())
 	}
 }
 
@@ -8434,7 +8269,7 @@ func BenchmarkCustomTypeEncode(b *testing.B) {
 		ID    int64      `avro:"id"`
 		Price benchMoney `avro:"price"`
 	}
-	s, err := Parse(`{
+	s := mustParse(b, `{
 		"type":"record","name":"Order","fields":[
 			{"name":"id","type":"long"},
 			{"name":"price","type":{"type":"long","logicalType":"money"}}
@@ -8443,16 +8278,11 @@ func BenchmarkCustomTypeEncode(b *testing.B) {
 		func(m benchMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
 		func(c int64, _ *SchemaNode) (benchMoney, error) { return benchMoney{Cents: c}, nil },
 	))
-	if err != nil {
-		b.Fatal(err)
-	}
 	v := Order{ID: 1, Price: benchMoney{Cents: 1999}}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err := s.Encode(&v); err != nil {
-			b.Fatal(err)
-		}
+		mustEncode(b, s, &v)
 	}
 }
 
@@ -8461,7 +8291,7 @@ func BenchmarkCustomTypeDecode(b *testing.B) {
 		ID    int64      `avro:"id"`
 		Price benchMoney `avro:"price"`
 	}
-	s, err := Parse(`{
+	s := mustParse(b, `{
 		"type":"record","name":"Order","fields":[
 			{"name":"id","type":"long"},
 			{"name":"price","type":{"type":"long","logicalType":"money"}}
@@ -8470,38 +8300,26 @@ func BenchmarkCustomTypeDecode(b *testing.B) {
 		func(m benchMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
 		func(c int64, _ *SchemaNode) (benchMoney, error) { return benchMoney{Cents: c}, nil },
 	))
-	if err != nil {
-		b.Fatal(err)
-	}
 	data, _ := s.Encode(&Order{ID: 1, Price: benchMoney{Cents: 1999}})
 	var out Order
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err := s.Decode(data, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, data, &out)
 	}
 }
 
 func BenchmarkCustomTypeDecodeAny(b *testing.B) {
-	s, err := Parse(`{"type":"long","logicalType":"money"}`,
-		NewCustomType[benchMoney, int64]("money",
-			func(m benchMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
-			func(c int64, _ *SchemaNode) (benchMoney, error) { return benchMoney{Cents: c}, nil },
-		),
-	)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, `{"type":"long","logicalType":"money"}`, NewCustomType[benchMoney, int64]("money",
+		func(m benchMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
+		func(c int64, _ *SchemaNode) (benchMoney, error) { return benchMoney{Cents: c}, nil },
+	))
 	data, _ := s.Encode(int64(1999))
 	var out any
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err := s.Decode(data, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, data, &out)
 	}
 }
 
@@ -8523,17 +8341,12 @@ const benchDecodeJSONSchema = `{
 var benchDecodeJSONInput = []byte(`{"id":12345,"name":"test-event","created_at":1700000000000,"updated_at":1700000000000000,"date":19700,"amount":3.14,"active":true,"tag":{"string":"hello"}}`)
 
 func BenchmarkDecodeJSON_Any(b *testing.B) {
-	s, err := Parse(benchDecodeJSONSchema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, benchDecodeJSONSchema)
 	var out any
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if err := s.DecodeJSON(benchDecodeJSONInput, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecodeJSON(b, s, benchDecodeJSONInput, &out)
 	}
 }
 
@@ -8548,17 +8361,12 @@ func BenchmarkDecodeJSON_Struct(b *testing.B) {
 		Active    bool      `avro:"active"`
 		Tag       *string   `avro:"tag"`
 	}
-	s, err := Parse(benchDecodeJSONSchema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, benchDecodeJSONSchema)
 	var out Event
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if err := s.DecodeJSON(benchDecodeJSONInput, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecodeJSON(b, s, benchDecodeJSONInput, &out)
 	}
 }
 
@@ -8579,10 +8387,7 @@ const benchUnionTryEachSchema = `{
 // value falls into try-each (the loop changed by the bare-nil parity
 // fix). map[string]int and []string also miss type-name dispatch.
 func BenchmarkEncodeJSON_UnionTryEach(b *testing.B) {
-	s, err := Parse(benchUnionTryEachSchema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, benchUnionTryEachSchema)
 	val := map[string]any{
 		"id":   json.Number("12345"),
 		"name": "hello",
@@ -8593,9 +8398,7 @@ func BenchmarkEncodeJSON_UnionTryEach(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err := s.EncodeJSON(val); err != nil {
-			b.Fatal(err)
-		}
+		mustEncodeJSON(b, s, val)
 	}
 }
 
@@ -8619,22 +8422,14 @@ func BenchmarkDecodeStringTextUnmarshaler(b *testing.B) {
 		V benchTextUnmarshaler `avro:"v"`
 	}
 	schema := `{"type":"record","name":"r","fields":[{"name":"v","type":"string"}]}`
-	s, err := Parse(schema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, schema)
 	in := Encoded{V: "hello world this is a test"}
-	enc, err := s.AppendEncode(nil, &in)
-	if err != nil {
-		b.Fatal(err)
-	}
+	enc := mustAppendEncode(b, s, nil, &in)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		var out Decoded
-		if _, err := s.Decode(enc, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, enc, &out)
 	}
 }
 
@@ -8643,22 +8438,14 @@ func BenchmarkDecodeStringBytes(b *testing.B) {
 		V []byte `avro:"v"`
 	}
 	schema := `{"type":"record","name":"r","fields":[{"name":"v","type":"string"}]}`
-	s, err := Parse(schema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, schema)
 	in := R{V: bytes.Repeat([]byte("x"), 32)}
-	enc, err := s.AppendEncode(nil, &in)
-	if err != nil {
-		b.Fatal(err)
-	}
+	enc := mustAppendEncode(b, s, nil, &in)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		var out R
-		if _, err := s.Decode(enc, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, enc, &out)
 	}
 }
 
@@ -8667,22 +8454,14 @@ func BenchmarkDecodeUUIDIntoFixed(b *testing.B) {
 		V [16]byte `avro:"v"`
 	}
 	schema := `{"type":"record","name":"r","fields":[{"name":"v","type":{"type":"string","logicalType":"uuid"}}]}`
-	s, err := Parse(schema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, schema)
 	in := R{V: [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}}
-	enc, err := s.AppendEncode(nil, &in)
-	if err != nil {
-		b.Fatal(err)
-	}
+	enc := mustAppendEncode(b, s, nil, &in)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		var out R
-		if _, err := s.Decode(enc, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, enc, &out)
 	}
 }
 
@@ -8712,25 +8491,17 @@ func BenchmarkDecodeMap_String_Large(b *testing.B) {
 
 func benchDecodeMapStringValue(b *testing.B, n int) {
 	schema := `{"type":"map","values":"string"}`
-	s, err := Parse(schema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, schema)
 	in := make(map[string]string, n)
 	for i := range n {
 		in[fmt.Sprintf("key-%05d", i)] = fmt.Sprintf("value-%05d", i)
 	}
-	enc, err := s.AppendEncode(nil, &in)
-	if err != nil {
-		b.Fatal(err)
-	}
+	enc := mustAppendEncode(b, s, nil, &in)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		var out map[string]string
-		if _, err := s.Decode(enc, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, enc, &out)
 	}
 }
 
@@ -8743,18 +8514,12 @@ func BenchmarkEncodeEnum_LargeAlphabet(b *testing.B) {
 	}
 	enc, _ := json.Marshal(syms)
 	schema := fmt.Sprintf(`{"type":"enum","name":"E","symbols":%s}`, enc)
-	s, err := Parse(schema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, schema)
 	val := "SYM_31" // worst case for linear scan
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_, err := s.AppendEncode(nil, &val)
-		if err != nil {
-			b.Fatal(err)
-		}
+		mustAppendEncode(b, s, nil, &val)
 	}
 }
 
@@ -8770,106 +8535,68 @@ func BenchmarkResolveDecodeWithDefaults(b *testing.B) {
 		{"name":"d","type":"int","default":42},
 		{"name":"e","type":["null","string"],"default":null}
 	]}`
-	w, err := Parse(writer)
-	if err != nil {
-		b.Fatal(err)
-	}
-	r, err := Parse(reader)
-	if err != nil {
-		b.Fatal(err)
-	}
-	resolved, err := Resolve(w, r)
-	if err != nil {
-		b.Fatal(err)
-	}
+	w := mustParse(b, writer)
+	r := mustParse(b, reader)
+	resolved := mustResolve(b, w, r)
 	type WIn struct {
 		A string `avro:"a"`
 		B int32  `avro:"b"`
 	}
 	in := WIn{A: "hello", B: 7}
-	enc, err := w.AppendEncode(nil, &in)
-	if err != nil {
-		b.Fatal(err)
-	}
+	enc := mustAppendEncode(b, w, nil, &in)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		var out map[string]any
-		if _, err := resolved.Decode(enc, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, resolved, enc, &out)
 	}
 }
 
 func BenchmarkDecodeMapInto_Any_Medium(b *testing.B) {
 	schema := `{"type":"map","values":"string"}`
-	s, err := Parse(schema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, schema)
 	in := make(map[string]string, 64)
 	for i := range 64 {
 		in[fmt.Sprintf("key-%05d", i)] = fmt.Sprintf("value-%05d", i)
 	}
-	enc, err := s.AppendEncode(nil, &in)
-	if err != nil {
-		b.Fatal(err)
-	}
+	enc := mustAppendEncode(b, s, nil, &in)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		var out any
-		if _, err := s.Decode(enc, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, enc, &out)
 	}
 }
 
 func BenchmarkDecodeArrayStringInto_Any_Medium(b *testing.B) {
 	schema := `{"type":"array","items":"string"}`
-	s, err := Parse(schema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, schema)
 	in := make([]string, 64)
 	for i := range 64 {
 		in[i] = fmt.Sprintf("value-%05d", i)
 	}
-	enc, err := s.AppendEncode(nil, &in)
-	if err != nil {
-		b.Fatal(err)
-	}
+	enc := mustAppendEncode(b, s, nil, &in)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		var out any
-		if _, err := s.Decode(enc, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, enc, &out)
 	}
 }
 
 func BenchmarkDecodeArrayIntInto_Any_Medium(b *testing.B) {
 	schema := `{"type":"array","items":"int"}`
-	s, err := Parse(schema)
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := mustParse(b, schema)
 	in := make([]int32, 64)
 	for i := range 64 {
 		in[i] = int32(i * 1000)
 	}
-	enc, err := s.AppendEncode(nil, &in)
-	if err != nil {
-		b.Fatal(err)
-	}
+	enc := mustAppendEncode(b, s, nil, &in)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		var out any
-		if _, err := s.Decode(enc, &out); err != nil {
-			b.Fatal(err)
-		}
+		mustDecode(b, s, enc, &out)
 	}
 }
 

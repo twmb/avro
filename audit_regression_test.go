@@ -103,23 +103,14 @@ func TestRegression_DecodeJSONCustomDecoderConcreteTargetErrors(t *testing.T) {
 	}
 	schema := `{"type":"record","name":"R","fields":[{"name":"p","type":{"type":"long","logicalType":"money"}}]}`
 	plain := avro.MustParse(schema)
-	s, err := avro.Parse(schema, avro.WithCustomType(ct))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema, avro.WithCustomType(ct))
 
 	// Compatible target (long → named integer): skip-custom == no-custom, both wires.
 	type R struct {
 		P auditMoney `avro:"p"`
 	}
-	wire, err := plain.Encode(R{P: 5})
-	if err != nil {
-		t.Fatal(err)
-	}
-	jsonBytes, err := plain.EncodeJSON(R{P: 5})
-	if err != nil {
-		t.Fatal(err)
-	}
+	wire := mustEncode(t, plain, R{P: 5})
+	jsonBytes := mustEncodeJSON(t, plain, R{P: 5})
 	var noCustom R
 	if _, err := plain.Decode(wire, &noCustom); err != nil {
 		t.Fatalf("no-custom decode (oracle): %v", err)
@@ -237,12 +228,9 @@ func TestRegression_SchemaCacheLaxNamesNotDeduped(t *testing.T) {
 // later definition. The fingerprint depends on this, so a mismatch breaks
 // single-object-encoding / schema-registry interop with Java.
 func TestRegression_CanonicalForwardRefFirstOccurrence(t *testing.T) {
-	s, err := avro.Parse(`{"type":"record","name":"outer","fields":[
+	s := mustParse(t, `{"type":"record","name":"outer","fields":[
 		{"name":"ref","type":{"type":"inner"}},
 		{"name":"def","type":{"type":"record","name":"inner","fields":[{"name":"x","type":"int"}]}}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
 	const want = `{"name":"outer","type":"record","fields":[` +
 		`{"name":"ref","type":{"name":"inner","type":"record","fields":[{"name":"x","type":"int"}]}},` +
 		`{"name":"def","type":"inner"}]}`
@@ -402,26 +390,13 @@ func TestRegression_UnionBytesFixedDefaultJSONBinaryParity(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			s, err := avro.Parse(c.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			bw, err := s.AppendEncode(nil, map[string]any{})
-			if err != nil {
-				t.Fatalf("binary encode: %v", err)
-			}
+			s := mustParse(t, c.schema)
+			bw := mustAppendEncode(t, s, nil, map[string]any{})
 			var bm map[string]any
-			if _, err := s.Decode(bw, &bm); err != nil {
-				t.Fatalf("binary decode: %v", err)
-			}
-			jw, err := s.AppendEncodeJSON(nil, map[string]any{})
-			if err != nil {
-				t.Fatalf("json encode: %v", err)
-			}
+			mustDecode(t, s, bw, &bm)
+			jw := mustAppendEncodeJSON(t, s, nil, map[string]any{})
 			var jm map[string]any
-			if err := s.DecodeJSON(jw, &jm); err != nil {
-				t.Fatalf("json decode: %v", err)
-			}
+			mustDecodeJSON(t, s, jw, &jm)
 			if !reflect.DeepEqual(bm["f"], c.want) {
 				t.Errorf("binary default-fill f = %T(%v), want %T(%v)", bm["f"], bm["f"], c.want, c.want)
 			}
@@ -500,10 +475,7 @@ func TestMatrix_ResolveSelfCompatAllShapes(t *testing.T) {
 	}
 	for _, sc := range schemas {
 		t.Run(sc, func(t *testing.T) {
-			s, err := avro.Parse(sc)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, sc)
 			if err := avro.CheckCompatibility(s, s); err != nil {
 				t.Errorf("CheckCompatibility(s,s) rejected a schema as incompatible with itself: %v", err)
 			}
@@ -525,22 +497,12 @@ func TestRegression_EmptyArrayDecodesNonNilBothFormats(t *testing.T) {
 	}
 	s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"items","type":{"type":"array","items":"int"}}]}`)
 
-	bin, err := s.AppendEncode(nil, Rec{Items: nil})
-	if err != nil {
-		t.Fatal(err)
-	}
-	js, err := s.AppendEncodeJSON(nil, Rec{Items: nil})
-	if err != nil {
-		t.Fatal(err)
-	}
+	bin := mustAppendEncode(t, s, nil, Rec{Items: nil})
+	js := mustAppendEncodeJSON(t, s, nil, Rec{Items: nil})
 
 	var bo, jo Rec
-	if _, err := s.Decode(bin, &bo); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.DecodeJSON(js, &jo); err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, s, bin, &bo)
+	mustDecodeJSON(t, s, js, &jo)
 	if bo.Items == nil {
 		t.Error("binary decode of empty array left the slice nil; want non-nil empty (JSON/map parity)")
 	}
@@ -553,14 +515,9 @@ func TestRegression_EmptyArrayDecodesNonNilBothFormats(t *testing.T) {
 
 	// Top-level (non-field) empty array decodes non-nil too.
 	st := avro.MustParse(`{"type":"array","items":"int"}`)
-	tw, err := st.AppendEncode(nil, []int{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	tw := mustAppendEncode(t, st, nil, []int{})
 	var top []int
-	if _, err := st.Decode(tw, &top); err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, st, tw, &top)
 	if top == nil {
 		t.Error("binary decode of top-level empty array left the slice nil; want non-nil empty")
 	}
@@ -578,14 +535,9 @@ func TestRegression_EmptyArrayDecodesNonNilBothFormats(t *testing.T) {
 	ms := avro.MustParse(`{"type":"record","name":"M","fields":[
 		{"name":"strs","type":{"type":"array","items":"string"}},
 		{"name":"recs","type":{"type":"array","items":{"type":"record","name":"Sub","fields":[{"name":"x","type":"int"}]}}}]}`)
-	mw, err := ms.AppendEncode(nil, Multi{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	mw := mustAppendEncode(t, ms, nil, Multi{})
 	var mo Multi
-	if _, err := ms.Decode(mw, &mo); err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, ms, mw, &mo)
 	if mo.Strs == nil || mo.Recs == nil {
 		t.Errorf("unsafe array fields left nil: strs nil=%v recs nil=%v", mo.Strs == nil, mo.Recs == nil)
 	}
@@ -603,17 +555,11 @@ func TestRegression_SkipMapBoundedValidSkip(t *testing.T) {
 		{"name":"m","type":{"type":"map","values":"long"}},
 		{"name":"keep","type":"int"}]}`)
 	reader := avro.MustParse(`{"type":"record","name":"W","fields":[{"name":"keep","type":"int"}]}`)
-	resolved, err := avro.Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wire, err := writer.Encode(map[string]any{
+	resolved := mustResolve(t, writer, reader)
+	wire := mustEncode(t, writer, map[string]any{
 		"m":    map[string]int64{"a": 1, "b": 2, "c": 3},
 		"keep": int32(7),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var out map[string]any
 	if _, err := resolved.Decode(wire, &out); err != nil {
 		t.Fatalf("resolved decode (skipping map field) failed: %v", err)
@@ -656,25 +602,12 @@ func TestMatrix_CustomDecodeReceivesRawValueBinaryJSONParity(t *testing.T) {
 				AvroType:    c.avroType,
 				Decode:      func(v any, _ *avro.SchemaNode) (any, error) { return fmt.Sprintf("%T", v), nil },
 			}
-			s, err := avro.Parse(c.schema, ct)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
-			bin, err := s.Encode(c.encode)
-			if err != nil {
-				t.Fatalf("Encode: %v", err)
-			}
-			jsn, err := s.EncodeJSON(c.encode)
-			if err != nil {
-				t.Fatalf("EncodeJSON: %v", err)
-			}
+			s := mustParse(t, c.schema, ct)
+			bin := mustEncode(t, s, c.encode)
+			jsn := mustEncodeJSON(t, s, c.encode)
 			var binVal, jsonVal any
-			if _, err := s.Decode(bin, &binVal); err != nil {
-				t.Fatalf("Decode: %v", err)
-			}
-			if err := s.DecodeJSON(jsn, &jsonVal); err != nil {
-				t.Fatalf("DecodeJSON: %v", err)
-			}
+			mustDecode(t, s, bin, &binVal)
+			mustDecodeJSON(t, s, jsn, &jsonVal)
 			if binVal != c.wantType {
 				t.Errorf("binary Decode callback received %v, want raw %s", binVal, c.wantType)
 			}
@@ -696,14 +629,9 @@ func TestRegression_CustomDecodeNewCustomTypeJSONNoPanic(t *testing.T) {
 		func(ms int64, _ *avro.SchemaNode) (eventTime, error) { return eventTime(time.UnixMilli(ms)), nil })
 	s := avro.MustParse(`{"type":"long","logicalType":"timestamp-millis"}`, ct)
 	ev := eventTime(time.UnixMilli(1700000000000))
-	jsn, err := s.EncodeJSON(ev)
-	if err != nil {
-		t.Fatalf("EncodeJSON: %v", err)
-	}
+	jsn := mustEncodeJSON(t, s, ev)
 	var out eventTime
-	if err := s.DecodeJSON(jsn, &out); err != nil {
-		t.Fatalf("DecodeJSON: %v", err)
-	}
+	mustDecodeJSON(t, s, jsn, &out)
 	if !time.Time(out).Equal(time.Time(ev)) {
 		t.Errorf("round-trip mismatch: got %v want %v", time.Time(out), time.Time(ev))
 	}
@@ -741,12 +669,8 @@ func TestRegression_CustomEncodePointerGoTypeBinaryJSONParity(t *testing.T) {
 			t.Fatalf("JSON Encode (custom encoder skipped on JSON?): %v", errJSON)
 		}
 		var binVal, jsonVal any
-		if _, err := s.Decode(bin, &binVal); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.DecodeJSON(jsn, &jsonVal); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, bin, &binVal)
+		mustDecodeJSON(t, s, jsn, &jsonVal)
 		if binVal != int64(5) || jsonVal != int64(5) {
 			t.Errorf("binary=%v json=%v, want both int64(5)", binVal, jsonVal)
 		}
@@ -788,10 +712,7 @@ func TestMatrix_CanonicalRawUTF8ForHTMLChars(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			s, err := avro.Parse(c.schema, avro.WithLaxNames(nil))
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, c.schema, avro.WithLaxNames(nil))
 			got := string(s.Canonical())
 			if got != c.want {
 				t.Errorf("canonical mismatch:\n got = %s\nwant = %s", got, c.want)
@@ -876,14 +797,8 @@ func TestMatrix_CustomDecodeNilRawValueBinaryJSONParity(t *testing.T) {
 			// Encode via a plain (no-custom) schema using the built-in logical
 			// encoder, then decode via an Encode-only custom schema.
 			plain := avro.MustParse(c.schema)
-			bin, err := plain.Encode(c.encVal)
-			if err != nil {
-				t.Fatalf("Encode: %v", err)
-			}
-			jsn, err := plain.EncodeJSON(c.encVal)
-			if err != nil {
-				t.Fatalf("EncodeJSON: %v", err)
-			}
+			bin := mustEncode(t, plain, c.encVal)
+			jsn := mustEncodeJSON(t, plain, c.encVal)
 			// Encode-only custom (Decode==nil) suppresses the logical decoder
 			// → raw Avro-native value on BOTH decode paths. The Encode callback
 			// is never invoked here (we only decode); its presence is what
@@ -893,12 +808,8 @@ func TestMatrix_CustomDecodeNilRawValueBinaryJSONParity(t *testing.T) {
 				Encode: func(v any, _ *avro.SchemaNode) (any, error) { return v, nil },
 			})
 			var bv, jv any
-			if _, err := custom.Decode(bin, &bv); err != nil {
-				t.Fatalf("Decode: %v", err)
-			}
-			if err := custom.DecodeJSON(jsn, &jv); err != nil {
-				t.Fatalf("DecodeJSON: %v", err)
-			}
+			mustDecode(t, custom, bin, &bv)
+			mustDecodeJSON(t, custom, jsn, &jv)
 			if got := fmt.Sprintf("%T", bv); got != c.wantType {
 				t.Errorf("binary nil-Decode produced %s, want raw %s", got, c.wantType)
 			}
@@ -1032,21 +943,11 @@ func TestRegression_WildcardCustomDecodeBinaryJSONParity(t *testing.T) {
 	}
 	decBoth := func(t *testing.T, s *avro.Schema, enc any) (string, string) {
 		t.Helper()
-		bin, err := s.Encode(enc)
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
-		js, err := s.EncodeJSON(enc)
-		if err != nil {
-			t.Fatalf("EncodeJSON: %v", err)
-		}
+		bin := mustEncode(t, s, enc)
+		js := mustEncodeJSON(t, s, enc)
 		var bo, jo any
-		if _, err := s.Decode(bin, &bo); err != nil {
-			t.Fatalf("Decode: %v", err)
-		}
-		if err := s.DecodeJSON(js, &jo); err != nil {
-			t.Fatalf("DecodeJSON: %v", err)
-		}
+		mustDecode(t, s, bin, &bo)
+		mustDecodeJSON(t, s, js, &jo)
 		return typeOf(bo), typeOf(jo)
 	}
 
@@ -1252,22 +1153,12 @@ func TestMatrix_CustomNoCallbackSuppressionBinaryJSONParity(t *testing.T) {
 		for _, m := range matchers {
 			t.Run(c.name+"/"+m.name, func(t *testing.T) {
 				plain := avro.MustParse(c.schema)
-				bin, err := plain.Encode(c.encVal)
-				if err != nil {
-					t.Fatalf("Encode: %v", err)
-				}
-				jsn, err := plain.EncodeJSON(c.encVal)
-				if err != nil {
-					t.Fatalf("EncodeJSON: %v", err)
-				}
+				bin := mustEncode(t, plain, c.encVal)
+				jsn := mustEncodeJSON(t, plain, c.encVal)
 				cs := avro.MustParse(c.schema, m.make(c))
 				var bv, jv any
-				if _, err := cs.Decode(bin, &bv); err != nil {
-					t.Fatalf("Decode: %v", err)
-				}
-				if err := cs.DecodeJSON(jsn, &jv); err != nil {
-					t.Fatalf("DecodeJSON: %v", err)
-				}
+				mustDecode(t, cs, bin, &bv)
+				mustDecodeJSON(t, cs, jsn, &jv)
 				if got := fmt.Sprintf("%T", bv); got != c.rawType {
 					t.Errorf("binary callback-less Decode produced %s, want raw %s", got, c.rawType)
 				}
@@ -1447,14 +1338,9 @@ func TestMatrix_ResolvedDecodeJSONMatchesBinary(t *testing.T) {
 	t.Run("enum-default-value-explicit", func(t *testing.T) {
 		w := avro.MustParse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
 		r := avro.MustParse(`{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`)
-		resolved, err := avro.Resolve(w, r)
-		if err != nil {
-			t.Fatalf("Resolve: %v", err)
-		}
+		resolved := mustResolve(t, w, r)
 		var got any
-		if err := resolved.DecodeJSON([]byte(`"C"`), &got); err != nil {
-			t.Fatalf("DecodeJSON: %v", err)
-		}
+		mustDecodeJSON(t, resolved, []byte(`"C"`), &got)
 		if got != "A" {
 			t.Errorf("writer-only enum symbol via JSON resolution: got %v, want reader default A", got)
 		}
@@ -1811,12 +1697,8 @@ func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
 				t.Fatalf("encodeJSON: %v", err)
 			}
 			var bv, jv any
-			if _, err := s.Decode(bin, &bv); err != nil {
-				t.Fatalf("Decode: %v", err)
-			}
-			if err := s.DecodeJSON(jsn, &jv); err != nil {
-				t.Fatalf("DecodeJSON: %v", err)
-			}
+			mustDecode(t, s, bin, &bv)
+			mustDecodeJSON(t, s, jsn, &jv)
 			if !reflect.DeepEqual(bv, jv) {
 				t.Errorf("recursive custom binary<->JSON divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
 			}
@@ -1866,12 +1748,8 @@ func TestMatrix_ForwardRefCustomTypeBinaryJSONParity(t *testing.T) {
 				t.Fatalf("encode: bin=%v json=%v", eb, ej)
 			}
 			var bv, jv any
-			if _, err := s.Decode(bin, &bv); err != nil {
-				t.Fatalf("Decode: %v", err)
-			}
-			if err := s.DecodeJSON(jsn, &jv); err != nil {
-				t.Fatalf("DecodeJSON: %v", err)
-			}
+			mustDecode(t, s, bin, &bv)
+			mustDecodeJSON(t, s, jsn, &jv)
 			if !reflect.DeepEqual(bv, jv) {
 				t.Errorf("forward-ref custom encode divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
 			}
@@ -1889,12 +1767,8 @@ func TestMatrix_ForwardRefCustomTypeBinaryJSONParity(t *testing.T) {
 			jsn, _ := plain.EncodeJSON(val)
 			s := avro.MustParse(p.schema, ct)
 			var bv, jv any
-			if _, err := s.Decode(bin, &bv); err != nil {
-				t.Fatalf("Decode: %v", err)
-			}
-			if err := s.DecodeJSON(jsn, &jv); err != nil {
-				t.Fatalf("DecodeJSON: %v", err)
-			}
+			mustDecode(t, s, bin, &bv)
+			mustDecodeJSON(t, s, jsn, &jv)
 			if !reflect.DeepEqual(bv, jv) {
 				t.Errorf("forward-ref custom decode divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
 			}
@@ -2185,9 +2059,7 @@ func TestMatrix_SchemaCacheSelfRefReParseWithCustom(t *testing.T) {
 			t.Fatalf("encode: %v", err)
 		}
 		var got any
-		if _, err := s.Decode(wire, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, wire, &got)
 		// No custom -> built-in timestamp-millis -> time.Time, NOT the marker.
 		if leaf := at(t, got, "t"); leaf == wantMarker {
 			t.Errorf("custom wrongly applied on a no-custom re-parse: leaf = %#v", leaf)
@@ -2235,14 +2107,8 @@ func TestRegression_CustomDecodePointerResultPointerTargetParity(t *testing.T) {
 		Decode: func(v any, _ *avro.SchemaNode) (any, error) { return &wrap{V: v.(string)}, nil },
 	}
 	s := avro.MustParse(`{"type":"string","logicalType":"wrapped"}`, ct)
-	bin, err := s.Encode(&wrap{V: "hi"})
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	jsn, err := s.EncodeJSON(&wrap{V: "hi"})
-	if err != nil {
-		t.Fatalf("EncodeJSON: %v", err)
-	}
+	bin := mustEncode(t, s, &wrap{V: "hi"})
+	jsn := mustEncodeJSON(t, s, &wrap{V: "hi"})
 
 	var tb, tj *wrap
 	_, eb := s.Decode(bin, &tb)
@@ -2335,14 +2201,8 @@ func TestMatrix_CustomSuppressionScalarTargetParity(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			plain := avro.MustParse(c.schema)
-			bin, err := plain.Encode(c.encVal)
-			if err != nil {
-				t.Fatalf("Encode: %v", err)
-			}
-			jsn, err := plain.EncodeJSON(c.encVal)
-			if err != nil {
-				t.Fatalf("EncodeJSON: %v", err)
-			}
+			bin := mustEncode(t, plain, c.encVal)
+			jsn := mustEncodeJSON(t, plain, c.encVal)
 			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
 			bp, jp := reflect.New(c.target), reflect.New(c.target)
 			_, eb := cs.Decode(bin, bp.Interface())
@@ -2425,9 +2285,7 @@ func TestMatrix_CustomSuppressionWrongKindLogicalEncodeParity(t *testing.T) {
 			if _, err := cs.Decode(bin, &bv); err != nil {
 				t.Fatalf("binary Encode produced a wire its own Decode rejects: %v", err)
 			}
-			if err := cs.DecodeJSON(jsn, &jv); err != nil {
-				t.Fatalf("DecodeJSON: %v", err)
-			}
+			mustDecodeJSON(t, cs, jsn, &jv)
 			// Both formats must encode the same raw Avro-native value.
 			if !reflect.DeepEqual(bv, jv) {
 				t.Errorf("binary vs JSON encode diverge under wrong-kind suppression: binary=%#v json=%#v", bv, jv)
@@ -2474,12 +2332,8 @@ func TestMatrix_CustomSuppressionSpecValidLogicalStillApplied(t *testing.T) {
 			// The encode must succeed AND round-trip through this schema's own
 			// (suppressed-to-raw) decoders identically on both wires.
 			var bv, jv any
-			if _, err := cs.Decode(bin, &bv); err != nil {
-				t.Fatalf("binary Decode: %v", err)
-			}
-			if err := cs.DecodeJSON(jsn, &jv); err != nil {
-				t.Fatalf("DecodeJSON: %v", err)
-			}
+			mustDecode(t, cs, bin, &bv)
+			mustDecodeJSON(t, cs, jsn, &jv)
 			if !reflect.DeepEqual(bv, jv) {
 				t.Errorf("spec-valid logical binary vs JSON diverge: binary=%#v json=%#v", bv, jv)
 			}
@@ -2591,9 +2445,7 @@ func TestRegression_InvalidUTF8StringBinaryVerbatimJSONCoercion(t *testing.T) {
 		t.Errorf("binary wire = % x, want % x (verbatim bytes)", bin, want)
 	}
 	var binBack string
-	if _, err := s.Decode(bin, &binBack); err != nil {
-		t.Fatalf("binary Decode: %v", err)
-	}
+	mustDecode(t, s, bin, &binBack)
 	if binBack != in {
 		t.Errorf("binary round-trip = %q, want verbatim %q", binBack, in)
 	}
@@ -2608,9 +2460,7 @@ func TestRegression_InvalidUTF8StringBinaryVerbatimJSONCoercion(t *testing.T) {
 		t.Errorf("JSON wire = % x, want % x (U+FFFD coercion)", jsn, want)
 	}
 	var jsonBack string
-	if err := s.DecodeJSON(jsn, &jsonBack); err != nil {
-		t.Fatalf("DecodeJSON: %v", err)
-	}
+	mustDecodeJSON(t, s, jsn, &jsonBack)
 	if jsonBack != "A�B" {
 		t.Errorf("JSON round-trip = %q, want coerced %q", jsonBack, "A�B")
 	}
@@ -2655,21 +2505,11 @@ type untaggedPinBig int64
 func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
 	t.Run("decode-into-any-first-class-branch", func(t *testing.T) {
 		sc := avro.MustParse(`["long","int"]`)
-		bw, err := sc.Encode(int32(7)) // writer chose the "int" branch (index 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		jw, err := sc.EncodeJSON(int32(7)) // bare wire: `7` — no branch on the wire
-		if err != nil {
-			t.Fatal(err)
-		}
+		bw := mustEncode(t, sc, int32(7))     // writer chose the "int" branch (index 1)
+		jw := mustEncodeJSON(t, sc, int32(7)) // bare wire: `7` — no branch on the wire
 		var bo, jo any
-		if _, err := sc.Decode(bw, &bo); err != nil {
-			t.Fatal(err)
-		}
-		if err := sc.DecodeJSON(jw, &jo); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, sc, bw, &bo)
+		mustDecodeJSON(t, sc, jw, &jo)
 		if _, ok := bo.(int32); !ok {
 			t.Errorf("binary decode-into-any = %T, want int32 (wire index recovers the writer's branch)", bo)
 		}
@@ -2679,14 +2519,9 @@ func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
 
 		// TaggedUnions names the branch: decode recovers it (in the documented
 		// {branch: value} envelope form for an any target).
-		tw, err := sc.EncodeJSON(int32(7), avro.TaggedUnions())
-		if err != nil {
-			t.Fatal(err)
-		}
+		tw := mustEncodeJSON(t, sc, int32(7), avro.TaggedUnions())
 		var to any
-		if err := sc.DecodeJSON(tw, &to, avro.TaggedUnions()); err != nil {
-			t.Fatal(err)
-		}
+		mustDecodeJSON(t, sc, tw, &to, avro.TaggedUnions())
 		env, ok := to.(map[string]any)
 		if !ok || len(env) != 1 {
 			t.Fatalf("tagged decode-into-any = %T %v, want one-key envelope", to, to)
@@ -2703,21 +2538,11 @@ func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
 			func(m untaggedPinBig, _ *avro.SchemaNode) (int64, error) { return int64(m), nil },
 			func(v int64, _ *avro.SchemaNode) (untaggedPinBig, error) { return untaggedPinBig(v * 10), nil })
 		sc := avro.MustParse(`["int",{"type":"long","logicalType":"upb"}]`, ct)
-		bw, err := sc.Encode(untaggedPinBig(7)) // long+custom branch on the wire
-		if err != nil {
-			t.Fatal(err)
-		}
-		jw, err := sc.EncodeJSON(untaggedPinBig(7)) // bare `7`
-		if err != nil {
-			t.Fatal(err)
-		}
+		bw := mustEncode(t, sc, untaggedPinBig(7))     // long+custom branch on the wire
+		jw := mustEncodeJSON(t, sc, untaggedPinBig(7)) // bare `7`
 		var bc, jc untaggedPinBig
-		if _, err := sc.Decode(bw, &bc); err != nil {
-			t.Fatal(err)
-		}
-		if err := sc.DecodeJSON(jw, &jc); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, sc, bw, &bc)
+		mustDecodeJSON(t, sc, jw, &jc)
 		if bc != 70 {
 			t.Errorf("binary concrete-target decode = %v, want 70 (custom Decode fired on the long branch)", bc)
 		}
@@ -2726,14 +2551,9 @@ func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
 		}
 
 		// TaggedUnions recovers the custom branch for the concrete target.
-		tw, err := sc.EncodeJSON(untaggedPinBig(7), avro.TaggedUnions())
-		if err != nil {
-			t.Fatal(err)
-		}
+		tw := mustEncodeJSON(t, sc, untaggedPinBig(7), avro.TaggedUnions())
 		var tc untaggedPinBig
-		if err := sc.DecodeJSON(tw, &tc, avro.TaggedUnions()); err != nil {
-			t.Fatal(err)
-		}
+		mustDecodeJSON(t, sc, tw, &tc, avro.TaggedUnions())
 		if tc != 70 {
 			t.Errorf("tagged JSON concrete-target decode = %v, want 70 (branch named on the wire, custom fires)", tc)
 		}
@@ -2882,14 +2702,9 @@ func TestRegression_CustomTypeRecursiveDepthUniform(t *testing.T) {
 func TestRegression_TimestampNanosNegativeSecondSpecValue(t *testing.T) {
 	s := avro.MustParse(`{"type":"long","logicalType":"timestamp-nanos"}`)
 	tm := time.Unix(-1, 500_000_000).UTC() // 0.5s before epoch → -5e8 ns
-	b, err := s.Encode(tm)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	b := mustEncode(t, s, tm)
 	var got int64
-	if _, err := s.Decode(b, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, b, &got)
 	const specValue = int64(-500_000_000) // Java's off-by-1000 yields a different value
 	if got != specValue {
 		t.Errorf("timestamp-nanos(0.5s-before-epoch) = %d, want spec-correct %d (regression toward Java's off-by-1000?)", got, specValue)
@@ -3115,14 +2930,9 @@ func TestRegression_FixedLogicalProbeSizeBounded(t *testing.T) {
 	// and JSON would leak the enriched type.
 	suppressed := avro.MustParse(`{"type":"fixed","size":16,"logicalType":"uuid","name":"u"}`, avro.WithCustomType(avro.CustomType{AvroType: "fixed", LogicalType: "uuid"}))
 	in := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
-	jb, err := suppressed.AppendEncodeJSON(nil, in)
-	if err != nil {
-		t.Fatalf("encodeJSON: %v", err)
-	}
+	jb := mustAppendEncodeJSON(t, suppressed, nil, in)
 	var got any
-	if err := suppressed.DecodeJSON(jb, &got); err != nil {
-		t.Fatalf("decodeJSON: %v", err)
-	}
+	mustDecodeJSON(t, suppressed, jb, &got)
 	if _, ok := got.([]byte); !ok {
 		t.Fatalf("uuid suppression broken by probe cap: DecodeJSON into any returned %T, want []byte (raw)", got)
 	}
@@ -3290,19 +3100,13 @@ func TestMatrix_FlatFieldRootSchemaRoundTrip(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := avro.Parse(tt.schema)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
+			s := mustParse(t, tt.schema)
 			root := s.Root()
 			if len(root.Fields) != 1 {
 				t.Fatalf("Root fields: %d, want 1", len(root.Fields))
 			}
 			tt.check(t, root.Fields[0])
-			rebuilt, err := root.Schema()
-			if err != nil {
-				t.Fatalf("Root().Schema(): %v", err)
-			}
+			rebuilt := mustNodeSchema(t, root)
 			if got, want := string(rebuilt.Canonical()), string(s.Canonical()); got != want {
 				t.Fatalf("canonical mismatch:\n got %s\nwant %s", got, want)
 			}
@@ -3316,12 +3120,9 @@ func TestMatrix_FlatFieldRootSchemaRoundTrip(t *testing.T) {
 // registered in the metadata name table and the name-referencing sibling's
 // default coerces exactly as it would against a nested-form definition.
 func TestRegression_FlatFixedNameRefDefaultCoerced(t *testing.T) {
-	s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+	s := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"F","type":"fixed","size":4},
 		{"name":"F2","type":"F","default":"abcd"}]}`)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
 	f2 := s.Root().Fields[1]
 	b, ok := f2.Default.([]byte)
 	if !ok {
@@ -3811,14 +3612,8 @@ func TestRegression_CustomSkipDecodeMatchedTransformSurvives(t *testing.T) {
 		Amt  int64  `avro:"amt"`
 		Name string `avro:"name"`
 	}
-	wireBin, err := plain.Encode(Rw{Amt: 500, Name: "alice"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	wireJSON, err := plain.EncodeJSON(Rw{Amt: 500, Name: "alice"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	wireBin := mustEncode(t, plain, Rw{Amt: 500, Name: "alice"})
+	wireJSON := mustEncodeJSON(t, plain, Rw{Amt: 500, Name: "alice"})
 
 	type R struct {
 		Amt  csTransformed `avro:"amt"`
@@ -3827,16 +3622,12 @@ func TestRegression_CustomSkipDecodeMatchedTransformSurvives(t *testing.T) {
 	want := R{Amt: csTransformed{Cents: 500}, Name: "alice"}
 
 	var gb R
-	if _, err := s.Decode(wireBin, &gb); err != nil {
-		t.Fatalf("binary decode: %v", err)
-	}
+	mustDecode(t, s, wireBin, &gb)
 	if gb != want {
 		t.Errorf("binary: matched transform did not survive (or skipped sibling wrong):\n got=%+v\n want=%+v", gb, want)
 	}
 	var gj R
-	if err := s.DecodeJSON(wireJSON, &gj); err != nil {
-		t.Fatalf("json decode: %v", err)
-	}
+	mustDecodeJSON(t, s, wireJSON, &gj)
 	if gj != want {
 		t.Errorf("json: matched transform did not survive (or skipped sibling wrong):\n got=%+v\n want=%+v", gj, want)
 	}
@@ -3865,33 +3656,19 @@ func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 		schema := `{"type":"map","values":"long"}`
 		plain := avro.MustParse(schema)
 		sskip := avro.MustParse(schema, skip)
-		bin, err := plain.Encode(map[string]int64{"k": 5})
-		if err != nil {
-			t.Fatal(err)
-		}
-		jsonw, err := plain.EncodeJSON(map[string]int64{"k": 5})
-		if err != nil {
-			t.Fatal(err)
-		}
+		bin := mustEncode(t, plain, map[string]int64{"k": 5})
+		jsonw := mustEncodeJSON(t, plain, map[string]int64{"k": 5})
 		nb := map[string]int64{"stale": 99}
-		if _, err := plain.Decode(bin, &nb); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, plain, bin, &nb)
 		sb := map[string]int64{"stale": 99}
-		if _, err := sskip.Decode(bin, &sb); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, sskip, bin, &sb)
 		if !reflect.DeepEqual(nb, sb) {
 			t.Errorf("binary typed-map: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
 		}
 		nj := map[string]int64{"stale": 99}
-		if err := plain.DecodeJSON(jsonw, &nj); err != nil {
-			t.Fatal(err)
-		}
+		mustDecodeJSON(t, plain, jsonw, &nj)
 		sj := map[string]int64{"stale": 99}
-		if err := sskip.DecodeJSON(jsonw, &sj); err != nil {
-			t.Fatal(err)
-		}
+		mustDecodeJSON(t, sskip, jsonw, &sj)
 		if !reflect.DeepEqual(nj, sj) {
 			t.Errorf("json typed-map: skip-custom=%v != no-custom=%v", sj, nj)
 		}
@@ -3905,33 +3682,19 @@ func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 		schema := `{"type":"map","values":"long"}`
 		plain := avro.MustParse(schema)
 		sskip := avro.MustParse(schema, skip)
-		bin, err := plain.Encode(map[string]int64{"k": 5})
-		if err != nil {
-			t.Fatal(err)
-		}
-		jsonw, err := plain.EncodeJSON(map[string]int64{"k": 5})
-		if err != nil {
-			t.Fatal(err)
-		}
+		bin := mustEncode(t, plain, map[string]int64{"k": 5})
+		jsonw := mustEncodeJSON(t, plain, map[string]int64{"k": 5})
 		nb := map[string]any{"stale": int64(99)}
-		if _, err := plain.Decode(bin, &nb); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, plain, bin, &nb)
 		sb := map[string]any{"stale": int64(99)}
-		if _, err := sskip.Decode(bin, &sb); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, sskip, bin, &sb)
 		if !reflect.DeepEqual(nb, sb) {
 			t.Errorf("binary map[string]any: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
 		}
 		nj := map[string]any{"stale": int64(99)}
-		if err := plain.DecodeJSON(jsonw, &nj); err != nil {
-			t.Fatal(err)
-		}
+		mustDecodeJSON(t, plain, jsonw, &nj)
 		sj := map[string]any{"stale": int64(99)}
-		if err := sskip.DecodeJSON(jsonw, &sj); err != nil {
-			t.Fatal(err)
-		}
+		mustDecodeJSON(t, sskip, jsonw, &sj)
 		if !reflect.DeepEqual(nj, sj) {
 			t.Errorf("json map[string]any: skip-custom=%v != no-custom=%v", sj, nj)
 		}
@@ -3944,18 +3707,11 @@ func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 		type Rw struct {
 			A int64 `avro:"a"`
 		}
-		bin, err := plain.Encode(Rw{A: 5})
-		if err != nil {
-			t.Fatal(err)
-		}
+		bin := mustEncode(t, plain, Rw{A: 5})
 		var nb any = map[string]any{"stale": int64(99)}
-		if _, err := plain.Decode(bin, &nb); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, plain, bin, &nb)
 		var sb any = map[string]any{"stale": int64(99)}
-		if _, err := sskip.Decode(bin, &sb); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, sskip, bin, &sb)
 		if !reflect.DeepEqual(nb, sb) {
 			t.Errorf("binary record-into-any: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
 		}
@@ -3969,18 +3725,11 @@ func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 		schema := `{"type":"map","values":"long"}`
 		plain := avro.MustParse(schema)
 		sskip := avro.MustParse(schema, skip)
-		bin, err := plain.Encode(map[string]int64{"k": 5})
-		if err != nil {
-			t.Fatal(err)
-		}
+		bin := mustEncode(t, plain, map[string]int64{"k": 5})
 		var nb any = map[string]any{"stale": int64(99)}
-		if _, err := plain.Decode(bin, &nb); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, plain, bin, &nb)
 		var sb any = map[string]any{"stale": int64(99)}
-		if _, err := sskip.Decode(bin, &sb); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, sskip, bin, &sb)
 		if !reflect.DeepEqual(nb, sb) {
 			t.Errorf("binary map-into-any: skip-custom=%v != no-custom=%v", sb, nb)
 		}
@@ -4019,14 +3768,8 @@ func TestMatrix_CustomSkipDecodeLogicalIntoBaseTypedTarget(t *testing.T) {
 		t.Run(r.name, func(t *testing.T) {
 			plain := avro.MustParse(r.schema)
 			sskip := avro.MustParse(r.schema, skip)
-			bin, err := plain.Encode(r.enc)
-			if err != nil {
-				t.Fatal(err)
-			}
-			jsonw, err := plain.EncodeJSON(r.enc)
-			if err != nil {
-				t.Fatal(err)
-			}
+			bin := mustEncode(t, plain, r.enc)
+			jsonw := mustEncodeJSON(t, plain, r.enc)
 			no := r.mk()
 			if _, err := plain.Decode(bin, no); err != nil {
 				t.Fatalf("no-custom binary: %v", err)
@@ -4088,33 +3831,19 @@ func TestMatrix_CustomSkipDecodeTaggedUnionIntoAny(t *testing.T) {
 		t.Run(r.name, func(t *testing.T) {
 			plain := avro.MustParse(r.schema)
 			sskip := avro.MustParse(r.schema, skip)
-			bin, err := plain.Encode(r.value)
-			if err != nil {
-				t.Fatal(err)
-			}
-			jsonw, err := plain.EncodeJSON(r.value)
-			if err != nil {
-				t.Fatal(err)
-			}
+			bin := mustEncode(t, plain, r.value)
+			jsonw := mustEncodeJSON(t, plain, r.value)
 			var nb any
-			if _, err := plain.Decode(bin, &nb, avro.TaggedUnions()); err != nil {
-				t.Fatal(err)
-			}
+			mustDecode(t, plain, bin, &nb, avro.TaggedUnions())
 			var sb any
-			if _, err := sskip.Decode(bin, &sb, avro.TaggedUnions()); err != nil {
-				t.Fatal(err)
-			}
+			mustDecode(t, sskip, bin, &sb, avro.TaggedUnions())
 			if !reflect.DeepEqual(nb, sb) {
 				t.Errorf("binary: skip-custom=%#v != no-custom=%#v", sb, nb)
 			}
 			var nj any
-			if err := plain.DecodeJSON(jsonw, &nj, avro.TaggedUnions()); err != nil {
-				t.Fatal(err)
-			}
+			mustDecodeJSON(t, plain, jsonw, &nj, avro.TaggedUnions())
 			var sj any
-			if err := sskip.DecodeJSON(jsonw, &sj, avro.TaggedUnions()); err != nil {
-				t.Fatal(err)
-			}
+			mustDecodeJSON(t, sskip, jsonw, &sj, avro.TaggedUnions())
 			if !reflect.DeepEqual(nj, sj) {
 				t.Errorf("json: skip-custom=%#v != no-custom=%#v", sj, nj)
 			}
@@ -4154,35 +3883,23 @@ func TestRegression_CustomSkipDecodeChainInputUntagged(t *testing.T) {
 	}
 	x32, x64 := int32(7), int64(9)
 	in := Rw{U: &x32, S: "hi", Arr: []*int64{&x64, nil}}
-	bin, err := plain.Encode(in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	jsonw, err := plain.EncodeJSON(in)
-	if err != nil {
-		t.Fatal(err)
-	}
+	bin := mustEncode(t, plain, in)
+	jsonw := mustEncodeJSON(t, plain, in)
 
 	// Oracle: an UNtagged no-custom decode into any — exactly what the chain sees.
 	var oracle any
-	if _, err := plain.Decode(bin, &oracle); err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, plain, bin, &oracle)
 
 	captured = nil
 	var sinkB any
-	if _, err := s.Decode(bin, &sinkB); err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, s, bin, &sinkB)
 	if !reflect.DeepEqual(captured, oracle) {
 		t.Errorf("binary: custom chain saw\n %#v\n want untagged\n %#v", captured, oracle)
 	}
 
 	captured = nil
 	var sinkJ any
-	if err := s.DecodeJSON(jsonw, &sinkJ); err != nil {
-		t.Fatal(err)
-	}
+	mustDecodeJSON(t, s, jsonw, &sinkJ)
 	if !reflect.DeepEqual(captured, oracle) {
 		t.Errorf("json: custom chain saw\n %#v\n want untagged\n %#v", captured, oracle)
 	}
@@ -4211,12 +3928,8 @@ func TestRegression_CustomSkipDecodeOverlappingUnion(t *testing.T) {
 		// binary: array[1] = union branch 1 (EnumB) + enum idx 1 ("X"), end block.
 		bin := []byte{0x02, 0x02, 0x02, 0x00}
 		var nb, sb []int32
-		if _, err := plain.Decode(bin, &nb); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := sskip.Decode(bin, &sb); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, plain, bin, &nb)
+		mustDecode(t, sskip, bin, &sb)
 		if !reflect.DeepEqual(nb, sb) || len(nb) != 1 || nb[0] != 1 {
 			t.Errorf("binary ordinal: skip=%v no-custom=%v (want [1] = EnumB ordinal of X)", sb, nb)
 		}
@@ -4224,12 +3937,8 @@ func TestRegression_CustomSkipDecodeOverlappingUnion(t *testing.T) {
 		// json: tagged-union spec form selecting EnumB.
 		jsonw := []byte(`[{"EnumB":"X"}]`)
 		var nj, sj []int32
-		if err := plain.DecodeJSON(jsonw, &nj); err != nil {
-			t.Fatal(err)
-		}
-		if err := sskip.DecodeJSON(jsonw, &sj); err != nil {
-			t.Fatal(err)
-		}
+		mustDecodeJSON(t, plain, jsonw, &nj)
+		mustDecodeJSON(t, sskip, jsonw, &sj)
 		if !reflect.DeepEqual(nj, sj) || len(nj) != 1 || nj[0] != 1 {
 			t.Errorf("json ordinal: skip=%v no-custom=%v (want [1])", sj, nj)
 		}
@@ -4245,24 +3954,16 @@ func TestRegression_CustomSkipDecodeOverlappingUnion(t *testing.T) {
 		// binary: record -> union branch 1 (EB) -> enum idx 1 ("X").
 		bin := []byte{0x02, 0x02}
 		var nb, sb any
-		if _, err := plain.Decode(bin, &nb, avro.TaggedUnions()); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := sskip.Decode(bin, &sb, avro.TaggedUnions()); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, plain, bin, &nb, avro.TaggedUnions())
+		mustDecode(t, sskip, bin, &sb, avro.TaggedUnions())
 		if !reflect.DeepEqual(nb, sb) {
 			t.Errorf("binary tagged-any: skip=%#v no-custom=%#v", sb, nb)
 		}
 
 		jsonw := []byte(`{"e":{"EB":"X"}}`)
 		var nj, sj any
-		if err := plain.DecodeJSON(jsonw, &nj, avro.TaggedUnions()); err != nil {
-			t.Fatal(err)
-		}
-		if err := sskip.DecodeJSON(jsonw, &sj, avro.TaggedUnions()); err != nil {
-			t.Fatal(err)
-		}
+		mustDecodeJSON(t, plain, jsonw, &nj, avro.TaggedUnions())
+		mustDecodeJSON(t, sskip, jsonw, &sj, avro.TaggedUnions())
 		if !reflect.DeepEqual(nj, sj) {
 			t.Errorf("json tagged-any: skip=%#v no-custom=%#v", sj, nj)
 		}
@@ -4281,16 +3982,11 @@ func TestRegression_CustomSkipDecodeLogicalSuppression(t *testing.T) {
 	matchRaw := avro.CustomType{LogicalType: "timestamp-millis"} // Decode==nil → suppress → raw
 	wildSkip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
 
-	wire, err := avro.MustParse(schema).Encode(time.UnixMilli(1600000000000).UTC())
-	if err != nil {
-		t.Fatal(err)
-	}
+	wire := mustEncode(t, avro.MustParse(schema), time.UnixMilli(1600000000000).UTC())
 
 	dec := func(opts ...avro.SchemaOpt) any {
 		var got any
-		if _, err := avro.MustParse(schema, opts...).Decode(wire, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, avro.MustParse(schema, opts...), wire, &got)
 		return got
 	}
 
@@ -4631,9 +4327,7 @@ func TestRegression_BareRefWriterCustomControl(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var got map[string]any
-	if _, err := bare.Decode(wire, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, bare, wire, &got)
 	if want := map[string]any{"f": ctLong{7}}; !reflect.DeepEqual(got, want) {
 		t.Errorf("bare-ref direct decode: got %#v, want %#v", got, want)
 	}
@@ -4782,9 +4476,7 @@ func TestRegression_CacheKeylessDefStaleSplice(t *testing.T) {
 		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
 	}
 	var out map[string]any
-	if _, err := writer.Decode(wire, &out); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, writer, wire, &out)
 	if !reflect.DeepEqual(out, in) {
 		t.Errorf("decode round-trip: got %#v, want %#v", out, in)
 	}
@@ -4849,9 +4541,7 @@ func TestRegression_CacheKeylessDefCrossParseRef(t *testing.T) {
 		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
 	}
 	var out map[string]any
-	if _, err := writer.Decode(wire, &out); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, writer, wire, &out)
 	if !reflect.DeepEqual(out, in) {
 		t.Errorf("decode round-trip: got %#v, want %#v", out, in)
 	}
@@ -5883,10 +5573,7 @@ func TestMatrix_LeadingDotNameNormalization(t *testing.T) {
 			`{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}},{"name":"b","type":"x"}]}`},
 	} {
 		t.Run(cell.key, func(t *testing.T) {
-			writer, err := avro.Parse(cell.src, lax)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			writer := mustParse(t, cell.src, lax)
 			nc := reparseNameClass{"leadingdot-sameparse", "", "x", "x", lax}
 			in := map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}}
 			want := map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}, "added": "x"}
@@ -6231,10 +5918,7 @@ func TestMatrix_CanonicalEmptyNameFastavroParity(t *testing.T) {
 	// Java's first-occurrence rule: the full body is emitted at the FIRST
 	// walk occurrence (the referencing field), a bare fullname afterward.
 	t.Run("fwdref/ok", func(t *testing.T) {
-		s, err := avro.Parse(`{"type":"record","name":"Top","fields":[{"name":"b","type":"ok."},{"name":"a","type":`+okDef+`}]}`, avro.WithLaxNames(acceptAll))
-		if err != nil {
-			t.Fatalf("parse: %v", err)
-		}
+		s := mustParse(t, `{"type":"record","name":"Top","fields":[{"name":"b","type":"ok."},{"name":"a","type":`+okDef+`}]}`, avro.WithLaxNames(acceptAll))
 		want := `{"name":"Top","type":"record","fields":[{"name":"b","type":{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"}]}},{"name":"a","type":"ok."}]}`
 		if got := string(s.Canonical()); got != want {
 			t.Errorf("fwd-ref first-occurrence canonical:\n got %s\nwant %s", got, want)
@@ -6499,15 +6183,9 @@ func TestRegression_RecursiveRecordCustomThroughResolve(t *testing.T) {
 	// Reader reorders fields vs writer so Resolve builds a real resolving decoder.
 	reader := avro.MustParse(`{"type":"record","name":"LL","fields":[{"name":"v","type":"int"},{"name":"next","type":["null","LL"]}]}`, ct)
 	writer := avro.MustParse(`{"type":"record","name":"LL","fields":[{"name":"next","type":["null","LL"]},{"name":"v","type":"int"}]}`)
-	res, err := avro.Resolve(writer, reader)
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
+	res := mustResolve(t, writer, reader)
 	val := map[string]any{"v": int32(1), "next": map[string]any{"v": int32(2), "next": nil}}
-	wire, err := writer.AppendEncode(nil, val)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	wire := mustAppendEncode(t, writer, nil, val)
 	var got any
 	if _, err := res.Decode(wire, &got); err != nil {
 		t.Fatalf("resolved decode: %v", err)
@@ -6527,18 +6205,10 @@ func TestRegression_RecursiveRecordCustomThroughResolve(t *testing.T) {
 func TestResolvedRecordWithoutCustomIsUnwrapped(t *testing.T) {
 	r := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
 	w := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"b","type":"string"},{"name":"a","type":"int"}]}`)
-	res, err := avro.Resolve(w, r)
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	wire, err := w.AppendEncode(nil, map[string]any{"a": int32(1), "b": "x"})
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	res := mustResolve(t, w, r)
+	wire := mustAppendEncode(t, w, nil, map[string]any{"a": int32(1), "b": "x"})
 	var got map[string]any
-	if _, err := res.Decode(wire, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, res, wire, &got)
 	if fmt.Sprintf("%v", got["a"]) != "1" || got["b"] != "x" {
 		t.Fatalf("plain resolved record decode wrong: %#v", got)
 	}
@@ -6575,10 +6245,7 @@ func ucpCustom() avro.CustomType {
 
 func TestRegression_UnionCustomDecodePointerReusedTargetParity(t *testing.T) {
 	const schema = `{"type":"record","name":"R","fields":[{"name":"when","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}]}`
-	s, err := avro.Parse(schema, avro.WithCustomType(ucpCustom()))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
+	s := mustParse(t, schema, avro.WithCustomType(ucpCustom()))
 	type Event struct {
 		When any `avro:"when"`
 	}
@@ -6699,15 +6366,9 @@ func TestRegression_UnionCustomDecodePointerFieldTarget(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s, err := avro.Parse(tc.schema, avro.WithCustomType(ucpCustom()))
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, tc.schema, avro.WithCustomType(ucpCustom()))
 			in := EventPtr{When: &ucpEvent{T: want}}
-			b, err := s.AppendEncode(nil, in)
-			if err != nil {
-				t.Fatalf("binary encode: %v", err)
-			}
+			b := mustAppendEncode(t, s, nil, in)
 			var gotB EventPtr
 			if _, err := s.Decode(b, &gotB); err != nil {
 				t.Fatalf("binary decode into *T field: %v", err)
@@ -6715,10 +6376,7 @@ func TestRegression_UnionCustomDecodePointerFieldTarget(t *testing.T) {
 			if gotB.When == nil || !gotB.When.T.Equal(want) {
 				t.Fatalf("binary *T field: got %v", gotB.When)
 			}
-			j, err := s.AppendEncodeJSON(nil, in)
-			if err != nil {
-				t.Fatalf("json encode: %v", err)
-			}
+			j := mustAppendEncodeJSON(t, s, nil, in)
 			var gotJ EventPtr
 			if err := s.DecodeJSON(j, &gotJ); err != nil {
 				t.Fatalf("json decode into *T field: %v", err)
@@ -8429,9 +8087,7 @@ func TestScalarDecodeNoAllocAfterGC(t *testing.T) {
 		runtime.GC()
 		runtime.GC()
 		runtime.ReadMemStats(&before)
-		if _, err := s.Decode(wire, &v); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, wire, &v)
 		runtime.ReadMemStats(&after)
 		minMallocs = min(minMallocs, after.Mallocs-before.Mallocs)
 	}
@@ -8773,14 +8429,9 @@ func TestRegression_SliceElementPointerChainBounded(t *testing.T) {
 		}
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":"int"}}]}`)
 		v := int32(7)
-		wire, err := s.Encode(&R{F: []*int32{&v}})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		wire := mustEncode(t, s, &R{F: []*int32{&v}})
 		var out R
-		if _, err := s.Decode(wire, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, wire, &out)
 		if len(out.F) != 1 || out.F[0] == nil || *out.F[0] != 7 {
 			t.Fatalf("roundtrip wrong: %#v", out)
 		}
@@ -9129,14 +8780,9 @@ func TestMatrix_NamedByteElementRoundTrip(t *testing.T) {
 	t.Run("fixed/binary", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
 		in := nbeFix3{1, 2, 3}
-		b, err := s.AppendEncode(nil, in)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		b := mustAppendEncode(t, s, nil, in)
 		var out nbeFix3
-		if _, err := s.Decode(b, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, b, &out)
 		if out != in {
 			t.Fatalf("round-trip: got %v want %v", out, in)
 		}
@@ -9145,14 +8791,9 @@ func TestMatrix_NamedByteElementRoundTrip(t *testing.T) {
 	t.Run("fixed/json", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
 		in := nbeFix3{1, 2, 3}
-		j, err := s.AppendEncodeJSON(nil, in)
-		if err != nil {
-			t.Fatalf("encode json: %v", err)
-		}
+		j := mustAppendEncodeJSON(t, s, nil, in)
 		var out nbeFix3
-		if err := s.DecodeJSON(j, &out); err != nil {
-			t.Fatalf("decode json: %v", err)
-		}
+		mustDecodeJSON(t, s, j, &out)
 		if out != in {
 			t.Fatalf("round-trip json: got %v want %v", out, in)
 		}
@@ -9161,14 +8802,9 @@ func TestMatrix_NamedByteElementRoundTrip(t *testing.T) {
 	t.Run("bytes/array/binary", func(t *testing.T) {
 		s := avro.MustParse(`"bytes"`)
 		in := nbeFix3{4, 5, 6}
-		b, err := s.AppendEncode(nil, in)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		b := mustAppendEncode(t, s, nil, in)
 		var out nbeFix3
-		if _, err := s.Decode(b, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, b, &out)
 		if out != in {
 			t.Fatalf("round-trip: got %v want %v", out, in)
 		}
@@ -9177,34 +8813,21 @@ func TestMatrix_NamedByteElementRoundTrip(t *testing.T) {
 	t.Run("bytes/slice/binary+json", func(t *testing.T) {
 		s := avro.MustParse(`"bytes"`)
 		in := nbeSlice{7, 8, 9}
-		b, err := s.AppendEncode(nil, in)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		b := mustAppendEncode(t, s, nil, in)
 		var out nbeSlice
-		if _, err := s.Decode(b, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, b, &out)
 		if !bytes.Equal([]byte(toBytes(out)), []byte{7, 8, 9}) {
 			t.Fatalf("round-trip: got %v", out)
 		}
-		j, err := s.AppendEncodeJSON(nil, in)
-		if err != nil {
-			t.Fatalf("encode json: %v", err)
-		}
+		j := mustAppendEncodeJSON(t, s, nil, in)
 		var outJ nbeSlice
-		if err := s.DecodeJSON(j, &outJ); err != nil {
-			t.Fatalf("decode json: %v", err)
-		}
+		mustDecodeJSON(t, s, j, &outJ)
 	})
 
 	t.Run("bytes/array->fixed-slice-target/binary", func(t *testing.T) {
 		// deserFixed's slice arm (was Set(reflect.ValueOf), now SetBytes).
 		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
-		b, err := s.AppendEncode(nil, nbeFix3{1, 2, 3})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		b := mustAppendEncode(t, s, nil, nbeFix3{1, 2, 3})
 		var out nbeSlice
 		if _, err := s.Decode(b, &out); err != nil {
 			t.Fatalf("decode into named-byte slice: %v", err)
@@ -9216,25 +8839,15 @@ func TestMatrix_NamedByteElementRoundTrip(t *testing.T) {
 
 	t.Run("uuid-fixed/binary+json", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`)
-		b, err := s.AppendEncode(nil, uuidWire)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		b := mustAppendEncode(t, s, nil, uuidWire)
 		var out nbeUUID
-		if _, err := s.Decode(b, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, b, &out)
 		if out != uuidWire {
 			t.Fatalf("round-trip: got %v want %v", out, uuidWire)
 		}
-		j, err := s.AppendEncodeJSON(nil, uuidWire)
-		if err != nil {
-			t.Fatalf("encode json: %v", err)
-		}
+		j := mustAppendEncodeJSON(t, s, nil, uuidWire)
 		var outJ nbeUUID
-		if err := s.DecodeJSON(j, &outJ); err != nil {
-			t.Fatalf("decode json: %v", err)
-		}
+		mustDecodeJSON(t, s, j, &outJ)
 		if outJ != uuidWire {
 			t.Fatalf("round-trip json: got %v want %v", outJ, uuidWire)
 		}
@@ -9243,25 +8856,15 @@ func TestMatrix_NamedByteElementRoundTrip(t *testing.T) {
 	t.Run("uuid-string->[16]named/binary+json", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"string","logicalType":"uuid"}`)
 		str := "01234567-89ab-cdef-1032-547698badcfe"
-		b, err := s.AppendEncode(nil, str)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		b := mustAppendEncode(t, s, nil, str)
 		var out nbeUUID
-		if _, err := s.Decode(b, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, b, &out)
 		if out != uuidWire {
 			t.Fatalf("round-trip: got %v want %v", out, uuidWire)
 		}
-		j, err := s.AppendEncodeJSON(nil, str)
-		if err != nil {
-			t.Fatalf("encode json: %v", err)
-		}
+		j := mustAppendEncodeJSON(t, s, nil, str)
 		var outJ nbeUUID
-		if err := s.DecodeJSON(j, &outJ); err != nil {
-			t.Fatalf("decode json: %v", err)
-		}
+		mustDecodeJSON(t, s, j, &outJ)
 		if outJ != uuidWire {
 			t.Fatalf("round-trip json: got %v want %v", outJ, uuidWire)
 		}
@@ -9273,14 +8876,9 @@ func TestMatrix_NamedByteElementRoundTrip(t *testing.T) {
 		}
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"F","type":{"type":"fixed","name":"F3","size":3}}]}`)
 		in := R{F: nbeFix3{1, 2, 3}}
-		b, err := s.AppendEncode(nil, in)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		b := mustAppendEncode(t, s, nil, in)
 		var out R
-		if _, err := s.Decode(b, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, b, &out)
 		if out != in {
 			t.Fatalf("round-trip: got %v want %v", out, in)
 		}
@@ -9292,14 +8890,9 @@ func TestMatrix_NamedByteElementRoundTrip(t *testing.T) {
 		}
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"u","type":{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}}]}`)
 		in := R{U: uuidWire}
-		b, err := s.AppendEncode(nil, in)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		b := mustAppendEncode(t, s, nil, in)
 		var out R
-		if _, err := s.Decode(b, &out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, b, &out)
 		if out != in {
 			t.Fatalf("round-trip: got %v want %v", out, in)
 		}
@@ -9310,15 +8903,9 @@ func TestMatrix_NamedByteElementRoundTrip(t *testing.T) {
 		// [16]named. Was reflect.Copy (panic), now copyBytesToArray.
 		w := avro.MustParse(`"bytes"`)
 		r := avro.MustParse(`{"type":"string","logicalType":"uuid"}`)
-		res, err := avro.Resolve(w, r)
-		if err != nil {
-			t.Fatalf("resolve: %v", err)
-		}
+		res := mustResolve(t, w, r)
 		// Writer encodes the 36-char canonical UUID string AS bytes.
-		b, err := w.AppendEncode(nil, []byte("01234567-89ab-cdef-1032-547698badcfe"))
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		b := mustAppendEncode(t, w, nil, []byte("01234567-89ab-cdef-1032-547698badcfe"))
 		var out nbeUUID
 		if _, err := res.Decode(b, &out); err != nil {
 			t.Fatalf("promoted decode: %v", err)

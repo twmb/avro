@@ -86,10 +86,7 @@ func TestMatrix_TimestampScaledOverflowBoundaries(t *testing.T) {
 	for _, u := range units {
 		t.Run(u.logical, func(t *testing.T) {
 			t.Parallel()
-			s, err := avro.Parse(fmt.Sprintf(`{"type":"long","logicalType":%q}`, u.logical))
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, fmt.Sprintf(`{"type":"long","logicalType":%q}`, u.logical))
 			maxSec := int64(math.MaxInt64) / u.scale
 
 			// Every side of both guards. The nanosecond is chosen so the
@@ -466,10 +463,7 @@ func TestMatrix_SchemaTreeNonFiniteFloatImages(t *testing.T) {
 // json.Marshal's own cause rather than silently charged or dropped.
 func TestMatrix_SchemaTreeMapKeyMarshalFailureSurfacesJSONCause(t *testing.T) {
 	t.Parallel()
-	s, err := avro.Parse(`{"type":"record","name":"R","fields":[]}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"record","name":"R","fields":[]}`)
 	n := s.Root()
 	if n.Props == nil {
 		n.Props = map[string]any{}
@@ -925,10 +919,7 @@ func TestMatrix_StrictJSONSkipperRejectsMalformedSkippedValues(t *testing.T) {
 		{"well-formed-object", `{"a":{"b":[1,2]}}`},
 	}
 
-	s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
 	// Closing axis: a malformed value followed by the record's own '}' is a
 	// different scanner state than the same value truncated at EOF — the
 	// first has a byte to reject, the second has none.
@@ -973,10 +964,7 @@ func (e darkTextEnum) MarshalText() ([]byte, error) { return []byte(e.S), nil }
 func TestMatrix_EnumCarrierAcceptanceAgreesAcrossWires(t *testing.T) {
 	t.Parallel()
 
-	s, err := avro.Parse(`{"type":"enum","name":"E","symbols":["RED","BLUE"]}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
+	s := mustParse(t, `{"type":"enum","name":"E","symbols":["RED","BLUE"]}`)
 	cells := []struct {
 		name    string
 		v       any
@@ -1008,9 +996,7 @@ func TestMatrix_EnumCarrierAcceptanceAgreesAcrossWires(t *testing.T) {
 				return
 			}
 			var sym string
-			if _, err := s.Decode(bin, &sym); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
+			mustDecode(t, s, bin, &sym)
 			if sym != c.wantSym {
 				t.Fatalf("binary decoded %q, want %q", sym, c.wantSym)
 			}

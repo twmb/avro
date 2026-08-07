@@ -28,55 +28,31 @@ func TestSchemaForBasic(t *testing.T) {
 	}
 
 	t.Run("with namespace", func(t *testing.T) {
-		s, err := SchemaFor[User](WithNamespace("com.example"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[User](t, WithNamespace("com.example"))
 		u := User{Name: "Alice", Age: 30, Score: 100}
-		data, err := s.Encode(&u)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &u)
 		var got User
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != u {
 			t.Errorf("got %+v, want %+v", got, u)
 		}
 	})
 
 	t.Run("no namespace", func(t *testing.T) {
-		s, err := SchemaFor[User]()
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := s.Encode(&User{Name: "Bob", Age: 25, Score: 50})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		s := mustSchemaFor[User](t)
+		data := mustEncode(t, s, &User{Name: "Bob", Age: 25, Score: 50})
 		var got User
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Name != "Bob" {
 			t.Errorf("got %q, want Bob", got.Name)
 		}
 	})
 
 	t.Run("pointer to struct", func(t *testing.T) {
-		s, err := SchemaFor[*User]()
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := s.Encode(&User{Name: "C", Age: 1, Score: 2})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		s := mustSchemaFor[*User](t)
+		data := mustEncode(t, s, &User{Name: "C", Age: 1, Score: 2})
 		var got User
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Name != "C" {
 			t.Errorf("got %q, want C", got.Name)
 		}
@@ -88,22 +64,14 @@ func TestSchemaForNullable(t *testing.T) {
 		Name  string  `avro:"name"`
 		Email *string `avro:"email"`
 	}
-	s, err := SchemaFor[Record]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Record](t)
 
 	t.Run("non-nil", func(t *testing.T) {
 		email := "alice@example.com"
 		r := Record{Name: "Alice", Email: &email}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Email == nil || *got.Email != *r.Email {
 			t.Errorf("got %+v, want %+v", got, r)
 		}
@@ -111,14 +79,9 @@ func TestSchemaForNullable(t *testing.T) {
 
 	t.Run("nil", func(t *testing.T) {
 		r := Record{Name: "Bob", Email: nil}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Email != nil {
 			t.Errorf("expected nil email, got %v", *got.Email)
 		}
@@ -139,10 +102,7 @@ func TestSchemaForMultiLevelPointer(t *testing.T) {
 		type Rec struct {
 			V **int32 `avro:"v"`
 		}
-		s, err := SchemaFor[Rec]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Rec](t)
 		// The emitted schema must itself parse.
 		if _, err := Parse(s.String()); err != nil {
 			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
@@ -150,14 +110,9 @@ func TestSchemaForMultiLevelPointer(t *testing.T) {
 		n := int32(7)
 		p := &n
 		in := Rec{V: &p}
-		data, err := s.Encode(&in)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &in)
 		var got Rec
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.V == nil || *got.V == nil || **got.V != 7 {
 			t.Fatalf("round-trip mismatch: got %v, want **int32(7)", got.V)
 		}
@@ -170,10 +125,7 @@ func TestSchemaForMultiLevelPointer(t *testing.T) {
 		type Rec struct {
 			V **Inner `avro:"v"`
 		}
-		s, err := SchemaFor[Rec]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Rec](t)
 		if _, err := Parse(s.String()); err != nil {
 			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
 		}
@@ -183,10 +135,7 @@ func TestSchemaForMultiLevelPointer(t *testing.T) {
 		type Rec struct {
 			V ***int32 `avro:"v"`
 		}
-		s, err := SchemaFor[Rec]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Rec](t)
 		if _, err := Parse(s.String()); err != nil {
 			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
 		}
@@ -263,16 +212,11 @@ func TestSchemaForNullableDefaultNull(t *testing.T) {
 		Name  string  `avro:"name"`
 		Email *string `avro:"email"` // should get default null automatically
 	}
-	reader, err := SchemaFor[V2]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustSchemaFor[V2](t)
 
 	// Verify the default appears in the schema.
 	var raw any
-	if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
-		t.Fatal(err)
-	}
+	mustUnmarshal(t, []byte(reader.String()), &raw)
 	fields := raw.(map[string]any)["fields"].([]any)
 	emailField := fields[1].(map[string]any)
 	if emailField["default"] != nil {
@@ -283,24 +227,13 @@ func TestSchemaForNullableDefaultNull(t *testing.T) {
 	}
 
 	// Verify backward compatibility: reader has email, writer does not.
-	writer, err := Parse(`{"type":"record","name":"V2","fields":[
+	writer := mustParse(t, `{"type":"record","name":"V2","fields":[
 		{"name":"name","type":"string"}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{"name": "Alice"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{"name": "Alice"})
 	var got V2
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.Name != "Alice" {
 		t.Errorf("name: got %q, want Alice", got.Name)
 	}
@@ -314,14 +247,9 @@ func TestSchemaForNullableExplicitDefault(t *testing.T) {
 	type R struct {
 		Value *string `avro:"value,default=hello"`
 	}
-	s, err := SchemaFor[R]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[R](t)
 	var raw any
-	if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
-		t.Fatal(err)
-	}
+	mustUnmarshal(t, []byte(s.String()), &raw)
 	fields := raw.(map[string]any)["fields"].([]any)
 	dflt := fields[0].(map[string]any)["default"]
 	if dflt != "hello" {
@@ -336,14 +264,9 @@ func TestSchemaForFixedTypeName(t *testing.T) {
 		type R struct {
 			Hash MyHash `avro:"hash"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		var raw any
-		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(s.String()), &raw)
 		fields := raw.(map[string]any)["fields"].([]any)
 		fixed := fields[0].(map[string]any)["type"].(map[string]any)
 		if fixed["name"] != "MyHash" {
@@ -358,14 +281,9 @@ func TestSchemaForFixedTypeName(t *testing.T) {
 		type R struct {
 			Hash [16]byte `avro:"hash"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		var raw any
-		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(s.String()), &raw)
 		fields := raw.(map[string]any)["fields"].([]any)
 		fixed := fields[0].(map[string]any)["type"].(map[string]any)
 		if fixed["name"] != "fixed_16" {
@@ -377,19 +295,11 @@ func TestSchemaForFixedTypeName(t *testing.T) {
 		type R struct {
 			Hash MyHash `avro:"hash"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		input := R{Hash: MyHash{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}}
-		data, err := s.Encode(&input)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, &input)
 		var got R
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Hash != input.Hash {
 			t.Errorf("got %v, want %v", got.Hash, input.Hash)
 		}
@@ -405,14 +315,9 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 			A MD5  `avro:"a"`
 			B SHA1 `avro:"b"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		var raw any
-		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(s.String()), &raw)
 		fields := raw.(map[string]any)["fields"].([]any)
 		a := fields[0].(map[string]any)["type"].(map[string]any)
 		b := fields[1].(map[string]any)["type"].(map[string]any)
@@ -425,14 +330,9 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 
 		// Round-trip.
 		input := R{A: MD5{1}, B: SHA1{2}}
-		data, err := s.Encode(&input)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, &input)
 		var got R
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != input {
 			t.Errorf("got %+v, want %+v", got, input)
 		}
@@ -445,19 +345,11 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 			A MD5 `avro:"a"`
 			B MD5 `avro:"b"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		input := R{A: MD5{1}, B: MD5{2}}
-		data, err := s.Encode(&input)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, &input)
 		var got R
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != input {
 			t.Errorf("got %+v, want %+v", got, input)
 		}
@@ -469,19 +361,11 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 			A MD5 `avro:"a,type-alias=old_hash"`
 			B MD5 `avro:"b"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		input := R{A: MD5{1}, B: MD5{2}}
-		data, err := s.Encode(&input)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, &input)
 		var got R
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != input {
 			t.Errorf("got %+v, want %+v", got, input)
 		}
@@ -495,10 +379,7 @@ func TestSchemaForTimestamp(t *testing.T) {
 		UpdatedAt time.Time `avro:"updated_at,timestamp-micros"`
 		Birthday  time.Time `avro:"birthday,date"`
 	}
-	s, err := SchemaFor[Event]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Event](t)
 	now := time.Now().Truncate(time.Millisecond)
 	e := Event{
 		ID:        "abc",
@@ -506,14 +387,9 @@ func TestSchemaForTimestamp(t *testing.T) {
 		UpdatedAt: now,
 		Birthday:  time.Date(2000, 1, 15, 0, 0, 0, 0, time.UTC),
 	}
-	data, err := s.Encode(&e)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &e)
 	var got Event
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if !got.CreatedAt.Equal(e.CreatedAt) {
 		t.Errorf("created_at: got %v, want %v", got.CreatedAt, e.CreatedAt)
 	}
@@ -524,19 +400,11 @@ func TestSchemaForDuration(t *testing.T) {
 		Millis time.Duration `avro:"millis"`
 		Micros time.Duration `avro:"micros,time-micros"`
 	}
-	s, err := SchemaFor[Record]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Record](t)
 	r := Record{Millis: 5 * time.Second, Micros: 5 * time.Second}
-	data, err := s.Encode(&r)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &r)
 	var got Record
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got != r {
 		t.Errorf("got %+v, want %+v", got, r)
 	}
@@ -579,27 +447,19 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			D Duration `avro:"d"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		assertDurationFixed(t, s.Root().Fields[0].Type)
 		// A single-field record's wire IS the field's encoding (no framing),
 		// so it must be exactly the 12-byte duration fixed — a decomposed
 		// record would emit three zig-zag varint longs (4 bytes here), so the
 		// length alone separates the two even before the byte compare.
-		w, err := s.Encode(R{D: dur})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		w := mustEncode(t, s, R{D: dur})
 		b := dur.Bytes()
 		if string(w) != string(b[:]) {
 			t.Fatalf("wire = %x, want the 12-byte duration fixed %x", w, b)
 		}
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 		if got.D != dur {
 			t.Errorf("round-trip: got %v, want %v", got.D, dur)
 		}
@@ -609,10 +469,7 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			D *Duration `avro:"d"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		ft := s.Root().Fields[0].Type
 		if ft.Type != "union" || len(ft.Branches) != 2 || ft.Branches[0].Type != "null" {
 			t.Fatalf("pointer field type = %+v, want [\"null\", duration]", ft)
@@ -624,9 +481,7 @@ func TestSchemaForAvroDuration(t *testing.T) {
 				t.Fatalf("encode %v: %v", v, err)
 			}
 			var got R
-			if _, err := s.Decode(w, &got); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
+			mustDecode(t, s, w, &got)
 			if (v == nil) != (got.D == nil) || (v != nil && *got.D != *v) {
 				t.Errorf("round-trip ptr: got %v want %v", got.D, v)
 			}
@@ -637,24 +492,16 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			D []Duration `avro:"d"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		ft := s.Root().Fields[0].Type
 		if ft.Type != "array" || ft.Items == nil {
 			t.Fatalf("slice field type = %+v, want array of duration", ft)
 		}
 		assertDurationFixed(t, *ft.Items)
 		rt := R{D: []Duration{dur, {}}}
-		w, err := s.Encode(rt)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		w := mustEncode(t, s, rt)
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 		if len(got.D) != 2 || got.D[0] != dur || got.D[1] != (Duration{}) {
 			t.Errorf("round-trip slice: got %v", got.D)
 		}
@@ -664,23 +511,15 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			D [2]Duration `avro:"d"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		ft := s.Root().Fields[0].Type
 		if ft.Type != "array" || ft.Items == nil {
 			t.Fatalf("array field type = %+v, want array of duration", ft)
 		}
 		assertDurationFixed(t, *ft.Items)
-		w, err := s.Encode(R{D: [2]Duration{dur, {}}})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		w := mustEncode(t, s, R{D: [2]Duration{dur, {}}})
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 		if got.D[0] != dur || got.D[1] != (Duration{}) {
 			t.Errorf("round-trip array: got %v", got.D)
 		}
@@ -690,23 +529,15 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			D map[string]Duration `avro:"d"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		ft := s.Root().Fields[0].Type
 		if ft.Type != "map" || ft.Values == nil {
 			t.Fatalf("map field type = %+v, want map of duration", ft)
 		}
 		assertDurationFixed(t, *ft.Values)
-		w, err := s.Encode(R{D: map[string]Duration{"k": dur}})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		w := mustEncode(t, s, R{D: map[string]Duration{"k": dur}})
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 		if got.D["k"] != dur {
 			t.Errorf("round-trip map: got %v", got.D)
 		}
@@ -719,10 +550,7 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			In Inner `avro:"in"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		inner := s.Root().Fields[0].Type
 		if inner.Type != "record" {
 			t.Fatalf("inner field type = %q, want record", inner.Type)
@@ -758,19 +586,11 @@ func TestSchemaForDecimal(t *testing.T) {
 		Name  string  `avro:"name"`
 		Price big.Rat `avro:"price,decimal(10,2)"`
 	}
-	s, err := SchemaFor[Product]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Product](t)
 	p := Product{Name: "Widget", Price: *new(big.Rat).SetFrac64(314, 100)}
-	data, err := s.Encode(&p)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &p)
 	var got Product
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got.Price.Cmp(&p.Price) != 0 {
 		t.Errorf("price: got %s, want %s", got.Price.RatString(), p.Price.RatString())
 	}
@@ -781,19 +601,11 @@ func TestSchemaForDefault(t *testing.T) {
 		Name  string `avro:"name,default=unknown"`
 		Score int32  `avro:"score,default=42"`
 	}
-	s, err := SchemaFor[Record]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Record](t)
 	// Encode from map with missing fields — both defaults should apply.
-	data, err := s.Encode(map[string]any{})
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, map[string]any{})
 	var got Record
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got.Name != "unknown" {
 		t.Errorf("name: got %q, want %q", got.Name, "unknown")
 	}
@@ -807,29 +619,15 @@ func TestSchemaForAlias(t *testing.T) {
 		EmailAddress string `avro:"email_address,alias=email"`
 		Name         string `avro:"name"`
 	}
-	reader, err := SchemaFor[V2]()
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer, err := Parse(`{"type":"record","name":"V2","fields":[
+	reader := mustSchemaFor[V2](t)
+	writer := mustParse(t, `{"type":"record","name":"V2","fields":[
 		{"name":"email","type":"string"},
 		{"name":"name","type":"string"}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{"email": "a@b.com", "name": "Alice"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{"email": "a@b.com", "name": "Alice"})
 	var got V2
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.EmailAddress != "a@b.com" {
 		t.Errorf("email: got %q, want %q", got.EmailAddress, "a@b.com")
 	}
@@ -883,26 +681,14 @@ func TestSchemaForAliasMultiple(t *testing.T) {
 		EmailAddress string `avro:"email_address,alias=[email,e_mail]"`
 		Name         string `avro:"name"`
 	}
-	reader, err := SchemaFor[V2]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustSchemaFor[V2](t)
 	for _, writerName := range []string{"email", "e_mail"} {
-		writer, err := Parse(`{"type":"record","name":"V2","fields":[
-			{"name":"` + writerName + `","type":"string"},
+		writer := mustParse(t, `{"type":"record","name":"V2","fields":[
+			{"name":"`+writerName+`","type":"string"},
 			{"name":"name","type":"string"}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resolved, err := Resolve(writer, reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := writer.Encode(map[string]any{writerName: "a@b.com", "name": "Alice"})
-		if err != nil {
-			t.Fatal(err)
-		}
+		resolved := mustResolve(t, writer, reader)
+		data := mustEncode(t, writer, map[string]any{writerName: "a@b.com", "name": "Alice"})
 		var got V2
 		if _, err := resolved.Decode(data, &got); err != nil {
 			t.Fatalf("decode with writer field %q: %v", writerName, err)
@@ -923,16 +709,11 @@ func TestSchemaForTypeAlias(t *testing.T) {
 		List  []Inner `avro:"list"`
 	}
 
-	reader, err := SchemaFor[Outer]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustSchemaFor[Outer](t)
 
 	// Verify the alias appears in the generated schema.
 	var raw any
-	if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
-		t.Fatal(err)
-	}
+	mustUnmarshal(t, []byte(reader.String()), &raw)
 	fields := raw.(map[string]any)["fields"].([]any)
 	innerField := fields[1].(map[string]any)["type"].(map[string]any)
 	aliases, _ := innerField["aliases"].([]any)
@@ -941,32 +722,21 @@ func TestSchemaForTypeAlias(t *testing.T) {
 	}
 
 	// Verify resolution works against a writer using the old name.
-	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+	writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 		{"name":"name","type":"string"},
 		{"name":"inner","type":{"type":"record","name":"legacy_inner","fields":[
 			{"name":"value","type":"int"}
 		]}},
 		{"name":"list","type":{"type":"array","items":"legacy_inner"}}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{
 		"name":  "test",
 		"inner": map[string]any{"value": int32(42)},
 		"list":  []any{map[string]any{"value": int32(7)}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var got Outer
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.Inner.Value != 42 {
 		t.Errorf("inner.value: got %d, want 42", got.Inner.Value)
 	}
@@ -983,33 +753,19 @@ func TestSchemaForTypeAliasNullable(t *testing.T) {
 		Inner *Inner `avro:"inner,type-alias=old_inner"`
 	}
 
-	reader, err := SchemaFor[Outer]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustSchemaFor[Outer](t)
 
-	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+	writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 		{"name":"inner","type":["null",{"type":"record","name":"old_inner","fields":[
 			{"name":"value","type":"int"}
 		]}]}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{
 		"inner": map[string]any{"value": int32(99)},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var got Outer
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.Inner == nil || got.Inner.Value != 99 {
 		t.Errorf("inner: got %+v, want &{Value:99}", got.Inner)
 	}
@@ -1023,33 +779,19 @@ func TestSchemaForTypeAliasMap(t *testing.T) {
 		Items map[string]Inner `avro:"items,type-alias=old_inner"`
 	}
 
-	reader, err := SchemaFor[Outer]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustSchemaFor[Outer](t)
 
-	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+	writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 		{"name":"items","type":{"type":"map","values":{"type":"record","name":"old_inner","fields":[
 			{"name":"value","type":"int"}
 		]}}}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{
 		"items": map[string]any{"k": map[string]any{"value": int32(5)}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var got Outer
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.Items["k"].Value != 5 {
 		t.Errorf("items[k].value: got %d, want 5", got.Items["k"].Value)
 	}
@@ -1068,19 +810,14 @@ func TestSchemaForTypeAliasEnum(t *testing.T) {
 	type Outer struct {
 		State Status `avro:"state,type-alias=OldStatus"`
 	}
-	reader, err := SchemaFor[Outer](CustomType{
+	reader := mustSchemaFor[Outer](t, CustomType{
 		GoType: reflect.TypeFor[Status](),
 		Schema: &enumNode,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	// Verify the alias appears on the enum type.
 	var raw any
-	if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
-		t.Fatal(err)
-	}
+	mustUnmarshal(t, []byte(reader.String()), &raw)
 	fields := raw.(map[string]any)["fields"].([]any)
 	enumType := fields[0].(map[string]any)["type"].(map[string]any)
 	if enumType["type"] != "enum" {
@@ -1092,24 +829,13 @@ func TestSchemaForTypeAliasEnum(t *testing.T) {
 	}
 
 	// Verify resolution against a writer using the old name.
-	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+	writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 		{"name":"state","type":{"type":"enum","name":"OldStatus","symbols":["ACTIVE","INACTIVE"]}}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{"state": "ACTIVE"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{"state": "ACTIVE"})
 	var got Outer
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.State != "ACTIVE" {
 		t.Errorf("state: got %q, want ACTIVE", got.State)
 	}
@@ -1196,9 +922,7 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 			A Inner `avro:"a,type-alias=old_inner"`
 			B Inner `avro:"b,type-alias=old_inner"`
 		}
-		if _, err := SchemaFor[Outer](); err != nil {
-			t.Fatal(err)
-		}
+		mustSchemaFor[Outer](t)
 	})
 
 	t.Run("two fields same type conflicting aliases", func(t *testing.T) {
@@ -1216,34 +940,20 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 			A Inner `avro:"a,type-alias=old_inner"`
 			B Inner `avro:"b"`
 		}
-		reader, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
-		writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+		reader := mustSchemaFor[Outer](t)
+		writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 			{"name":"a","type":{"type":"record","name":"old_inner","fields":[
 				{"name":"value","type":"int"}
 			]}},
 			{"name":"b","type":"old_inner"}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resolved, err := Resolve(writer, reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := writer.Encode(map[string]any{
+		resolved := mustResolve(t, writer, reader)
+		data := mustEncode(t, writer, map[string]any{
 			"a": map[string]any{"value": int32(1)},
 			"b": map[string]any{"value": int32(2)},
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
 		var got Outer
-		if _, err := resolved.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, resolved, data, &got)
 		if got.A.Value != 1 || got.B.Value != 2 {
 			t.Errorf("got A=%d B=%d, want A=1 B=2", got.A.Value, got.B.Value)
 		}
@@ -1268,9 +978,7 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 			Direct Inner   `avro:"direct,type-alias=old_inner"`
 			List   []Inner `avro:"list,type-alias=old_inner"`
 		}
-		if _, err := SchemaFor[Outer](); err != nil {
-			t.Fatal(err)
-		}
+		mustSchemaFor[Outer](t)
 	})
 
 	t.Run("array of named ref only first aliased", func(t *testing.T) {
@@ -1278,34 +986,20 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 			Direct Inner   `avro:"direct,type-alias=old_inner"`
 			List   []Inner `avro:"list"`
 		}
-		reader, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
-		writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+		reader := mustSchemaFor[Outer](t)
+		writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 			{"name":"direct","type":{"type":"record","name":"old_inner","fields":[
 				{"name":"value","type":"int"}
 			]}},
 			{"name":"list","type":{"type":"array","items":"old_inner"}}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resolved, err := Resolve(writer, reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := writer.Encode(map[string]any{
+		resolved := mustResolve(t, writer, reader)
+		data := mustEncode(t, writer, map[string]any{
 			"direct": map[string]any{"value": int32(10)},
 			"list":   []any{map[string]any{"value": int32(20)}},
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
 		var got Outer
-		if _, err := resolved.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, resolved, data, &got)
 		if got.Direct.Value != 10 {
 			t.Errorf("direct.value: got %d, want 10", got.Direct.Value)
 		}
@@ -1318,25 +1012,17 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 		type Outer struct {
 			M *map[string][]Inner `avro:"m,type-alias=old_inner"`
 		}
-		_, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		mustSchemaFor[Outer](t)
 	})
 
 	t.Run("fixed type", func(t *testing.T) {
 		type Outer struct {
 			Hash [16]byte `avro:"hash,type-alias=old_hash"`
 		}
-		reader, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		reader := mustSchemaFor[Outer](t)
 		// Verify the alias appears on the fixed type.
 		var raw any
-		if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(reader.String()), &raw)
 		fields := raw.(map[string]any)["fields"].([]any)
 		hashField := fields[0].(map[string]any)["type"].(map[string]any)
 		if hashField["type"] != "fixed" {
@@ -1361,15 +1047,10 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 			A Inner `avro:"a,type-alias=old_inner"`
 			B Inner `avro:"b,type-alias=old_inner"`
 		}
-		s, err := SchemaFor[Outer](WithNamespace("com.example"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Outer](t, WithNamespace("com.example"))
 		// The alias must be present on the (namespaced) Inner definition.
 		var raw map[string]any
-		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(s.String()), &raw)
 		aField := raw["fields"].([]any)[0].(map[string]any)["type"].(map[string]any)
 		aliases, _ := aField["aliases"].([]any)
 		if len(aliases) != 1 || aliases[0] != "old_inner" {
@@ -1429,9 +1110,7 @@ func TestSchemaForTypeAliasCrossRecord(t *testing.T) {
 		// Structural proof: the defining field's type is the Inner object with the
 		// alias; the nested field's Ref is the bare string "Inner".
 		var raw map[string]any
-		if err := json.Unmarshal([]byte(js), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(js), &raw)
 		fields := raw["fields"].([]any)
 		defType := fields[0].(map[string]any)["type"].(map[string]any)
 		if defType["name"] != "Inner" {
@@ -1576,19 +1255,11 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 			Base
 			Name string `avro:"name"`
 		}
-		s, err := SchemaFor[User]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[User](t)
 		u := User{Base: Base{ID: 123}, Name: "Alice"}
-		data, err := s.Encode(&u)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &u)
 		var got User
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != u {
 			t.Errorf("got %+v, want %+v", got, u)
 		}
@@ -1599,19 +1270,11 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 			Name    string `avro:"name"`
 			Address Addr   `avro:",inline"`
 		}
-		s, err := SchemaFor[User]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[User](t)
 		u := User{Name: "Alice", Address: Addr{City: "Seattle", Zip: 98101}}
-		data, err := s.Encode(&u)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &u)
 		var got User
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != u {
 			t.Errorf("got %+v, want %+v", got, u)
 		}
@@ -1625,20 +1288,12 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 			Name  string `avro:"name"`
 			Inner *Inner `avro:",inline"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Outer](t)
 		o := Outer{Name: "test", Inner: &Inner{X: 42}}
-		data, err := s.Encode(&o)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &o)
 		var got Outer
 		got.Inner = &Inner{}
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Inner.X != 42 {
 			t.Errorf("got %d, want 42", got.Inner.X)
 		}
@@ -1652,20 +1307,12 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 			*Inner
 			Y int32 `avro:"y"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Outer](t)
 		o := Outer{Inner: &Inner{X: 1}, Y: 2}
-		data, err := s.Encode(&o)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &o)
 		var got Outer
 		got.Inner = &Inner{}
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Inner.X != 1 || got.Y != 2 {
 			t.Errorf("got %+v, want x=1 y=2", got)
 		}
@@ -1679,19 +1326,11 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 			Inner `avro:"inner"`
 			Y     int32 `avro:"y"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Outer](t)
 		o := Outer{Inner: Inner{X: 1}, Y: 2}
-		data, err := s.Encode(&o)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &o)
 		var got Outer
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != o {
 			t.Errorf("got %+v, want %+v", got, o)
 		}
@@ -1705,18 +1344,10 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 			Inner `avro:"-"`
 			Y     int32 `avro:"y"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := s.Encode(&Outer{Y: 42})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		s := mustSchemaFor[Outer](t)
+		data := mustEncode(t, s, &Outer{Y: 42})
 		var got Outer
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Y != 42 {
 			t.Errorf("got %d, want 42", got.Y)
 		}
@@ -1732,19 +1363,11 @@ func TestSchemaForNestedRecord(t *testing.T) {
 		Name    string  `avro:"name"`
 		Address Address `avro:"address"`
 	}
-	s, err := SchemaFor[User]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[User](t)
 	u := User{Name: "Alice", Address: Address{City: "Seattle", Zip: 98101}}
-	data, err := s.Encode(&u)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &u)
 	var got User
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got != u {
 		t.Errorf("got %+v, want %+v", got, u)
 	}
@@ -1763,19 +1386,11 @@ func TestSchemaForDeepNesting(t *testing.T) {
 		Name    string  `avro:"name"`
 		Address Address `avro:"address"`
 	}
-	s, err := SchemaFor[User]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[User](t)
 	u := User{Name: "Alice", Address: Address{City: "Seattle", Street: Street{Name: "Main St", Number: 42}}}
-	data, err := s.Encode(&u)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &u)
 	var got User
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got != u {
 		t.Errorf("got %+v, want %+v", got, u)
 	}
@@ -1790,19 +1405,11 @@ func TestSchemaForDuplicateNestedType(t *testing.T) {
 		Home Address `avro:"home"`
 		Work Address `avro:"work"`
 	}
-	s, err := SchemaFor[User]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[User](t)
 	u := User{Name: "Alice", Home: Address{City: "Seattle"}, Work: Address{City: "Portland"}}
-	data, err := s.Encode(&u)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &u)
 	var got User
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got != u {
 		t.Errorf("got %+v, want %+v", got, u)
 	}
@@ -1824,10 +1431,7 @@ func TestSchemaForFourLevelWithReuse(t *testing.T) {
 		Name string `avro:"name"`
 		Sub  L4     `avro:"sub"`
 	}
-	s, err := SchemaFor[L1]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[L1](t)
 	v := L1{
 		Name: "test",
 		Sub: L4{
@@ -1835,14 +1439,9 @@ func TestSchemaForFourLevelWithReuse(t *testing.T) {
 			Reuse: L2{V: 2},
 		},
 	}
-	data, err := s.Encode(&v)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &v)
 	var got L1
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got != v {
 		t.Errorf("got %+v, want %+v", got, v)
 	}
@@ -1850,18 +1449,10 @@ func TestSchemaForFourLevelWithReuse(t *testing.T) {
 
 func TestSchemaForEmptyStruct(t *testing.T) {
 	type Empty struct{}
-	s, err := SchemaFor[Empty]()
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := s.Encode(&Empty{})
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	s := mustSchemaFor[Empty](t)
+	data := mustEncode(t, s, &Empty{})
 	var got Empty
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 }
 
 func TestSchemaForCollections(t *testing.T) {
@@ -1870,22 +1461,14 @@ func TestSchemaForCollections(t *testing.T) {
 			Tags     []string          `avro:"tags"`
 			Metadata map[string]string `avro:"metadata"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{
 			Tags:     []string{"go", "avro"},
 			Metadata: map[string]string{"env": "prod"},
 		}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if !reflect.DeepEqual(got, r) {
 			t.Errorf("got %+v, want %+v", got, r)
 		}
@@ -1898,19 +1481,11 @@ func TestSchemaForCollections(t *testing.T) {
 		type Record struct {
 			Items []Item `avro:"items"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{Items: []Item{{ID: 1}, {ID: 2}}}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if !reflect.DeepEqual(got, r) {
 			t.Errorf("got %+v, want %+v", got, r)
 		}
@@ -1920,19 +1495,11 @@ func TestSchemaForCollections(t *testing.T) {
 		type Record struct {
 			Data []byte `avro:"data"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{Data: []byte{1, 2, 3}}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if !reflect.DeepEqual(got.Data, r.Data) {
 			t.Errorf("got %v, want %v", got.Data, r.Data)
 		}
@@ -1942,19 +1509,11 @@ func TestSchemaForCollections(t *testing.T) {
 		type Record struct {
 			A [3]int32 `avro:"a"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{A: [3]int32{1, 2, 3}}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != r {
 			t.Errorf("got %+v, want %+v", got, r)
 		}
@@ -1964,19 +1523,11 @@ func TestSchemaForCollections(t *testing.T) {
 		type Record struct {
 			Hash [32]byte `avro:"hash"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{Hash: [32]byte{1, 2, 3}}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != r {
 			t.Errorf("got %v, want %v", got, r)
 		}
@@ -1998,19 +1549,11 @@ func TestSchemaForAllPrimitives(t *testing.T) {
 		F64 float64 `avro:"f64"`
 		S   string  `avro:"s"`
 	}
-	s, err := SchemaFor[Prims]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Prims](t)
 	p := Prims{B: true, I8: 1, I16: 2, I32: 3, I64: 4, I: 5, U8: 6, U16: 7, U32: 8, F32: 1.5, F64: 3.14, S: "hello"}
-	data, err := s.Encode(&p)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &p)
 	var got Prims
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got != p {
 		t.Errorf("got %+v, want %+v", got, p)
 	}
@@ -2021,19 +1564,11 @@ func TestSchemaForUUID(t *testing.T) {
 		type Record struct {
 			ID string `avro:"id,uuid"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{ID: "550e8400-e29b-41d4-a716-446655440000"}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.ID != r.ID {
 			t.Errorf("got %q, want %q", got.ID, r.ID)
 		}
@@ -2043,19 +1578,11 @@ func TestSchemaForUUID(t *testing.T) {
 		type Record struct {
 			ID [16]byte `avro:"id,uuid"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{ID: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != r {
 			t.Errorf("got %v, want %v", got, r)
 		}
@@ -2175,10 +1702,7 @@ func TestSchemaForInlineRejectsOtherOptions(t *testing.T) {
 			Embed `avro:",inline"`
 			B     string `avro:"b"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		s := mustSchemaFor[Outer](t)
 		got := s.String()
 		// Flattened: should have both a and b at the top level.
 		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"b"`) {
@@ -2271,10 +1795,7 @@ func TestSchemaForInlineRejectsNonStructFieldType(t *testing.T) {
 			Foo Embed `avro:",inline"`
 			Bar int32 `avro:"bar"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		got := s.String()
 		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"bar"`) {
 			t.Errorf("expected flattened a + bar fields; got %s", got)
@@ -2288,10 +1809,7 @@ func TestSchemaForInlineRejectsNonStructFieldType(t *testing.T) {
 			Foo *Embed `avro:",inline"`
 			Bar int32  `avro:"bar"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		got := s.String()
 		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"bar"`) {
 			t.Errorf("expected flattened a + bar fields; got %s", got)
@@ -2611,18 +2129,10 @@ func TestSchemaForLogicalOnNumericKind(t *testing.T) {
 		type R struct {
 			D int32 `avro:"d,date"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
-		enc, err := s.Encode(&R{D: 19723})
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
+		s := mustSchemaFor[R](t)
+		enc := mustEncode(t, s, &R{D: 19723})
 		var got R
-		if _, err := s.Decode(enc, &got); err != nil {
-			t.Fatalf("Decode: %v", err)
-		}
+		mustDecode(t, s, enc, &got)
 		if got.D != 19723 {
 			t.Errorf("got %d, want 19723", got.D)
 		}
@@ -2632,18 +2142,10 @@ func TestSchemaForLogicalOnNumericKind(t *testing.T) {
 		type R struct {
 			T int64 `avro:"t,timestamp-millis"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
-		enc, err := s.Encode(&R{T: 1700000000000})
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
+		s := mustSchemaFor[R](t)
+		enc := mustEncode(t, s, &R{T: 1700000000000})
 		var got R
-		if _, err := s.Decode(enc, &got); err != nil {
-			t.Fatalf("Decode: %v", err)
-		}
+		mustDecode(t, s, enc, &got)
 		if got.T != 1700000000000 {
 			t.Errorf("got %d, want 1700000000000", got.T)
 		}
@@ -2733,10 +2235,7 @@ func TestSchemaForIgnored(t *testing.T) {
 		Name    string `avro:"name"`
 		Ignored int    `avro:"-"`
 	}
-	s, err := SchemaFor[Record]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Record](t)
 	var m map[string]any
 	json.Unmarshal([]byte(s.Canonical()), &m)
 	fields := m["fields"].([]any)
@@ -2772,90 +2271,53 @@ type recMutualB struct {
 
 func TestSchemaForRecursive(t *testing.T) {
 	t.Run("linked list", func(t *testing.T) {
-		s, err := SchemaFor[recNode]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[recNode](t)
 		// Round-trip encode/decode a 3-node list.
 		head := &recNode{Value: 1, Next: &recNode{Value: 2, Next: &recNode{Value: 3}}}
-		data, err := s.Encode(head)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, head)
 		var got recNode
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Value != 1 || got.Next == nil || got.Next.Value != 2 || got.Next.Next == nil || got.Next.Next.Value != 3 || got.Next.Next.Next != nil {
 			t.Errorf("decoded list mismatch: %+v", got)
 		}
 	})
 
 	t.Run("with namespace", func(t *testing.T) {
-		s, err := SchemaFor[recNode](WithNamespace("com.example"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[recNode](t, WithNamespace("com.example"))
 		// Ensure the namespace is applied to the root and the recursive
 		// reference resolves to the namespaced name.
 		head := &recNode{Value: 42}
-		if _, err := s.Encode(head); err != nil {
-			t.Fatal(err)
-		}
+		mustEncode(t, s, head)
 	})
 
 	t.Run("tree via slice", func(t *testing.T) {
-		s, err := SchemaFor[recTree]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[recTree](t)
 		root := &recTree{Value: 1, Children: []*recTree{{Value: 2}, {Value: 3, Children: []*recTree{{Value: 4}}}}}
-		data, err := s.Encode(root)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, root)
 		var got recTree
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Value != 1 || len(got.Children) != 2 || got.Children[1].Children[0].Value != 4 {
 			t.Errorf("decoded tree mismatch: %+v", got)
 		}
 	})
 
 	t.Run("recursion via map", func(t *testing.T) {
-		s, err := SchemaFor[recMap]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[recMap](t)
 		root := &recMap{Name: "root", Branches: map[string]*recMap{"a": {Name: "leaf"}}}
-		data, err := s.Encode(root)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, root)
 		var got recMap
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Name != "root" || got.Branches["a"].Name != "leaf" {
 			t.Errorf("decoded map mismatch: %+v", got)
 		}
 	})
 
 	t.Run("mutual recursion", func(t *testing.T) {
-		s, err := SchemaFor[recMutualA]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[recMutualA](t)
 		in := &recMutualA{AVal: 1, B: &recMutualB{BVal: 2, A: &recMutualA{AVal: 3}}}
-		data, err := s.Encode(in)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, in)
 		var got recMutualA
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.AVal != 1 || got.B.BVal != 2 || got.B.A.AVal != 3 {
 			t.Errorf("mutual recursion mismatch: %+v", got)
 		}
@@ -2888,15 +2350,9 @@ func TestSchemaForWithName(t *testing.T) {
 	type UserV2 struct {
 		Name string `avro:"name"`
 	}
-	s, err := SchemaFor[UserV2](WithNamespace("com.example"), WithName("User"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[UserV2](t, WithNamespace("com.example"), WithName("User"))
 	// The schema should be compatible with a writer using the name "User".
-	writer, err := Parse(`{"type":"record","name":"User","namespace":"com.example","fields":[{"name":"name","type":"string"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	writer := mustParse(t, `{"type":"record","name":"User","namespace":"com.example","fields":[{"name":"name","type":"string"}]}`)
 	if err := CheckCompatibility(writer, s); err != nil {
 		t.Fatalf("schemas should be compatible: %v", err)
 	}
@@ -2910,19 +2366,11 @@ func TestSchemaForFieldConflict(t *testing.T) {
 		Base
 		FullName string `avro:"Name"` // tagged as "Name", depth 0
 	}
-	s, err := SchemaFor[User]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[User](t)
 	u := User{FullName: "direct"}
-	data, err := s.Encode(&u)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &u)
 	var got User
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got.FullName != "direct" {
 		t.Errorf("got %q, want %q", got.FullName, "direct")
 	}
@@ -2953,10 +2401,7 @@ type namedEmbeddedBadTag struct {
 
 func TestSchemaForUnexportedFields(t *testing.T) {
 	t.Run("unexported field", func(t *testing.T) {
-		s, err := SchemaFor[unexportedFieldStruct]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[unexportedFieldStruct](t)
 		data, _ := s.Encode(&unexportedFieldStruct{Name: "test"})
 		var got unexportedFieldStruct
 		s.Decode(data, &got)
@@ -2966,10 +2411,7 @@ func TestSchemaForUnexportedFields(t *testing.T) {
 	})
 
 	t.Run("unexported embed", func(t *testing.T) {
-		s, err := SchemaFor[unexportedEmbedStruct]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[unexportedEmbedStruct](t)
 		data, _ := s.Encode(&unexportedEmbedStruct{Name: "test"})
 		var got unexportedEmbedStruct
 		s.Decode(data, &got)
@@ -3201,10 +2643,7 @@ func TestSchemaForTextMarshalerInferredAsString(t *testing.T) {
 	type Record struct {
 		A customString `avro:"a"`
 	}
-	s, err := SchemaFor[Record]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Record](t)
 	root := s.Root()
 	if len(root.Fields) == 0 {
 		t.Fatal("expected fields")
@@ -3218,9 +2657,7 @@ func TestSchemaForOmitzeroTag(t *testing.T) {
 	type Record struct {
 		Name string `avro:"name,omitzero"`
 	}
-	if _, err := SchemaFor[Record](); err != nil {
-		t.Fatal(err)
-	}
+	mustSchemaFor[Record](t)
 }
 
 func TestSchemaForDuplicateUUID(t *testing.T) {
@@ -3238,9 +2675,7 @@ func TestSchemaForDuplicateUUID(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out TwoUUIDs
-	if _, err := s.Decode(enc, &out); err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, s, enc, &out)
 	if out != input {
 		t.Fatalf("round-trip: got %v, want %v", out, input)
 	}
@@ -3305,10 +2740,7 @@ func TestRegression_SchemaForShadowedEmbedShallowestWins(t *testing.T) {
 			Inner
 			X int64 `avro:"x"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[Outer](t)
 		js := s.String()
 		if !strings.Contains(js, `"type":"long"`) {
 			t.Fatalf("expected outer field's int64→long; got: %s", js)
@@ -3330,10 +2762,7 @@ func TestRegression_SchemaForShadowedEmbedShallowestWins(t *testing.T) {
 			Inner
 			X int64
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[Outer](t)
 		js := s.String()
 		if !strings.Contains(js, `"type":"long"`) {
 			t.Fatalf("expected outer field's int64→long for untagged shadowed embed; got: %s", js)
@@ -3374,9 +2803,7 @@ func TestRegression_SchemaForSameDepthTaggedBeatsUntagged(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 	var got Collide
-	if _, err := s.Decode(b, &got); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
+	mustDecode(t, s, b, &got)
 	if got.Renamed != 7 {
 		t.Fatalf("tagged field should own the Avro name: got Renamed=%d want 7", got.Renamed)
 	}
@@ -3406,24 +2833,16 @@ func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
 			A ID `avro:"a,uuid"`
 			B ID `avro:"b"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		// Two distinct fixed(16) definitions, not one definition + a
 		// dangling reference.
 		if c := strings.Count(s.String(), `"size":16`); c != 2 {
 			t.Fatalf("want 2 fixed(16) definitions, got %d in %s", c, s.String())
 		}
 		in := R{A: ID{1, 2, 3}, B: ID{4, 5, 6}}
-		data, err := s.Encode(&in)
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
+		data := mustEncode(t, s, &in)
 		var got R
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("Decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != in {
 			t.Fatalf("round trip: got %+v want %+v", got, in)
 		}
@@ -3434,9 +2853,7 @@ func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
 			B ID `avro:"b"`
 			A ID `avro:"a,uuid"`
 		}
-		if _, err := SchemaFor[R](); err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		mustSchemaFor[R](t)
 	})
 
 	// Boundary: the same type used the SAME way twice still collapses to
@@ -3446,10 +2863,7 @@ func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
 			A ID `avro:"a,uuid"`
 			B ID `avro:"b,uuid"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		if c := strings.Count(s.String(), `"size":16`); c != 1 {
 			t.Fatalf("want 1 fixed(16) definition (rest references), got %d in %s", c, s.String())
 		}
@@ -3590,10 +3004,7 @@ func TestMatrix_SchemaForDefaultWithBrackets(t *testing.T) {
 		type R struct {
 			X string `avro:"x,default=note (a"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		if !strings.Contains(s.String(), "note (a") {
 			t.Fatalf("default not preserved: %s", s.String())
 		}
@@ -3603,10 +3014,7 @@ func TestMatrix_SchemaForDefaultWithBrackets(t *testing.T) {
 		type R struct {
 			X string `avro:"x,default=a]b"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		if !strings.Contains(s.String(), "a]b") {
 			t.Fatalf("default not preserved: %s", s.String())
 		}
@@ -3616,10 +3024,7 @@ func TestMatrix_SchemaForDefaultWithBrackets(t *testing.T) {
 		type R struct {
 			X string `avro:"x,default=a,b,c"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		if !strings.Contains(s.String(), "a,b,c") {
 			t.Fatalf("default not preserved: %s", s.String())
 		}
@@ -3631,9 +3036,7 @@ func TestMatrix_SchemaForDefaultWithBrackets(t *testing.T) {
 		type R struct {
 			M map[string]int32 `avro:"m,default={\"a\":1,\"b\":2}"`
 		}
-		if _, err := SchemaFor[R](); err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		mustSchemaFor[R](t)
 	})
 
 	// Boundary: a malformed bracketed NON-default option still errors — the
@@ -4375,9 +3778,7 @@ func TestSchemaForRecursiveStructStillBuilds(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var got LinkedNode
-	if _, err := s.Decode(b, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, b, &got)
 	if got.Val != 1 || got.Next == nil || got.Next.Val != 2 {
 		t.Fatalf("round-trip mismatch: %+v", got)
 	}
@@ -4809,14 +4210,9 @@ func realNXNode() *SchemaNode {
 // compare structurally.
 func jsonReencode(t *testing.T, v any) any {
 	t.Helper()
-	b, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
+	b := mustMarshal(t, v)
 	var out any
-	if err := json.Unmarshal(b, &out); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
+	mustUnmarshal(t, b, &out)
 	return out
 }
 
@@ -8190,9 +7586,7 @@ func TestRegression_EmbedResolvedBelowRootRoundTrips(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var out epRootResolves
-	if _, err := s.Decode(b, &out); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, b, &out)
 	if out.V != 7 {
 		t.Errorf("round trip put the value in a different field: got V=%d, want 7", out.V)
 	}
@@ -8550,9 +7944,7 @@ func TestRegression_SchemaForResolvableCollisionNotAmbiguous(t *testing.T) {
 			t.Fatalf("encode: %v", err)
 		}
 		var got Outer
-		if _, err := s.Decode(wire, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, wire, &got)
 		if got.Name != "direct" {
 			t.Fatalf("\"Name\" mapped to a shadowed field, not the direct one: %+v", got)
 		}
@@ -8582,9 +7974,7 @@ func TestRegression_SchemaForResolvableCollisionNotAmbiguous(t *testing.T) {
 			t.Fatalf("encode: %v", err)
 		}
 		var got Outer
-		if _, err := s.Decode(wire, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, wire, &got)
 		if got.EmbTagged.Other != "tagged" {
 			t.Fatalf("\"Name\" mapped to an untagged field, not the tagged one: %+v", got)
 		}
@@ -10216,14 +9606,8 @@ func TestInvariant_EmbedDiamondCostFactors(t *testing.T) {
 	}
 
 	// Factor 2 again, on the DECODE collector, where the memo makes it free.
-	s, err := SchemaFor[T1]()
-	if err != nil {
-		t.Fatalf("SchemaFor: %v", err)
-	}
-	wire, err := s.Encode(T1{})
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	s := mustSchemaFor[T1](t)
+	wire := mustEncode(t, s, T1{})
 	var out T1
 	first := timeCall(func() {
 		if _, err := s.Decode(wire, &out); err != nil {
@@ -10282,9 +9666,7 @@ func TestRegression_RepeatedEmbedShallowestWins(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var out map[string]any
-	if _, err := s.Decode(data, &out); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &out)
 	if out["X"] != int32(2) {
 		t.Fatalf("encode selected the DEEPER field: X=%v, want 2 (shallowest-wins / Go promotion)", out["X"])
 	}

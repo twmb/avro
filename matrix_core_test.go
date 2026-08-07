@@ -1785,9 +1785,7 @@ func udInvariant(t *testing.T, schema, fillJSON string, fillVal map[string]any, 
 		t.Fatalf("binary auto-fill encode: %v", err)
 	}
 	var a1 map[string]any
-	if _, err := s.Decode(w1, &a1); err != nil {
-		t.Fatalf("binary decode: %v", err)
-	}
+	mustDecode(t, s, w1, &a1)
 	j1, err := s.AppendEncodeJSON(nil, fillVal)
 	if err != nil {
 		t.Fatalf("json auto-fill encode: %v", err)
@@ -1866,10 +1864,7 @@ func TestMatrix_GenerativeProps(t *testing.T) {
 		t.Fatalf("props perturb the canonical fingerprint:\n propful=%s\n bare   =%s", s.Canonical(), bare.Canonical())
 	}
 	// The rebuild preserves the props (observation survives a round-trip).
-	rebuilt, err := root.Schema()
-	if err != nil {
-		t.Fatalf("Root().Schema(): %v", err)
-	}
+	rebuilt := mustNodeSchema(t, root)
 	rr := rebuilt.Root()
 	if rr.Props["myrec"] != "v1" || rr.Fields[0].Props["myfield"] == nil {
 		t.Fatalf("rebuild dropped props: root=%#v field=%#v", rr.Props, rr.Fields[0].Props)
@@ -3122,7 +3117,7 @@ func runResurrectionCell(t *testing.T, c resurrectionCell) {
 						if got, want := decBin(csProm, wire, mk), decBin(plainProm, wire, mk); got != want {
 							t.Errorf("binary decode RESOLVED-PROMOTION %s->%s target#%d: custom=%s plain=%s — promotion re-applied a wrong-kind logical", src.kind, c.kind, ti, got, want)
 						}
-						if got, want := decJSON(csProm, mustEncodeJSON(w, src.value), mk), decJSON(plainProm, mustEncodeJSON(w, src.value), mk); got != want {
+						if got, want := decJSON(csProm, encodeJSONOrNil(w, src.value), mk), decJSON(plainProm, encodeJSONOrNil(w, src.value), mk); got != want {
 							t.Errorf("JSON decode RESOLVED-PROMOTION %s->%s target#%d: custom=%s plain=%s — promotion re-applied a wrong-kind logical", src.kind, c.kind, ti, got, want)
 						}
 					}
@@ -3163,7 +3158,9 @@ func promotionSourceFor(readerKind string) (struct {
 	}{}, false
 }
 
-func mustEncodeJSON(s *avro.Schema, v any) []byte {
+// encodeJSONOrNil returns nil rather than failing, so a rejected encode
+// compares equal across the two sides of a parity cell.
+func encodeJSONOrNil(s *avro.Schema, v any) []byte {
 	b, err := s.EncodeJSON(v)
 	if err != nil {
 		return nil
@@ -4683,17 +4680,11 @@ func TestMatrix_ConcurrentFirstUse(t *testing.T) {
 			{"name":"keep","type":"int"}]}`)
 		r := avro.MustParse(`{"type":"record","name":"FU","fields":[
 			{"name":"keep","type":"int"}]}`)
-		res, err := avro.Resolve(w, r)
-		if err != nil {
-			t.Fatalf("Resolve: %v", err)
-		}
-		wire, err := w.AppendEncode(nil, map[string]any{
+		res := mustResolve(t, w, r)
+		wire := mustAppendEncode(t, w, nil, map[string]any{
 			"drop": map[string]any{"x": "s", "y": []any{int64(1), int64(2)}},
 			"keep": int32(9),
 		})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
 		var wg sync.WaitGroup
 		errs := make(chan error, 8)
 		for g := 0; g < 8; g++ {
@@ -4965,10 +4956,7 @@ func TestMatrix_CustomTypes(t *testing.T) {
 						return nil, avro.ErrSkipCustomType
 					},
 				}
-				cs, err := avro.Parse(posSchema, ct)
-				if err != nil {
-					t.Fatalf("Parse: %v", err)
-				}
+				cs := mustParse(t, posSchema, ct)
 				// A matching custom WITH Encode suppresses the built-in
 				// logical encoder on fixed/decimal builds (documented
 				// per-build suppression), so enriched inputs reject there
@@ -5183,28 +5171,17 @@ func TestMatrix_CustomTimesOCF(t *testing.T) {
 			ct := crossBoxCT(fr.logical)
 			raw := crossRaw(t, fr)
 			schemaJSON := fmt.Sprintf(`{"type":"record","name":"OC","fields":[{"name":"f","type":%s}]}`, fr.schema)
-			ws, err := avro.Parse(schemaJSON, ct)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
+			ws := mustParse(t, schemaJSON, ct)
 			var buf bytes.Buffer
-			w, err := ocf.NewWriter(&buf, ws)
-			if err != nil {
-				t.Fatalf("NewWriter: %v", err)
-			}
+			w := mustNewWriter(t, &buf, ws)
 			for i := 0; i < 3; i++ {
 				if err := w.Encode(map[string]any{"f": cbox{Raw: raw}}); err != nil {
 					t.Fatalf("Encode #%d: %v", i, err)
 				}
 			}
-			if err := w.Close(); err != nil {
-				t.Fatalf("Close: %v", err)
-			}
+			mustClose(t, w)
 
-			r, err := ocf.NewReader(bytes.NewReader(buf.Bytes()), ocf.WithSchemaOpts(ct))
-			if err != nil {
-				t.Fatalf("NewReader: %v", err)
-			}
+			r := mustNewReader(t, bytes.NewReader(buf.Bytes()), ocf.WithSchemaOpts(ct))
 			defer r.Close()
 			var n int
 			for {
@@ -6340,9 +6317,7 @@ func TestMatrix_FieldReorder(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var got map[string]any
-	if _, err := res.Decode(wire, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, res, wire, &got)
 	if got["a"] != int32(1) || got["b"] != "two" || !bytes.Equal(got["c"].([]byte), []byte{3}) || got["d"] != int64(4) {
 		t.Fatalf("reordered fields mismatched: %#v", got)
 	}
@@ -6402,9 +6377,7 @@ func TestMatrix_UnionEvolution(t *testing.T) {
 		}
 		wire, _ := w.AppendEncode(nil, int32(3))
 		var got any
-		if _, err := res.Decode(wire, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, res, wire, &got)
 		if _, ok := got.(int32); !ok {
 			t.Fatalf("exact int branch must win over double promotion, got %T", got)
 		}
@@ -6418,9 +6391,7 @@ func TestMatrix_UnionEvolution(t *testing.T) {
 		}
 		wire, _ := w.AppendEncode(nil, int64(12))
 		var got any
-		if _, err := res.Decode(wire, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, res, wire, &got)
 		if _, ok := got.(float64); !ok {
 			t.Fatalf("long should promote into the double branch, got %T", got)
 		}
@@ -7116,17 +7087,11 @@ func TestMatrix_NilShapesAcrossUnions(t *testing.T) {
 		}
 		for _, sh := range shapes {
 			t.Run(un.label+"/"+sh.label, func(t *testing.T) {
-				got, err := s.AppendEncode(nil, sh.value)
-				if err != nil {
-					t.Fatalf("encode: %v", err)
-				}
+				got := mustAppendEncode(t, s, nil, sh.value)
 				if !bytes.Equal(got, wantWire) {
 					t.Fatalf("binary nil-shape diverges: got=%x want=%x", got, wantWire)
 				}
-				gotJ, err := s.AppendEncodeJSON(nil, sh.value)
-				if err != nil {
-					t.Fatalf("encodeJSON: %v", err)
-				}
+				gotJ := mustAppendEncodeJSON(t, s, nil, sh.value)
 				if !bytes.Equal(gotJ, wantJSON) {
 					t.Fatalf("JSON nil-shape diverges: got=%s want=%s", gotJ, wantJSON)
 				}
@@ -7137,10 +7102,7 @@ func TestMatrix_NilShapesAcrossUnions(t *testing.T) {
 		fWant, _ := fs.AppendEncode(nil, map[string]any{"u": nil})
 		for _, sh := range shapes {
 			t.Run(un.label+"/field/"+sh.label, func(t *testing.T) {
-				got, err := fs.AppendEncode(nil, map[string]any{"u": sh.value})
-				if err != nil {
-					t.Fatalf("encode: %v", err)
-				}
+				got := mustAppendEncode(t, fs, nil, map[string]any{"u": sh.value})
 				if !bytes.Equal(got, fWant) {
 					t.Fatalf("field nil-shape diverges: got=%x want=%x", got, fWant)
 				}
@@ -8658,10 +8620,7 @@ func TestMatrix_ForeignFramingThroughSkip(t *testing.T) {
 		{"name":"keep","type":"int"}]}`
 	w := avro.MustParse(wSchema)
 	r := avro.MustParse(rSchema)
-	res, err := avro.Resolve(w, r)
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
+	res := mustResolve(t, w, r)
 	strSchema := avro.MustParse(`"string"`)
 	var items [][]byte
 	for _, s := range []string{"x", "yy", "zzz"} {
@@ -8777,9 +8736,7 @@ func FuzzMatrixCore(f *testing.F) {
 			t.Fatalf("encode: %v", err)
 		}
 		var a1 any
-		if _, err := s.Decode(w1, &a1); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w1, &a1)
 		w2, err := s.AppendEncode(nil, a1)
 		if err != nil || string(w2) != string(w1) {
 			t.Fatalf("re-encode unstable: err=%v\n w1=%x\n w2=%x\nschema: %s", err, w1, w2, schemaJSON)
@@ -8848,19 +8805,10 @@ func TestMatrix_HostileTruncationAndCorruption(t *testing.T) {
 			t.Run(fr.label+"/"+cx.label, func(t *testing.T) {
 				u := &uniq{}
 				schemaJSON := cx.schema(fr.schema(u), fr.kind, u)
-				s, err := avro.Parse(schemaJSON)
-				if err != nil {
-					t.Fatalf("Parse: %v", err)
-				}
+				s := mustParse(t, schemaJSON)
 				vin := cx.wrap(fr.values[0])
-				w1, err := s.AppendEncode(nil, vin)
-				if err != nil {
-					t.Fatalf("encode: %v", err)
-				}
-				j1, err := s.AppendEncodeJSON(nil, vin)
-				if err != nil {
-					t.Fatalf("encodeJSON: %v", err)
-				}
+				w1 := mustAppendEncode(t, s, nil, vin)
+				j1 := mustAppendEncodeJSON(t, s, nil, vin)
 
 				// Every strict prefix of the valid binary wire.
 				for i := 0; i < len(w1); i++ {
@@ -8911,10 +8859,7 @@ func TestMatrix_HostileThroughResolution(t *testing.T) {
 		{"name":"tail","type":"string"}]}`
 	w := avro.MustParse(wSchema)
 	r := avro.MustParse(rSchema)
-	res, err := avro.Resolve(w, r)
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
+	res := mustResolve(t, w, r)
 	vin := map[string]any{
 		"keep": int32(7),
 		"drop": []any{
@@ -8923,10 +8868,7 @@ func TestMatrix_HostileThroughResolution(t *testing.T) {
 		},
 		"tail": "end",
 	}
-	w1, err := w.AppendEncode(nil, vin)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	w1 := mustAppendEncode(t, w, nil, vin)
 	for i := 0; i < len(w1); i++ {
 		hostileDecode(t, res, "resolved(R)", w1[:i], fmt.Sprintf("prefix[:%d]", i))
 	}
@@ -9024,10 +8966,7 @@ func TestMatrix_HostileSizeRejects(t *testing.T) {
 func TestMatrix_HostileSizeDecodeMessages(t *testing.T) {
 	s := avro.MustParse(`"string"`)
 	big := strings.Repeat("y", 1<<20)
-	wire, err := s.AppendEncode(nil, big)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	wire := mustAppendEncode(t, s, nil, big)
 	// Decoding a 1 MiB string wire into an int target: the rejection must
 	// not echo the megabyte of wire content.
 	var i int32
@@ -10970,14 +10909,8 @@ func TestMatrix_DecodeTargetRejectionParity(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.label, func(t *testing.T) {
 			s := avro.MustParse(c.schema)
-			wire, err := s.AppendEncode(nil, c.value)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			j, err := s.AppendEncodeJSON(nil, c.value)
-			if err != nil {
-				t.Fatalf("encodeJSON: %v", err)
-			}
+			wire := mustAppendEncode(t, s, nil, c.value)
+			j := mustAppendEncodeJSON(t, s, nil, c.value)
 			for name, target := range mkTargets() {
 				_, binErr := s.Decode(wire, target)
 				jsonTargets := mkTargets() // fresh, undamaged by the binary pass
@@ -11248,10 +11181,7 @@ func TestMatrix_ResolvedJSONUnionInputForms(t *testing.T) {
 func TestMatrix_ResolvedJSONUnionEnvelopeShapedMapValue(t *testing.T) {
 	writer := avro.MustParse(`{"type":"record","name":"Top","fields":[{"name":"u","type":["int",{"type":"map","values":"int"}]}]}`)
 	reader := avro.MustParse(`{"type":"record","name":"Top","fields":[{"name":"u","type":["int",{"type":"map","values":"int"}]},{"name":"pad","type":"int","default":0}]}`)
-	resolved, err := avro.Resolve(writer, reader)
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
+	resolved := mustResolve(t, writer, reader)
 	cells := []struct {
 		name        string
 		oracleValue any
@@ -11404,10 +11334,7 @@ func TestDifferentialFastavroResolvedJSONUnion(t *testing.T) {
 			}
 			w := avro.MustParse(c.writer)
 			r := avro.MustParse(c.reader)
-			resolved, err := avro.Resolve(w, r)
-			if err != nil {
-				t.Fatalf("Resolve: %v", err)
-			}
+			resolved := mustResolve(t, w, r)
 			var got any
 			if err := resolved.DecodeJSON([]byte(c.json), &got); err != nil {
 				t.Fatalf("resolved.DecodeJSON: %v", err)
@@ -12394,9 +12321,7 @@ func TestMatrix_UUIDByteArrayTrustsRawBytes(t *testing.T) {
 					t.Fatalf("binary encode for round trip: %v", err)
 				}
 				var out markerUUID
-				if _, err := s.Decode(bin, &out); err != nil {
-					t.Fatalf("decode: %v", err)
-				}
+				mustDecode(t, s, bin, &out)
 				if [16]byte(out) != raw {
 					t.Fatalf("uuid bytes not preserved: %x vs %x", out, raw)
 				}
@@ -12963,10 +12888,7 @@ var magnitudeEntryPoints = []struct {
 	{
 		name: "Parse+Decode",
 		decode: func(t *testing.T, cs string, body []byte) error {
-			s, err := avro.Parse(cs)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+			s := mustParse(t, cs)
 			return magDecode(func() error {
 				var v any
 				_, err := s.Decode(body, &v)
@@ -13127,14 +13049,8 @@ func TestInvariant_LegitimateBlockBoundsStillAccept(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			s, err := avro.Parse(c.schema)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
-			b, err := s.Encode(c.value)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
+			s := mustParse(t, c.schema)
+			b := mustEncode(t, s, c.value)
 			var got any
 			if _, err := s.Decode(b, &got); err != nil {
 				t.Fatalf("the bound refused a block this schema's own encoder produced: %v", err)
