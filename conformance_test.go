@@ -3813,14 +3813,11 @@ func TestSOEFingerprintMismatch(t *testing.T) {
 	schema2 := mustParse(t, `"string"`)
 
 	v := int32(42)
-	data, err := schema1.AppendSingleObject(nil, &v)
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := mustAppendSingleObject(t, schema1, nil, &v)
 
 	// Decoding with a different schema should fail.
 	var out string
-	_, err = schema2.DecodeSingleObject(data, &out)
+	_, err := schema2.DecodeSingleObject(data, &out)
 	if err == nil {
 		t.Fatal("expected error for fingerprint mismatch")
 	}
@@ -10374,12 +10371,9 @@ func TestMatrix_NonFiniteFloatRejectedForJSONNumberTarget(t *testing.T) {
 	for _, tc := range rejectCases {
 		t.Run("binary/"+tc.name, func(t *testing.T) {
 			s := avro.MustParse(tc.schema)
-			enc, err := s.AppendEncode(nil, tc.wire)
-			if err != nil {
-				t.Fatalf("AppendEncode: %v", err)
-			}
+			enc := mustAppendEncode(t, s, nil, tc.wire)
 			var n json.Number
-			_, err = s.Decode(enc, &n)
+			_, err := s.Decode(enc, &n)
 			if err == nil {
 				t.Fatalf("expected reject, decoded json.Number=%q (json.Marshal would fail later)", string(n))
 			}
@@ -10420,13 +10414,10 @@ func TestMatrix_NonFiniteFloatRejectedForJSONNumberTarget(t *testing.T) {
 	t.Run("promote float→double +Inf", func(t *testing.T) {
 		w := avro.MustParse(`"float"`)
 		r := avro.MustParse(`"double"`)
-		resolved, err := avro.Resolve(w, r)
-		if err != nil {
-			t.Fatalf("Resolve: %v", err)
-		}
+		resolved := mustResolve(t, w, r)
 		enc, _ := w.AppendEncode(nil, float32(math.Inf(1)))
 		var n json.Number
-		_, err = resolved.Decode(enc, &n)
+		_, err := resolved.Decode(enc, &n)
 		if err == nil {
 			t.Fatalf("expected reject under promotion, decoded json.Number=%q", string(n))
 		}
@@ -11332,12 +11323,9 @@ func TestMatrix_UnionBareNumberDispatchByLogicalCarrier(t *testing.T) {
 
 		for _, c := range contexts {
 			t.Run(b.name+"/"+c.name, func(t *testing.T) {
-				s, err := avro.Parse(c.wrap(`["null",`+b.branch+`]`), b.opts...)
-				if err != nil {
-					t.Fatalf("parse: %v", err)
-				}
+				s := mustParse(t, c.wrap(`["null",`+b.branch+`]`), b.opts...)
 				var root any
-				err = s.DecodeJSON([]byte(c.wire), &root)
+				err := s.DecodeJSON([]byte(c.wire), &root)
 
 				if !b.offered {
 					ranUnoffered++
@@ -19004,20 +18992,14 @@ func TestMatrix_CustomTypeBuiltinPreservedPerDirection(t *testing.T) {
 // but Java alignment fits this package.
 func TestMatrix_AliasClashRejectAtResolve(t *testing.T) {
 	t.Run("two writer fields collide via alias rename — Resolve rejects", func(t *testing.T) {
-		writer, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		writer := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"old_name","type":"int"},
 			{"name":"new_name","type":"int"}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		reader, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		reader := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"new_name","type":"int","aliases":["old_name"]}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = avro.Resolve(writer, reader)
+		_, err := avro.Resolve(writer, reader)
 		if err == nil {
 			t.Fatal("expected CompatibilityError on alias-rename collision")
 		}
@@ -19050,20 +19032,14 @@ func TestMatrix_AliasClashRejectAtResolve(t *testing.T) {
 	t.Run("two writer fields both via alias also reject", func(t *testing.T) {
 		// Both writer field names are aliases of the same reader field —
 		// also a duplicate-claim collision.
-		writer, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		writer := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"alpha","type":"int"},
 			{"name":"beta","type":"int"}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		reader, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		reader := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"gamma","type":"int","aliases":["alpha","beta"]}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = avro.Resolve(writer, reader)
+		_, err := avro.Resolve(writer, reader)
 		if err == nil {
 			t.Fatal("expected CompatibilityError on dual-alias collision")
 		}
@@ -20098,12 +20074,9 @@ func TestJSONNumberMapKeyContentValidated(t *testing.T) {
 	})
 	t.Run("binary_map_non_numeric_key_rejected", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"map","values":"int"}`)
-		wire, err := s.Encode(map[string]int{"not-a-number": 1})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		wire := mustEncode(t, s, map[string]int{"not-a-number": 1})
 		var got map[json.Number]int
-		_, err = s.Decode(wire, &got)
+		_, err := s.Decode(wire, &got)
 		if err == nil {
 			t.Fatalf("expected reject for non-numeric key; got %v", got)
 		}

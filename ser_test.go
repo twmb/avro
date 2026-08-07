@@ -137,11 +137,8 @@ func TestEmbed(t *testing.T) {
 
 func encodeErr(t *testing.T, schema string, v any) {
 	t.Helper()
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	_, err = s.AppendEncode(nil, v)
+	s := mustParse(t, schema)
+	_, err := s.AppendEncode(nil, v)
 	if err == nil {
 		t.Fatal("expected encode error, got nil")
 	}
@@ -257,12 +254,9 @@ func TestSerRecordMapNullField(t *testing.T) {
 			{"name":"id","type":"int"},
 			{"name":"name","type":"string"}
 		]}`
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		m := map[string]any{"id": int32(1), "name": nil}
-		_, err = s.AppendEncode(nil, &m)
+		_, err := s.AppendEncode(nil, &m)
 		if err == nil {
 			t.Fatal("expected error encoding nil into non-nullable string field, got nil")
 		}
@@ -400,21 +394,15 @@ func TestDecodeDeepInputDoesntPanic(t *testing.T) {
 	// Resolved-decode path: same recursive schema for writer and reader,
 	// goes through resolvedRecord.buildDeser which has its own depth bump.
 	t.Run("resolved", func(t *testing.T) {
-		r, err := Parse(nodeRecursiveSchema)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resolved, err := Resolve(s, r)
-		if err != nil {
-			t.Fatal(err)
-		}
+		r := mustParse(t, nodeRecursiveSchema)
+		resolved := mustResolve(t, s, r)
 		defer func() {
 			if r := recover(); r != nil {
 				t.Fatalf("panicked: %v", r)
 			}
 		}()
 		var n node
-		_, err = resolved.Decode(src, &n)
+		_, err := resolved.Decode(src, &n)
 		if err == nil {
 			t.Fatal("expected error on deep nesting, got nil")
 		}
@@ -426,16 +414,10 @@ func TestDecodeDeepInputDoesntPanic(t *testing.T) {
 	// resolved decoder must skip the writer's deeply nested subtree
 	// via skipRecord/skipUnion.
 	t.Run("skip", func(t *testing.T) {
-		r, err := Parse(`{"type":"record","name":"Node","fields":[
+		r := mustParse(t, `{"type":"record","name":"Node","fields":[
 			{"name":"value","type":"int"}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resolved, err := Resolve(s, r)
-		if err != nil {
-			t.Fatal(err)
-		}
+		resolved := mustResolve(t, s, r)
 		defer func() {
 			if r := recover(); r != nil {
 				t.Fatalf("panicked: %v", r)
@@ -445,7 +427,7 @@ func TestDecodeDeepInputDoesntPanic(t *testing.T) {
 			Value int32 `avro:"value"`
 		}
 		var rr readerR
-		_, err = resolved.Decode(src, &rr)
+		_, err := resolved.Decode(src, &rr)
 		if err == nil {
 			t.Fatal("expected error on deep skip, got nil")
 		}
@@ -1092,12 +1074,9 @@ type valStringer struct{ v string }
 func (vs valStringer) String() string { return vs.v }
 
 func TestSerStringRejectsStringer(t *testing.T) {
-	s, err := Parse(`"string"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"string"`)
 	v := valStringer{v: "hello"}
-	_, err = s.AppendEncode(nil, &v)
+	_, err := s.AppendEncode(nil, &v)
 	if err == nil {
 		t.Fatal("expected error: Stringer should not be accepted for string fields")
 	}
@@ -1115,33 +1094,24 @@ func TestSerStringAcceptsTextMarshaler(t *testing.T) {
 }
 
 func TestSerStringRejectsJsonNumber(t *testing.T) {
-	s, err := Parse(`"string"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = s.AppendEncode(nil, json.Number("42"))
+	s := mustParse(t, `"string"`)
+	_, err := s.AppendEncode(nil, json.Number("42"))
 	if err == nil {
 		t.Fatal("expected error: json.Number should not be accepted for string fields")
 	}
 }
 
 func TestSerStringRejectsJsonNumberInArray(t *testing.T) {
-	s, err := Parse(`{"type":"array","items":"string"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = s.Encode([]any{json.Number("42")})
+	s := mustParse(t, `{"type":"array","items":"string"}`)
+	_, err := s.Encode([]any{json.Number("42")})
 	if err == nil {
 		t.Fatal("expected error: json.Number should not be accepted for string array items")
 	}
 }
 
 func TestSerStringRejectsJsonNumberInMap(t *testing.T) {
-	s, err := Parse(`{"type":"map","values":"string"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = s.Encode(map[string]any{"k": json.Number("42")})
+	s := mustParse(t, `{"type":"map","values":"string"}`)
+	_, err := s.Encode(map[string]any{"k": json.Number("42")})
 	if err == nil {
 		t.Fatal("expected error: json.Number should not be accepted for string map values")
 	}
@@ -1516,10 +1486,7 @@ func TestSerErrorDottedPath(t *testing.T) {
 			}}
 		]
 	}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	// zip is a string, should be int — error should show "address.zip".
 	input := map[string]any{
 		"id": "abc",
@@ -1528,7 +1495,7 @@ func TestSerErrorDottedPath(t *testing.T) {
 			"zip":  "not-a-number",
 		},
 	}
-	_, err = s.Encode(input)
+	_, err := s.Encode(input)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -2608,12 +2575,9 @@ func TestRegression_EmbeddedPointerStructNoPanic(t *testing.T) {
 	})
 
 	t.Run("unexported embedded decode errors cleanly", func(t *testing.T) {
-		wire, err := s.AppendEncode(nil, &withNilEmbedPtr{EmbeddedInner: &EmbeddedInner{A: 7}, C: 3})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		wire := mustAppendEncode(t, s, nil, &withNilEmbedPtr{EmbeddedInner: &EmbeddedInner{A: 7}, C: 3})
 		var got withUnexportedEmbedPtr
-		_, err = s.Decode(wire, &got) // must error, not panic
+		_, err := s.Decode(wire, &got) // must error, not panic
 		if err == nil {
 			t.Fatal("expected clean error decoding into unexported embedded pointer; got nil")
 		}

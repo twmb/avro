@@ -4627,20 +4627,14 @@ func TestCheckWriterUnionDeepRecursionFailure(t *testing.T) {
 	// Both reader and writer are unions. kindsMatch passes for all branches
 	// (records have the same name), but deep compatibility check fails because
 	// a reader field has no default and is missing from writer.
-	reader, err := Parse(`["null", {"type":"record","name":"R","fields":[
+	reader := mustParse(t, `["null", {"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"string"}
 	]}]`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer, err := Parse(`["null", {"type":"record","name":"R","fields":[
+	writer := mustParse(t, `["null", {"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"}
 	]}]`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = CheckCompatibility(writer, reader)
+	err := CheckCompatibility(writer, reader)
 	if err == nil {
 		t.Fatal("expected error for deep record incompatibility in union")
 	}
@@ -9294,44 +9288,29 @@ func TestSingleObjectFingerprint(t *testing.T) {
 }
 
 func TestSingleObjectFingerprintMismatch(t *testing.T) {
-	a, err := Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := Parse(`"string"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	a := mustParse(t, `"int"`)
+	b := mustParse(t, `"string"`)
 
-	encoded, err := a.AppendSingleObject(nil, new(int32))
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoded := mustAppendSingleObject(t, a, nil, new(int32))
 
 	var got string
-	_, err = b.DecodeSingleObject(encoded, &got)
+	_, err := b.DecodeSingleObject(encoded, &got)
 	if err == nil {
 		t.Fatal("expected fingerprint mismatch error")
 	}
 }
 
 func TestSingleObjectBadMagic(t *testing.T) {
-	s, err := Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 
-	encoded, err := s.AppendSingleObject(nil, new(int32))
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoded := mustAppendSingleObject(t, s, nil, new(int32))
 
 	// Corrupt magic bytes.
 	encoded[0] = 0x00
 	encoded[1] = 0x00
 
 	var got int32
-	_, err = s.DecodeSingleObject(encoded, &got)
+	_, err := s.DecodeSingleObject(encoded, &got)
 	if err == nil {
 		t.Fatal("expected bad magic error")
 	}
@@ -10152,16 +10131,13 @@ func TestSchemaCacheConflictingDefinition(t *testing.T) {
 	// Two different schemas defining the same name should still error.
 	cache := &SchemaCache{}
 
-	_, err := cache.Parse(`{
+	mustCacheParse(t, cache, `{
 		"type": "record",
 		"name": "Foo",
 		"fields": [{"name": "x", "type": "int"}]
 	}`)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	_, err = cache.Parse(`{
+	_, err := cache.Parse(`{
 		"type": "record",
 		"name": "Foo",
 		"fields": [{"name": "y", "type": "string"}]

@@ -58,11 +58,8 @@ func decode(t *testing.T, schema string, src []byte, v any) {
 // decodeErr is a test helper that expects Decode to return an error.
 func decodeErr(t *testing.T, schema string, src []byte, v any) {
 	t.Helper()
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	_, err = s.Decode(src, v)
+	s := mustParse(t, schema)
+	_, err := s.Decode(src, v)
 	if err == nil {
 		t.Fatal("expected error from Decode, got nil")
 	}
@@ -814,11 +811,8 @@ func TestDecodeTypeMismatch(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
-			_, err = s.Decode(tt.data, tt.target)
+			s := mustParse(t, tt.schema)
+			_, err := s.Decode(tt.data, tt.target)
 			if err == nil {
 				t.Fatal("expected type mismatch error, got nil")
 			}
@@ -838,11 +832,8 @@ func TestDecodeInvalidEnumIndex(t *testing.T) {
 }
 
 func TestDecodeNonPointer(t *testing.T) {
-	s, err := Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = s.Decode([]byte{0x02}, 42) // not a pointer
+	s := mustParse(t, `"int"`)
+	_, err := s.Decode([]byte{0x02}, 42) // not a pointer
 	if err == nil {
 		t.Fatal("expected error for non-pointer, got nil")
 	}
@@ -1168,10 +1159,7 @@ func TestDecodeArrayOversizedCountUnsafe(t *testing.T) {
 	// This tests the unsafe fast path (udArrayDirect and udArrayPtrRecord)
 	// to ensure they don't allocate based on untrusted counts.
 	schema := `{"type":"array","items":"int"}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	// count=999999 (zigzag-encoded), but only a few bytes of data.
 	var data []byte
 	data = appendVarlong(data, 999999)
@@ -1179,7 +1167,7 @@ func TestDecodeArrayOversizedCountUnsafe(t *testing.T) {
 
 	// Decode into []int32 — triggers the unsafe primitive array path.
 	var sl []int32
-	_, err = s.Decode(data, &sl)
+	_, err := s.Decode(data, &sl)
 	if err == nil {
 		t.Fatal("expected error for oversized array count")
 	}
@@ -1309,16 +1297,10 @@ func TestDecodeBytesIntoArray(t *testing.T) {
 }
 
 func TestDecodeBytesArrayWrongLength(t *testing.T) {
-	s, err := Parse(`"bytes"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded, err := s.AppendEncode(nil, ptr([]byte{1, 2, 3}))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"bytes"`)
+	encoded := mustAppendEncode(t, s, nil, ptr([]byte{1, 2, 3}))
 	var got [5]byte
-	_, err = s.Decode(encoded, &got)
+	_, err := s.Decode(encoded, &got)
 	if err == nil {
 		t.Fatal("expected error for wrong array length")
 	}
@@ -1739,17 +1721,11 @@ func TestDecodeArrayIntoFixedArray(t *testing.T) {
 
 func TestDecodeArrayIntoFixedArrayTooFew(t *testing.T) {
 	schema := `{"type":"array","items":"int"}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	input := []int32{10, 20} // 2 elements
-	encoded, err := s.AppendEncode(nil, &input)
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoded := mustAppendEncode(t, s, nil, &input)
 	var got [3]int32 // expects 3
-	_, err = s.Decode(encoded, &got)
+	_, err := s.Decode(encoded, &got)
 	if err == nil {
 		t.Fatal("expected error for too few elements")
 	}
@@ -1757,17 +1733,11 @@ func TestDecodeArrayIntoFixedArrayTooFew(t *testing.T) {
 
 func TestDecodeArrayIntoFixedArrayTooMany(t *testing.T) {
 	schema := `{"type":"array","items":"int"}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	input := []int32{10, 20, 30, 40} // 4 elements
-	encoded, err := s.AppendEncode(nil, &input)
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoded := mustAppendEncode(t, s, nil, &input)
 	var got [3]int32 // expects 3
-	_, err = s.Decode(encoded, &got)
+	_, err := s.Decode(encoded, &got)
 	if err == nil {
 		t.Fatal("expected error for too many elements")
 	}
@@ -2235,16 +2205,10 @@ func TestUnsafeDecodeTruncatedBuffer(t *testing.T) {
 func TestDecodeIntUint(t *testing.T) {
 	// Exercise the CanUint branch in the slow-path deserInt.
 	schema := `"int"`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dst, err := s.AppendEncode(nil, ptr(int32(42)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
+	dst := mustAppendEncode(t, s, nil, ptr(int32(42)))
 	var got uint32
-	if _, err = s.Decode(dst, &got); err != nil {
+	if _, err := s.Decode(dst, &got); err != nil {
 		t.Fatalf("decode uint32: %v", err)
 	}
 	if got != 42 {
@@ -2254,16 +2218,10 @@ func TestDecodeIntUint(t *testing.T) {
 
 func TestDecodeLongUint(t *testing.T) {
 	schema := `"long"`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dst, err := s.AppendEncode(nil, ptr(int64(42)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
+	dst := mustAppendEncode(t, s, nil, ptr(int64(42)))
 	var got uint64
-	if _, err = s.Decode(dst, &got); err != nil {
+	if _, err := s.Decode(dst, &got); err != nil {
 		t.Fatalf("decode uint64: %v", err)
 	}
 	if got != 42 {
@@ -2525,12 +2483,9 @@ func TestUnsafePtrNilSerialize(t *testing.T) {
 	type S struct {
 		X *int32 `avro:"x"`
 	}
-	s, err := Parse(`{"type":"record","name":"S","fields":[{"name":"x","type":"int"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `{"type":"record","name":"S","fields":[{"name":"x","type":"int"}]}`)
 	// Encode with nil pointer — should trigger errUnsafeNilPtr via the fast path.
-	_, err = s.AppendEncode(nil, &S{X: nil})
+	_, err := s.AppendEncode(nil, &S{X: nil})
 	if err == nil {
 		t.Fatal("expected error for nil pointer field")
 	}
@@ -2566,12 +2521,9 @@ func TestSerRecordSlowPathError(t *testing.T) {
 		X int32  `avro:"x"`
 		Y *int32 `avro:"y"`
 	}
-	s, err := Parse(`{"type":"record","name":"S","fields":[{"name":"x","type":"int"},{"name":"y","type":"int"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `{"type":"record","name":"S","fields":[{"name":"x","type":"int"},{"name":"y","type":"int"}]}`)
 	// Non-addressable struct value with nil pointer field → slow path + error.
-	_, err = s.AppendEncode(nil, S{X: 42, Y: nil})
+	_, err := s.AppendEncode(nil, S{X: 42, Y: nil})
 	if err == nil {
 		t.Fatal("expected error for nil pointer in slow path")
 	}
@@ -2991,21 +2943,15 @@ func TestUnsafeRecordFastPtrError(t *testing.T) {
 		Item *Inner `avro:"item"`
 	}
 	schema := nullableInnerSchema
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	// Warm up: encode a valid value to compile fast paths.
 	input := Outer{Item: &Inner{X: 1, Y: "hello"}}
-	encoded, err := s.AppendEncode(nil, &input)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	encoded := mustAppendEncode(t, s, nil, &input)
 	// Decode truncated data to trigger error inside deserRecordFastPtr.
 	var out Outer
 	// Take just the non-null union byte + partial record.
 	if len(encoded) > 2 {
-		_, err = s.Decode(encoded[:2], &out)
+		_, err := s.Decode(encoded[:2], &out)
 		if err == nil {
 			t.Fatal("expected error for truncated record")
 		}
@@ -3427,18 +3373,12 @@ func TestArrayDeserTruncatedPrimitives(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dst, err := s.AppendEncode(nil, tt.input)
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := mustParse(t, tt.schema)
+			dst := mustAppendEncode(t, s, nil, tt.input)
 			// Truncate: keep the block count but remove some item data.
 			truncated := dst[:len(dst)/2]
 			out := reflect.New(reflect.TypeOf(tt.input).Elem()).Interface()
-			_, err = s.Decode(truncated, out)
+			_, err := s.Decode(truncated, out)
 			if err == nil {
 				t.Fatal("expected error for truncated data")
 			}
@@ -3461,18 +3401,12 @@ func TestMapDeserTruncatedPrimitives(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dst, err := s.AppendEncode(nil, tt.input)
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := mustParse(t, tt.schema)
+			dst := mustAppendEncode(t, s, nil, tt.input)
 			// Truncate: keep the block count but remove some data.
 			truncated := dst[:len(dst)/2]
 			out := reflect.New(reflect.TypeOf(tt.input).Elem()).Interface()
-			_, err = s.Decode(truncated, out)
+			_, err := s.Decode(truncated, out)
 			if err == nil {
 				t.Fatal("expected error for truncated data")
 			}
@@ -3913,18 +3847,12 @@ func TestTimeOverflow(t *testing.T) {
 	t.Run("deser_time_micros_overflow", func(t *testing.T) {
 		// Encode a raw long value that overflows when converted to time.Duration.
 		schema := `{"type":"long","logicalType":"time-micros"}`
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		// Encode MaxInt64 as raw long (it will overflow when * Microsecond).
 		var big int64 = math.MaxInt64
-		dst, err := s.AppendEncode(nil, &big)
-		if err != nil {
-			t.Fatal(err)
-		}
+		dst := mustAppendEncode(t, s, nil, &big)
 		var d time.Duration
-		_, err = s.Decode(dst, &d)
+		_, err := s.Decode(dst, &d)
 		if err == nil {
 			t.Fatal("expected overflow error for time-micros")
 		}
@@ -3934,26 +3862,17 @@ func TestTimeOverflow(t *testing.T) {
 			T time.Duration `avro:"t"`
 		}
 		schema := `{"type":"record","name":"W","fields":[{"name":"t","type":{"type":"long","logicalType":"time-micros"}}]}`
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		// Encode a record with a huge long value for time-micros.
 		rawSchema := `{"type":"record","name":"W","fields":[{"name":"t","type":"long"}]}`
-		rawS, err := Parse(rawSchema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		rawS := mustParse(t, rawSchema)
 		type RawW struct {
 			T int64 `avro:"t"`
 		}
 		raw := RawW{T: math.MaxInt64}
-		dst, err := rawS.AppendEncode(nil, &raw)
-		if err != nil {
-			t.Fatal(err)
-		}
+		dst := mustAppendEncode(t, rawS, nil, &raw)
 		var got W
-		_, err = s.Decode(dst, &got)
+		_, err := s.Decode(dst, &got)
 		if err == nil {
 			t.Fatal("expected overflow error for time-micros")
 		}
@@ -4230,10 +4149,7 @@ func TestSerRecordFastPtrError(t *testing.T) {
 			"fields": [{"name": "p", "type": "int"}]
 		}]}]
 	}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	// Warm up: encode valid value to compile fast paths.
 	valid := Outer{Item: &Inner{P: ptr(int32(42))}}
 	mustAppendEncode(t, s, nil, &valid)
@@ -4242,7 +4158,7 @@ func TestSerRecordFastPtrError(t *testing.T) {
 	s.Decode(enc, &dummy)
 	// Now encode with nil P → error in serRecordFastPtr.
 	bad := Outer{Item: &Inner{P: nil}}
-	_, err = s.AppendEncode(nil, &bad)
+	_, err := s.AppendEncode(nil, &bad)
 	if err == nil {
 		t.Fatal("expected error for nil non-union pointer")
 	}
@@ -4259,10 +4175,7 @@ func TestDeserRecordFastPtrError(t *testing.T) {
 		Item *Inner `avro:"item"`
 	}
 	schema := nullableInnerSchema
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	valid := Outer{Item: &Inner{X: 1, Y: "hello"}}
 	enc, _ := s.AppendEncode(nil, &valid)
 	// First decode: warms up inner record fast path.
@@ -4273,7 +4186,7 @@ func TestDeserRecordFastPtrError(t *testing.T) {
 	s.Decode(enc, &out2)
 	// Third decode with truncated data: triggers error in deserRecordFastPtr.
 	var out3 Outer
-	_, err = s.Decode(enc[:2], &out3)
+	_, err := s.Decode(enc[:2], &out3)
 	if err == nil {
 		t.Fatal("expected error for truncated data")
 	}
@@ -4293,12 +4206,9 @@ func TestArrayPtrRecordNilError(t *testing.T) {
 			"fields": [{"name": "x", "type": "int"}]
 		}}}]
 	}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	bad := Outer{Items: []*Inner{nil}}
-	_, err = s.AppendEncode(nil, &bad)
+	_, err := s.AppendEncode(nil, &bad)
 	if err == nil {
 		t.Fatal("expected error for nil array element")
 	}
@@ -4311,10 +4221,7 @@ func TestArrayNegativeCountBlock(t *testing.T) {
 	// Test with a value array ([]int32) to exercise udArrayDirect.
 	t.Run("direct", func(t *testing.T) {
 		schema := arrayOfIntSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		// Warm up fast path with normal encode/decode.
 		normal := Wrapper{Vals: []int32{1, 2, 3}}
 		enc, _ := s.AppendEncode(nil, &normal)
@@ -4335,7 +4242,7 @@ func TestArrayNegativeCountBlock(t *testing.T) {
 		data = append(data, 0) // terminator
 
 		var out2 Wrapper
-		_, err = s.Decode(data, &out2)
+		_, err := s.Decode(data, &out2)
 		if err != nil {
 			t.Fatalf("decode negative count block: %v", err)
 		}
@@ -4350,10 +4257,7 @@ func TestArrayNegativeCountBlock(t *testing.T) {
 			Items []*Rec `avro:"items"`
 		}
 		schema := arrayOfPtrRecSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		// Warm up.
 		normal := Wrapper{Items: []*Rec{{V: 1}}}
 		enc, _ := s.AppendEncode(nil, &normal)
@@ -4371,7 +4275,7 @@ func TestArrayNegativeCountBlock(t *testing.T) {
 		data = append(data, 0) // terminator
 
 		var out2 Wrapper
-		_, err = s.Decode(data, &out2)
+		_, err := s.Decode(data, &out2)
 		if err != nil {
 			t.Fatalf("decode negative count block: %v", err)
 		}
@@ -4386,10 +4290,7 @@ func TestArrayNegativeCountBlock(t *testing.T) {
 func TestArrayMultiBlockDeser(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
 		schema := arrayOfIntSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		// Warm up.
 		s.AppendEncode(nil, &Wrapper{Vals: []int32{1}})
 
@@ -4403,7 +4304,7 @@ func TestArrayMultiBlockDeser(t *testing.T) {
 		data = append(data, 0)        // terminator
 
 		var out Wrapper
-		_, err = s.Decode(data, &out)
+		_, err := s.Decode(data, &out)
 		if err != nil {
 			t.Fatalf("decode multi-block: %v", err)
 		}
@@ -4417,10 +4318,7 @@ func TestArrayMultiBlockDeser(t *testing.T) {
 			Items []*Rec `avro:"items"`
 		}
 		schema := arrayOfPtrRecSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		// Warm up.
 		normal := Wrapper{Items: []*Rec{{V: 1}}}
 		enc, _ := s.AppendEncode(nil, &normal)
@@ -4436,7 +4334,7 @@ func TestArrayMultiBlockDeser(t *testing.T) {
 		data = append(data, 0)
 
 		var out Wrapper
-		_, err = s.Decode(data, &out)
+		_, err := s.Decode(data, &out)
 		if err != nil {
 			t.Fatalf("decode multi-block: %v", err)
 		}
@@ -4451,10 +4349,7 @@ func TestArrayMultiBlockDeser(t *testing.T) {
 func TestArrayDeserTruncatedData(t *testing.T) {
 	t.Run("direct_truncated_count", func(t *testing.T) {
 		schema := arrayOfIntSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		// Warm up so fast path is compiled.
 		s.AppendEncode(nil, &Wrapper{Vals: []int32{1}})
 
@@ -4463,7 +4358,7 @@ func TestArrayDeserTruncatedData(t *testing.T) {
 		data = appendVarlong(data, 2)
 		data = appendVarint(data, 1) // only 1 element
 		var out Wrapper
-		_, err = s.Decode(data, &out)
+		_, err := s.Decode(data, &out)
 		if err == nil {
 			t.Fatal("expected error for truncated array data")
 		}
@@ -4474,10 +4369,7 @@ func TestArrayDeserTruncatedData(t *testing.T) {
 			Items []*Rec `avro:"items"`
 		}
 		schema := arrayOfPtrRecSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		// Warm up.
 		normal := Wrapper{Items: []*Rec{{V: 1}}}
 		enc, _ := s.AppendEncode(nil, &normal)
@@ -4489,7 +4381,7 @@ func TestArrayDeserTruncatedData(t *testing.T) {
 		data = appendVarlong(data, 2)
 		data = appendVarint(data, 10) // only 1 element
 		var out Wrapper
-		_, err = s.Decode(data, &out)
+		_, err := s.Decode(data, &out)
 		if err == nil {
 			t.Fatal("expected error for truncated array data")
 		}
@@ -4497,14 +4389,11 @@ func TestArrayDeserTruncatedData(t *testing.T) {
 
 	t.Run("direct_truncated_readvarlong", func(t *testing.T) {
 		schema := arrayOfIntSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		s.AppendEncode(nil, &Wrapper{Vals: []int32{1}})
 		// Empty data: readVarlong fails.
 		var out Wrapper
-		_, err = s.Decode([]byte{}, &out)
+		_, err := s.Decode([]byte{}, &out)
 		if err == nil {
 			t.Fatal("expected error for empty data")
 		}
@@ -4515,17 +4404,14 @@ func TestArrayDeserTruncatedData(t *testing.T) {
 			Items []*Rec `avro:"items"`
 		}
 		schema := arrayOfPtrRecSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		normal := Wrapper{Items: []*Rec{{V: 1}}}
 		enc, _ := s.AppendEncode(nil, &normal)
 		var dummy Wrapper
 		s.Decode(enc, &dummy)
 		// Empty data: readVarlong fails.
 		var out Wrapper
-		_, err = s.Decode([]byte{}, &out)
+		_, err := s.Decode([]byte{}, &out)
 		if err == nil {
 			t.Fatal("expected error for empty data")
 		}
@@ -4541,12 +4427,9 @@ func TestArraySerError(t *testing.T) {
 		Items []Inner `avro:"items"` // value slice, not ptr slice
 	}
 	schema := arrayOfPtrInnerSchema
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	bad := Outer{Items: []Inner{{P: nil}}}
-	_, err = s.AppendEncode(nil, &bad)
+	_, err := s.AppendEncode(nil, &bad)
 	if err == nil {
 		t.Fatal("expected error for nil pointer in array element")
 	}
@@ -4671,10 +4554,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 			Items []*Inner `avro:"items"`
 		}
 		schema := arrayOfPtrInnerSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		// Warm up with valid data.
 		valid := Outer{Items: []*Inner{{P: ptr(int32(1))}}}
 		enc, _ := s.AppendEncode(nil, &valid)
@@ -4684,7 +4564,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 
 		// Now encode with nil P inside a record → error.
 		bad := Outer{Items: []*Inner{{P: nil}}}
-		_, err = s.AppendEncode(nil, &bad)
+		_, err := s.AppendEncode(nil, &bad)
 		if err == nil {
 			t.Fatal("expected error for nil pointer in array record")
 		}
@@ -4698,10 +4578,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 			Items []*Inner `avro:"items"`
 		}
 		schema := arrayOfNullableInnerSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		// Warm up.
 		valid := Outer{Items: []*Inner{{P: ptr(int32(1))}}}
 		enc, _ := s.AppendEncode(nil, &valid)
@@ -4711,7 +4588,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 
 		// Encode with nil P → error in inner record ser.
 		bad := Outer{Items: []*Inner{{P: nil}}}
-		_, err = s.AppendEncode(nil, &bad)
+		_, err := s.AppendEncode(nil, &bad)
 		if err == nil {
 			t.Fatal("expected error for nil pointer in array null-union record")
 		}
@@ -4725,10 +4602,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 			Items []Inner `avro:"items"` // value slice
 		}
 		schema := arrayOfPtrInnerSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		valid := Outer{Items: []Inner{{P: ptr(int32(1))}}}
 		enc, _ := s.AppendEncode(nil, &valid)
 		var dummy Outer
@@ -4736,7 +4610,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		s.AppendEncode(nil, &valid)
 
 		bad := Outer{Items: []Inner{{P: nil}}}
-		_, err = s.AppendEncode(nil, &bad)
+		_, err := s.AppendEncode(nil, &bad)
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -4750,15 +4624,12 @@ func TestArraySerErrorWarm(t *testing.T) {
 			Items []Inner `avro:"items"` // value slice
 		}
 		schema := arrayOfPtrInnerSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		valid := Outer{Items: []Inner{{P: ptr(int32(1))}}}
 		s.AppendEncode(nil, &valid) // warm up
 
 		bad := Outer{Items: []Inner{{P: nil}}}
-		_, err = s.AppendEncode(nil, &bad)
+		_, err := s.AppendEncode(nil, &bad)
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -4772,15 +4643,12 @@ func TestArraySerErrorWarm(t *testing.T) {
 			Items []*Inner `avro:"items"`
 		}
 		schema := arrayOfNullableInnerSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		valid := Outer{Items: []*Inner{{P: ptr(int32(1))}}}
 		s.AppendEncode(nil, &valid) // warm up
 
 		bad := Outer{Items: []*Inner{{P: nil}}}
-		_, err = s.AppendEncode(nil, &bad)
+		_, err := s.AppendEncode(nil, &bad)
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -4834,10 +4702,7 @@ func TestArrayReusedSliceCap(t *testing.T) {
 func TestArrayNegativeCountReadVarlongError(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
 		schema := arrayOfIntSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		s.AppendEncode(nil, &Wrapper{Vals: []int32{1}}) // warm up
 
 		// Negative count with truncated byte-size.
@@ -4845,7 +4710,7 @@ func TestArrayNegativeCountReadVarlongError(t *testing.T) {
 		data = appendVarlong(data, -3) // negative count
 		// No byte-size follows → readVarlong error.
 		var out Wrapper
-		_, err = s.Decode(data, &out)
+		_, err := s.Decode(data, &out)
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -4856,10 +4721,7 @@ func TestArrayNegativeCountReadVarlongError(t *testing.T) {
 			Items []*Rec `avro:"items"`
 		}
 		schema := arrayOfPtrRecSchema
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		normal := Wrapper{Items: []*Rec{{V: 1}}}
 		enc, _ := s.AppendEncode(nil, &normal)
 		var dummy Wrapper
@@ -4869,7 +4731,7 @@ func TestArrayNegativeCountReadVarlongError(t *testing.T) {
 		var data []byte
 		data = appendVarlong(data, -3)
 		var out Wrapper
-		_, err = s.Decode(data, &out)
+		_, err := s.Decode(data, &out)
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -5140,13 +5002,10 @@ func TestAdversarialArrayCountLie(t *testing.T) {
 func TestAdversarialMinInt64BlockCount(t *testing.T) {
 	t.Run("array_reflect", func(t *testing.T) {
 		schema := `{"type":"array","items":"int"}`
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		data := appendVarlong(nil, math.MinInt64)
 		var out []int32
-		_, err = s.Decode(data, &out)
+		_, err := s.Decode(data, &out)
 		if err == nil {
 			t.Fatal("expected error for MinInt64 block count")
 		}
@@ -5159,13 +5018,10 @@ func TestAdversarialMinInt64BlockCount(t *testing.T) {
 		schema := `{"type":"record","name":"R","fields":[
 			{"name":"vals","type":{"type":"array","items":"int"}}
 		]}`
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		data := appendVarlong(nil, math.MinInt64)
 		var out R
-		_, err = s.Decode(data, &out)
+		_, err := s.Decode(data, &out)
 		if err == nil {
 			t.Fatal("expected error for MinInt64 block count")
 		}
@@ -5181,13 +5037,10 @@ func TestAdversarialMinInt64BlockCount(t *testing.T) {
 				"fields":[{"name":"x","type":"int"}]
 			}}}
 		]}`
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		data := appendVarlong(nil, math.MinInt64)
 		var out R
-		_, err = s.Decode(data, &out)
+		_, err := s.Decode(data, &out)
 		if err == nil {
 			t.Fatal("expected error for MinInt64 block count")
 		}
@@ -5195,13 +5048,10 @@ func TestAdversarialMinInt64BlockCount(t *testing.T) {
 
 	t.Run("map_reflect", func(t *testing.T) {
 		schema := `{"type":"map","values":"int"}`
-		s, err := Parse(schema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, schema)
 		data := appendVarlong(nil, math.MinInt64)
 		var out map[string]int32
-		_, err = s.Decode(data, &out)
+		_, err := s.Decode(data, &out)
 		if err == nil {
 			t.Fatal("expected error for MinInt64 block count")
 		}
@@ -5951,16 +5801,10 @@ func TestShortBufferErrorAs(t *testing.T) {
 }
 
 func TestSemanticErrorIntegration(t *testing.T) {
-	s, err := Parse(`"boolean"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded, err := s.Encode(true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"boolean"`)
+	encoded := mustEncode(t, s, true)
 	var n int
-	_, err = s.Decode(encoded, &n)
+	_, err := s.Decode(encoded, &n)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -5974,12 +5818,9 @@ func TestSemanticErrorIntegration(t *testing.T) {
 }
 
 func TestShortBufferErrorIntegration(t *testing.T) {
-	s, err := Parse(`"boolean"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"boolean"`)
 	var b bool
-	_, err = s.Decode(nil, &b)
+	_, err := s.Decode(nil, &b)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -6277,16 +6118,10 @@ type testTextUnmarshalerErr struct{}
 func (*testTextUnmarshalerErr) UnmarshalText([]byte) error { return fmt.Errorf("unmarshal error") }
 
 func TestDeserStringTextUnmarshalerError(t *testing.T) {
-	s, err := Parse(`"string"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded, err := s.AppendEncode(nil, ptr("hello"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"string"`)
+	encoded := mustAppendEncode(t, s, nil, ptr("hello"))
 	var v testTextUnmarshalerErr
-	_, err = s.Decode(encoded, &v)
+	_, err := s.Decode(encoded, &v)
 	if err == nil {
 		t.Fatal("expected error from UnmarshalText")
 	}
@@ -6308,16 +6143,10 @@ func TestLogicalTypeDeserIntoInterface(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			encoded, err := s.AppendEncode(nil, tt.encode)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
+			s := mustParse(t, tt.schema)
+			encoded := mustAppendEncode(t, s, nil, tt.encode)
 			var v any
-			_, err = s.Decode(encoded, &v)
+			_, err := s.Decode(encoded, &v)
 			if err != nil {
 				t.Fatalf("decode into interface: %v", err)
 			}
@@ -6409,18 +6238,12 @@ func TestLogicalTypeDeserTypeMismatch(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := mustParse(t, tt.schema)
 			// Encode a valid value.
-			encoded, err := s.AppendEncode(nil, ptr(int64(42)))
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
+			encoded := mustAppendEncode(t, s, nil, ptr(int64(42)))
 			// Decode into incompatible type.
 			var v bool
-			_, err = s.Decode(encoded, &v)
+			_, err := s.Decode(encoded, &v)
 			if err == nil {
 				t.Fatal("expected error decoding logical type into bool")
 			}
@@ -6758,11 +6581,8 @@ func TestLogicalSerNilPointer(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, err = s.AppendEncode(nil, tt.v)
+			s := mustParse(t, tt.schema)
+			_, err := s.AppendEncode(nil, tt.v)
 			if err == nil {
 				t.Fatal("expected error encoding nil pointer")
 			}
@@ -6843,17 +6663,11 @@ func TestUUIDByteArrayRoundTrip(t *testing.T) {
 
 	t.Run("invalid UUID decode error", func(t *testing.T) {
 		// Encode a non-UUID string and try to decode into [16]byte.
-		s, err := Parse(uuidSchema)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustParse(t, uuidSchema)
 		badStr := "not-a-uuid"
-		encoded, err := s.Encode(&badStr)
-		if err != nil {
-			t.Fatal(err)
-		}
+		encoded := mustEncode(t, s, &badStr)
 		var out [16]byte
-		_, err = s.Decode(encoded, &out)
+		_, err := s.Decode(encoded, &out)
 		if err == nil {
 			t.Fatal("expected error decoding invalid UUID into [16]byte")
 		}
@@ -7011,14 +6825,11 @@ func TestDurationPointer(t *testing.T) {
 
 func TestDurationShortBuffer(t *testing.T) {
 	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	// Only 11 bytes — needs 12.
 	short := make([]byte, 11)
 	var out Duration
-	_, err = s.Decode(short, &out)
+	_, err := s.Decode(short, &out)
 	if err == nil {
 		t.Fatal("expected error for short buffer")
 	}
@@ -7301,13 +7112,10 @@ func TestFixedDecimalNegative(t *testing.T) {
 func TestFixedDecimalOverflow(t *testing.T) {
 	// Fixed size 2 can hold at most ±32767 unscaled. Try a value that overflows.
 	schema := `{"type":"fixed","name":"dec","size":2,"logicalType":"decimal","precision":4,"scale":0}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	// 100000 requires 3 bytes, won't fit in 2.
 	r := new(big.Rat).SetInt64(100000)
-	_, err = s.AppendEncode(nil, &r)
+	_, err := s.AppendEncode(nil, &r)
 	if err == nil {
 		t.Fatal("expected overflow error")
 	}
@@ -7405,17 +7213,11 @@ func TestFixedDecimalDecodeIntoString(t *testing.T) {
 func TestBytesDecimalDecodeFloat32Overflow(t *testing.T) {
 	// A decimal value that fits in float64 but overflows float32 (> ~3.4e38).
 	schema := `{"type":"bytes","logicalType":"decimal","precision":50,"scale":0}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	big, _ := new(big.Rat).SetString("1e39")
-	encoded, err := s.AppendEncode(nil, big)
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoded := mustAppendEncode(t, s, nil, big)
 	var f32 float32
-	_, err = s.Decode(encoded, &f32)
+	_, err := s.Decode(encoded, &f32)
 	if err == nil {
 		t.Fatal("expected float32 overflow error")
 	}
@@ -7458,14 +7260,11 @@ func TestDecimalSchemaValidation(t *testing.T) {
 
 func TestBytesDecimalShortBuffer(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	// Varint says 10 bytes but only 2 available.
 	data := []byte{20, 0x30, 0x39} // length=10 (zigzag), only 2 data bytes
 	var out *big.Rat
-	_, err = s.Decode(data, &out)
+	_, err := s.Decode(data, &out)
 	if err == nil {
 		t.Fatal("expected short buffer error")
 	}
@@ -7473,13 +7272,10 @@ func TestBytesDecimalShortBuffer(t *testing.T) {
 
 func TestFixedDecimalShortBuffer(t *testing.T) {
 	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	short := make([]byte, 7) // needs 8
 	var out *big.Rat
-	_, err = s.Decode(short, &out)
+	_, err := s.Decode(short, &out)
 	if err == nil {
 		t.Fatal("expected short buffer error")
 	}
@@ -7487,14 +7283,11 @@ func TestFixedDecimalShortBuffer(t *testing.T) {
 
 func TestBytesDecimalNegativeLength(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	// Zigzag encode -1 as length → 0x01.
 	data := []byte{0x01}
 	var out *big.Rat
-	_, err = s.Decode(data, &out)
+	_, err := s.Decode(data, &out)
 	if err == nil {
 		t.Fatal("expected negative length error")
 	}
@@ -7628,17 +7421,11 @@ func TestFixedDecimalDeserInterface(t *testing.T) {
 func TestBytesDecimalDeserWrongType(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
 	r := new(big.Rat).SetFrac64(12345, 100)
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded, err := s.AppendEncode(nil, &r)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
+	encoded := mustAppendEncode(t, s, nil, &r)
 	// bool is not a supported decimal target.
 	var out bool
-	_, err = s.Decode(encoded, &out)
+	_, err := s.Decode(encoded, &out)
 	if err == nil {
 		t.Fatal("expected error decoding decimal into bool")
 	}
@@ -7648,14 +7435,11 @@ func TestBytesDecimalDeserWrongType(t *testing.T) {
 
 func TestBytesDecimalTruncatedVarint(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	// Byte with continuation bit but no following byte.
 	data := []byte{0x80}
 	var out *big.Rat
-	_, err = s.Decode(data, &out)
+	_, err := s.Decode(data, &out)
 	if err == nil {
 		t.Fatal("expected error for truncated varint")
 	}
@@ -7694,12 +7478,9 @@ func TestFixedDecimalNegativePadding(t *testing.T) {
 
 func TestDurationSerNilPointer(t *testing.T) {
 	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	var d *Duration
-	_, err = s.AppendEncode(nil, &d)
+	_, err := s.AppendEncode(nil, &d)
 	if err == nil {
 		t.Fatal("expected error for nil Duration pointer")
 	}
@@ -7707,12 +7488,9 @@ func TestDurationSerNilPointer(t *testing.T) {
 
 func TestBytesDecimalSerNilPointer(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	var r *big.Rat
-	_, err = s.AppendEncode(nil, &r)
+	_, err := s.AppendEncode(nil, &r)
 	if err == nil {
 		t.Fatal("expected error for nil *big.Rat pointer")
 	}
@@ -7720,12 +7498,9 @@ func TestBytesDecimalSerNilPointer(t *testing.T) {
 
 func TestFixedDecimalSerNilPointer(t *testing.T) {
 	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	var r *big.Rat
-	_, err = s.AppendEncode(nil, &r)
+	_, err := s.AppendEncode(nil, &r)
 	if err == nil {
 		t.Fatal("expected error for nil *big.Rat pointer")
 	}
@@ -7923,11 +7698,8 @@ func TestSerUUIDArrayType(t *testing.T) {
 
 func TestSerUUIDTypeError(t *testing.T) {
 	schema := `{"type":"string","logicalType":"uuid"}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = s.Encode(42)
+	s := mustParse(t, schema)
+	_, err := s.Encode(42)
 	if err == nil {
 		t.Fatal("expected error encoding int as UUID")
 	}
@@ -8666,12 +8438,9 @@ func TestDecodeNonEmptyInterfaceTarget(t *testing.T) {
 					t.Fatalf("panic: %v", r)
 				}
 			}()
-			s, err := Parse(tc.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := mustParse(t, tc.schema)
 			var v interface{ Foo() }
-			_, err = s.Decode(tc.bin, &v)
+			_, err := s.Decode(tc.bin, &v)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -8682,12 +8451,9 @@ func TestDecodeNonEmptyInterfaceTarget(t *testing.T) {
 					t.Fatalf("panic: %v", r)
 				}
 			}()
-			s, err := Parse(tc.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := mustParse(t, tc.schema)
 			var v interface{ Foo() }
-			err = s.DecodeJSON([]byte(tc.json), &v)
+			err := s.DecodeJSON([]byte(tc.json), &v)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -13214,41 +12980,23 @@ func TestResolveEnumIdentity(t *testing.T) {
 
 func TestResolveEnumDeserTyped(t *testing.T) {
 	// Non-identity enum to exercise the closure branches.
-	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := Parse(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	writer := mustParse(t, `{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	reader := mustParse(t, `{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
+	resolved := mustResolve(t, writer, reader)
 
 	// Encode "A" (index 0 in writer).
-	encoded, err := writer.Encode("A")
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoded := mustEncode(t, writer, "A")
 
 	// Decode into string (SetString path).
 	var s string
-	_, err = resolved.Decode(encoded, &s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, resolved, encoded, &s)
 	if s != "A" {
 		t.Fatalf("expected A, got %s", s)
 	}
 
 	// Decode into int (CanInt path).
 	var i int
-	_, err = resolved.Decode(encoded, &i)
-	if err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, resolved, encoded, &i)
 	// "A" maps to reader index 1 (B=0, A=1, C=2).
 	if i != 1 {
 		t.Fatalf("expected reader index 1, got %d", i)
@@ -13256,39 +13004,27 @@ func TestResolveEnumDeserTyped(t *testing.T) {
 
 	// Decode into uint (CanUint path).
 	var u uint
-	_, err = resolved.Decode(encoded, &u)
-	if err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, resolved, encoded, &u)
 	if u != 1 {
 		t.Fatalf("expected reader index 1, got %d", u)
 	}
 
 	// Decode into incompatible type (SemanticError path).
 	var f float64
-	_, err = resolved.Decode(encoded, &f)
+	_, err := resolved.Decode(encoded, &f)
 	if err == nil {
 		t.Fatal("expected error for float64 target")
 	}
 }
 
 func TestResolveEnumDeserErrors(t *testing.T) {
-	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := Parse(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	writer := mustParse(t, `{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	reader := mustParse(t, `{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
+	resolved := mustResolve(t, writer, reader)
 
 	// readVarint error: empty input.
 	var s string
-	_, err = resolved.Decode(nil, &s)
+	_, err := resolved.Decode(nil, &s)
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -13329,27 +13065,15 @@ func TestResolveMapIdentity(t *testing.T) {
 
 func TestResolveBuildDeserSemanticError(t *testing.T) {
 	// buildDeser with unsupported target type (e.g. slice).
-	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	writer := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	reader := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	resolved := mustResolve(t, writer, reader)
 
-	encoded, err := writer.Encode(map[string]any{"a": 42})
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoded := mustEncode(t, writer, map[string]any{"a": 42})
 
 	// Decode into a slice (unsupported target for record).
 	var result []int
-	_, err = resolved.Decode(encoded, &result)
+	_, err := resolved.Decode(encoded, &result)
 	if err == nil {
 		t.Fatal("expected error for slice target")
 	}
@@ -13476,11 +13200,8 @@ func TestEncodeDefaultErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, err = encodeDefault(nil, tt.val, s.node)
+			s := mustParse(t, tt.schema)
+			_, err := encodeDefault(nil, tt.val, s.node)
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -13537,25 +13258,16 @@ func TestPromoteBytesToStringNegativeLength(t *testing.T) {
 func TestResolveDeserTruncatedData(t *testing.T) {
 	// Set up a resolved schema where writer has fields A (kept) and B (skipped),
 	// reader has fields A (promoted) and C (default).
-	writer, err := Parse(recABSchema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := Parse(`{"type":"record","name":"R","fields":[
+	writer := mustParse(t, recABSchema)
+	reader := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"a","type":"long"},
 		{"name":"c","type":"int","default":0}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolved := mustResolve(t, writer, reader)
 
 	// Test with truncated data (read error on first wire field).
 	var result any
-	_, err = resolved.Decode(nil, &result)
+	_, err := resolved.Decode(nil, &result)
 	if err == nil {
 		t.Fatal("expected error for empty data")
 	}
@@ -13598,22 +13310,13 @@ func TestResolveDeserTruncatedData(t *testing.T) {
 func TestResolveDeserReadError(t *testing.T) {
 	// Writer and reader both have field A but promoted (int→long).
 	// Test with truncated data to trigger read error.
-	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	writer := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	reader := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	resolved := mustResolve(t, writer, reader)
 
 	// Empty data: read error.
 	var result any
-	_, err = resolved.Decode(nil, &result)
+	_, err := resolved.Decode(nil, &result)
 	if err == nil {
 		t.Fatal("expected read error for empty data into interface")
 	}
@@ -13639,30 +13342,18 @@ func TestResolveDeserDefaultError(t *testing.T) {
 	// whose deser will fail due to bad encoded data. This is hard to trigger
 	// normally, so we test the deserMap/deserStruct error paths for defaults
 	// by using valid data that exercises the default code path.
-	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := Parse(`{"type":"record","name":"R","fields":[
+	writer := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	reader := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"string","default":"hello"}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolved := mustResolve(t, writer, reader)
 
-	encoded, err := writer.Encode(map[string]any{"a": 1})
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoded := mustEncode(t, writer, map[string]any{"a": 1})
 
 	// Default into map[string]int32: type mismatch (string default into int32 value).
 	badMap := make(map[string]int32)
-	_, err = resolved.Decode(encoded, &badMap)
+	_, err := resolved.Decode(encoded, &badMap)
 	if err == nil {
 		t.Fatal("expected error for string default into int32 map")
 	}
@@ -14068,33 +13759,21 @@ func TestResolveUnionUnionBranchError(t *testing.T) {
 func TestResolveDeserStructMissingField(t *testing.T) {
 	// Struct is missing a field the reader schema expects → typeFieldMapping error.
 	// Schemas must differ so Resolve doesn't short-circuit.
-	writer, err := Parse(recABSchema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := Parse(`{"type":"record","name":"R","fields":[
+	writer := mustParse(t, recABSchema)
+	reader := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"a","type":"long"},
 		{"name":"b","type":"string"}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolved := mustResolve(t, writer, reader)
 
-	encoded, err := writer.Encode(map[string]any{"a": 1, "b": "x"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoded := mustEncode(t, writer, map[string]any{"a": 1, "b": "x"})
 
 	// Struct only has field A, missing field B.
 	type Partial struct {
 		A int64 `avro:"a"`
 	}
 	var result Partial
-	_, err = resolved.Decode(encoded, &result)
+	_, err := resolved.Decode(encoded, &result)
 	if err == nil {
 		t.Fatal("expected error for struct missing field b")
 	}
@@ -14103,24 +13782,18 @@ func TestResolveDeserStructMissingField(t *testing.T) {
 func TestResolveNamespacedAlias(t *testing.T) {
 	// Reader uses a namespaced name with aliases, writer uses one of the aliases.
 	// This exercises qualifyAliases with a dot in fullname and unqualified aliases.
-	reader, err := Parse(`{
+	reader := mustParse(t, `{
 		"type":"record",
 		"name":"com.example.NewName",
 		"aliases":["OldName"],
 		"fields":[{"name":"a","type":"int"}]
 	}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer, err := Parse(`{
+	writer := mustParse(t, `{
 		"type":"record",
 		"name":"com.example.OldName",
 		"fields":[{"name":"a","type":"int"}]
 	}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = CheckCompatibility(writer, reader)
+	err := CheckCompatibility(writer, reader)
 	if err != nil {
 		t.Fatalf("expected compatible via alias: %v", err)
 	}
@@ -14128,24 +13801,18 @@ func TestResolveNamespacedAlias(t *testing.T) {
 
 func TestResolveFullyQualifiedAlias(t *testing.T) {
 	// Alias already contains a dot (fully qualified).
-	reader, err := Parse(`{
+	reader := mustParse(t, `{
 		"type":"record",
 		"name":"com.example.NewName",
 		"aliases":["com.other.OldName"],
 		"fields":[{"name":"a","type":"int"}]
 	}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer, err := Parse(`{
+	writer := mustParse(t, `{
 		"type":"record",
 		"name":"com.other.OldName",
 		"fields":[{"name":"a","type":"int"}]
 	}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = CheckCompatibility(writer, reader)
+	err := CheckCompatibility(writer, reader)
 	if err != nil {
 		t.Fatalf("expected compatible via fully-qualified alias: %v", err)
 	}
@@ -16146,13 +15813,10 @@ func TestDeserFixedArrayNegativeBlock(t *testing.T) {
 }
 
 func TestDeserFixedArrayTruncated(t *testing.T) {
-	s, err := Parse(`{"type":"array","items":"int"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `{"type":"array","items":"int"}`)
 	// Truncated data — readVarlong fails.
 	var got [3]int32
-	_, err = s.Decode([]byte{}, &got)
+	_, err := s.Decode([]byte{}, &got)
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -16184,16 +15848,13 @@ func TestDeserFixedArrayNegBlockTruncatedSize(t *testing.T) {
 }
 
 func TestDeserFixedArrayItemError(t *testing.T) {
-	s, err := Parse(`{"type":"array","items":"string"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `{"type":"array","items":"string"}`)
 	// Craft a block with count=1 but truncated string data.
 	var data []byte
 	data = appendVarlong(data, 1)       // 1 element
 	data = appendVarlong(data, 1000000) // string length: huge, will fail
 	var got [1]string
-	_, err = s.Decode(data, &got)
+	_, err := s.Decode(data, &got)
 	if err == nil {
 		t.Fatal("expected error for truncated string in fixed array")
 	}
@@ -17146,11 +16807,8 @@ func TestCustomTypeFixedLogicalType(t *testing.T) {
 
 func TestCustomTypeJsonNumberInt64Validation(t *testing.T) {
 	// Exercises jsonNumberToInt64 non-whole-number error.
-	s, err := Parse(`{"type":"array","items":"long"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = s.Encode([]any{json.Number("1.5")})
+	s := mustParse(t, `{"type":"array","items":"long"}`)
+	_, err := s.Encode([]any{json.Number("1.5")})
 	if err == nil {
 		t.Fatal("expected error for non-whole json.Number in long array")
 	}

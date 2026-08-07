@@ -13001,11 +13001,8 @@ func magFramed(entryPoint string, body []byte) []byte {
 // it names the exact arithmetic, and a matrix cell that stops driving this
 // shape would otherwise take the pin with it.
 func TestRegression_MapBlockBoundSurvivesWrappedMinimum(t *testing.T) {
-	s, err := avro.Parse(`{"type":"map","values":` + sumWrapsToZero + `}`)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	err = magDecode(func() error {
+	s := mustParse(t, `{"type":"map","values":`+sumWrapsToZero+`}`)
+	err := magDecode(func() error {
 		var v any
 		_, err := s.Decode(nonEmptyBlock, &v)
 		return err

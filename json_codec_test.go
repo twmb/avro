@@ -1554,12 +1554,9 @@ func TestEncodeJSONBareUnionRecord(t *testing.T) {
 
 func TestEncodeJSONRecordMissingRequiredField(t *testing.T) {
 	schema := recABSchema
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, schema)
 	// Missing required field "b".
-	_, err = s.EncodeJSON(map[string]any{"a": int32(1)})
+	_, err := s.EncodeJSON(map[string]any{"a": int32(1)})
 	if err == nil {
 		t.Fatal("expected error for missing required field")
 	}

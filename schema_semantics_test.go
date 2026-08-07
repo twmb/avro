@@ -7250,11 +7250,8 @@ func TestRegression_LaxNamesValidatorSeesNamespaceComponents(t *testing.T) {
 func TestRegression_SemanticErrorFieldRenderBounded(t *testing.T) {
 	bigName := "F" + strings.Repeat("A", 1<<20)
 	schema := `{"type":"record","name":"R","fields":[{"name":"` + bigName + `","type":"int"}]}`
-	s, err := avro.Parse(schema)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	_, err = s.Encode(map[string]any{bigName: "not-an-int"})
+	s := mustParse(t, schema)
+	_, err := s.Encode(map[string]any{bigName: "not-an-int"})
 	if err == nil {
 		t.Fatal("expected a type-mismatch error")
 	}
@@ -12691,11 +12688,8 @@ func TestMatrix_FieldNameErrorEchoBounded(t *testing.T) {
 	// asymmetry with this path, not field names being inherently echo-safe.
 	t.Run("control: binary type mismatch already bounded", func(t *testing.T) {
 		huge := strings.Repeat("A", hostileLen)
-		s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"` + huge + `","type":"int"}]}`)
-		if err != nil {
-			t.Fatalf("parse: %v", err)
-		}
-		_, err = s.Encode(map[string]any{huge: "not-an-int"})
+		s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"`+huge+`","type":"int"}]}`)
+		_, err := s.Encode(map[string]any{huge: "not-an-int"})
 		assertBounded(t, err)
 	})
 }

@@ -241,17 +241,11 @@ func TestBadMagic(t *testing.T) {
 }
 
 func TestUnknownCodec(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	codec := xorCodec{0x42}
 
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s, WithCodec(codec))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s, WithCodec(codec))
 	v := int32(1)
 	if err := w.Encode(&v); err != nil {
 		t.Fatal(err)
@@ -259,23 +253,17 @@ func TestUnknownCodec(t *testing.T) {
 	mustClose(t, w)
 
 	// Read without registering the codec.
-	_, err = NewReader(bytes.NewReader(buf.Bytes()))
+	_, err := NewReader(bytes.NewReader(buf.Bytes()))
 	if err == nil {
 		t.Fatal("expected error for unknown codec")
 	}
 }
 
 func TestBadSync(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s, WithBlockCount(1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s, WithBlockCount(1))
 	v := int32(42)
 	if err := w.Encode(&v); err != nil {
 		t.Fatal(err)
@@ -307,16 +295,13 @@ func TestBadSync(t *testing.T) {
 	}
 	data[len(data)-1] ^= 0xFF // flip bits in last sync byte
 
-	r, err := NewReader(bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, bytes.NewReader(data))
 	// First block should decode fine.
 	if err := r.Decode(&v); err != nil {
 		t.Fatal(err)
 	}
 	// Second block should fail with sync mismatch.
-	err = r.Decode(&v)
+	err := r.Decode(&v)
 	if err == nil {
 		t.Fatal("expected sync mismatch error")
 	}
@@ -388,20 +373,14 @@ func TestCloseFlushError(t *testing.T) {
 }
 
 func TestStickyWriteError(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	// Use a writer that accepts the header but fails on block writes.
 	ew := &errAfterN{max: 4096}
-	w, err := NewWriter(ew, s, WithBlockCount(1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, ew, s, WithBlockCount(1))
 	// Now make subsequent writes fail.
 	ew.max = 0
 	v := int32(1)
-	err = w.Encode(&v)
+	err := w.Encode(&v)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -477,18 +456,12 @@ func TestDeflateRoundTripLarge(t *testing.T) {
 }
 
 func TestEncodeError(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s, WithBlockCount(100))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s, WithBlockCount(100))
 	// Encode a string into an int schema — should fail.
 	v := "not an int"
-	err = w.Encode(&v)
+	err := w.Encode(&v)
 	if err == nil {
 		t.Fatal("expected error encoding bad type")
 	}
@@ -513,17 +486,11 @@ func (failCompressCodec) Compress([]byte) ([]byte, error) {
 func (failCompressCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
 
 func TestCompressError(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s, WithCodec(failCompressCodec{}), WithBlockCount(1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s, WithCodec(failCompressCodec{}), WithBlockCount(1))
 	v := int32(1)
-	err = w.Encode(&v)
+	err := w.Encode(&v)
 	if err == nil {
 		t.Fatal("expected compress error")
 	}
@@ -560,51 +527,33 @@ func TestMissingSchemaInFile(t *testing.T) {
 }
 
 func TestTruncatedBlockCount(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
 	// Append a partial varlong (continuation byte with no termination)
 	// after the valid empty file to trigger a non-EOF readBlock error.
 	data := buf.Bytes()
 	data = append(data, 0x80) // continuation byte, then EOF
-	r, err := NewReader(bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, bytes.NewReader(data))
 	var v int32
-	err = r.Decode(&v)
+	err := r.Decode(&v)
 	if err == nil || err == io.EOF {
 		t.Fatalf("expected non-EOF read error, got %v", err)
 	}
 }
 
 func TestTruncatedBlockSize(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
 	// Write a valid block count (1) but truncate before the size.
 	data := buf.Bytes()
 	data = binary.AppendVarint(data, 1) // count = 1, then EOF before size
-	r, err := NewReader(bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, bytes.NewReader(data))
 	var v int32
-	err = r.Decode(&v)
+	err := r.Decode(&v)
 	if err == nil {
 		t.Fatal("expected error for truncated block size")
 	}
@@ -617,26 +566,17 @@ func TestTruncatedBlockSize(t *testing.T) {
 }
 
 func TestTruncatedBlockData(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
 	data := buf.Bytes()
 	data = binary.AppendVarint(data, 1)   // count
 	data = binary.AppendVarint(data, 100) // size = 100 bytes, but EOF
 	data = append(data, 0x01)             // only 1 byte of data
-	r, err := NewReader(bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, bytes.NewReader(data))
 	var v int32
-	err = r.Decode(&v)
+	err := r.Decode(&v)
 	if err == nil {
 		t.Fatal("expected error for truncated block data")
 	}
@@ -646,27 +586,18 @@ func TestTruncatedBlockData(t *testing.T) {
 }
 
 func TestTruncatedBlockSyncMarker(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
 	data := buf.Bytes()
 	data = binary.AppendVarint(data, 1) // count
 	data = binary.AppendVarint(data, 1) // size = 1
 	data = append(data, 0x02)           // 1 byte of data
 	data = append(data, 0x00)           // only 1 byte of sync marker, need 16
-	r, err := NewReader(bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, bytes.NewReader(data))
 	var v int32
-	err = r.Decode(&v)
+	err := r.Decode(&v)
 	if err == nil {
 		t.Fatal("expected error for truncated sync marker")
 	}
@@ -676,25 +607,16 @@ func TestTruncatedBlockSyncMarker(t *testing.T) {
 }
 
 func TestNegativeBlockSize(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
 	data := buf.Bytes()
 	data = binary.AppendVarint(data, 1)  // count
 	data = binary.AppendVarint(data, -1) // negative size
-	r, err := NewReader(bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, bytes.NewReader(data))
 	var v int32
-	err = r.Decode(&v)
+	err := r.Decode(&v)
 	if err == nil {
 		t.Fatal("expected error for negative block size")
 	}
@@ -713,27 +635,18 @@ func (failDecompressCodec) Decompress([]byte) ([]byte, error) {
 }
 
 func TestDecompressError(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	codec := failDecompressCodec{}
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s, WithCodec(codec), WithBlockCount(1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s, WithCodec(codec), WithBlockCount(1))
 	v := int32(42)
 	if err := w.Encode(&v); err != nil {
 		t.Fatal(err)
 	}
 	mustClose(t, w)
 
-	r, err := NewReader(bytes.NewReader(buf.Bytes()), WithCodec(codec))
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = r.Decode(&v)
+	r := mustNewReader(t, bytes.NewReader(buf.Bytes()), WithCodec(codec))
+	err := r.Decode(&v)
 	if err == nil {
 		t.Fatal("expected decompress error")
 	}
@@ -744,27 +657,18 @@ func TestDecompressError(t *testing.T) {
 
 func TestDecodeError(t *testing.T) {
 	// Write a string value, then try to decode as int.
-	s, err := avro.Parse(`"string"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"string"`)
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s, WithBlockCount(1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s, WithBlockCount(1))
 	v := "hello"
 	if err := w.Encode(&v); err != nil {
 		t.Fatal(err)
 	}
 	mustClose(t, w)
 
-	r, err := NewReader(bytes.NewReader(buf.Bytes()))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, bytes.NewReader(buf.Bytes()))
 	var n int32
-	err = r.Decode(&n)
+	err := r.Decode(&n)
 	if err == nil {
 		t.Fatal("expected decode error")
 	}
@@ -772,15 +676,9 @@ func TestDecodeError(t *testing.T) {
 
 func TestTrailingBytesInBlock(t *testing.T) {
 	// Construct a block where item count is 1 but the data has extra bytes.
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
 
 	// Manually construct a block with count=1 but data for 2 ints.
@@ -799,12 +697,9 @@ func TestTrailingBytesInBlock(t *testing.T) {
 
 	data := append(hdr, block...)
 
-	r, err := NewReader(bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, bytes.NewReader(data))
 	var v int32
-	err = r.Decode(&v)
+	err := r.Decode(&v)
 	if err == nil {
 		t.Fatal("expected trailing bytes error")
 	}
@@ -928,11 +823,8 @@ func TestOptMarkerMethods(t *testing.T) {
 }
 
 func TestHeaderWriteError(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = NewWriter(&errAfterN{max: 0}, s)
+	s := mustParse(t, `"int"`)
+	_, err := NewWriter(&errAfterN{max: 0}, s)
 	if err == nil {
 		t.Fatal("expected error writing header")
 	}
@@ -1006,11 +898,8 @@ func TestRandReadError(t *testing.T) {
 	randRead = func(b []byte) (int, error) { return 0, errors.New("rand failed") }
 	defer func() { randRead = orig }()
 
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = NewWriter(&bytes.Buffer{}, s)
+	s := mustParse(t, `"int"`)
+	_, err := NewWriter(&bytes.Buffer{}, s)
 	if err == nil {
 		t.Fatal("expected error from failing rand")
 	}
@@ -1471,22 +1360,16 @@ func TestAppendWriterCustomCodec(t *testing.T) {
 }
 
 func TestAppendWriterSeekError(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 
 	// Write a valid OCF file first.
 	sb := &seekBuf{}
-	w, err := NewWriter(sb, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, sb, s)
 	mustClose(t, w)
 
 	// Wrap in a type that fails on Seek.
 	fsb := &failSeekRWS{data: sb.data}
-	_, err = NewAppendWriter(fsb)
+	_, err := NewAppendWriter(fsb)
 	if err == nil {
 		t.Fatal("expected error from seek failure")
 	}
@@ -1522,18 +1405,12 @@ func (f *failSeekRWS) Seek(int64, int) (int64, error) {
 }
 
 func TestAppendWriterUnknownCodec(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 
 	// Write with a custom codec.
 	codec := xorCodec{0x42}
 	sb := &seekBuf{}
-	w, err := NewWriter(sb, s, WithCodec(codec))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, sb, s, WithCodec(codec))
 	v := int32(1)
 	if err := w.Encode(&v); err != nil {
 		t.Fatal(err)
@@ -1542,7 +1419,7 @@ func TestAppendWriterUnknownCodec(t *testing.T) {
 
 	// Try to append without providing the codec.
 	sb.pos = 0
-	_, err = NewAppendWriter(sb)
+	_, err := NewAppendWriter(sb)
 	if err == nil {
 		t.Fatal("expected error for unknown codec")
 	}
@@ -1731,23 +1608,17 @@ func TestWrite(t *testing.T) {
 }
 
 func TestWriteAfterError(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 
 	ew := &errAfterN{max: 4096}
-	w, err := NewWriter(ew, s, WithBlockCount(1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, ew, s, WithBlockCount(1))
 	ew.max = 0
 	v := int32(1)
 	if err := w.Encode(&v); err == nil {
 		t.Fatal("expected error")
 	}
 	// Write should return the sticky error.
-	_, err = w.Write([]byte{0x02})
+	_, err := w.Write([]byte{0x02})
 	if err == nil {
 		t.Fatal("expected sticky error on Write")
 	}
@@ -1779,18 +1650,12 @@ func TestWriteAutoFlush(t *testing.T) {
 }
 
 func TestWriteFlushError(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	ew := &errAfterN{max: 4096}
-	w, err := NewWriter(ew, s, WithBlockCount(1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, ew, s, WithBlockCount(1))
 	ew.max = 0
 	// Write triggers auto-flush which fails.
-	_, err = w.Write([]byte{0x02})
+	_, err := w.Write([]byte{0x02})
 	if err == nil {
 		t.Fatal("expected error from flush during Write")
 	}
@@ -2276,12 +2141,9 @@ func TestReadBlockOversizedBlock(t *testing.T) {
 	data = binary.AppendVarint(data, 1)       // block count
 	data = binary.AppendVarint(data, 1<<26+1) // block size > 64 MiB
 
-	r, err := NewReader(bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, bytes.NewReader(data))
 	var v any
-	err = r.Decode(&v)
+	err := r.Decode(&v)
 	if err == nil || !strings.Contains(err.Error(), "exceeds safety limit") {
 		t.Fatalf("expected safety limit error, got %v", err)
 	}
@@ -2443,28 +2305,22 @@ func TestWithReaderSchemaIncompatible(t *testing.T) {
 	readerSchema := avro.MustParse(readerSchemaStr)
 
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, writerSchema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, writerSchema)
 	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
 		t.Fatal(err)
 	}
 	mustClose(t, w)
 
-	_, err = NewReader(&buf, WithReaderSchema(readerSchema))
+	_, err := NewReader(&buf, WithReaderSchema(readerSchema))
 	if err == nil {
 		t.Fatal("expected error for incompatible schemas")
 	}
 }
 
 func TestReservedMetadataKey(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	var buf bytes.Buffer
-	_, err = NewWriter(&buf, s, WithMetadata(map[string][]byte{
+	_, err := NewWriter(&buf, s, WithMetadata(map[string][]byte{
 		"avro.custom": []byte("value"),
 	}))
 	if err == nil {
@@ -2570,17 +2426,14 @@ func TestWithReaderSchemaFuncReturnsError(t *testing.T) {
 	writerSchema := avro.MustParse(recordSchema)
 
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, writerSchema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, writerSchema)
 	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
 		t.Fatal(err)
 	}
 	mustClose(t, w)
 
 	sentinel := errors.New("picky callback")
-	_, err = NewReader(&buf, WithReaderSchemaFunc(func(rd *Reader) (*avro.Schema, error) {
+	_, err := NewReader(&buf, WithReaderSchemaFunc(func(rd *Reader) (*avro.Schema, error) {
 		return nil, sentinel
 	}))
 	if err == nil {
@@ -2597,17 +2450,14 @@ func TestReaderSchemaOptionsAreExclusive(t *testing.T) {
 	writerSchema := avro.MustParse(recordSchema)
 
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, writerSchema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, writerSchema)
 	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
 		t.Fatal(err)
 	}
 	mustClose(t, w)
 
 	s := avro.MustParse(recordSchema)
-	_, err = NewReader(&buf,
+	_, err := NewReader(&buf,
 		WithReaderSchema(s),
 		WithReaderSchemaFunc(func(*Reader) (*avro.Schema, error) { return s, nil }),
 	)
@@ -2617,27 +2467,18 @@ func TestReaderSchemaOptionsAreExclusive(t *testing.T) {
 }
 
 func TestNegativeBlockCountRead(t *testing.T) {
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, `"int"`)
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
 	// Append a block with negative count after the valid (empty) file.
 	data := buf.Bytes()
 	data = binary.AppendVarint(data, -1)     // negative count
 	data = binary.AppendVarint(data, 0)      // size
 	data = append(data, make([]byte, 16)...) // sync marker
-	r, err := NewReader(bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, bytes.NewReader(data))
 	var v int32
-	err = r.Decode(&v)
+	err := r.Decode(&v)
 	if err == nil {
 		t.Fatal("expected error for negative block count")
 	}
@@ -2828,14 +2669,8 @@ func TestRegression_TrailingEmptyBlockIsCleanEOF(t *testing.T) {
 func TestRegression_BlockCountZeroValidatesSync(t *testing.T) {
 	sync := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	var buf bytes.Buffer
-	s, err := avro.Parse(recordSchema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w, err := NewWriter(&buf, s, WithSyncMarker(sync))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustParse(t, recordSchema)
+	w := mustNewWriter(t, &buf, s, WithSyncMarker(sync))
 	if err := w.Encode(&person{Name: "alice", Age: 30}); err != nil {
 		t.Fatal(err)
 	}
@@ -2845,15 +2680,12 @@ func TestRegression_BlockCountZeroValidatesSync(t *testing.T) {
 	zeroBlock = append(zeroBlock, bytes.Repeat([]byte{0xFF}, 16)...)
 	buf.Write(zeroBlock)
 
-	r, err := NewReader(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := mustNewReader(t, &buf)
 	var p person
 	if err := r.Decode(&p); err != nil {
 		t.Fatalf("decode first record: %v", err)
 	}
-	err = r.Decode(&p)
+	err := r.Decode(&p)
 	if err == nil || err == io.EOF {
 		t.Fatalf("expected sync-mismatch error on count=0 block with corrupt sync, got %v", err)
 	}
@@ -2984,17 +2816,14 @@ func TestRegression_OCFWriterCloseClosesCodecWhenPoisoned(t *testing.T) {
 // returned nil + err without closing the already-resolved codec.
 func TestRegression_OCFNewReaderClosesCodecOnReaderSchemaFnError(t *testing.T) {
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, avro.MustParse(`"long"`))
-	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
-	}
+	w := mustNewWriter(t, &buf, avro.MustParse(`"long"`))
 	if err := w.Encode(int64(1)); err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
 	mustClose(t, w)
 
 	codec := &leakDetectCodec{name: "null"}
-	_, err = NewReader(
+	_, err := NewReader(
 		bytes.NewReader(buf.Bytes()),
 		WithCodec(codec),
 		WithReaderSchemaFunc(func(*Reader) (*avro.Schema, error) {
@@ -3013,10 +2842,7 @@ func TestRegression_OCFNewReaderClosesCodecOnReaderSchemaFnError(t *testing.T) {
 // same invariant for the avro.Resolve error path.
 func TestRegression_OCFNewReaderClosesCodecOnResolveError(t *testing.T) {
 	var buf bytes.Buffer
-	w, err := NewWriter(&buf, avro.MustParse(`"long"`))
-	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
-	}
+	w := mustNewWriter(t, &buf, avro.MustParse(`"long"`))
 	if err := w.Encode(int64(1)); err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
@@ -3025,7 +2851,7 @@ func TestRegression_OCFNewReaderClosesCodecOnResolveError(t *testing.T) {
 	// Reader schema is incompatible with the writer (long → string),
 	// forcing avro.Resolve to error.
 	codec := &leakDetectCodec{name: "null"}
-	_, err = NewReader(
+	_, err := NewReader(
 		bytes.NewReader(buf.Bytes()),
 		WithCodec(codec),
 		WithReaderSchema(avro.MustParse(`"string"`)),
@@ -3090,15 +2916,12 @@ func TestRegression_OCFBlockEnvelopeInvariant(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			bs := makeOCFWithBadBlock(t, c.suffix)
-			r, err := NewReader(bytes.NewReader(bs))
-			if err != nil {
-				t.Fatal(err)
-			}
+			r := mustNewReader(t, bytes.NewReader(bs))
 			var v int64
 			if err := r.Decode(&v); err != nil { // first valid record
 				t.Fatalf("decode first: %v", err)
 			}
-			err = r.Decode(&v) // bad block
+			err := r.Decode(&v) // bad block
 			if err == nil || err == io.EOF {
 				t.Fatalf("expected loud error containing %q, got %v", c.want, err)
 			}
@@ -3161,14 +2984,11 @@ func TestRegression_OCFBlockCountCap(t *testing.T) {
 		mb = append(mb, zigzag(0)...)             // size = 0 (empty block payload)
 		mb = append(mb, sync...)
 
-		rd, err := NewReader(bytes.NewReader(mb))
-		if err != nil {
-			t.Fatal(err)
-		}
+		rd := mustNewReader(t, bytes.NewReader(mb))
 		defer rd.Close()
 
 		var v map[string]any
-		err = rd.Decode(&v)
+		err := rd.Decode(&v)
 		if err == nil || err == io.EOF {
 			t.Fatalf("expected error rejecting huge block count, got %v", err)
 		}
@@ -3224,14 +3044,11 @@ func TestRegression_OCFBlockCountCap(t *testing.T) {
 		mb = append(mb, zigzag(0)...)
 		mb = append(mb, sync...)
 
-		rd, err := NewReader(bytes.NewReader(mb))
-		if err != nil {
-			t.Fatal(err)
-		}
+		rd := mustNewReader(t, bytes.NewReader(mb))
 		defer rd.Close()
 
 		var v int64
-		err = rd.Decode(&v)
+		err := rd.Decode(&v)
 		if err == nil || err == io.EOF {
 			t.Fatalf("expected error rejecting huge count for empty block, got %v", err)
 		}
@@ -7439,10 +7256,7 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 		for _, c := range cells {
 			t.Run(c.name, func(t *testing.T) {
 				var buf bytes.Buffer
-				w, err := NewWriter(&buf, s, WithSyncMarker(foreignSync))
-				if err != nil {
-					t.Fatal(err)
-				}
+				w := mustNewWriter(t, &buf, s, WithSyncMarker(foreignSync))
 				if err := w.Encode("d0"); err != nil {
 					t.Fatal(err)
 				}
@@ -7453,16 +7267,13 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 				}
 				mustClose(t, w)
 
-				r, err := NewReader(bytes.NewReader(buf.Bytes()))
-				if err != nil {
-					t.Fatal(err)
-				}
+				r := mustNewReader(t, bytes.NewReader(buf.Bytes()))
 				defer r.Close()
 				var v string
 				if err := r.Decode(&v); err != nil || v != "d0" {
 					t.Fatalf("first datum: %v %q", err, v)
 				}
-				err = r.Decode(&v)
+				err := r.Decode(&v)
 				if c.wantErr == "" {
 					if err != nil || v != "d1" {
 						t.Fatalf("skip cell: second datum %v %q", err, v)
@@ -7490,10 +7301,7 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 	t.Run("corrupt-sync-on-empty", func(t *testing.T) {
 		s := avro.MustParse(`"string"`)
 		var buf bytes.Buffer
-		w, err := NewWriter(&buf, s, WithSyncMarker(foreignSync))
-		if err != nil {
-			t.Fatal(err)
-		}
+		w := mustNewWriter(t, &buf, s, WithSyncMarker(foreignSync))
 		if err := w.Encode("d0"); err != nil {
 			t.Fatal(err)
 		}
@@ -7501,24 +7309,18 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 		bad := foreignSync
 		bad[0] ^= 0xFF
 		appendRawBlock(&buf, 0, nil, bad)
-		datum, err := s.AppendEncode(nil, "d1")
-		if err != nil {
-			t.Fatal(err)
-		}
+		datum := mustAppendEncode(t, s, nil, "d1")
 		var rest bytes.Buffer
 		appendRawBlock(&rest, 1, datum, foreignSync)
 		buf.Write(rest.Bytes())
 
-		r, err := NewReader(bytes.NewReader(buf.Bytes()))
-		if err != nil {
-			t.Fatal(err)
-		}
+		r := mustNewReader(t, bytes.NewReader(buf.Bytes()))
 		defer r.Close()
 		var v string
 		if err := r.Decode(&v); err != nil || v != "d0" {
 			t.Fatalf("first datum: %v %q", err, v)
 		}
-		err = r.Decode(&v)
+		err := r.Decode(&v)
 		if err == nil || !strings.Contains(err.Error(), "sync marker mismatch") {
 			t.Fatalf("want sync marker mismatch on corrupt-sync empty block, got %v", err)
 		}
@@ -9370,16 +9172,13 @@ func TestRegression_TruncatedBlockHeaderNotEOF(t *testing.T) {
 	}
 	for _, c := range cuts {
 		t.Run(c.name, func(t *testing.T) {
-			r, err := NewReader(bytes.NewReader(c.bytes()))
-			if err != nil {
-				t.Fatal(err)
-			}
+			r := mustNewReader(t, bytes.NewReader(c.bytes()))
 			defer r.Close()
 			var v int32
 			if err := r.Decode(&v); err != nil || v != 7 {
 				t.Fatalf("first record: v=%d err=%v", v, err)
 			}
-			err = r.Decode(&v)
+			err := r.Decode(&v)
 			if err == nil {
 				t.Fatal("expected error for truncated second block")
 			}
@@ -9431,16 +9230,13 @@ func TestRegression_TruncatedLargeBlockDataNotEOF(t *testing.T) {
 			data := binary.AppendVarint(append([]byte{}, full...), 1) // count
 			data = binary.AppendVarint(data, (64<<20)+1)              // size past the eager window
 			data = append(data, c.partial...)
-			r, err := NewReader(bytes.NewReader(data), WithMaxBlockBytes(128<<20))
-			if err != nil {
-				t.Fatal(err)
-			}
+			r := mustNewReader(t, bytes.NewReader(data), WithMaxBlockBytes(128<<20))
 			defer r.Close()
 			var v int32
 			if err := r.Decode(&v); err != nil || v != 7 {
 				t.Fatalf("first record: v=%d err=%v", v, err)
 			}
-			err = r.Decode(&v)
+			err := r.Decode(&v)
 			if err == nil {
 				t.Fatal("expected error for truncated block data")
 			}
