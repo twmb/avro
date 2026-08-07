@@ -843,14 +843,11 @@ func checkDecimalUnscaledSize(n int) error {
 // first-byte check below rejects a leading-space input on its way to
 // rejecting every other non-numeric start.
 //
-// boundedRatFromString uses this gate because big.Rat.SetString's
-// accepted-input set is strictly broader than JSON: it accepts
-// hex ("0x10"), binary ("0b10"), octal ("0o10"), underscore-separated
-// ("1_000"), rational ("5/1"), and hex-float-with-binary-exponent
-// ("0x1p4") forms. None of these are valid JSON numbers, and all of
-// them silently produced an integer value when they leaked into the
-// integer / decimal / big-decimal encode paths via parseInt64Lenient,
-// jsonNumberToInt64, jsonCoerceToInt32/64, and tryCoerceToRat.
+// boundedRatFromString needs this gate because big.Rat.SetString accepts
+// strictly more than JSON does — hex, binary, octal, underscore-separated,
+// rational "5/1", and hex-float forms. None is a valid JSON number, and every
+// one of them silently yielded an integer when it leaked into the
+// integer/decimal/big-decimal encode paths.
 func isJSONNumber(s string) bool {
 	if len(s) == 0 {
 		return false
@@ -867,24 +864,18 @@ func isJSONNumber(s string) bool {
 	return json.Valid(unsafe.Slice(unsafe.StringData(s), len(s)))
 }
 
-// boundedRatFromString parses s into a *big.Rat, validating that s is
-// a JSON-spec number (via isJSONNumber) before reaching big.Rat.SetString
-// and rejecting decimal-form inputs whose net 10^exponent magnitude
-// exceeds decimalScaleLimit. SetString materializes 10^|net-exp| eagerly
-// during parsing — a 9-byte "1e1000000" allocates ~3 MB without the
-// magnitude guard, and 1 MiB of digits costs ~2 sec without the length
-// cap. Mirrors the wire-side bound in parseBigDecimalPayload so every
-// external decimal path (JSON decode bytes/fixed decimal, encode of
-// json.Number and string-typed values) shares the same caps.
+// boundedRatFromString parses s into a *big.Rat, gating on isJSONNumber before
+// big.Rat.SetString and rejecting decimal forms whose net 10^exponent exceeds
+// decimalScaleLimit. SetString materializes 10^|net-exp| eagerly, so a 9-byte
+// "1e1000000" allocates ~3 MB without the magnitude guard and 1 MiB of digits
+// costs ~2 sec without the length cap. Mirrors parseBigDecimalPayload's
+// wire-side bound, so every external decimal path shares the caps.
 //
-// Three-valued return: (rat, true, nil) on success; (nil, false, nil)
-// when s is not a number form at all (e.g. "abc", empty, or any input
-// that doesn't start with '-' or a digit — caller may fall back to raw
-// bytes for legitimate non-numeric inputs); (nil, false, err) when s
-// IS number-shaped (leading '-' or digit) but rejected — JSON-invalid
-// grammar, length cap, or magnitude cap. Callers must propagate err
-// so hostile numeric-looking input cannot silently re-encode as raw
-// bytes via the fall-through path.
+// Three-valued: (rat, true, nil) on success; (nil, false, nil) when s is no
+// number form at all, so the caller may fall back to raw bytes; (nil, false,
+// err) when s IS number-shaped — leading '-' or digit — but rejected for
+// grammar, length or magnitude. Callers MUST propagate that err, or hostile
+// numeric-looking input silently re-encodes as raw bytes via the fall-through.
 func boundedRatFromString(s string) (*big.Rat, bool, error) {
 	if len(s) > maxRatInputLen {
 		return nil, false, fmt.Errorf("decimal value exceeds %d byte length cap", maxRatInputLen)
@@ -959,43 +950,35 @@ const magnitudeWidestMultiplier = 8
 //
 // A `fixed` size is the only parse-time quantity whose VALUE is not bounded by
 // the length of the text declaring it — nineteen characters name 2^63, and the
-// parser deliberately leaves the upper bound open to match the lenient
-// majority. Precision and scale are capped at decimalScaleLimit during
-// validation; field, branch and symbol counts each cost bytes to write. So an
-// unsaturated magnitude is the one way arithmetic here can leave the int
-// range, and it does not take a product to do it: a running SUM over a
-// record's fields wraps just as readily, and a guard testing only the positive
-// side of the range (`s >= someCeiling`) never sees the wrapped value, because
-// a negative number is not greater than a positive one.
+// parser leaves the upper bound open to match the lenient majority. Precision
+// and scale are capped at decimalScaleLimit; field, branch and symbol counts
+// each cost bytes to write. So an unsaturated magnitude is the one way
+// arithmetic here leaves the int range, and it takes no product to do it: a
+// running SUM over a record's fields wraps just as readily, and a guard testing
+// only the positive side (`s >= ceiling`) never sees the wrapped value.
 //
 // 1<<27 is the largest power of two that survives magnitudeWidestMultiplier
-// inside a 32-bit int (1<<27 * 8 == 1<<30, with the sign bit to spare). It is
-// also 128 MiB — orders of magnitude above any fixed anyone declares — so no
-// real schema is clipped.
+// inside a 32-bit int (1<<27 * 8 == 1<<30, sign bit to spare). It is also 128
+// MiB, far above any fixed anyone declares, so no real schema is clipped.
 //
-// What clipping an absurd one costs, stated exactly rather than waved at: a
-// buffer-relative block bound derived from a clipped magnitude is looser than
-// one derived from the true magnitude, so for a buffer at least this large a
-// block count can pass the bound and then fail at the element decode instead
-// of at the bound. Both reject; only the error moves. For any buffer below the
-// ceiling — which is every buffer the bound was written for — the verdict is
-// identical, and TestInvariant_ClippedMagnitudeStillRejects pins that.
+// Clipping an absurd one costs exactly this: a buffer-relative block bound from
+// a clipped magnitude is LOOSER, so for a buffer at least this large a count
+// can pass the bound and fail at the element decode instead. Both reject; only
+// the error moves. Below the ceiling — every buffer the bound was written for —
+// the verdict is identical, pinned by TestInvariant_ClippedMagnitudeStillRejects.
 const maxSchemaMagnitude = 1 << 27
 
 // saturateSchemaMagnitude clamps a schema-declared magnitude into
-// [0, maxSchemaMagnitude] so arithmetic on the result cannot wrap. It is TOTAL
-// on purpose: callers must not have to know whether their input was validated
-// upstream, since the whole failure mode is a site assuming someone else
-// bounded the value.
+// [0, maxSchemaMagnitude] so arithmetic on the result cannot wrap. TOTAL on
+// purpose: the failure mode is a site assuming someone else bounded the value,
+// so callers must not need to know whether theirs was validated upstream.
 //
-// This bounds ARITHMETIC RANGE, not allocation size. A magnitude that becomes
-// a make() length needs its own, far tighter bound — maxSchemaMagnitude is
-// 128 MiB, which is a fine addend and a terrible allocation — and that bound
-// belongs at the allocating site, where the reason for its size lives
-// (jsonDecodeAppliesLogical's probe buffer is the instance: it caps at the
-// largest length any fixed logical inspects, because it only has to tell 12
-// and 16 apart from everything else). The two are different questions; this
-// one is only the first.
+// This bounds ARITHMETIC RANGE, not allocation size. 128 MiB is a fine addend
+// and a terrible allocation, so a magnitude that becomes a make() length needs
+// its own far tighter bound, at the allocating site where the reason for its
+// size lives — jsonDecodeAppliesLogical's probe buffer caps at the largest
+// length any fixed logical inspects, because it only has to tell 12 and 16
+// apart from everything else.
 func saturateSchemaMagnitude(n int) int {
 	if n < 0 {
 		return 0
@@ -1058,37 +1041,32 @@ func (w *minBytesWalk) minBytesOf(n *schemaNode) int {
 }
 
 // maxMinBytesWork bounds the WORK one walk may perform, counted in children
-// examined. Because one walk is shared across every container of an operation
-// (see newMinBytesWalk), this bounds the OPERATION's total, not each container's
-// — the count of containers is caller-chosen, so a per-container allowance
-// would cap the wrong factor of the product. The memo makes an acyclic graph
-// linear no matter how many paths reach a node, but a CYCLIC one cannot be
-// memoized at all (see minBytesWalk), and a chain whose levels are mutually
-// recursive still fans out per reference. This is the backstop for that residue.
+// examined. One walk is shared across every container of an operation, so this
+// bounds the OPERATION's total rather than each container's: the container
+// count is caller-chosen, and a per-container allowance would cap the wrong
+// factor of the product. The memo makes an acyclic graph linear however many
+// paths reach a node, but a CYCLIC one cannot be memoized at all and mutually
+// recursive levels still fan out per reference. This is the backstop for that.
 //
-// It is charged per CHILD, not per node entered, and that is the whole point of
-// the constant rather than an implementation detail. Entering a record iterates
-// its own fields, so an allowance spent one unit per entry bounds how many
-// nodes are entered while the cost of each is a SECOND magnitude the schema
-// author picks — and a bound on one factor of a product is not a bound. Charged
-// per child, the unit of the allowance is the unit of the work and the product
-// cannot reappear. walkBudget.takeNodes (schema_node.go) charges the same way
-// for the same reason.
+// It is charged per CHILD, not per node entered, and that is the point of the
+// constant. Entering a record iterates its own fields, so an allowance spent
+// per entry bounds how many nodes are entered while each one's cost stays a
+// SECOND author-picked magnitude — and bounding one factor of a product is not
+// a bound. Per child, the unit of the allowance is the unit of the work.
+// walkBudget.takeNodes charges the same way for the same reason.
 //
-// Exhausting it is sound in the one direction that matters. Reaching the cap
-// requires a subtree of cyclic references, which means the node the caller
-// asked about is a record, union or container above them — every one of which
-// costs at least one wire byte, since the reference closing a cycle can be
-// neither `null` nor an all-null record. So the stand-in below is never
-// ABOVE the true minimum, and a bound derived from it is loose rather than
-// wrong.
+// Exhausting it is sound in the direction that matters: reaching the cap
+// requires cyclic references, so the node asked about is a record, union or
+// container above them, each costing at least one wire byte — the reference
+// closing a cycle can be neither `null` nor an all-null record. The stand-in is
+// therefore never ABOVE the true minimum, leaving derived bounds loose rather
+// than wrong.
 //
-// The value is far above the work any schema that is not built to hit it costs:
-// the memo makes an acyclic graph cost the sum of its nodes' child counts,
-// which is bounded by the schema TEXT (a field costs bytes to write), so a
-// schema would have to run to tens of megabytes before an honest parse traded
-// its exact bound for the loose one. That headroom is what
-// TestInvariant_MemoAgreesWithUnmemoizedWalk relies on.
+// The value sits far above what an honest schema costs: the memo makes an
+// acyclic graph cost the sum of its child counts, itself bounded by the schema
+// TEXT, so a schema would run to tens of megabytes before trading its exact
+// bound for the loose one. TestInvariant_MemoAgreesWithUnmemoizedWalk relies on
+// that headroom.
 const maxMinBytesWork = 1 << 22
 
 // minBytesUnknown is what the walk reports when it cannot compute a node's
@@ -1109,56 +1087,48 @@ const minBytesUnknown = -1
 // reused across every container the operation computes a bound for.
 //
 // A named type referenced twice binds BOTH references to one *schemaNode, so
-// the graph the walk descends is a DAG, not a tree, and a walk that
-// re-descends per reference does 2^depth work on a schema whose text grows
-// linearly. Nothing about that requires deep nesting — every level can be
-// declared as a sibling field wired by forward reference — so the memo is the
-// only thing that bounds it.
+// the walk descends a DAG, not a tree, and re-descending per reference is
+// 2^depth work on a schema whose text grows linearly. That needs no deep
+// nesting — every level can be a sibling field wired by forward reference — so
+// the memo is the only thing bounding it.
 //
-// The memo is not simply "have I seen this node", because that is also what
-// detects cycles, and the two want opposite lifetimes. Cycle detection needs a
-// mark removed on the way back OUT (a node is only a cycle if it is on the
-// CURRENT path); a memo needs one that survives. That is `path` and `done`.
+// The memo is not simply "have I seen this node", because that is also cycle
+// detection and the two want opposite lifetimes: a cycle mark must be removed
+// on the way back OUT, since a node is a cycle only while on the CURRENT path,
+// while a memo entry must survive. Hence `path` and `done`.
 //
-// WHICH results may be remembered is the whole subtlety, and the condition is
-// stricter than it first looks. A back-edge does not return the referenced
-// node's minimum — it cannot, that computation is still running — it returns a
-// conservative stand-in. So a result computed through one is a property of the
-// PATH, not of the node.
+// WHICH results may be remembered is the subtlety. A back-edge cannot return
+// the referenced node's minimum — that computation is still running — so it
+// returns a conservative stand-in, making any result computed through one a
+// property of the PATH rather than the node.
 //
-// It is not enough to ask whether a back-edge escaped ABOVE the node while it
-// was being computed. A result must also be safe to CONSUME later, and a
-// second entry has a different path: if any node currently being computed lies
-// inside n's subtree, recomputing n would hit it as a back-edge and get a
-// different answer. That is only possible when n's subtree contains a cycle —
-// an on-path node inside n's subtree that also reaches n is exactly a cycle
-// through n — so the exact condition is that n's subtree is entirely
-// cycle-free, and `minBytes` reports that alongside the value.
+// Asking only whether a back-edge escaped ABOVE the node is not enough: the
+// result must also be safe to CONSUME later, from a different path. If any
+// node currently being computed lies inside n's subtree, recomputing n would
+// hit it as a back-edge and get a different answer — and an on-path node
+// inside n's subtree that also reaches n is exactly a cycle through n. So the
+// exact condition is that n's subtree is entirely cycle-free, which minBytes
+// reports alongside the value.
 //
-// The weaker "no back-edge escaped above me" condition is wrong in a way no
-// cost test can see, because a wrong memo is faster rather than slower:
-// mutually recursive A and X, where A is computed from outside and then
-// consumed from inside X, produce a total that differs from the walk with no
-// memo at all. TestInvariant_MemoAgreesWithUnmemoizedWalk is what settles it.
+// The weaker condition is wrong in a way no cost test can see, because a wrong
+// memo is FASTER, not slower: mutually recursive A and X, with A computed from
+// outside and then consumed from inside X, total differently than an
+// unmemoized walk. TestInvariant_MemoAgreesWithUnmemoizedWalk settles it.
 type minBytesWalk struct {
-	// mu guards the three fields below. One walk is shared across a whole
-	// operation, and the SKIP path's share of that operation runs at DECODE
-	// time — a record's field set is compiled inside its sync.Once, which fires
-	// on whichever goroutine first reaches that record on the wire. Two
-	// different records of one resolved schema can therefore compile
-	// concurrently on one walk.
+	// mu guards the three fields below. The SKIP path's share of an operation
+	// runs at DECODE time — a record's field set compiles inside its sync.Once,
+	// firing on whichever goroutine first reaches that record on the wire — so
+	// two records of one resolved schema can compile concurrently on one walk.
 	//
-	// It is uncontended in steady state: each record compiles exactly once, and
-	// every non-skip reaching path (build, finalize, resolve) is single-threaded
-	// by construction. Sharing the memo is the whole point — see newMinBytesWalk
-	// — so a per-record walk is not an alternative to the lock, it is a
-	// different (and unbounded) cost.
+	// It is uncontended in steady state: each record compiles once, and every
+	// non-skip path here is single-threaded by construction. A per-record walk
+	// is not an alternative to the lock; it is a different, unbounded cost.
 	//
-	// Drain ORDER is deliberately not made deterministic. It does not need to
-	// be: an exhausted allowance yields minBytesUnknown, whose bound admits the
-	// union of what every computable answer would admit (checkArrayBlockBounds),
-	// so which record drains the walk can only ever LOOSEN a later record's
-	// bound and can never reject a wire another order would have accepted.
+	// Drain ORDER is deliberately nondeterministic, and need not be otherwise:
+	// an exhausted allowance yields minBytesUnknown, whose bound admits the
+	// union of what every computable answer admits, so which record drains the
+	// walk can only LOOSEN a later bound, never reject a wire another order
+	// would have accepted.
 	mu        sync.Mutex
 	path      map[*schemaNode]bool // the nodes currently being computed
 	done      map[*schemaNode]int  // results for nodes whose subtree has no cycle
@@ -2162,14 +2132,11 @@ func setStringTarget(v reflect.Value, s, avroType string) error {
 // values); arbitrary string content silently violates the invariant.
 // No-op for any other key type.
 //
-// Called per-key during both decode and encode so the round-trip is
-// content-symmetric: every map[json.Number]V key that encodes also
-// decodes back into the same target. Avro field names (used when a
-// record is encoded from or decoded into map[K]V) follow the Avro
-// naming rule [A-Za-z_][A-Za-z0-9_]*, so for the record-as-map case
-// the first field name always fails validation — effectively the same
-// outcome as a blanket reject for that shape, but the error names the
-// specific key.
+// Called per-key on both decode and encode, so the round-trip is
+// content-symmetric: every map[json.Number]V key that encodes decodes back.
+// Avro field names follow [A-Za-z_][A-Za-z0-9_]*, so for the record-as-map
+// case the first one always fails — the same outcome as a blanket reject for
+// that shape, except the error names the offending key.
 func validateJSONNumberMapKey(key string, keyType reflect.Type, avroType string) error {
 	if keyType != jsonNumberType {
 		return nil
@@ -2203,13 +2170,12 @@ func formatToStringKindTarget(v reflect.Value, content, avroType string) (wrote 
 // promote*To{Float,Double}: every float-emitting deserializer accepts the
 // same integer and json.Number target shapes.
 //
-// Non-finite floats (±Inf, NaN) are rejected for integer AND json.Number
-// targets: neither type can faithfully hold the value (no integer representation;
-// json.Number's encoding/json contract requires a valid JSON number literal,
-// which RFC 8259 doesn't define for ±Inf/NaN). Float/Interface targets pass
-// non-finite values through unchanged. Users who need ±Inf/NaN round-trip
-// should decode into a typed float (float32/float64) and pick their own JSON
-// convention (twmb's quoted-string default, LinkedinFloats' 1e999, custom).
+// Non-finite floats are rejected for integer AND json.Number targets, neither
+// of which can hold them faithfully: there is no integer representation, and
+// json.Number's contract requires a valid JSON number literal, which RFC 8259
+// does not define for ±Inf/NaN. Float and interface targets pass them through.
+// Users needing ±Inf/NaN round-trip should decode into a typed float and pick
+// a JSON convention (the quoted-string default, LinkedinFloats' 1e999, custom).
 func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error {
 	if v.Kind() == reflect.Interface {
 		var rv reflect.Value
@@ -2636,14 +2602,12 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	if ok, err := setDecimalValue(v, b, s.scale); ok {
 		return src, err
 	}
-	// Opaque-bytes pass-through for a []byte target: mirrors
-	// serBytesDecimal's fall-through to serBytes for a []byte carrier (the
-	// opaque escape hatch) — see also deserFixedDecimal below. A string
-	// target never reaches here: setDecimalRat's string arm (above) always
-	// reads the wire as numeric decimal text, and the encoder rejects a
-	// non-numeric string for a decimal (rejectNonNumericStructuredString,
-	// ser.go), so string is numeric-text-only on BOTH sides while []byte is
-	// the sole opaque carrier, symmetric on both sides.
+	// Opaque-bytes pass-through for a []byte target, mirroring
+	// serBytesDecimal's fall-through to serBytes. A string target never gets
+	// here: setDecimalRat's string arm always reads the wire as numeric decimal
+	// text, and the encoder rejects a non-numeric string for a decimal. So
+	// string is numeric-text-only and []byte the sole opaque carrier,
+	// symmetric on both sides.
 	return src, setBytesValue(v, b, "decimal")
 }
 
@@ -2675,16 +2639,14 @@ func (s *deserBigDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte, 
 //   - (true, err): the result is final — either setDecimalRat failed
 //     OR the parse failed AND the target is structured-only (not
 //     []byte/string/[N]byte). Caller must surface err.
-//   - (false, nil): the caller should fall through to setBytesValue
-//     for opaque-bytes pass-through. Happens when parse succeeded but
-//     no structured target matched, OR when parse failed and the
-//     target is byte-like (user is intentionally bypassing the
-//     framing, so the parse error doesn't matter).
+//   - (false, nil): fall through to setBytesValue for opaque-bytes
+//     pass-through — either the parse succeeded and no structured target
+//     matched, or it failed against a byte-like target, where the user is
+//     intentionally bypassing the framing and the parse error is moot.
 //
-// Shared by binary deserBigDecimal, JSON assignBytes's big-decimal
-// arm, and promote.go's promoteStringToBytesBigDecimal so the three
-// sites agree on the structured-vs-opaque dispatch and the parse-fail
-// surface-vs-suppress rule.
+// Shared by binary deserBigDecimal, JSON assignBytes, and
+// promoteStringToBytesBigDecimal, so all three agree on the
+// structured-vs-opaque dispatch and the parse-fail surface-vs-suppress rule.
 func applyBigDecimalPayload(v reflect.Value, payload []byte) (done bool, err error) {
 	r, displayScale, perr := parseBigDecimalPayload(payload)
 	if perr == nil {
