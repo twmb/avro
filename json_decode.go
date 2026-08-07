@@ -79,20 +79,15 @@ func decodeLogicalBytes(b []byte, node *schemaNode) (any, error) {
 // Avro-native value into an enriched Go type for this node's logical type —
 // the JSON parallel of the binary logical deserializer.
 //
-// It DERIVES the answer from the very decodeLogical{Int,Long,Bytes,Fixed}
-// functions decodeKind uses, by probing each with a placeholder value and
-// checking whether the result is still the raw Avro-native type. There is no
-// second list to keep in sync: a logical added to / removed from a
-// decodeLogical* switch is reflected here automatically, so the JSON
-// suppression gate can never drift from what decode actually does — correct by
-// construction ("applies a transform" ≡ "the decode function returns a non-raw
-// type"), including for a future logical.
+// It DERIVES the answer by probing the decodeLogical{Int,Long,Bytes,Fixed}
+// functions decodeKind itself uses and checking whether the result is still the
+// raw Avro-native type. No second list to keep in sync: a logical added to or
+// removed from a decodeLogical* switch shows up here automatically, so the
+// suppression gate cannot drift from what decode does.
 //
-// This is consulted ONLY by applyCustomTypes at PARSE time (the
-// wildcard/Decode-suppression gate). The placeholder boxing it does is a
-// parse-time-only cost (a handful of allocs per custom-typed logical node, one
-// time per schema) and never touches the encode/decode hot path — decodeKind
-// and the decodeLogical* functions are unchanged.
+// Consulted only by applyCustomTypes at PARSE time. The placeholder boxing
+// costs a handful of allocs per custom-typed logical node, once per schema, and
+// never touches the hot path.
 // TestMatrix_JSONDecodeAppliesLogicalMatchesDecode pins the result for
 // every logical against the human-known expected set.
 func jsonDecodeAppliesLogical(node *schemaNode) bool {
@@ -804,19 +799,17 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool) error {
 	if raw {
 		return setBytesValue(v, b, node.kind)
 	}
-	// Each logical arm fires only on the Avro kind that logical is spec-valid
-	// on, so the typed-target transform set matches what decodeLogicalBytes /
-	// decodeLogicalFixed (the *any path) and jsonDecodeAppliesLogical's probe
-	// report for the same (kind, logical). decimal is valid on bytes AND fixed;
-	// big-decimal is bytes-only; duration and uuid are fixed-only (uuid-on-string
-	// is handled by decodeString, never here). A logical on the WRONG kind only
-	// arises when a CustomType resurrects a soft-dropped non-standard placement
-	// (e.g. {"type":"bytes","logicalType":"uuid"}); that match also SUPPRESSES the
-	// codec, so the contract is the raw Avro-native value — which is exactly what
-	// the kind-gated fall-through to setBytesValue produces, matching the binary
-	// path's suppressed deserBytes/deserFixed. Without the kind gate the JSON
-	// typed path transformed (uuid→hex-dash, duration→avro.Duration,
-	// big-decimal→*big.Rat) while binary returned raw bytes.
+	// Each arm fires only on the kind its logical is spec-valid on, so the
+	// typed-target transform set matches the *any path and
+	// jsonDecodeAppliesLogical's probe for the same (kind, logical). decimal is
+	// valid on bytes AND fixed, big-decimal on bytes only, duration and uuid on
+	// fixed only (uuid-on-string goes through decodeString).
+	//
+	// A logical on the WRONG kind arises only when a CustomType resurrects a
+	// soft-dropped placement, and that match also SUPPRESSES the codec, so the
+	// contract is the raw value — which the kind-gated fall-through produces.
+	// Without the gate, JSON transformed (uuid→hex-dash, duration→avro.Duration)
+	// while binary returned raw bytes.
 	switch node.logical {
 	case "decimal":
 		// Share setDecimalValue with the binary path so JSON accepts
@@ -1486,26 +1479,18 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 	)
 }
 
-// applyFieldDefault decodes the field's pre-encoded binary default
-// into target via the record's wrapped binary deserfn — the same fn
-// that decodes a present field's wire bytes. Routing through the
-// wrapped deser is what makes a registered CustomType.Decode fire for
-// default-filled fields, matching the binary side where pre-encoded
-// f.defaultBytes roundtrip through dr.fields[i].fn naturally. The raw
-// per-node node.fields[idx].node.deser is the unwrapped primitive
-// (built before applyCustomTypes had a chance to install the custom
-// chain), so calling it directly bypasses the wrap and surfaces the
-// raw Avro-native value (int64, []byte, ...) into a target Go type
-// that expects the user's custom domain type.
+// applyFieldDefault decodes the field's pre-encoded binary default into target
+// via the record's WRAPPED binary deserfn, the same one a present field uses.
+// That is what makes a registered CustomType.Decode fire for default-filled
+// fields. node.fields[idx].node.deser is the unwrapped primitive, built before
+// applyCustomTypes installed the chain, so calling it directly surfaces the raw
+// Avro-native value into a target expecting the custom domain type.
 //
-// A zero-length defaultBytes is a *valid* default for any field whose
-// wire encoding is naturally 0 bytes — null-typed fields, empty-record
-// fields, and records whose every field is null-typed. The caller
-// (iterateRecordFields) gates on f.hasDefault before invoking us, so
-// presence of a default is already authoritative; the structural check
-// below only guards a malformed schema where serRecord/deserRecord is
-// missing (both are built in lockstep at buildRecord time, so checking
-// serRecord transitively covers deserRecord).
+// A zero-length defaultBytes is a VALID default for any field whose wire
+// encoding is naturally 0 bytes: null-typed fields, empty records, records of
+// all-null fields. The caller already gated on f.hasDefault, so the check below
+// only guards a malformed schema missing serRecord — built in lockstep with
+// deserRecord, so it covers both.
 func (ctx *jsonDecoder) applyFieldDefault(target reflect.Value, node *schemaNode, idx int) error {
 	if node.serRecord == nil || idx >= len(node.serRecord.fields) {
 		return fmt.Errorf("record has no pre-encoded default for field %d", idx)
@@ -1533,19 +1518,14 @@ func unionBranchRecurses(kind string) bool {
 func (ctx *jsonDecoder) decodeUnion(v reflect.Value, node *schemaNode) error {
 	p := ctx.scanner.peek()
 
-	// JSON null → null branch (only if the union has one). Handle
-	// before indirectAlloc so *T pointer targets stay nil. Java's
-	// JsonDecoder.readIndex and fastavro's read_index both reject
-	// null when no "null" label is in the union; we match.
+	// JSON null → null branch, if the union has one. Handled before
+	// indirectAlloc so *T targets stay nil. Java and fastavro both reject null
+	// when no "null" label is in the union; this matches.
 	//
-	// Use isJSONNullStart to disambiguate from bare special-float
-	// tokens. Currently parseSpecialFloat rejects lowercase 'n'-start
-	// (parity tightening with Java/fastavro/goavro), so a bare 'n'
-	// here is unambiguous as "null". The helper is still used
-	// defensively: if future leniency re-accepts lowercase nan, this
-	// dispatcher must NOT hijack it into the null arm. Sibling
-	// dispatchers decodeFloat (json_decode.go) and decodeDouble use
-	// the helper for the same reason.
+	// isJSONNullStart disambiguates from bare special-float tokens. A bare 'n'
+	// is unambiguous today, since parseSpecialFloat rejects lowercase, but the
+	// helper stays so a future leniency re-accepting lowercase nan cannot be
+	// hijacked into the null arm. decodeFloat and decodeDouble use it likewise.
 	if isJSONNullStart(ctx.scanner, p) {
 		hasNull := false
 		for _, br := range node.branches {
@@ -1765,22 +1745,16 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, p byt
 			return err
 		} else {
 			lastErr = err
-			// Commit to the FIRST token-class-matching CONTAINER branch
-			// (record/array/map): do not backtrack to a later container branch
-			// on failure. Backtracking re-decodes the whole subtree per branch,
-			// which is 2^depth for a recursive union-of-records/arrays/maps — a
-			// hostile-input DoS (a ~120-byte bare nested object rejects in
-			// seconds). The Avro JSON spec encodes a non-null union as the tagged
-			// {"branch-name":value} form, and Java/fastavro/goavro read the branch
-			// from that tag with no branch-guessing; the tagged path
-			// (decodeUnionObject) already commits deterministically, so the bare
-			// leniency commits to first too. A caller needing a later container
-			// branch uses the tagged form. Container tokens ('{','[') match only
-			// container branches (jsonTokenMatchesBranch), so this never skips a
-			// scalar branch. Scalar branches cannot recurse into the union, so
-			// their bounded backtrack stays — preserving the numeric-width
-			// fall-through (e.g. ["int","long"] accepting an int-overflowing value
-			// via the long branch) at O(1) per node.
+			// Commit to the FIRST token-class-matching CONTAINER branch; do not
+			// backtrack. Backtracking re-decodes the subtree per branch, 2^depth
+			// on a recursive union of records/arrays/maps — a ~120-byte bare
+			// nested object then rejects in seconds. The spec's tagged form
+			// names the branch, and the tagged path already commits
+			// deterministically, so a caller needing a later container branch
+			// uses it. Container tokens match only container branches, so this
+			// never skips a scalar one. Scalar branches cannot recurse, so their
+			// bounded backtrack stays and ["int","long"] still falls through to
+			// long for an int-overflowing value at O(1) per node.
 			if unionBranchRecurses(branch.kind) {
 				break
 			}
