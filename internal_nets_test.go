@@ -346,7 +346,7 @@ var censusRegistry = []censusQuestion{
 		tells: []censusTell{
 			{pattern: `isNilValue`, counts: map[string]int{
 				"ser.go":        12,
-				"json_codec.go": 5,
+				"json_codec.go": 4,
 				"unsafe.go":     4,
 				"reflect.go":    1,
 			}},
@@ -421,7 +421,7 @@ var censusRegistry = []censusQuestion{
 		tells: []censusTell{
 			{pattern: `isNamedKind`, counts: map[string]int{
 				"cache.go": 3, "schema_canonical.go": 1, "schema_for.go": 4,
-				"schema_node.go": 13, "schema_parse.go": 2, "schema_walk.go": 2, "schema.go": 5,
+				"schema_node.go": 13, "schema_parse.go": 2, "schema_walk.go": 1, "schema.go": 5,
 			}},
 			{pattern: `isRecordKind`, counts: map[string]int{
 				"schema_canonical.go": 1, "schema_for.go": 2, "schema_node.go": 10,
@@ -494,10 +494,10 @@ var censusRegistry = []censusQuestion{
 		},
 		tells: []censusTell{
 			{pattern: `flatFieldNeedsLift`, counts: map[string]int{
-				"schema_parse.go": 4, "schema_walk.go": 3,
+				"schema_parse.go": 4, "schema_walk.go": 2,
 			}},
 			{pattern: `flatLiftTypeMap`, counts: map[string]int{
-				"schema_parse.go": 5, "schema_walk.go": 2, "schema_node.go": 1, "cache.go": 1,
+				"schema_parse.go": 5, "schema_walk.go": 1, "schema_node.go": 1, "cache.go": 1,
 			}},
 			// Rejected tell: `liftFlatFieldType` — it names the MUTATOR, which
 			// only the parse path calls, so the walker and renderer sites
