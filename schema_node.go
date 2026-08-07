@@ -1429,9 +1429,8 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// The same losslessness question as the primitive arm above, for a NAME
 	// REFERENCE: it may collapse to the bare name only when the node carries
 	// nothing else. Both sites ask nodeCarriesOnlyType rather than repeating
-	// a field list — they previously held two copies of the same incomplete
-	// list, which is why a stray Symbols/Size/Aliases vanished here while a
-	// stray Name was caught.
+	// a field list: two hand-written copies drift, and one that misses a
+	// field silently drops the stray attribute stored there.
 	if n.Type != "array" && n.Type != "map" && !isNamedKind(n.Type) &&
 		n.Type != "union" && nodeCarriesOnlyType(n) {
 		return refType

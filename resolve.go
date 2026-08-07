@@ -986,7 +986,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 		}
 		// Ask the array encoders' own shared compliance helper, whose doc
 		// requires exactly this: every array encoder routes through it, or the
-		// paths drift. The default walk is one, and was the third to be missed.
+		// paths drift. This default walk is one of them.
 		sink.record(arrayZeroByteEncodeCompliance(len(dst) == bodyStart, len(arr)))
 		return append(dst, 0), nil
 	case "map":
@@ -1060,8 +1060,8 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 			// back as the attempt's err would look like a fix (no unreadable
 			// wire is emitted) while silently selecting a LATER branch, and the
 			// metadata API would then report a different branch than the wire
-			// names. Passing nil instead, as this loop first did, keeps
-			// selection right and charges nothing at all.
+			// names. Passing nil instead keeps selection right but charges
+			// nothing at all.
 			var attemptSink defaultChargeSink
 			if encoded, err := encodeDefaultDepth(attempt, val, branch, depth+1, &attemptSink); err == nil {
 				sink.record(attemptSink.err)

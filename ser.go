@@ -1518,8 +1518,7 @@ type serArray struct {
 // discipline). Non-zero-byte items grow the buffer, so this fires only for
 // genuinely zero-byte element types; the >=1-byte primitive fast paths never
 // reach it. Every array encoder MUST route through this one helper so the
-// reflect and unsafe paths cannot drift (the unsafe twins were missed the
-// first time this cap was added).
+// reflect and unsafe paths cannot drift.
 func arrayZeroByteEncodeCompliance(emptyBody bool, n int) error {
 	if emptyBody && n > maxZeroByteItems {
 		return &SemanticError{AvroType: "array", Err: fmt.Errorf(
