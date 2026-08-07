@@ -18,20 +18,18 @@ import (
 // ---------- dark_sweep_test.go ----------
 //
 // Cells for code paths the rest of the suite executes with NOTHING — derived
-// from a coverage census that unions every Test, every net, and every fuzz
-// seed and then subtracts. A block reached by nothing is the only place a
-// behavioral defect can hide, so each cell below drives an input that lands
-// on one and checks the result against an oracle OUTSIDE this package:
-// encoding/json for the JSON-tree shapes, big.Int arithmetic for the
-// timestamp bounds, the binary auto-fill for the metadata default surface,
-// and json.Valid for the strict skipper.
+// from a coverage census that unions every Test, net and fuzz seed and then
+// subtracts. A block reached by nothing is the only place a behavioral defect
+// can hide, so each cell drives an input that lands on one and checks the result
+// against an oracle OUTSIDE this package: encoding/json for the JSON-tree
+// shapes, big.Int arithmetic for the timestamp bounds, the binary auto-fill for
+// the metadata default surface, and json.Valid for the strict skipper.
 //
-// The axes are the ones that decide which arm runs, not the ones that decide
-// the value: carrier shape, container shape, nesting parity, and wire path.
-// Parity in particular is what makes the recursion guards reachable at all —
-// each schema level costs one depth unit, so whether a union / array / map
-// node or a record node sits on the limit depth is decided by how many levels
-// separate it from the root, and only one of the two ever trips first.
+// The axes are the ones deciding which arm runs, not which value: carrier shape,
+// container shape, nesting parity, and wire path. Parity is what makes the
+// recursion guards reachable at all — each schema level costs one depth unit, so
+// whether a union / array / map node or a record node sits on the limit depth is
+// decided by how many levels separate it from the root.
 
 // ---------------------------------------------------------------------------
 // Timestamp scaling: the int64 overflow boundary on both sides.
@@ -1112,15 +1110,13 @@ func TestMatrix_ResolvedJSONDecodeRejectsBadWriterJSON(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Field-level logicalType: where the lift points.
 //
-// A logicalType written as a SIBLING of "type" on a field object is lifted
-// into the type definition for the WIRE path only — the metadata API keeps
-// reporting the schema as written, which is the documented scope of the
-// concession. Which node the lift lands on depends on the field's type shape:
-// a bare primitive takes it, a union hands it to the first non-null branch,
-// an object takes it unless it already carries one, and a union with NO
-// non-null branch has nowhere to put it. The oracle is the equivalent
-// NESTED-form schema: same wire bytes, same canonical form, or (where there
-// is no target) the un-annotated type's own behavior.
+// A logicalType written as a SIBLING of "type" on a field object is lifted into
+// the type definition for the WIRE path only — the metadata API keeps reporting
+// the schema as written, the documented scope of the concession. Which node the
+// lift lands on depends on the field's type shape: a bare primitive takes it, a
+// union hands it to the first non-null branch, an object takes it unless it
+// already carries one, and a union with NO non-null branch has nowhere to put
+// it. The oracle is the equivalent NESTED-form schema.
 // ---------------------------------------------------------------------------
 
 func TestMatrix_FieldLevelLogicalLiftTargetShapes(t *testing.T) {

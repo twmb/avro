@@ -2644,17 +2644,13 @@ func TestDeserIntegerOverflow(t *testing.T) {
 }
 
 // TestDeserNullIntoNonPointerZeroes verifies that decoding a null-branch union
-// into a non-pointer Go field always replaces the prior value with the Go zero
-// value. This matches encoding/json/v2's documented semantics:
-//
-//	"A JSON null may be decoded into every supported Go value where it is
-//	 equivalent to storing the zero value of the Go value."
-//	"Unless otherwise specified, the decoded value replaces any pre-existing
-//	 value."
-//
-// Prior to v1.x.0 twmb/avro matched encoding/json v1 and left non-pointer
-// targets untouched on null, which preserved prior values across reused
-// struct decodes — a silent data-corruption footgun.
+// into a non-pointer Go field always replaces the prior value with the Go zero,
+// matching encoding/json/v2: "A JSON null may be decoded into every supported Go
+// value where it is equivalent to storing the zero value", and "the decoded
+// value replaces any pre-existing value". Prior to v1.x.0 twmb/avro matched
+// encoding/json v1 and left non-pointer targets untouched on null, which
+// preserved prior values across reused struct decodes — a silent
+// data-corruption footgun.
 func TestDeserNullIntoNonPointerZeroes(t *testing.T) {
 	// Covers: deserNullUnion (["null", T]), deserNullSecondUnion (["T", "null"]),
 	// and deserNull (general null branch in a 3+ way union).
@@ -5951,19 +5947,16 @@ func TestRegression_OmitzeroNullSecondUnionPtr(t *testing.T) {
 	}
 }
 
-// TestRegression_OmitzeroMapFillEffectiveDefaultParity pins the exact
-// relationship between map default-fill and omitzero across the three
-// no-written-default field shapes (the doc.go "Struct tags" contract):
+// TestRegression_OmitzeroMapFillEffectiveDefaultParity pins the relationship
+// between map default-fill and omitzero across the three no-written-default
+// field shapes (the doc.go "Struct tags" contract):
 //
-//   - ["null", T]: an implicit null default is inferred (the canonical
-//     nullable pattern), so BOTH routes encode null — map fill does not
-//     error here.
-//   - [T, "null"]: a union default must match the first branch, so no
-//     null default can exist and none is inferred. This is the one
-//     divergence: omitzero encodes the null branch, map fill errors on
-//     the missing key.
-//   - plain T: nothing to fill with — omitzero keeps the zero value,
-//     map fill errors on the missing key.
+//   - ["null", T]: an implicit null default is inferred, so BOTH routes encode
+//     null and map fill does not error.
+//   - [T, "null"]: a union default must match the first branch, so none is
+//     inferred. The one divergence: omitzero encodes the null branch, map fill
+//     errors on the missing key.
+//   - plain T: nothing to fill with — omitzero keeps the zero, map fill errors.
 func TestRegression_OmitzeroMapFillEffectiveDefaultParity(t *testing.T) {
 	type R struct {
 		F int64 `avro:"f,omitzero"`
@@ -9329,17 +9322,14 @@ func TestMatrix_TimeMicrosOverflowGuardIsUniform(t *testing.T) {
 	t.Logf("time-micros overflow guard: %d rejected, %d accepted across %d callers", rejected, accepted, len(callersRun))
 }
 
-// TestDurationSubResolutionTruncatesTowardZero locks in that
-// time.Duration values whose nanosecond component is not a whole
-// multiple of the schema's resolution unit are silently truncated
-// toward zero at encode — matching Go's time.Duration.Milliseconds()
-// and .Microseconds() integer-conversion semantics. The wire format
-// physically can't represent sub-resolution precision, so encode
-// either truncates, rounds, or rejects; this implementation truncates
-// (consistent with the standard library's int conversion methods).
-// Locked in README §Logical Types and the serTimeMillis doc-string.
-//
-// A whole-millisecond / whole-microsecond Duration round-trips exactly.
+// TestDurationSubResolutionTruncatesTowardZero locks that time.Duration values
+// whose nanosecond component is not a whole multiple of the schema's resolution
+// unit are silently truncated toward zero at encode, matching
+// time.Duration.Milliseconds() and .Microseconds(). The wire format cannot
+// represent sub-resolution precision, so encode must truncate, round, or reject;
+// this implementation truncates, consistent with the standard library's integer
+// conversion methods. Locked in README §Logical Types and the serTimeMillis
+// doc-string. A whole-millisecond Duration round-trips exactly.
 func TestDurationSubResolutionTruncatesTowardZero(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -9790,18 +9780,14 @@ func TestRegression_NestedDefaultJSONIgnoresTaggedUnions(t *testing.T) {
 	}
 }
 
-// TestMatrix_TimestampMillisMicrosSilentOverflow locks in that
-// timestamp-millis / timestamp-micros / local-timestamp-millis /
-// local-timestamp-micros encoders return an error for time.Time
-// values whose UnixMilli/UnixMicro would overflow int64, instead of
-// silently wrapping. Java's Instant.toEpochMilli and
-// TimestampMicrosConversion.toLong (Math.multiplyExact / Math.addExact)
-// throw ArithmeticException on the same input; Go's UnixMilli /
-// UnixMicro are documented as "undefined" for out-of-range times.
-// timeToTimestampNanos has an analogous guard.
-//
-// Year 300_000 overflows micros (MaxInt64µs ≈ year 294246); year
-// 300_000_000 overflows millis (MaxInt64ms ≈ year 292M).
+// TestMatrix_TimestampMillisMicrosSilentOverflow locks that the
+// timestamp-millis/micros and local-timestamp-millis/micros encoders return an
+// error for time.Time values whose UnixMilli/UnixMicro would overflow int64
+// instead of silently wrapping. Java's Instant.toEpochMilli and
+// TimestampMicrosConversion.toLong throw on the same input, and Go's UnixMilli /
+// UnixMicro are documented as undefined for out-of-range times.
+// timeToTimestampNanos has an analogous guard. Year 300_000 overflows micros
+// (MaxInt64us is about year 294246); year 300_000_000 overflows millis.
 func TestMatrix_TimestampMillisMicrosSilentOverflow(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -10343,17 +10329,14 @@ func TestMatrix_EncodeJSONNullParity(t *testing.T) {
 	})
 }
 
-// TestMatrix_EncodeJSONNullParityPointerToNilPointer extends
-// TestMatrix_EncodeJSONNullParity to the **T-with-nil-inner shape:
-// a non-nil outer pointer whose Elem() is a nil pointer (e.g. `&p`
-// where `var p *int = nil`), with or without an enclosing any{}
-// wrapper. The 2-branch [null,T] optimization works via isNilValue
-// (which peels both Pointer and Interface); the prior serNull only
-// peeled Interface so the outer Pointer's IsNil()==false reached the
-// kind switch and errNonNil was returned. JSON's appendAvroJSON
-// indirect loop already peeled both, so JSON encode succeeded —
-// binary↔JSON asymmetry. The fix extends serNull's peel loop to
-// include reflect.Pointer, mirroring isNilValue's behavior.
+// TestMatrix_EncodeJSONNullParityPointerToNilPointer extends the null-parity net
+// to the **T-with-nil-inner shape: a non-nil outer pointer whose Elem() is a nil
+// pointer, with or without an enclosing any{} wrapper. The 2-branch [null,T]
+// optimization works via isNilValue, which peels both Pointer and Interface, but
+// the prior serNull peeled only Interface, so the outer Pointer's IsNil()==false
+// reached the kind switch and errNonNil came back. JSON's appendAvroJSON
+// indirect loop already peeled both, so JSON succeeded — a binary/JSON
+// asymmetry. The fix extends serNull's peel loop to reflect.Pointer.
 func TestMatrix_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 	nilIntPtrPtr := func() any { var p *int; return &p }
 	nilMapPtrPtr := func() any { var p *map[string]any; return &p }
@@ -10938,18 +10921,15 @@ func TestRegression_DecodeJSONDecimalRecordFloatField(t *testing.T) {
 	}
 }
 
-// TestRegression_UnionDefaultStringMatchesStringBranchNotFloat locks
-// in that a textual union default matches the string branch first when
-// the union contains both string and float (in that order), matching
-// Java/fastavro/hamba. coerceDefault must consult branch order — a
-// string default against ["string","float"] picks branch 0 (string),
-// not the float branch via string-to-float coercion.
-//
-// Spec ("Schema Records / Default Values", Avro 1.12): "Default values
-// for union fields correspond to the first schema that matches in the
-// union". Java's isCompatible(STRING, TextNode) is true → branch 0
-// wins. fastavro's _default_matches_schema and hamba/avro's
-// isValidDefault both pick branch 0 by type-equality first.
+// TestRegression_UnionDefaultStringMatchesStringBranchNotFloat locks that a
+// textual union default matches the string branch first when the union contains
+// both string and float in that order, matching Java/fastavro/hamba:
+// coerceDefault must consult branch order, so a string default against
+// ["string","float"] picks branch 0, not the float branch via string-to-float
+// coercion. Per the spec, "default values for union fields correspond to the
+// first schema that matches in the union"; Java's isCompatible(STRING, TextNode)
+// is true, and fastavro's and hamba's validators both pick branch 0 by
+// type-equality first.
 func TestRegression_UnionDefaultStringMatchesStringBranchNotFloat(t *testing.T) {
 	w := MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
 	r := MustParse(`{"type":"record","name":"R","fields":[
@@ -10966,26 +10946,19 @@ func TestRegression_UnionDefaultStringMatchesStringBranchNotFloat(t *testing.T) 
 	}
 }
 
-// TestRegression_MapDecodeBucketAmplificationDoS pins that an Avro
-// map<V> decode does not pre-allocate bucket storage proportional to
-// an attacker-declared count.
+// TestRegression_MapDecodeBucketAmplificationDoS pins that an Avro map<V> decode
+// does not pre-allocate bucket storage proportional to an attacker-declared
+// count. Two layered defenses are required: the block-count bound uses
+// minMapEntryBytes (a 1-byte empty-key varint plus schemaMinBytes(values)) like
+// the array path's minItemBytes, since a bare `count > len(src)` admits
+// zero-byte-entry inflation; and the MakeMapWithSize hint is capped at
+// maxMapPreAllocSize so the worst case is bounded regardless of any
+// bound-check loophole.
 //
-// Two layered defenses are required:
-// (a) Block-count bound uses minMapEntryBytes (1-byte empty-key
-//
-//	varint plus schemaMinBytes(values)) like the array path's
-//	minItemBytes. A bare `count > len(src)` admits zero-byte-entry
-//	inflation.
-//
-// (b) MakeMapWithSize hint capped at maxMapPreAllocSize so worst-case
-//
-//	allocation is bounded regardless of any bound-check loophole.
-//
-// Without these, a 4 MB input declaring 2 M entries with empty keys
-// would collapse to one decoded entry while heap-allocating ~160 MB
-// of bucket overhead (≈ 40× amplification for map[string]any).
-// fastavro avoids the issue by not pre-sizing; Java has a smaller
-// version (~4×) and we amplify less than Java.
+// Without these, a 4 MB input declaring 2M entries with empty keys collapses to
+// one decoded entry while heap-allocating ~160 MB of bucket overhead — about 40x
+// amplification for map[string]any. fastavro avoids it by not pre-sizing; Java
+// has a ~4x version.
 func TestRegression_MapDecodeBucketAmplificationDoS(t *testing.T) {
 	s := MustParse(`{"type":"map","values":"long"}`)
 
@@ -11022,22 +10995,16 @@ func TestRegression_MapDecodeBucketAmplificationDoS(t *testing.T) {
 	}
 }
 
-// TestRegression_ResolveArrayPromotion_MinItemBytesBoundTooStrict
-// locks in that resolveArray bounds the writer's wire block-count
-// against the WRITER's per-item minimum, not the reader's resolved
-// item size. The wire was produced by the WRITER, so its minimum
-// item size is what the count bound must use. Using
-// schemaMinBytes(resolved) (the reader's resolved item node) would
-// reject e.g. array<int> writer → array<double> reader on a valid
-// 18-byte stream of 16 small ints (1 byte each on wire) because the
-// reader's min is 8 bytes — the bound math would say
-// "count 16 exceeds remaining buffer length 17 (min 8 byte/item)".
+// TestRegression_ResolveArrayPromotion_MinItemBytesBoundTooStrict locks that
+// resolveArray bounds the writer's wire block-count against the WRITER's
+// per-item minimum, not the reader's resolved item size — the wire was produced
+// by the writer, so its minimum is what the bound must use. Using the reader's
+// resolved node would reject array<int> writer → array<double> reader on a valid
+// 18-byte stream of 16 small ints, because the reader's min is 8 bytes.
 // resolveMap uses the same writer-min rule.
 //
-// Java/fastavro/avro-rs all decode promoted arrays without this
-// bound (no per-block count×item-size check at all). Spec lists
-// int → long/float/double, long → float/double, float → double as
-// valid numeric promotions, plus bytes ↔ string and record-evolution.
+// Java, fastavro and avro-rs all decode promoted arrays with no per-block
+// count-times-item-size check at all.
 func TestRegression_ResolveArrayPromotion_MinItemBytesBoundTooStrict(t *testing.T) {
 	w := MustParse(`{"type":"array","items":"int"}`)
 	r := MustParse(`{"type":"array","items":"double"}`)
@@ -11095,17 +11062,14 @@ func TestRegression_ResolveArrayRecordEvolution_DefaultedField_TooStrict(t *test
 	mustDecode(t, res, src, &got)
 }
 
-// TestRegression_JSONDurationIgnoresNonDurationFixedSize locks in
-// that the JSON encoder's case "fixed" arm only invokes the
-// avro.Duration → 12-byte-encoded path when node.logical ==
-// "duration". Without the logical-type gate, the avro.Duration
-// branch would fire for any fixed node regardless of node.logical
-// or node.size, producing a 12-byte duration encoding in a fixed
-// schema declaring a different size — invalid Avro JSON (the same
-// library's decoder rejects it as "fixed value has 12 bytes, schema
-// declares 8") and rejected by Java/fastavro consumers. The binary
-// path's schema build only assigns serDuration when node.logical ==
-// "duration" (schema.go:1665), so the gate must mirror that.
+// TestRegression_JSONDurationIgnoresNonDurationFixedSize locks that the JSON
+// encoder's case "fixed" arm invokes the avro.Duration 12-byte path only when
+// node.logical == "duration". Without the gate the Duration branch fires for any
+// fixed node regardless of logical or size, producing a 12-byte duration
+// encoding in a fixed schema declaring a different size — invalid Avro JSON that
+// this library's own decoder rejects and Java/fastavro consumers reject. The
+// binary path assigns serDuration only when node.logical == "duration"
+// (schema.go:1665), so the gate must mirror that.
 func TestRegression_JSONDurationIgnoresNonDurationFixedSize(t *testing.T) {
 	s := MustParse(`{"type":"fixed","name":"F","size":8}`)
 	d := Duration{Months: 1, Days: 2, Milliseconds: 3}
@@ -11143,17 +11107,14 @@ func TestRegression_EncodeJSONFixedDefaultCodepointMapping(t *testing.T) {
 	}
 }
 
-// TestRegression_ResolveReaderUnionAmbiguousUnqualifiedNames locks
-// in that Resolve picks the correct full-name match when a reader
-// union contains two named types with the same unqualified name and
-// different namespaces (a configuration the spec explicitly permits:
-// "permitting multiple types with the same name and different
-// namespaces is necessary"). findMatchingBranch / namesMatch must
-// match by FULL name when namespaces differ — unqualified-name
-// match alone would let writer b.Foo pick reader a.Foo (the first
-// occurrence), typically erroring with "field has no default and is
-// missing from writer" or silently yielding wrong output.
-// Java/fastavro both match by full name in this context.
+// TestRegression_ResolveReaderUnionAmbiguousUnqualifiedNames locks that Resolve
+// picks the correct full-name match when a reader union contains two named types
+// with the same unqualified name in different namespaces — a configuration the
+// spec explicitly permits. findMatchingBranch / namesMatch must match by FULL
+// name when namespaces differ; unqualified-name match alone would let writer
+// b.Foo pick reader a.Foo, typically erroring with "field has no default and is
+// missing from writer" or silently yielding wrong output. Java and fastavro both
+// match by full name here.
 func TestRegression_ResolveReaderUnionAmbiguousUnqualifiedNames(t *testing.T) {
 	w := MustParse(`{"type":"record","name":"Foo","namespace":"b","fields":[{"name":"bf","type":"int"}]}`)
 	r := MustParse(`[
@@ -11346,15 +11307,13 @@ func TestRegression_SerTimeMicrosAcceptsTime(t *testing.T) {
 
 // TestMatrix_FloatDecodeIntegerOverflowBoundary pins that decoding a
 // float/double wire value into an integer Go target performs its out-of-range
-// check in float space (like the encode-side floatFitsInt64), not via the
-// platform-dependent int64(f) round trip. Go's float->int conversion is
-// implementation-defined on overflow (spec: "the result value is
-// implementation-dependent"), so a `f != float64(int64(f))` check gives
-// different answers per platform for |f| >= 2^63. On saturating-conversion
-// platforms (arm64) it silently accepts the double 2^63 (= MaxInt64+1) and
-// stores int64(2^63-1) -- an off-by-one corruption of a value that is out of
-// int64 range and must be rejected, exactly as the encode side rejects
-// float64(2^63) against a long schema.
+// check in float space, like the encode-side floatFitsInt64, not via the
+// platform-dependent int64(f) round trip. Go's float-to-int conversion is
+// implementation-defined on overflow, so `f != float64(int64(f))` gives
+// different answers per platform for |f| >= 2^63: on arm64 it silently accepts
+// the double 2^63 and stores int64(2^63-1), an off-by-one corruption of a value
+// that must be rejected, exactly as the encode side rejects float64(2^63)
+// against a long schema.
 func TestMatrix_FloatDecodeIntegerOverflowBoundary(t *testing.T) {
 	doubleWire := func(f float64) []byte {
 		b := make([]byte, 8)
@@ -13974,17 +13933,15 @@ func TestRegression_PointerMarshalTextNonAddressableScalar(t *testing.T) {
 	}
 }
 
-// appendMapPrimitive, serMap.ser, and the JSON map encoder reuse two
-// addressable Values via SetIterKey/SetIterValue instead of allocating a
-// fresh Value per entry. Because the reused value Value is addressable
-// (iter.Value() is not), a struct-valued map now reaches serRecord's
-// unsafe fast path. These tests pin that the change is behavior-neutral:
-// every map shape round-trips (binary AND JSON) to a deep-equal value,
-// and the struct-valued map's record bytes match a standalone encode.
-//
-// Maps iterate in randomized order, so multi-entry wire is not
-// byte-stable across encodes — we compare decoded values, not bytes
-// (except the single-entry struct case, which is deterministic).
+// appendMapPrimitive, serMap.ser, and the JSON map encoder reuse two addressable
+// Values via SetIterKey/SetIterValue instead of allocating a fresh Value per
+// entry. Because the reused value Value is addressable (iter.Value() is not), a
+// struct-valued map now reaches serRecord's unsafe fast path. These pin that the
+// change is behavior-neutral: every map shape round-trips on both wires to a
+// deep-equal value, and the struct-valued map's record bytes match a standalone
+// encode. Maps iterate in randomized order, so multi-entry wire is not
+// byte-stable — decoded values are compared, except for the deterministic
+// single-entry struct case.
 
 type setIterRec struct {
 	A int32  `avro:"a"`
@@ -14518,17 +14475,17 @@ func TestRegression_MapStructValueMatchesStandaloneRecord(t *testing.T) {
 // Union-branch selection: the index must give the SCAN's verdict.
 //
 // Which reader branch a writer node selects is a rule with four ranks — full
-// name, alias, unqualified short name, bare-alias short name — plus numeric
-// and string/bytes promotion, and a fixed's SIZE folded into the match rather
-// than checked after it. Answering it by ranking every reader branch is a scan
-// inside the loop over writer branches that both Resolve and CheckCompatibility
-// run, so the answer is now indexed ahead of the questions.
+// name, alias, unqualified short name, bare-alias short name — plus numeric and
+// string/bytes promotion, and a fixed's SIZE folded into the match rather than
+// checked after it. Answering it by ranking every reader branch is a scan inside
+// the loop over writer branches that both Resolve and CheckCompatibility run, so
+// the answer is now indexed ahead of the questions.
 //
 // Indexing a rule is where a rule quietly changes. Java's
 // Resolver.firstMatchingBranch scans per writer branch too, so there is no
 // reference to re-derive the verdict from and no interop pressure that would
-// surface a drift — the only thing that can catch one is the scan itself,
-// stated independently and asked the same questions.
+// surface a drift — the only thing that can catch one is the scan itself, stated
+// independently and asked the same questions.
 
 // matchTierOracle ranks how strongly a reader branch matches a writer node.
 // This is the rule written out longhand, from the spec clauses and NOT_BUGS
@@ -15134,17 +15091,14 @@ func ptrAny[T any](v T) *T { return &v }
 // TestRegression_UnsafeDecodeDepthBounded gives end-to-end coverage of the
 // recursion-depth bound on the UNSAFE decode path: a self-referential record
 // nested past maxDepth, decoded into an addressable struct, must error and not
-// recurse unbounded. There was no such test before.
+// recurse unbounded.
 //
-// Triage note: a scoped mutation run flagged the slab-depth bookkeeping
-// (sl.depth++ / sl.depth-- at the recursive-dispatch sites) as surviving. This
-// test does NOT kill those mutants — verified by neutering each: the decode
-// still errors with the bookkeeping flipped, because the depth limit is
-// enforced REDUNDANTLY (a primary guard fires regardless of those specific
-// lines). They are therefore equivalent/redundant mutants, not an exploitable
-// gap. The test stays for the genuine end-to-end coverage. The wire is hand-
-// built because encode cannot produce an over-deep value (its own depth guard
-// stops it first).
+// Triage note: a scoped mutation run flagged the slab-depth bookkeeping as
+// surviving. This test does NOT kill those mutants — verified by neutering each:
+// the decode still errors with the bookkeeping flipped, because the depth limit
+// is enforced REDUNDANTLY. They are equivalent mutants, not an exploitable gap.
+// The wire is hand-built because encode cannot produce an over-deep value, its
+// own depth guard stopping it first.
 func TestRegression_UnsafeDecodeDepthBounded(t *testing.T) {
 	// Node = record{ child: ["null", Node], v: int } — a self-referential
 	// type whose decode recurses once per nesting level.
@@ -16880,25 +16834,21 @@ func TestMatrix_DecodeJSONFillsDefaultThroughCustomDecoder(t *testing.T) {
 	})
 }
 
-// TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill locks in
-// that AppendEncodeJSON does NOT invoke a registered CustomType.Encode
-// for default-filled record fields — matching binary's encodeDefault
-// which is a self-contained switch with no custom-wiring hook.
-//
-// Rationale: CustomType.Encode converts user-Go-type → Avro-native; the
-// parsed default value is already in Avro-native form (json.Number /
-// []byte / string per the schema's type) and never had a Go-domain-type
+// TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill locks that
+// AppendEncodeJSON does NOT invoke a registered CustomType.Encode for
+// default-filled record fields, matching binary's encodeDefault, which is a
+// self-contained switch with no custom-wiring hook. CustomType.Encode converts
+// user-Go-type → Avro-native, and the parsed default is already Avro-native
+// (json.Number / []byte / string per the schema), never having had a Go-domain
 // representation, so the directional contract has nothing to apply.
-// Pre-fix, appendJSONFieldDefault routed defaults through appendAvroJSON
-// with a non-nil custom map, firing the user's Encode once per
-// default-filled custom-typed field on JSON-encode of an empty map and
-// passing a json.Number the encoder's GoType filter doesn't recognize.
-// Binary-encode of the same empty map fired the encoder zero times.
 //
-// The asymmetry is silently benign for GoType-typed encoders that
-// fallthrough via ErrSkipCustomType on a type-assertion miss, but
-// surfaces as a behavioral surprise for GoType=nil encoders used for
-// logging / validation / property-based dispatch.
+// Pre-fix, appendJSONFieldDefault routed defaults through appendAvroJSON with a
+// non-nil custom map, firing the user's Encode once per default-filled field on
+// JSON-encode of an empty map and passing it a json.Number its GoType filter
+// does not recognize, while binary fired it zero times. The asymmetry is
+// silently benign for GoType-typed encoders that fall through on a
+// type-assertion miss, but surfaces for GoType=nil encoders used for logging or
+// property-based dispatch.
 func TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill(t *testing.T) {
 	// GoType=nil so the encoder fires on every value reaching the long+
 	// money node — instrumentation pattern that surfaces the asymmetry.
@@ -16940,16 +16890,14 @@ func TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill(t *testing.T) 
 }
 
 // The decode-side companion to the encoder default-fill bypass: when a reader
-// field is ABSENT from the writer and filled from its default through schema
+// field is ABSENT from the writer and filled from its default through
 // resolution, the field's custom Decode must fire EXACTLY ONCE on the SAME raw
-// (logical-suppressed) Avro-native value a natural decode would feed it — on
-// both the resolved binary and resolved JSON paths. This pins resolveRecord's
-// default-fill deser construction (resolve.go): the reader field node's deser
-// is the raw, logical-suppressed deser, and the custom decoder chain is wrapped
-// onto it once. A double-wrap (custom fires twice) or feeding the callback the
-// enriched logical value (instead of the raw int64) are the two regressions
-// this guards. The ×10 transform makes "the callback fired" distinguishable
-// from a plain raw coercion that happens to coincide in value.
+// (logical-suppressed) Avro-native value a natural decode would feed it, on both
+// resolved wires. This pins resolveRecord's default-fill deser construction: the
+// reader field node's deser is the raw, logical-suppressed one, with the custom
+// chain wrapped onto it once. A double-wrap, or feeding the callback the
+// enriched logical value, are the two regressions guarded; the x10 transform
+// makes "the callback fired" distinguishable from a coincidental raw coercion.
 func TestRegression_ResolvedDefaultFillFiresCustomDecodeOnceRaw(t *testing.T) {
 	var decodeCalls int
 	var lastIn any
@@ -17063,22 +17011,19 @@ func TestRegression_CustomDecodeBoundsRecursivePointerTarget(t *testing.T) {
 
 // ---------- callback_contract_matrix_test.go ----------
 
-// User-supplied callback contract matrix: every point where the encoders
-// and decoders do arithmetic, slicing, or a state transition on a value
-// returned by USER code — text-out methods (MarshalText / AppendText)
-// beyond the plain-string positions text_appender_contract_test.go pins,
-// TextUnmarshaler error returns, and CustomType Encode/Decode returns.
-// The invariant pinned per cell: a contract-violating return NEVER
-// panics through a public API and NEVER silently corrupts sibling data —
-// detectable violations yield named errors (*SemanticError with the
-// user's error preserved in the chain), and the fall-through / zeroing
-// shapes leave every sibling value intact.
+// User-supplied callback contract matrix: every point where the codecs do
+// arithmetic, slicing, or a state transition on a value returned by USER code —
+// text-out methods beyond the plain-string positions
+// text_appender_contract_test.go pins, TextUnmarshaler error returns, and
+// CustomType Encode/Decode returns. The invariant per cell: a contract-violating
+// return NEVER panics through a public API and NEVER silently corrupts sibling
+// data — detectable violations yield named errors (*SemanticError with the
+// user's error preserved in the chain), and the fall-through / zeroing shapes
+// leave every sibling intact.
 //
-// The lax-name validator (func(string) error), IsZero() bool, and the
-// wire-side use of map keys are structurally immune: the first two
-// return no value the library computes with, and map keys are read and
-// written as raw strings on every path — pinned by
-// TestRegression_MapKeysBypassTextMethods below.
+// The lax-name validator, IsZero() bool, and the wire-side use of map keys are
+// structurally immune: the first two return no value the library computes with,
+// and map keys are read and written as raw strings on every path.
 
 // symbolTexter's MarshalText names an enum symbol (or violates the
 // contract, per mode). The enum encoders look the returned text up in
@@ -17524,17 +17469,14 @@ func customEncodeReturning(shape string) CustomType {
 	}
 }
 
-// TestMatrix_CustomTypeEncodeReturnShapes crosses CustomType.Encode
-// return shapes with encode positions on both wire formats. The
-// contract: an untyped nil return is the named "returned nil" reject; a
-// typed-nil or wrong-typed return re-enters the underlying serializer,
-// whose type validation names it; a non-nil error is fatal with the
-// value discarded and the user's identity preserved; an
-// ErrSkipCustomType return (wrapped counts — the chain matches with
-// errors.Is) falls through to the built-in encode of the original
-// value. No shape panics, and sibling values already encoded are
-// unaffected (an error aborts the whole Encode; success shapes place
-// only their own node).
+// TestMatrix_CustomTypeEncodeReturnShapes crosses CustomType.Encode return
+// shapes with encode positions on both wires. The contract: an untyped nil
+// return is the named "returned nil" reject; a typed-nil or wrong-typed return
+// re-enters the underlying serializer, whose type validation names it; a non-nil
+// error is fatal with the value discarded and the user's identity preserved; an
+// ErrSkipCustomType return (wrapped counts, since the chain matches with
+// errors.Is) falls through to the built-in encode of the original value. No
+// shape panics, and sibling values already encoded are unaffected.
 func TestMatrix_CustomTypeEncodeReturnShapes(t *testing.T) {
 	positions := []struct {
 		name   string
@@ -17894,16 +17836,15 @@ func TestInvariant_CustomTypeHiddenStateFailsLoud(t *testing.T) {
 //
 // They differ in kind from refTarget, which selects a DEFINITION and so could
 // substitute one schema for another. A presence flag decides one thing only:
-// whether an attribute whose value is the field's own zero is written at all.
-// It never chooses a value, so for every value a caller can set, the value
-// that comes back is the value they set — with the flag set and with it
-// clear. That is the property proved here, over both a node extracted from a
-// parse (flags set) and the same node hand-composed (flags clear), including
-// the case a caller cannot otherwise reach: clearing the field to "".
+// whether an attribute whose value is the field's own zero is written at all. It
+// never chooses a value, so for every value a caller can set, the value that
+// comes back is the value they set — flag set and flag clear. That is proved
+// over both a node extracted from a parse and the same node hand-composed,
+// including the case a caller cannot otherwise reach: clearing the field to "".
 //
-// The wire, the canonical form and the fingerprint must be identical across
-// the pair as well: presence is a metadata-fidelity question, and none of
-// those surfaces carries doc or logicalType at all.
+// The wire, canonical form and fingerprint must be identical across the pair as
+// well: presence is a metadata-fidelity question, and none of those surfaces
+// carries doc or logicalType at all.
 func TestInvariant_PresenceStateIsValueTransparent(t *testing.T) {
 	// extracted carries every presence flag set; composed carries none.
 	extracted := MustParse(`{"type":"record","name":"R","doc":"","fields":[` +
