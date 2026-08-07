@@ -144,29 +144,25 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 		return nil, err
 	}
 
-	// A parse REFERENCING a type from a PRIOR cache Parse resolves the
-	// reference in the node tree, so Encode/Decode work, but leaves a bare
-	// reference in the JSON forms (s.c / s.full) because the inherited
-	// definition lives only in the resolved node. That makes
-	// Canonical()/Fingerprint()/Root()/String() non-self-contained, violating
-	// the documented "independent of the cache" contract and breaking
-	// cross-impl fingerprint and single-object interop. Splice the inherited
-	// definitions into the ORIGINAL JSON — preserving every attribute the node
-	// tree never stored, like doc, order and field props — and rebuild the
-	// metadata forms from it, parsed cache-LESSLY so the inlined definition is
-	// not itself seen as inherited. The encode/decode path is untouched.
+	// A parse REFERENCING a type from a prior cache Parse resolves it in the
+	// node tree but leaves a bare reference in the JSON forms, making
+	// Canonical/Fingerprint/Root/String non-self-contained. That breaks the
+	// documented "independent of the cache" contract and cross-impl
+	// fingerprint interop. Splice the inherited definitions into the ORIGINAL
+	// JSON, preserving attributes the node tree never stored like doc, order
+	// and field props, and rebuild the metadata forms from it cache-LESSLY so
+	// the inlined definition is not itself seen as inherited. The
+	// encode/decode path is untouched.
 	//
-	// The rebuild fires whenever inlineTreeDefs actually splices something. The
-	// obvious trigger, "s.full does not re-parse cache-lessly", misses a
-	// reference that re-parses to the WRONG type: a bare reference to an
-	// inherited type that, cache-lessly, FORWARD-binds to a same-named type
-	// defined LATER in this schema. Eager binding sent the wire reference to
-	// the inherited type (NOT_BUGS.md #24 — a later local definition cannot
-	// retroactively rebind it), so the node tree is right, but s.full re-parses
-	// cleanly with the reference bound locally and its metadata then describes
-	// a DIFFERENT schema than the wire codec. Splicing by the same
-	// eager/positional rule keeps metadata faithful to the node tree. A schema
-	// referencing nothing inherited splices nothing and keeps its String().
+	// The trigger is "inlineTreeDefs spliced something", not "s.full does not
+	// re-parse cache-lessly". The latter misses a reference that re-parses to
+	// the WRONG type: a bare reference to an inherited type that, cache-lessly,
+	// FORWARD-binds to a same-named type defined LATER in this schema. Eager
+	// binding sent the wire reference to the inherited type (NOT_BUGS.md #24),
+	// so the node tree is right, but s.full re-parses cleanly with the
+	// reference bound locally and its metadata then describes a DIFFERENT
+	// schema than the wire codec. A schema referencing nothing inherited
+	// splices nothing and keeps its String().
 	selfContained := s.full
 	if len(cloned) > 0 {
 		if tree, terr := unmarshalAnyPreservePrecision([]byte(s.full)); terr == nil {
@@ -279,25 +275,20 @@ func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
 	return short
 }
 
-// collectTreeDefs calls visit for every named-type definition in the tree,
-// with its resolved fullname and sub-tree, tracking namespace scope. Child
-// positions, key casing, and the flat-form ("linkedin/goavro") field lift
-// come from walkNodeChildren, so a named type defined by a flat field
-// (record/error/enum/fixed) or inside the field's items/values (array/map)
-// is collected exactly where the parser registers it. The node's own
-// "type" value is not walked: on a parser-accepted tree it is always a
-// string (aobjectFromMap rejects any other JSON type there), and a string
-// defines nothing to collect.
+// collectTreeDefs calls visit for every named-type definition in the tree, with
+// its resolved fullname and subtree, tracking namespace scope. Child positions,
+// key casing and the flat-form field lift come from walkNodeChildren, so every
+// definition is collected exactly where the parser registers it. The node's own
+// "type" value is a string on a parser-accepted tree and defines nothing.
 //
-// The visit fires for every named KIND, "name" key or not, and the child scope
-// is nodeChildScope, because the parser resolves and registers a fullname even
-// with no name key at all (fullname "ns.", or "" with no namespace in scope)
-// and scopes children by its namespace attribute regardless. Gating either on
-// name-key presence misfiles nested defs under ENCLOSING-scoped fullnames: a
+// The visit fires for every named KIND, "name" key or not, with nodeChildScope:
+// the parser registers a fullname even with no name key (fullname "ns.") and
+// scopes children by its namespace attribute regardless. Gating on name-key
+// presence misfiles nested defs under ENCLOSING-scoped fullnames — a
 // cross-parse reference then finds nothing to splice, and a parse that
-// references-then-locally-defines the misfiled short name splices the STALE
-// def over its own definition, producing metadata for a schema the wire codec
-// rejects. The "" fullname is collected but inert — no reference can spell it.
+// references-then-locally-defines the misfiled short name splices the STALE def
+// over its own, producing metadata for a schema the wire codec rejects. The ""
+// fullname is collected but inert; no reference can spell it.
 func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) {
 	switch v := node.(type) {
 	case []any:
@@ -327,22 +318,18 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 // transitive references resolve too. Subsequent occurrences stay bare. The def
 // is deep-copied before any mutation so the cache is not corrupted.
 //
-// Reference binding mirrors the parser EXACTLY — eager, in-scope-first, and
-// POSITIONAL. A bare reference resolves in scopedRefKeys precedence, and at
-// each candidate a LOCAL definition already registered AT THIS POINT IN THE
-// WALK beats a cache-inherited one. seen accumulates local fullnames in DFS
-// pre-order as the parser registers them (a name is in scope from the start of
-// its own definition, for self-reference), so a ref AFTER a local def stays
-// bare while a ref BEFORE it binds to the cached type and splices. Consulting
-// a position-INdependent local set would keep that second ref bare and diverge
-// String()/Canonical()/Fingerprint()/Root() from the wire codec.
+// Binding mirrors the parser EXACTLY — eager, in-scope-first, POSITIONAL. At
+// each scopedRefKeys candidate a LOCAL definition registered AT THIS POINT IN
+// THE WALK beats a cache-inherited one, and seen accumulates local fullnames in
+// DFS pre-order as the parser registers them. So a ref AFTER a local def stays
+// bare while a ref BEFORE it splices the cached type. A position-INdependent
+// local set would keep that second ref bare and diverge the JSON forms from the
+// wire codec.
 //
-// The walk also dedupes DEFINITIONS. Spliced defs are stored self-contained,
-// so two inherited refs sharing a transitive type would each carry a
-// definition of the shared name — a duplicate the rebuild Parse rejects. A
-// definition of a name already in seen is rewritten to a reference to the
-// first (dupDefRef, or rewriteFlatFieldToRef for flat-form fields), mirroring
-// the parser's one resolved type per name.
+// The walk also dedupes DEFINITIONS: spliced defs are self-contained, so two
+// inherited refs sharing a transitive type would each carry the shared name's
+// definition, a duplicate the rebuild Parse rejects. A second definition is
+// rewritten to a reference to the first.
 func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[string]bool) any {
 	switch v := node.(type) {
 	case string:
@@ -369,29 +356,23 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		}
 		return v
 	case map[string]any:
-		// A wrapped-form name reference — {"type":"X"}, optionally with extra
-		// non-structural keys — is the bare "X" plus whatever props it
-		// carries. The general path below would recurse INTO the "type" value
-		// and produce the invalid {"type":{X-def}} when X splices, which the
-		// rebuild Parse rejects, silently degrading the metadata to a dangling
-		// cross-parse reference. Both wrapper arities are accepted name-ref
-		// spellings, forward refs included, and a wrapper cannot carry
-		// schema-shaped structural keys, so extra keys are inert.
+		// A wrapped name reference — {"type":"X"} with optional non-structural
+		// keys — is the bare "X" plus its props. The general path below would
+		// recurse INTO the "type" value and emit the invalid {"type":{X-def}}
+		// when X splices, which the rebuild Parse rejects, degrading the
+		// metadata to a dangling reference. A wrapper cannot carry
+		// schema-shaped structural keys, so its extras are inert.
 		//
-		// When X splices, the definition replaces the wrapper and the
-		// wrapper's PROPS ride on it — the keys the definition's own kind
-		// routes to props, definition winning collisions. Reserved usage-site
-		// attributes do not survive; Java drops usage-site extras at reference
-		// sites entirely, so keeping the props is already the more faithful
-		// treatment, and props are canonical-stripped so schema identity is
-		// unchanged across all three reference spellings.
+		// When X splices, the definition replaces the wrapper and its PROPS
+		// ride on it, definition winning collisions. Reserved usage-site
+		// attributes do not survive; Java drops usage-site extras entirely, and
+		// props are canonical-stripped, so schema identity is unchanged across
+		// all three reference spellings.
 		//
-		// When X stays a bare reference, a SOLE-key wrapper collapses to the
-		// bare spelling: it carries nothing the bare form lacks, and a later
-		// wrapped reference to an already-inlined type would otherwise keep
-		// {"type":"X"} where bare "X" belongs, diverging String() from its
-		// bare-spelled twin. A props-carrying wrapper keeps its shape, since
-		// collapsing would drop the props.
+		// When X stays bare, a SOLE-key wrapper collapses to the bare
+		// spelling: a later wrapped reference to an already-inlined type would
+		// otherwise keep {"type":"X"} where "X" belongs and diverge String()
+		// from its bare-spelled twin. A props-carrying wrapper keeps its shape.
 		if ref, ok := v["type"].(string); ok && avroNamedRef(ref) {
 			resolved := inlineTreeDefs(ref, ns, defs, seen, inlined)
 			if def, isMap := resolved.(map[string]any); isMap {
@@ -422,22 +403,19 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		}
 		// Register this node's own name BEFORE walking its children, mirroring
 		// the parser's early self-registration, so a later sibling or
-		// descendant reference sees it; an earlier one already resolved
-		// against the cache above. Fires for every named KIND, "name" key or
-		// not, because the parser registers a keyless definition's fullname
-		// ("ns.", lax-only) the same way and a spliced subtree can carry one —
-		// a later reference must find it in scope, or the walk splices a
-		// second copy and the rebuild rejects the duplicate.
+		// descendant sees it. Fires for every named KIND, "name" key or not: a
+		// spliced subtree can carry a keyless definition, and a later reference
+		// must find it in scope or the walk splices a second copy and the
+		// rebuild rejects the duplicate.
 		//
-		// A name ALREADY defined at this point means this node is a SECOND
-		// definition arriving inside another spliced subtree: two inherited
-		// refs sharing a transitive type (the diamond A→{B,C}→D), or a nested
-		// type referenced before its container. The parser's node tree shares
-		// ONE resolved type per name, so the JSON must keep the first
-		// definition and reference it thereafter — Java's toString applies the
-		// same rule via NamedSchema.writeNameRef. Without the rewrite the
-		// rebuilt JSON defines the name twice, Parse rejects it, and the
-		// metadata falls back to the dangling original.
+		// A name ALREADY defined here means a SECOND definition inside another
+		// spliced subtree — two inherited refs sharing a transitive type (the
+		// diamond A→{B,C}→D), or a nested type referenced before its container.
+		// The node tree shares ONE resolved type per name, so the JSON keeps
+		// the first definition and references it thereafter, as Java's toString
+		// does. Without the rewrite the rebuilt JSON defines the name twice,
+		// Parse rejects it, and the metadata falls back to the dangling
+		// original.
 		if typ, _ := v["type"].(string); isNamedKind(typ) {
 			fullname := nodeFullnameTree(v, ns)
 			if ref, ok := dupDefRef(fullname, ns, seen); ok {
