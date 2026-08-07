@@ -538,7 +538,7 @@ var censusRegistry = []censusQuestion{
 				"schema_node.go": 3, "schema_parse.go": 1,
 			}},
 			{pattern: `schemaReservedKeyForObject`, counts: map[string]int{
-				"schema_node.go": 6, "schema_parse.go": 5, "cache.go": 1,
+				"schema_node.go": 6, "schema_parse.go": 4, "cache.go": 1,
 			}},
 			// Rejected tell: `strayBodyShapeOK` — 20 hits across three files,
 			// but it answers the SHAPE question (does this body parse as the
