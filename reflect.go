@@ -17,19 +17,14 @@ var (
 	byteType            = reflect.TypeFor[byte]()
 )
 
-// copyBytesToArray writes b into the byte-array v one element at a time when v's
-// element type is a NAMED byte type (Kind Uint8 but not exactly uint8), and uses
-// reflect.Copy's memmove for the common exact-uint8 element. The caller has
-// established that v is an Array whose element Kind is Uint8 and that
+// copyBytesToArray writes b into the byte-array v: reflect.Copy's memmove for
+// an exact-uint8 element, element-wise SetUint for a NAMED byte type. Callers
+// have established that v is an Array of Uint8-kind elements with
 // v.Len() == len(b).
 //
-// reflect.Copy and reflect.Value.Set(reflect.ValueOf([]byte)) both require the
-// element type to be EXACTLY uint8 and panic on a named byte element
-// (type B byte; [N]B) — a panic that surfaces from the public Decode /
-// DecodeJSON on a value the byte ENCODER accepts (serSize / doSerBytes /
-// appendAvroJSONBytes iterate via Uint, so they encode [N]B fine). The
-// element-wise SetUint writes through the Kind, restoring round-trip parity for
-// the named-element case while leaving the exact-uint8 fast path untouched.
+// reflect.Copy panics on [N]B where type B byte — a panic reaching the public
+// Decode on a value the encoder accepts, since the byte encoders iterate via
+// Uint. SetUint writes through the Kind and restores round-trip parity.
 func copyBytesToArray(v reflect.Value, b []byte) {
 	if v.Type().Elem() == byteType {
 		reflect.Copy(v, reflect.ValueOf(b))
@@ -73,18 +68,13 @@ func reuseOrMakeStringAnyMap(v reflect.Value, hint int) map[string]any {
 	return make(map[string]any, hint)
 }
 
-// tryTextUnmarshal calls (*v).UnmarshalText(b) when v is addressable
-// and its address implements [encoding.TextUnmarshaler]. Returns
-// (true, err) when invoked; (false, nil) when v can't accept the text.
-// Caller owns b — the helper does not copy. Used at every text-shaped
-// decode site (Avro string, string+uuid, fixed+uuid, enum symbol;
-// binary and JSON).
+// tryTextUnmarshal calls (*v).UnmarshalText(b) when v is addressable and its
+// address implements [encoding.TextUnmarshaler]. Returns (true, err) when
+// invoked, (false, nil) when v cannot accept the text. Caller owns b; this does
+// not copy. Used at every text-shaped decode site, binary and JSON.
 //
-// TextUnmarshaler stands on its own — the decoder does not require
-// the type to also implement TextMarshaler. The one-way Go idiom
-// (parse-only types: config values, enum keys, lookup tables) is
-// supported. A user can pair MarshalText on type A with
-// UnmarshalText on type B without either type implementing both.
+// TextUnmarshaler stands alone: the decoder does not also require TextMarshaler,
+// so the one-way parse-only idiom is supported.
 func tryTextUnmarshal(v reflect.Value, b []byte) (bool, error) {
 	if !v.CanAddr() || !v.Addr().Type().Implements(textUnmarshalerType) {
 		return false, nil
@@ -140,14 +130,11 @@ func textOutFor(v reflect.Value) (encoding.TextAppender, encoding.TextMarshaler)
 	return appender, marshaler
 }
 
-// textValue materializes v's TextAppender or TextMarshaler output as
-// a Go string. Returns (text, true, nil) on success; ("", false, nil)
-// when v has no text-out method (caller falls through); ("", false,
-// SemanticError) when the text-out method itself errored. avroType
-// labels the SemanticError. Used at every text-shaped encode site
-// (string+uuid, fixed+uuid, enum symbol; binary and JSON) so all
-// callers share the wrap shape and the AppendText vs MarshalText
-// preference.
+// textValue materializes v's TextAppender or TextMarshaler output as a string.
+// Returns (text, true, nil) on success, ("", false, nil) when v has no text-out
+// method so the caller falls through, ("", false, SemanticError) when the
+// method itself errored. Every text-shaped encode site uses it, so all share
+// one wrap shape and one AppendText-over-MarshalText preference.
 func textValue(v reflect.Value, avroType string) (string, bool, error) {
 	a, m := textOutFor(v)
 	if a == nil && m == nil {
@@ -167,20 +154,16 @@ func textValue(v reflect.Value, avroType string) (string, bool, error) {
 }
 
 // implementsTextMarshaler reports whether t's value or pointer method set
-// implements TextMarshaler or TextAppender. The unsafe/fast string-encode
-// paths (usString, usFixedUUIDString) read the underlying string directly
-// and bypass appendAvroString's text-out arm; keeping text-method types
-// off those paths is what makes a string-kind type with a text method
-// encode its marshaled form in a struct field exactly as it does as a
-// scalar. Evaluated once per type at fast-path compile time, never per
-// value.
+// implements TextMarshaler or TextAppender. The fast string-encode paths read
+// the underlying string directly and bypass appendAvroString's text-out arm, so
+// keeping text-method types off them is what makes such a type encode its
+// marshaled form in a struct field exactly as it does as a scalar. Evaluated
+// once per type at compile time, never per value.
 func implementsTextMarshaler(t reflect.Type) bool {
-	// Method-set fast-out: the pointer method set is a superset of the value
-	// method set, so an empty pointer method set means the type has no
-	// methods at all and can implement no interface. A NumMethod field read
-	// is far cheaper than four Implements method-set scans — this gates the
-	// per-element encode path, where plain string / enum types (zero methods)
-	// are the overwhelming-common case.
+	// The pointer method set is a superset of the value one, so an empty
+	// pointer set means no methods at all. One NumMethod read beats four
+	// Implements scans on the per-element encode path, where zero-method
+	// string and enum types dominate.
 	pt := reflect.PointerTo(t)
 	if pt.NumMethod() == 0 {
 		return false
@@ -189,12 +172,10 @@ func implementsTextMarshaler(t reflect.Type) bool {
 		pt.Implements(textMarshalerType) || pt.Implements(textAppenderType)
 }
 
-// implementsTextUnmarshaler reports whether *t implements TextUnmarshaler.
-// The unsafe/fast string-decode paths (udStringDeser, udFixedUUIDString)
-// and the array/map fast loops write the wire string directly and bypass
-// setStringValue's UnmarshalText arm; keeping such types off those paths
-// makes a string-kind type with UnmarshalText decode through it in a
-// struct field / container exactly as it does as a scalar.
+// implementsTextUnmarshaler reports whether *t implements TextUnmarshaler. The
+// fast string-decode paths and the array/map loops write the wire string
+// directly and bypass setStringValue's UnmarshalText arm, so keeping such types
+// off them makes a struct field or container decode as the scalar does.
 func implementsTextUnmarshaler(t reflect.Type) bool {
 	return reflect.PointerTo(t).Implements(textUnmarshalerType)
 }
@@ -206,10 +187,9 @@ func implementsTextUnmarshaler(t reflect.Type) bool {
 // method (appendAvroString's text-out arm) — both of which the fast paths
 // bypass. Callers have already established Kind()==String.
 //
-// This is the SINGLE source of truth for "which string-kind types are
-// fast-path-ineligible on encode." Every encode fast-path gate consults it,
-// so a future slow-path-only string concern is added in one place rather
-// than re-swept across every gate (the pattern-14c trap).
+// The SINGLE source of truth for which string-kind types are
+// fast-path-ineligible on encode. Every encode gate consults it, so a new
+// slow-path-only concern is added once rather than re-swept across all of them.
 func stringFastPathEligibleEncode(t reflect.Type) bool {
 	return t != jsonNumberType && !implementsTextMarshaler(t)
 }
@@ -304,30 +284,19 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 	return v
 }
 
-// setIface assigns rv to an interface-kind v with an assignability
-// check. Returns a SemanticError if rv's type isn't assignable to v's
-// interface type — the common case being a user passing
-// *interface{Foo()} as a decode target, where the decoder produces a
-// value that doesn't implement Foo. Without the check, reflect.Value.Set
-// panics with "value of type X is not assignable to type Y".
+// setIface assigns rv to an interface-kind v, checking assignability first.
+// Without the check reflect.Value.Set panics; the case that reaches it is a
+// user passing *interface{Foo()} as a decode target.
 //
-// Caller contract: v.Kind() must be reflect.Interface. Concrete-kind v
-// is rejected with a SemanticError rather than silently calling Set.
-// Concrete-target paths must split the dispatch at the call site — see
-// deserFixedUUIDReflect (Interface vs isUUIDType arms), deserTimeMillis
-// (Interface vs durationType), and deserDuration (Interface vs
-// avroDurationType) for the pattern.
+// Caller contract: v.Kind() must be reflect.Interface. A concrete v gets a
+// SemanticError, so concrete-target paths split the dispatch at the call site —
+// see deserFixedUUIDReflect for the pattern.
 //
-// Use this on the cold paths (logical types, promoted decoders, resolved
-// records, etc.) where the per-call function-boundary cost doesn't matter.
-//
-// On the HOT primitive paths (deserBoolean / setIntValue / deserString /
-// the toAny=true branches in json_decode), do NOT use setIface. Pass rv
-// across a function boundary and escape analysis loses sight of it,
-// forcing every reflect.ValueOf(primitive) call to heap-allocate per
-// decode (~+2 allocs / +330 B per record decode in the bench). Inline the
-// check at the callsite instead, with the fast path written first so
-// rv only exists on the slow branch:
+// Cold paths only. On the HOT primitive paths, do NOT use setIface: passing rv
+// across a function boundary loses escape analysis and heap-allocates every
+// reflect.ValueOf(primitive), ~+2 allocs / +330 B per record decode in the
+// bench. Inline the check instead, fast path first so rv exists only on the
+// slow branch:
 //
 //	if v.Type().NumMethod() == 0 {        // empty interface (any) — common
 //	    v.Set(reflect.ValueOf(b))
@@ -563,15 +532,12 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 			}
 			if len(f.index) == len(existing.index) {
 				// Equal depth, same tagged status, no tiebreaker: AMBIGUOUS.
-				// encoding/json silently drops such a field. We DEFER the
-				// error to lookup rather than rejecting here, so a
-				// coincidental collision on a field the schema never
-				// references (e.g. two embedded library structs that
-				// happen to share a name) does not break the whole struct
-				// — but a schema field that DOES resolve here errors loudly
-				// (not a silent first-win or drop). SchemaFor's collectFields
-				// rejects eagerly because it must emit every field; the runtime
-				// is schema-driven, so it only errors on names actually used.
+				// encoding/json silently drops such a field; this DEFERS the
+				// error to lookup, so a coincidental collision on a name the
+				// schema never references does not break the whole struct
+				// while one that does resolve errors loudly. SchemaFor's
+				// collectFields rejects eagerly because it must emit every
+				// field; the runtime is schema-driven.
 				ambiguous[f.name] = [2]string{t.FieldByIndex(existing.index).Name, t.FieldByIndex(f.index).Name}
 			}
 			continue
@@ -607,18 +573,13 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 	return result, nil
 }
 
-// splitFieldTag tokenizes an avro struct tag for the runtime field mapper
-// using the SAME grammar SchemaFor uses ([splitTag]): top-level commas
-// separate options, a default= value takes the rest of the tag verbatim, and
-// bracketed alias=[...] / decimal(...) values are not split on their internal
-// commas. Without this, a naive strings.Split would mis-read a comma inside a
-// default= value or an alias list — e.g. `default=a,omitzero` or
-// `alias=[x,inline,y]` — as a separate option, so the runtime would spuriously
-// fire omitzero/inline that SchemaFor (correctly) never sees, corrupting the
-// zero value's wire form or making SchemaFor's own schema unencodable for its
-// source type. A malformed tag (unbalanced brackets, which splitTag rejects)
-// falls back to the naive split so the runtime never newly errors on a tag a
-// hand-written-schema user already relies on.
+// splitFieldTag tokenizes an avro struct tag with the SAME grammar SchemaFor
+// uses ([splitTag]): top-level commas separate options, default= takes the rest
+// verbatim, and bracketed alias=[...] / decimal(...) values do not split on
+// their internal commas. A naive strings.Split would read `default=a,omitzero`
+// or `alias=[x,inline,y]` as separate options and fire omitzero/inline that
+// SchemaFor never sees. A malformed tag falls back to the naive split, so the
+// runtime never newly errors on a tag a hand-written-schema user relies on.
 func splitFieldTag(tag string) []string {
 	parts, err := splitTag(tag)
 	if err != nil {
@@ -657,10 +618,9 @@ func parseTagOptions(opts []string) (inline, omitzero bool) {
 // valueIsZero reports whether v is the zero value for its type, or implements
 // an IsZero() bool method that returns true.
 func valueIsZero(v reflect.Value) bool {
-	// A nil pointer or interface IS the zero value — short-circuit before
-	// the IsZero() interface assertion, because a promoted value-receiver
-	// IsZero (e.g. (time.Time).IsZero on a nil *time.Time) dereferences
-	// the nil pointer and panics.
+	// A nil pointer or interface IS the zero value. Short-circuit before the
+	// IsZero assertion: a promoted value-receiver IsZero on a nil *time.Time
+	// dereferences the nil and panics.
 	if k := v.Kind(); (k == reflect.Pointer || k == reflect.Interface) && v.IsNil() {
 		return true
 	}
@@ -668,15 +628,11 @@ func valueIsZero(v reflect.Value) bool {
 		if z, ok := v.Interface().(interface{ IsZero() bool }); ok {
 			return z.IsZero()
 		}
-		// Pointer-receiver IsZero: the method is in *T's method set, not T's,
-		// so the value-method-set assertion above misses it. Reach it through
-		// the address — mirroring textOutFor's pointer-method-set discovery on
-		// addressable values. Box a non-addressable value (e.g. a field of a
-		// struct passed by value) into an addressable temp so Encode(v) and
-		// Encode(&v) agree; a value-receiver IsZero is already reachable on both
-		// via the value method set, and this keeps the pointer-receiver case
-		// symmetric. The nil short-circuit above already handled nil pointers,
-		// so v here is a non-nil value whose *T IsZero is safe to invoke.
+		// Pointer-receiver IsZero lives in *T's method set, which the assertion
+		// above misses. Box a non-addressable value into an addressable temp so
+		// Encode(v) and Encode(&v) agree, as they already do for a
+		// value-receiver IsZero. The nil short-circuit above ran, so v is
+		// non-nil and *T IsZero is safe to invoke.
 		if reflect.PointerTo(v.Type()).Implements(isZeroerType) {
 			if !v.CanAddr() {
 				box := reflect.New(v.Type())
@@ -689,12 +645,9 @@ func valueIsZero(v reflect.Value) bool {
 	return v.IsZero()
 }
 
-// setZero sets v to the Go zero value of its type. Used wherever a null
-// (or a custom-type-returned nil) must clear the target, replacing any
-// prior value — concrete primitives included. Pre-populated non-pointer
-// fields would otherwise silently retain stale data across reused
-// decodes, contradicting the public-API promise that null clears the
-// target.
+// setZero sets v to its type's zero value. A null must clear the target,
+// concrete primitives included, or a pre-populated field retains stale data
+// across a reused decode and breaks the documented promise that null clears.
 func setZero(v reflect.Value) {
 	v.Set(reflect.Zero(v.Type()))
 }

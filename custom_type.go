@@ -262,13 +262,10 @@ func setCustomResult(v reflect.Value, result any, avroType string) error {
 		return nil
 	}
 	rv := reflect.ValueOf(result)
-	// Walk through pointers, allocating as needed. Stop early if
-	// the result is directly assignable (e.g. pointer-valued custom
-	// decoder returning *T into a *T target). Bounded by maxIndirectDepth:
-	// a cyclic target type (`type P *P`, whose Elem is itself) would
-	// otherwise loop forever, allocating a level each iteration. This is the
-	// same ceiling indirect/indirectAlloc apply on the non-custom decode
-	// path, which returns a SemanticError for the same target.
+	// Walk pointers, allocating as needed, stopping early once the result is
+	// directly assignable. Bounded by maxIndirectDepth, the same ceiling the
+	// non-custom path applies: a cyclic target type (type P *P) would otherwise
+	// allocate a level per iteration forever.
 	for i := 0; v.Kind() == reflect.Pointer; i++ {
 		if rv.Type().AssignableTo(v.Type()) {
 			v.Set(rv)
@@ -293,25 +290,22 @@ func setCustomResult(v reflect.Value, result any, avroType string) error {
 // Used both at parse time and during schema resolution to re-apply custom
 // decoders to promoted/resolved nodes.
 //
-// When every registered decoder returns ErrSkipCustomType (the documented
-// property-dispatch fall-through) the wire is RE-DECODED into the real target
-// through the base deserializer (inner) — byte-for-byte the decode a no-custom
-// schema performs. Re-decoding rather than placing a probe-decoded any is what
-// makes the fall-through faithful: a reused map keeps its existing keys, a
-// logical node lands in a base typed target, an overlapping union recovers its
-// exact wire branch — none of which placing an any value reproduces.
+// When every decoder returns ErrSkipCustomType, the wire is RE-DECODED into the
+// real target through inner, byte-for-byte the decode a no-custom schema
+// performs. Placing the probe-decoded any instead would lose what only a real
+// decode reproduces: a reused map keeping its existing keys, a logical node
+// landing in a base typed target, an overlapping union recovering its exact
+// wire branch.
 //
-// Cost. A naive re-decode re-runs nested wrappers, which re-probe → O(depth^2).
-// The probe counts customMatches over the subtree (saved before, compared
-// after); if none matched, bypassCustom is set for the re-decode so nested
-// wrappers skip straight to inner — one O(subtree) pass. If some nested custom
-// matched, the re-decode runs with customs active so the match is reproduced
-// (O(depth^2), bounded by maxDepth, only this case).
+// Cost: a naive re-decode re-runs nested wrappers, which re-probe, giving
+// O(depth^2). The probe counts customMatches over the subtree; if none matched,
+// bypassCustom makes the re-decode one O(subtree) pass. Only when a nested
+// custom did match does the re-decode run with customs active, at O(depth^2)
+// bounded by maxDepth.
 //
-// An interface (any) target needs no separate probe + re-decode: inner already
-// produces the canonical value a no-custom decode yields, so it is decoded
-// straight into v, which doubles as the chain input. This keeps a parent's
-// probe — whose element targets are all `any` — to a single pass.
+// A fresh interface target needs no probe: inner already produces the canonical
+// no-custom value, so it decodes straight into v, which doubles as the chain
+// input. That keeps a parent's probe — all-`any` element targets — single-pass.
 func wrapDeserWithCustomDecoders(inner deserfn, decoders []func(any, *SchemaNode) (any, error), sn *SchemaNode) deserfn {
 	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		// A no-match ancestor set this so the whole subtree decodes through inner
