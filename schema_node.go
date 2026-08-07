@@ -1515,10 +1515,10 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	}
 	// fixed.size is a required attribute and 0 is a legal size, so for
 	// fixed types it is always emitted — omitting a zero value would make
-	// the re-emitted schema unparseable ("fixed is missing size").
-	if n.Type == "fixed" {
-		m["size"] = n.Size
-	} else if n.Size != 0 || n.present.has(presSize) {
+	// the re-emitted schema unparseable ("fixed is missing size"). On any
+	// other kind it is a stray, surfaced as-written. Same required-or-
+	// as-written shape as the "fields" rule below.
+	if n.Type == "fixed" || n.Size != 0 || n.present.has(presSize) {
 		m["size"] = n.Size
 	}
 	// enum.symbols is a required attribute per the Avro spec (Complex

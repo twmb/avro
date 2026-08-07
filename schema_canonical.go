@@ -100,8 +100,13 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 	dst = key(dst, "type")
 	dst = appendCanonString(dst, o.Type)
 
-	switch o.Type {
-	case "record", "error":
+	// One rule per required array: the kind that REQUIRES the key always
+	// emits it (even empty — a record with no "fields" or an enum with no
+	// "symbols" is unparseable), and any other kind emits it only when it
+	// carries one. Stated as a single condition because both halves emit
+	// identically; the metadata emitter states its "fields" rule the same
+	// way (toJSONWalk, schema_node.go).
+	if isRecordKind(o.Type) || len(o.Fields) > 0 {
 		dst = key(dst, "fields")
 		dst = append(dst, '[')
 		for i := range o.Fields {
@@ -111,24 +116,9 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 			dst = appendCanonField(dst, &o.Fields[i])
 		}
 		dst = append(dst, ']')
-	default:
-		if len(o.Fields) > 0 {
-			dst = key(dst, "fields")
-			dst = append(dst, '[')
-			for i := range o.Fields {
-				if i > 0 {
-					dst = append(dst, ',')
-				}
-				dst = appendCanonField(dst, &o.Fields[i])
-			}
-			dst = append(dst, ']')
-		}
 	}
 
-	if o.Type == "enum" {
-		dst = key(dst, "symbols")
-		dst = appendCanonStringArray(dst, o.Symbols)
-	} else if len(o.Symbols) > 0 {
+	if o.Type == "enum" || len(o.Symbols) > 0 {
 		dst = key(dst, "symbols")
 		dst = appendCanonStringArray(dst, o.Symbols)
 	}

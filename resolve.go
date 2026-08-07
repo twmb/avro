@@ -231,9 +231,12 @@ func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, err
 			return resolveArray(r, w, path, ctx)
 		case "map":
 			return resolveMap(r, w, path, ctx)
-		case "fixed":
-			return maybeWrapResolvedNode(r, ctx), nil
 		default:
+			// Everything else — the primitives, and fixed — resolves to the
+			// reader node itself. fixed needs no arm of its own despite being
+			// a named type: CheckCompatibility ran first and already required
+			// the names and the sizes to match (checkSameKind), so there is
+			// nothing left to reconcile.
 			return maybeWrapResolvedNode(r, ctx), nil
 		}
 	}
