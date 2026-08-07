@@ -306,25 +306,15 @@ func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
 	}
 }
 
-// TestMatrix_TaggedUnionsBareNullForNullBranch locks in that
-// EncodeJSON emits bare `null` for the null branch under TaggedUnions,
-// matching the doc commitment ("wraps non-null union values"),
-// Java's JsonEncoder.writeIndex (lang/java/avro/src/main/java/org/
-// apache/avro/io/JsonEncoder.java: `if (symbol != Symbol.NULL &&
-// includeNamespace)`), and the Avro JSON spec's bare-null union form.
-//
-// Without this guarantee, appendAvroJSONUnion's four cfg.tagged sites
-// (tagged-form, nil-first, type-name, try-each) would wrap any branch
-// — including null — when cfg.tagged is set, producing {"null":null}.
-// Meanwhile the entry early-null at appendAvroJSON:165-172 (reached
-// when the entry peel converts a nil Pointer/Interface to invalid)
-// emits bare "null" regardless of cfg.tagged. Two paths, same
-// conceptual input, different output.
-//
-// Structural fix: appendUnionBranch centralizes
-// `wrap iff cfg.tagged && branch.kind != "null"`, used at all four
-// dispatcher sites — so a future dispatcher addition inherits the
-// null special-case automatically.
+// TestMatrix_TaggedUnionsBareNullForNullBranch locks that EncodeJSON emits bare
+// `null` for the null branch under TaggedUnions, matching the doc commitment,
+// Java's JsonEncoder.writeIndex, and the Avro JSON spec's bare-null union form.
+// Without it, appendAvroJSONUnion's four cfg.tagged sites would wrap any branch
+// including null, producing {"null":null}, while the entry early-null — reached
+// when the entry peel converts a nil Pointer/Interface to invalid — emits bare
+// "null" regardless: two paths, same conceptual input, different output. The
+// structural fix is appendUnionBranch, which centralizes `wrap iff cfg.tagged &&
+// branch.kind != "null"` so a future dispatcher inherits the special case.
 func TestMatrix_TaggedUnionsBareNullForNullBranch(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -2499,23 +2489,17 @@ func TestEncodeJSONStringBytesEnumCoverage(t *testing.T) {
 }
 
 // TestMatrix_BytesToAvroJSONStringCodepointPerByte pins that
-// [bytesToAvroJSONString] emits each byte 0x00-0xFF as a separate
-// Unicode codepoint (not as a UTF-8-interpreted multi-byte sequence).
-// `string(b)` is NOT equivalent: it reinterprets the byte slice as a
-// UTF-8 string, which (a) collapses adjacent bytes that form a valid
-// UTF-8 sequence into a single codepoint (bytes c3 a9 → 1 codepoint
-// U+00E9 instead of 2 codepoints U+00C3 + U+00A9), and (b) maps
-// invalid UTF-8 bytes (0xFF, isolated 0x80-0xBF, etc.) to U+FFFD
-// which avroJSONBytesToBytes then rejects as out-of-range. The Avro
-// JSON spec mandates "code points 0-255 encoded as ASCII or escape
-// sequences" — one byte per codepoint.
+// [bytesToAvroJSONString] emits each byte 0x00-0xFF as a separate Unicode
+// codepoint. `string(b)` is NOT equivalent: it reinterprets the slice as UTF-8,
+// collapsing adjacent bytes that form a valid sequence (c3 a9 → one codepoint
+// instead of two) and mapping invalid bytes to U+FFFD, which
+// avroJSONBytesToBytes then rejects as out of range. The spec mandates one byte
+// per codepoint.
 //
-// Round-trip invariant: [avroJSONBytesToBytes] of
-// [bytesToAvroJSONString] of b must equal b for every []byte. The
-// inverse pair is what makes [SchemaField.Default] = []byte for
-// bytes/fixed defaults round-trip through [SchemaNode.Schema]; the
-// naive string(b) path (or [encoding/json.Marshal]'s default base64)
-// breaks the round-trip for any default containing a byte ≥ 0x80.
+// Round-trip invariant: avroJSONBytesToBytes(bytesToAvroJSONString(b)) == b for
+// every []byte. That inverse pair is what makes SchemaField.Default round-trip
+// through SchemaNode.Schema; the naive string(b) path — or json.Marshal's
+// base64 — breaks it for any default containing a byte >= 0x80.
 func TestMatrix_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -3566,19 +3550,13 @@ func TestDecodeJSONNullTypedTargets(t *testing.T) {
 }
 
 // TestDecodeJSONNullIntoNonPointerZeroes is the JSON sibling of
-// TestDeserNullIntoNonPointerZeroes. doc.go states that a null union
-// branch decodes to the target's Go zero value, always replacing any
-// prior value. The binary path honors this unconditionally; the JSON
-// path historically only zeroed nilable kinds (pointer/map/slice/
-// interface), leaving non-nilable concrete targets (int, string, bool,
-// struct fields) at whatever prior value they held. That was a silent
-// value-bleed footgun across reused decode targets, contradicting the
-// public-API promise.
-//
-// Covers all three null-handling dispatch sites in json_decode.go:
-//   - decodeNull (top-level "null" schema and non-union null fields)
-//   - decodeUnion null branch (3+ branch unions and bare null in ["null", T])
-//   - assignAny nil value (toAny path)
+// TestDeserNullIntoNonPointerZeroes. doc.go states that a null union branch
+// decodes to the target's Go zero value, always replacing any prior value. The
+// binary path honors this unconditionally; the JSON path historically zeroed
+// only nilable kinds, leaving non-nilable concrete targets at whatever they held
+// — a silent value-bleed footgun across reused decode targets. Covers all three
+// null-handling dispatch sites: decodeNull, the decodeUnion null branch, and
+// assignAny's nil value.
 func TestDecodeJSONNullIntoNonPointerZeroes(t *testing.T) {
 	t.Run("top-level null", func(t *testing.T) {
 		s, _ := Parse(`"null"`)

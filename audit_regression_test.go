@@ -1474,18 +1474,13 @@ func unionEnvelopeKey(t *testing.T, out any) string {
 }
 
 // A resolved schema's DecodeJSON must match its binary Decode (the oracle) even
-// when the WRITER carries a CustomType whose Decode the writer's own Encode
-// cannot reproduce — a Decode-only read-side mapping being the common case.
-// decodeJSONResolved performs a pure wire-shape transform (writer-JSON ->
-// writer-binary) before the resolving decode, and that transform must run
-// against a CUSTOM-FREE view of the writer: decoding writer-JSON through the
-// writer's own custom Decode produces a Go-domain value the re-encode cannot
-// invert. The reader's custom Decode still fires in the final resolving decode.
-//
-// Non-vacuity: the invertible-custom cells exercise the identical path and
-// round-tripped before the fix, so asserting both proves the repair without
-// regressing them. Reverting decodeJSONResolved to s.resolveWriter fails every
-// decode-only cell.
+// when the WRITER carries a CustomType whose Decode its own Encode cannot
+// reproduce. decodeJSONResolved transforms writer-JSON into writer-binary before
+// the resolving decode, and that transform must run against a CUSTOM-FREE view
+// of the writer: decoding writer-JSON through the writer's own custom Decode
+// produces a Go-domain value the re-encode cannot invert. Non-vacuity: the
+// invertible-custom cells took the identical path and round-tripped before the
+// fix, so asserting both proves the repair without regressing them.
 func TestMatrix_ResolvedDecodeJSONWriterCustomDecodeRawRoundTrip(t *testing.T) {
 	type domainTS struct{ ms int64 }
 	type domainDec struct{ raw string }
@@ -2088,15 +2083,13 @@ func TestRegression_CustomDecodePointerResultPointerTargetParity(t *testing.T) {
 }
 
 // A no-Decode CustomType that suppresses a logical must yield the RAW
-// Avro-native value on BOTH wire formats for a SCALAR typed target, as binary's
-// raw deser* already does. The JSON per-kind decoders honored suppression only
-// in their decode-into-any branch and applied the logical transform
-// unconditionally for a typed target: a suppressed decimal into *string read
-// "123.45" where binary handed back the raw payload, and time-millis into
-// time.Duration SILENTLY produced a different value — no error, corrupt data.
-// The fix threads the flag into assignBytes/decodeInt/decodeLong so each returns
-// the raw value before its logical switch. Driven across bytes, fixed, int and
-// long; the [N]byte-array sibling is
+// Avro-native value on BOTH wires for a SCALAR typed target, as binary's raw
+// deser* already does. The JSON per-kind decoders honored suppression only in
+// their decode-into-any branch and applied the transform unconditionally for a
+// typed target: a suppressed decimal into *string read "123.45" where binary
+// handed back the raw payload, and time-millis into time.Duration SILENTLY
+// produced a different value. The fix threads the flag into
+// assignBytes/decodeInt/decodeLong. [N]byte sibling:
 // TestMatrix_CustomSuppressionByteArrayTargetParity.
 func TestMatrix_CustomSuppressionScalarTargetParity(t *testing.T) {
 	strT := reflect.TypeOf("")
@@ -2430,15 +2423,11 @@ type untaggedPinBig int64
 
 // A bare (untagged) JSON union value cannot name its branch, so DecodeJSON
 // commits to the FIRST declaration-order branch of the matching token class.
-// DOCUMENTED INTENTIONAL (TaggedUnions and DecodeJSON docs; BUG_AUDIT.md §Known
-// intentional divergences): the untagged wire for int32(7)-via-int and
-// int64(7)-via-long is the identical byte `7`, so the writer's branch is
-// information-theoretically unrecoverable — do not "fix" with branch-guessing.
-// The consequences are spelled out so a future round surfaces the policy instead
-// of re-flagging the asymmetry: decode-into-any picks the first number-class
-// branch where binary recovers the writer's; a TRANSFORMING CustomType on a
-// non-first same-class branch is skipped even for a concrete typed target; and
-// TaggedUnions recovers the branch on both counts.
+// DOCUMENTED INTENTIONAL (BUG_AUDIT.md §Known intentional divergences): the
+// untagged wire for int32(7)-via-int and int64(7)-via-long is the identical byte
+// `7`, so the writer's branch is information-theoretically unrecoverable — do
+// not "fix" with branch-guessing. The consequences are spelled out so a future
+// round surfaces the policy rather than re-flagging the asymmetry.
 func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
 	t.Run("decode-into-any-first-class-branch", func(t *testing.T) {
 		sc := avro.MustParse(`["long","int"]`)
@@ -3384,20 +3373,16 @@ type (
 )
 
 // TestMatrix_CustomSkipNestedMatchRedecodes adds the SELECTIVITY axis. The skip
-// matrix drives a wildcard that skips at every node, so its corpus only ever
-// reaches the fall-through's bypass arm: nothing matched anywhere, so one clean
-// re-decode with customs off reproduces the no-custom result.
+// matrix drives a wildcard that skips at every node, so its corpus only reaches
+// the fall-through's bypass arm. The other value of the axis is a custom that
+// skips at the OUTER node but matched somewhere in its subtree: the fall-through
+// cannot bypass then — that would discard the nested match — so it re-decodes
+// with customs ACTIVE, and both wires have their own copy of that decision.
 //
-// The other value of the axis is a custom that skips at the OUTER node but
-// matched somewhere in its subtree. The fall-through cannot bypass then —
-// bypassing would discard the nested match — so it re-decodes with customs
-// ACTIVE. Both wires have their own copy of that decision, and the corpus
-// reached neither.
-//
-// Crossed with CONTAINER KIND, because the fall-through sits in each container's
+// Crossed with CONTAINER KIND, since the fall-through sits in each container's
 // decoder. The oracle is a no-custom decode into the raw-typed twin: the marked
-// position must carry the transform of exactly the value the raw decode saw, and
-// every sibling must be untouched.
+// position carries the transform of exactly the value the raw decode saw, and
+// every sibling is untouched.
 func TestMatrix_CustomSkipNestedMatchRedecodes(t *testing.T) {
 	t.Parallel()
 	money := avro.CustomType{
@@ -3551,19 +3536,17 @@ func TestRegression_CustomSkipDecodeMatchedTransformSurvives(t *testing.T) {
 }
 
 // TestMatrix_CustomSkipDecodeReusesTarget pins that a wildcard all-skip custom
-// decode REUSES a pre-populated target identically to a no-custom decode. A
+// decode REUSES a pre-populated target identically to a no-custom decode — a
 // non-nil typed map and an interface already wrapping a map[string]any retain
-// keys absent from the wire — deserMap's `mapVal = v` reuse and deserRecord's
-// reuseOrMakeStringAnyMap stale-key contract. The fall-through RE-DECODES into
-// the same target through the base deserializer, so reuse is inherited rather
-// than re-implemented.
+// keys absent from the wire. The fall-through RE-DECODES into the same target
+// through the base deserializer, so reuse is inherited rather than
+// re-implemented.
 //
-// This axis is invisible to the main skip matrix, which decodes only into fresh
-// targets. The oracle is a no-custom decode into the SAME pre-populated target.
-// The map[string]any subtest is the cell an earlier assignable-fast-path
-// placement swallowed; an Avro map decoded into `any` is the control, since
-// deserMap's iface arm allocates fresh. Non-vacuity: neutering the typed-target
-// re-decode reds the map[string]any and record-into-any cells.
+// Invisible to the main skip matrix, which decodes only into fresh targets. The
+// map[string]any subtest is the cell an earlier assignable-fast-path placement
+// swallowed; an Avro map decoded into `any` is the control, since deserMap's
+// iface arm allocates fresh. Non-vacuity: neutering the typed-target re-decode
+// reds the map[string]any and record-into-any cells.
 func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
 
@@ -3654,14 +3637,11 @@ func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 // TestMatrix_CustomSkipDecodeLogicalIntoBaseTypedTarget pins that a WILDCARD
 // all-skip custom — which does not suppress logicals — decoding a logical node
 // into a base TYPED target lands identically to a no-custom decode. The base
-// deserializer fills the typed target natively (deserDate→int32 raw days,
-// deserDuration→[12]byte), and the fall-through RE-DECODES through it. A
-// box-into-any placement could not: the probe holds the ENRICHED type, which no
-// base-kind setter accepts, so it ERRORED where no-custom succeeds.
-//
-// The main skip matrix holds the decode target equal to the encode value's own
-// type, so this crosses logical schema x base typed target — the foreclosed cell
-// — on both wires. Non-vacuity: neutering the typed re-decode reds every row.
+// deserializer fills the target natively and the fall-through RE-DECODES through
+// it; a box-into-any placement could not, since the probe holds the ENRICHED
+// type no base-kind setter accepts. The main skip matrix holds the target equal
+// to the encode value's own type, so this crosses the foreclosed cell.
+// Non-vacuity: neutering the typed re-decode reds every row.
 func TestMatrix_CustomSkipDecodeLogicalIntoBaseTypedTarget(t *testing.T) {
 	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
 	rows := []struct {
@@ -3927,15 +3907,12 @@ func TestRegression_CustomSkipDecodeLogicalSuppression(t *testing.T) {
 
 // Internal re-parse surfaces vs user lax names.
 //
-// Two sites re-parse LIBRARY-PRODUCED schema text: Resolve builds a custom-free
-// writer view from writer.full for resolved DecodeJSON, and SchemaCache.Parse
-// rebuilds the metadata forms from the spliced JSON. Both once used
-// WithLaxNames(nil), assuming it subsumes any user lax validator — false for
-// empty name components, the only class lax(nil) rejects that a user fn can
-// accept. The original parse already validated those names under the user's
-// validator, so the internal validator has no safety role and both sites now
-// parse with internalReparseNames. TestMatrix_InternalReparseLaxNames covers the
-// class.
+// Two sites re-parse LIBRARY-PRODUCED schema text: Resolve's custom-free writer
+// view, and SchemaCache.Parse's rebuild from the spliced JSON. Both once used
+// WithLaxNames(nil), assuming it subsumes any user validator — false for empty
+// name components, the only class lax(nil) rejects that a user fn can accept.
+// The original parse already validated those names, so the internal validator
+// has no safety role and both sites now use internalReparseNames.
 
 // ctLong is a decode-side domain type so the custom wiring in these tests
 // is observable, not just registered.
@@ -4296,17 +4273,14 @@ func TestRegression_CacheSpliceEmptyShortName(t *testing.T) {
 }
 
 // AUDIT_PATTERNS.md B7 second instance, the stale-splice arm. A KEYLESS
-// definition registers the parser fullname "x." for
-// {"type":"record","namespace":"x",...} and builds its children under x, so the
-// nested Inner is x.Inner. collectTreeDefs gated both the def visit and the child
-// namespace scope on a string "name" KEY being present, so parse-1's nested
-// definition was misfiled under the enclosing-scoped "Inner". A later same-cache
-// parse referencing the short name BEFORE locally defining a DIFFERENT Inner is
-// bound by the parser to the LOCAL definition, and the wire codec implements
-// Inner{z:string}; the splice walker instead found the misfiled stale def,
-// inlined Inner{w:long}, and rewrote the local definition to a reference —
-// shipping metadata describing a field the wire rejects. Post-fix the defs table
-// holds only parser-scoped fullnames and every metadata form equals the twin's.
+// definition registers the parser fullname "x." and builds its children under x,
+// so the nested Inner is x.Inner. collectTreeDefs gated both the def visit and
+// the child namespace scope on a string "name" KEY being present, so parse-1's
+// nested definition was misfiled under the enclosing-scoped "Inner". A later
+// parse referencing the short name BEFORE locally defining a DIFFERENT Inner
+// binds to the LOCAL one, but the splice walker found the misfiled stale def and
+// rewrote the local definition to a reference — shipping metadata describing a
+// field the wire rejects.
 func TestRegression_CacheKeylessDefStaleSplice(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	var c avro.SchemaCache
@@ -4551,9 +4525,8 @@ func TestRegression_LeadingDotStaleSpliceHealed(t *testing.T) {
 
 // ---------- lax_internal_reparse_matrix_test.go ----------
 
-// Class matrix for the internal re-parse surfaces (Resolve's custom-free writer
-// view; SchemaCache's splice rebuild) against the full name class the ORIGINAL
-// parse can accept:
+// Class matrix for the internal re-parse surfaces against the full name class
+// the ORIGINAL parse can accept:
 //
 //	{site: resolve-view, cache-splice}
 //	  x {name class: strict, lax-nonempty, empty-component ns, empty-string name}
@@ -4562,11 +4535,11 @@ func TestRegression_LeadingDotStaleSpliceHealed(t *testing.T) {
 //	plus a cache cell whose OUTER parse carries the user lax fn, and pinned
 //	verdicts for the structurally-unreferenceable bare "" name.
 //
-// Every cell is framed as PARITY WITH THE ORIGINAL PARSE: whatever the public
-// parse accepted must survive Resolve, the String()/Canonical() re-parse, and
-// resolved DecodeJSON, and the wire bytes and fingerprints must equal the
-// no-custom / directly-parsed twin's. The reader always differs from the writer
-// so Resolve's canonical fast path cannot mask the writer-view construction.
+// Every cell is PARITY WITH THE ORIGINAL PARSE: whatever the public parse
+// accepted must survive Resolve, the String()/Canonical() re-parse, and resolved
+// DecodeJSON, with wire bytes and fingerprints equal to the twin's. The reader
+// always differs from the writer so Resolve's canonical fast path cannot mask
+// the writer-view construction.
 
 func ctLongEncDec() avro.CustomType {
 	return avro.CustomType{
@@ -5057,9 +5030,8 @@ func TestMatrix_InternalReparseBareEmptyName(t *testing.T) {
 
 // Class matrix for KEYLESS definitions in the SchemaCache def table — named-kind
 // nodes with no "name" key at all, parseable only under a WithLaxNames fn
-// accepting "" (AUDIT_PATTERNS.md B7 second instance). The parser registers a
-// fullname for them regardless and scopes their children by it, so the
-// def-collection and splice walkers must do the same.
+// accepting "". The parser registers a fullname for them regardless and scopes
+// their children by it, so the def-collection and splice walkers must too.
 //
 //	{namespace attr: present "x", absent}
 //	  x {parse-2 shape: cross-parse reference to the parser fullname,
@@ -5067,10 +5039,10 @@ func TestMatrix_InternalReparseBareEmptyName(t *testing.T) {
 //	     local-define-then-reference}
 //	plus keyless-def-visit, seen-parity, and same-string lax re-parse cells.
 //
-// Invariant per cell, as everywhere in this file: the metadata forms describe
-// the wire codec's schema, twin-parity where a twin exists. The bare-namespace
-// reference-then-define orders have NO twin — the parser rejects the parse — so
-// they are pinned as the rejection.
+// Invariant per cell: the metadata forms describe the wire codec's schema,
+// twin-parity where a twin exists. The bare-namespace reference-then-define
+// orders have NO twin — the parser rejects the parse — so they pin the
+// rejection.
 func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	lax := avro.WithLaxNames(acceptAll)
@@ -5346,16 +5318,14 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 	})
 }
 
-// Class matrix for LEADING-DOT names (AUDIT_PATTERNS.md B7 third instance). A
-// single leading dot with no other dot is the explicit null-namespace escape:
-// {"name":".x"} builds as "x" in the null namespace, and "." collapses to the
-// bare empty name — the rule qualifyAliases already applies to aliases and
-// Java's Name constructor applies to every name. Lax-only: strict parses still
-// reject the empty leading component. fastavro 1.12.2 holds a third posture,
-// executed 2026-07-14: it keeps ".x" verbatim in PCF and rejects the bare-"x"
-// reference. twmb follows Java's normalized identity, so post-fix fingerprints
-// for ".x" match Java and diverge from fastavro; pre-fix twmb matched fastavro
-// on definition-only shapes but was SELF-inconsistent on references.
+// Class matrix for LEADING-DOT names. A single leading dot with no other dot is
+// the explicit null-namespace escape: {"name":".x"} builds as "x" in the null
+// namespace, and "." collapses to the bare empty name — the rule qualifyAliases
+// already applies to aliases and Java's Name constructor applies to every name.
+// Lax-only. fastavro 1.12.2 holds a third posture (executed 2026-07-14): it
+// keeps ".x" verbatim in PCF and rejects the bare-"x" reference. twmb follows
+// Java's normalized identity; pre-fix twmb matched fastavro on definition-only
+// shapes but was SELF-inconsistent on references.
 //
 //	{".x" definition x reference spelling {"x", ".x"} x cross-parse
 //	 x {pure reference, reference-then-define, define-then-reference}}
@@ -5776,17 +5746,15 @@ func TestMatrix_CanonicalEmptyNameFastavroParity(t *testing.T) {
 	})
 }
 
-// Tagged-union JSON naming for an EMPTY-NAMED union branch (short name "" with
-// and without a namespace — reachable only under a user WithLaxNames fn). The
-// tag is the branch's FULLNAME, exactly as for any other named branch, matching
-// fastavro's json_writer (1.12.2, executed: `{"ok.": "A"}`). fastavro cannot
-// WRITE the bare class but its reader accepts the "" key, so twmb's `{"":"A"}`
-// is fastavro-readable on both classes.
+// Tagged-union JSON naming for an EMPTY-NAMED union branch (reachable only under
+// a user WithLaxNames fn). The tag is the branch's FULLNAME, as for any other
+// named branch, matching fastavro's json_writer (1.12.2, executed:
+// `{"ok.": "A"}`). fastavro cannot WRITE the bare class but its reader accepts
+// the "" key, so twmb's `{"":"A"}` is fastavro-readable on both.
 //
 //	{class: bare "", namespaced "ok."}
-//	  x {tagged encode emission (exact bytes),
-//	     decode of own emission (plain and TaggedUnions),
-//	     tagged-map encode routing, resolved DecodeJSON routing}
+//	  x {tagged encode emission, decode of own emission (plain and
+//	     TaggedUnions), tagged-map encode routing, resolved DecodeJSON routing}
 func TestMatrix_EmptyNameTaggedUnion(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	for _, tc := range []struct {
@@ -7365,15 +7333,13 @@ func TestMatrix_SchemaCacheWrappedFormCrossParseRefSelfContains(t *testing.T) {
 
 // TestMatrix_SpliceWrapperReservedKeyMerge drives the splice merge's
 // reserved-key routing with wrapper props on cached definitions. A wrapper key
-// the def's kind/logical CONSUMES never survives the splice (reserved usage-site
-// attributes drop, matching Java's reference arms, which return the found schema
-// with no properties pass); an UNCONSUMED key merges onto the definition as an
-// ordinary custom property, definition-wins on collision. A non-string
-// logicalType is unconsumed everywhere; precision/scale are consumed exactly on
-// a decimal carrier. The decimal def omits "scale" on purpose (spec default 0):
-// a consumed wrapper "scale" must be dropped by the ROUTING, not masked by the
-// def-wins presence check. fastavro rejects the props-carrying wrapped-reference
-// spelling outright, so these cells have no differential arm.
+// the def's kind/logical CONSUMES never survives the splice, matching Java's
+// reference arms; an UNCONSUMED key merges onto the definition as an ordinary
+// custom property, definition-wins on collision. The decimal def omits "scale"
+// on purpose (spec default 0): a consumed wrapper "scale" must be dropped by the
+// ROUTING, not masked by the def-wins presence check. fastavro rejects the
+// props-carrying wrapped-reference spelling outright, so there is no
+// differential arm.
 func TestMatrix_SpliceWrapperReservedKeyMerge(t *testing.T) {
 	plainDef := `{"type":"fixed","name":"F","size":4}`
 	decimalDef := `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":2}`
@@ -7513,17 +7479,14 @@ func TestMatrix_SpliceWrapperReservedKeyMerge(t *testing.T) {
 	}
 }
 
-// spliceStrayRoutedKeys is the SHAPE-CONDITIONAL reserved-key axis: the keys
-// that have a SchemaNode structural field to land on, so a stray placement
-// routes on whether its body parses as that key's schema shape rather than on
-// the key alone. It mirrors the parser's own strayRoutedKeys;
+// spliceStrayRoutedKeys is the SHAPE-CONDITIONAL reserved-key axis: keys with a
+// SchemaNode structural field to land on, so a stray placement routes on whether
+// its body parses as that key's schema shape rather than on the key alone. It
+// mirrors the parser's own strayRoutedKeys, and
 // TestInvariant_StrayRoutedKeyAxisMirrorsTheSource reds if the source list
-// changes, so a new stray-routed key cannot ship without a cell here.
-//
-// The three keys the older cells drive (logicalType, precision, scale) are NOT
-// in this list — their binding turns on the value or the logical type, never on
-// shape — so each short-circuits before the shape question is asked. That is the
-// axis this table adds.
+// changes. The three keys the older cells drive (logicalType, precision, scale)
+// are NOT here — their binding turns on the value or the logical type — so each
+// short-circuits before the shape question is asked.
 var spliceStrayRoutedKeys = []string{
 	"items", "values", "fields", "symbols", "size", "name", "namespace", "aliases",
 }
@@ -7618,18 +7581,16 @@ var spliceStrayRuling = map[string]spliceStrayOutcome{
 }
 
 // TestMatrix_SpliceWrapperStrayRoutedKeyShape widens the wrapper-key axis onto
-// the shape-conditional class. The older cells drive only logicalType, precision
-// and scale, each settled before the routing reaches its shape question, so the
-// splice's shape verdict — the nil-verdict arm, the one call site with no
-// recorded parse verdict to consult, which must decode the body afresh — never
-// ran at all.
+// the shape-conditional class. The older cells drive only keys settled before
+// the routing reaches its shape question, so the splice's shape verdict — the
+// nil-verdict arm, the one call site with no recorded parse verdict to consult —
+// never ran.
 //
-// The cross product is stray-routed key x definition kind x body class, and each
-// cell is checked against an INDEPENDENT image rather than the routing's own
-// answer: a merged body must equal what the SAME body becomes under a
-// non-reserved key, and every cell — merged, dropped or rejected — must leave
-// the definition's structural surface, wire image and canonical form untouched,
-// since a usage-site attribute can never redefine the type it references.
+// The cross product is stray-routed key x definition kind x body class, each
+// checked against an INDEPENDENT image rather than the routing's own answer: a
+// merged body must equal what the SAME body becomes under a non-reserved key,
+// and every cell must leave the definition's structural surface, wire image and
+// canonical form untouched.
 func TestMatrix_SpliceWrapperStrayRoutedKeyShape(t *testing.T) {
 	t.Parallel()
 	counts := map[spliceStrayOutcome]int{}
@@ -8054,15 +8015,11 @@ func TestSlabFreeClassifier(t *testing.T) {
 // TestSlabFreeMatchesNilSlabOracle is the two-sided generative net: for every
 // matrix fragment in every context, the slab-free classification must EXACTLY
 // equal the independent oracle "decoding every encoded value with a nil slab
-// does not panic". A slab-free schema whose deser secretly touches the slab
-// panics (too eager: a user-visible crash in Decode); a pooled schema whose
-// deser never touches it survives nil (too conservative: issue #41 regresses).
-// Composite kinds panic at entry via the recursion-depth bump and string leaves
-// via the slab string copy, so the oracle discriminates every cell.
-//
-// Non-vacuity: adding "string" to slabFreeKinds fails the string cells in the
-// panicked direction, and hardcoding slabFree=false fails every scalar cell in
-// the other.
+// does not panic". Too eager is a user-visible crash in Decode; too conservative
+// regresses issue #41. Composite kinds panic at entry via the recursion-depth
+// bump and string leaves via the slab string copy, so the oracle discriminates
+// every cell. Non-vacuity: adding "string" to slabFreeKinds fails the string
+// cells, and hardcoding slabFree=false fails every scalar cell the other way.
 func TestSlabFreeMatchesNilSlabOracle(t *testing.T) {
 	u := &uniq{}
 	var freeCells, pooledCells int

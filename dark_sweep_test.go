@@ -21,15 +21,14 @@ import (
 // from a coverage census that unions every Test, net and fuzz seed and then
 // subtracts. A block reached by nothing is the only place a behavioral defect
 // can hide, so each cell drives an input that lands on one and checks the result
-// against an oracle OUTSIDE this package: encoding/json for the JSON-tree
-// shapes, big.Int arithmetic for the timestamp bounds, the binary auto-fill for
-// the metadata default surface, and json.Valid for the strict skipper.
+// against an oracle OUTSIDE this package: encoding/json, big.Int arithmetic for
+// the timestamp bounds, the binary auto-fill for the metadata default surface,
+// and json.Valid for the strict skipper.
 //
-// The axes are the ones deciding which arm runs, not which value: carrier shape,
-// container shape, nesting parity, and wire path. Parity is what makes the
-// recursion guards reachable at all — each schema level costs one depth unit, so
-// whether a union / array / map node or a record node sits on the limit depth is
-// decided by how many levels separate it from the root.
+// The axes decide which arm runs, not which value: carrier shape, container
+// shape, nesting parity, and wire path. Parity is what makes the recursion
+// guards reachable at all — each schema level costs one depth unit, so which
+// node sits on the limit depth is decided by its distance from the root.
 
 // ---------------------------------------------------------------------------
 // Timestamp scaling: the int64 overflow boundary on both sides.

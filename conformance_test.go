@@ -585,14 +585,11 @@ func TestSpecUnionDefaultMatchesAnyBranch(t *testing.T) {
 
 // TestRegression_UnionNullDefaultRoutesToNullBranchNotCompound locks the
 // branch-routing for unions [Compound, null] with default null. Per Java's
-// isValidDefault (Schema.java:1751-1798: the RECORD/ARRAY/MAP cases reject a
-// non-matching JSON type, NULL accepts only isNull), null is not a valid default
-// for record/array/map — it can only match the null branch. validateDefault must
-// reject nil for those kinds so the branch-walk falls through to null and
-// encodeDefault emits a null-branch index; without that, the compound branch
-// matches first and emits empty-record/array/map bytes, a binary/JSON parity
-// break since JSON's auto-fill bypasses defaultBytes and emits "null" correctly.
-//
+// isValidDefault (Schema.java:1751-1798), null is not a valid default for
+// record/array/map, so validateDefault must reject nil for those kinds and let
+// the branch-walk fall through to null; without that the compound branch matches
+// first and emits empty-record/array/map bytes — a binary/JSON parity break,
+// since JSON's auto-fill bypasses defaultBytes and emits "null" correctly.
 // Cross-checked: fastavro's _validate_record requires a Mapping; hamba's
 // isValidDefault returns false on type-assertion failure.
 func TestRegression_UnionNullDefaultRoutesToNullBranchNotCompound(t *testing.T) {
@@ -4052,17 +4049,14 @@ func TestSpecDecimalRejectsScaleTruncation(t *testing.T) {
 }
 
 // TestSpecBigDecimalWireFormat locks the AVRO-4124 big-decimal wire format: an
-// Avro-bytes-framed unscaled integer (length varint + two's-complement
-// big-endian bytes), then a zigzag varint scale.
-//
-// Oracle: Java's Conversions.toBytes (Conversions.java:206-220) and avro-rs's
+// Avro-bytes-framed unscaled integer, then a zigzag varint scale. Oracle: Java's
+// Conversions.toBytes (Conversions.java:206-220) and avro-rs's
 // big_decimal_as_bytes (bigdecimal.rs:29-37), verified against a Java-generated
-// bigdec.avro round-trip (2.24 produces 08 04 00 e0 04). fastavro and hamba do
+// bigdec.avro round trip (2.24 produces 08 04 00 e0 04). fastavro and hamba do
 // not implement big-decimal at all.
 //
-// Carrier limitation, documented as a known divergence: *big.Rat reduces to
-// lowest terms, so twmb always emits the canonical scale where Java preserves
-// the declared one (BigDecimal("3.140") keeps scale=3).
+// Documented divergence: *big.Rat reduces to lowest terms, so twmb always emits
+// the canonical scale where Java preserves the declared one.
 func TestSpecBigDecimalWireFormat(t *testing.T) {
 	schema := mustParse(t, `{"type":"bytes","logicalType":"big-decimal"}`)
 	t.Run("java_ground_truth_2.24", func(t *testing.T) {
@@ -4952,14 +4946,12 @@ func TestRegression_WholeFloatEncodesAsInt(t *testing.T) {
 
 // TestMatrix_FloatSourceMantissaBoundOnIntLongEncode locks the encoder-side
 // mantissa-precision bound on whole-number-float input against int/long schemas.
-// The decoder's float-target arms cap val at 1<<24 (float32) or 1<<53 (float64)
-// for a lossless round trip, so the encoder's CanFloat arm must apply the same
+// The decoder's float-target arms cap at 1<<24 (float32) or 1<<53 (float64) for
+// a lossless round trip, so the encoder's CanFloat arm must apply the same
 // source-bit-aware cap or `Encode(float32(1<<25), "int|long")` produces wire the
-// matching Decode cannot read back. All eight encode-side sites taking Go-float
-// input share the floatFitsInt32From / floatFitsInt64From helpers.
-//
-// json.Number values are unaffected: their precision is float64-implicit, so
-// that path keeps the unchecked helpers — capping at 1<<24 would falsely reject
+// matching Decode cannot read back. All eight encode sites share the
+// floatFitsInt32From / floatFitsInt64From helpers. json.Number is unaffected:
+// its precision is float64-implicit, and capping at 1<<24 would falsely reject
 // "1e9" → int32, which IS exact.
 func TestMatrix_FloatSourceMantissaBoundOnIntLongEncode(t *testing.T) {
 	intS := mustParse(t, `"int"`)
@@ -5056,17 +5048,13 @@ func TestMatrix_FloatSourceMantissaBoundOnIntLongEncode(t *testing.T) {
 
 // TestMatrix_JsonNumberOverflowToInfFloatEncodeParity locks that
 // jsonNumberToFloat and jsonCoerceToFloat64 accept a float-form json.Number
-// whose magnitude exceeds float64 range: strconv.ParseFloat returns (±Inf,
-// ErrRange) for those, and ±Inf IS the correct Avro wire encoding. Propagating
-// the error would create a route divergence — s.Encode(math.Inf(1)) and
-// s.Encode(float64(9.999e308)) both succeed, but the same value expressed
-// precision-preservingly through json.Number would reject. The decode side
-// already accepts ±Inf-from-overflow, and Java's BigDecimal.doubleValue() and
-// fastavro's float() both return ±Inf without error.
-//
-// Locked at both sites, at float32 (clean float64→float32 +Inf narrowing) and
-// float64. Boundary: just-below MaxFloat64 encodes finite, just-above encodes
-// ±Inf, and ErrRange-without-Inf would still reject.
+// beyond float64 range: ParseFloat returns (±Inf, ErrRange), and ±Inf IS the
+// correct Avro wire encoding. Propagating the error would diverge by route —
+// s.Encode(math.Inf(1)) succeeds, but the same value expressed
+// precision-preservingly through json.Number would reject. Decode already
+// accepts ±Inf-from-overflow, and Java's BigDecimal.doubleValue() and fastavro's
+// float() both return ±Inf without error. Boundary: just-below MaxFloat64
+// encodes finite, just-above encodes ±Inf.
 func TestMatrix_JsonNumberOverflowToInfFloatEncodeParity(t *testing.T) {
 	floatS := mustParse(t, `"float"`)
 	doubleS := mustParse(t, `"double"`)
@@ -5185,21 +5173,17 @@ func TestMatrix_JsonNumberOverflowToInfFloatEncodeParity(t *testing.T) {
 }
 
 // TestMatrix_SchemaDefaultOverflowToInfParity is the schema-default-parse-time
-// sibling of TestMatrix_JsonNumberOverflowToInfFloatEncodeParity: the encode
-// side accepts (±Inf, strconv.ErrRange), so the same predicate must apply at
-// defaultAsFloat64's json.Number and string arms and at coerceDefault.
-// Pattern 1b — a stdlib-parser predicate change at the encode arm must be
-// propagated to every schema-parse-time arm.
-//
-// Both upstream impls accept: Java's Schema.parseField converts textual
-// float/double defaults via Double.parseDouble, which returns +Inf for "1e1000"
-// without throwing; fastavro's _default_matches_schema accepts via
-// _maybe_float.
+// sibling of the encode-side net: the encode side accepts (±Inf, ErrRange), so
+// the same predicate must apply at defaultAsFloat64's two arms and at
+// coerceDefault. Pattern 1b — a stdlib-parser predicate change at the encode arm
+// must propagate to every parse-time arm. Both upstream impls accept: Java's
+// parseField uses Double.parseDouble, which returns +Inf without throwing, and
+// fastavro's _default_matches_schema accepts via _maybe_float.
 //
 // The matrix pins parse acceptance AND the round-trip wire value across the four
-// arms it can reach: literal-numeric vs string-form default x float vs double
-// schema, the negative mirror, the just-below-MaxFloat64 boundary, the union
-// shape, the nested-record carrier, and the still-rejects-syntax-error control.
+// arms it reaches: literal vs string-form default x float vs double, the
+// negative mirror, the just-below-MaxFloat64 boundary, the union shape, the
+// nested-record carrier, and the still-rejects-syntax-error control.
 func TestMatrix_SchemaDefaultOverflowToInfParity(t *testing.T) {
 	type acceptCase struct {
 		name         string
@@ -5713,20 +5697,16 @@ func TestMatrix_SchemaNodePropsDocstringContract(t *testing.T) {
 	})
 }
 
-// TestMatrix_SchemaNodePropsNonFiniteFloatRoundTrip pins the asymmetric
-// round-trip for non-finite float64 values in SchemaNode.Props. RFC 8259 has no
-// NaN literal: ±Inf can be emitted as 1e1000 / -1e1000, the IEEE overflow
-// re-parse closing the round trip, but NaN must emit as the JSON string "NaN"
-// and survive untouched on re-parse. Auto-coercing the literal "NaN" at the
-// Props normalize stage would silently reinterpret a user-intentional string
-// value — a hand-written {"x":"NaN"} legitimately stores a string, which the
-// "parsed intentional string preserved" subtest pins.
-//
-// SchemaField.Default closes for NaN via the schema-typed coercion stage; Props
-// has no analogous stage by design.
-//
-// Cross-impl: Java/Jackson shows the same Props asymmetry. fastavro avoids it
-// only by emitting non-RFC bare NaN; avro-rs and hamba reject or drop the value.
+// TestMatrix_SchemaNodePropsNonFiniteFloatRoundTrip pins the asymmetric round
+// trip for non-finite float64 values in SchemaNode.Props. RFC 8259 has no NaN
+// literal: ±Inf can be emitted as 1e1000, the IEEE overflow re-parse closing the
+// round trip, but NaN must emit as the JSON string "NaN" and survive untouched.
+// Auto-coercing the literal "NaN" at the Props normalize stage would silently
+// reinterpret a user-intentional string value, which the "parsed intentional
+// string preserved" subtest pins. SchemaField.Default closes for NaN via the
+// schema-typed coercion stage; Props has no analogous stage by design.
+// Java/Jackson shows the same asymmetry; fastavro avoids it only by emitting
+// non-RFC bare NaN.
 func TestMatrix_SchemaNodePropsNonFiniteFloatRoundTrip(t *testing.T) {
 	t.Run("pos_inf_round_trips", func(t *testing.T) {
 		n := avro.SchemaNode{Type: "int", Props: map[string]any{"x": math.Inf(1)}}
@@ -6188,14 +6168,11 @@ func TestRegression_JSONEncodeIgnoresAliases(t *testing.T) {
 // TestMatrix_ResolvedLongToFloatLossy pins that int/long → float/double resolved
 // promotion silently IEEE-rounds when the wire value exceeds the reader schema's
 // mantissa precision. The READER schema is lossy by the user's evolution choice,
-// so loss at the cast is acceptable — matching Java's
-// ResolvingDecoder.readDouble, fastavro's maybe_promote, and hamba's
-// createDoubleConverter.
-//
-// Asymmetric with the natural same-schema decode, where the reader schema IS
-// long (exact) and setLongValue's CanFloat arm rejects on precision loss. The
-// differentiator: did the user EVOLVE the schema to a lossy type, or just pick a
-// lossy Go target against an exact schema.
+// so loss at the cast is acceptable, matching Java's ResolvingDecoder.readDouble,
+// fastavro's maybe_promote, and hamba's createDoubleConverter. Asymmetric with
+// the natural same-schema decode, where the reader schema IS long and
+// setLongValue's CanFloat arm rejects: the differentiator is whether the user
+// EVOLVED the schema to a lossy type or just picked a lossy Go target.
 func TestMatrix_ResolvedLongToFloatLossy(t *testing.T) {
 	type promoteCase struct {
 		name      string
@@ -6295,23 +6272,16 @@ func TestRegression_JsonNumberToFloatErrorBounded(t *testing.T) {
 }
 
 // TestMatrix_LogicalTypeSoftDropMatrix pins that every known logical type, on
-// every wrong underlying type, soft-drops the logical and parses as bare
-// underlying — matching Java's fromSchemaIgnoreInvalid (Schema.java:1979 ->
-// LogicalTypes.java:120-194), fastavro's LOGICAL_*.get-then-fallthrough
-// (_read_py.py:662, _write_py.py:205/313), hamba's parse*LogicalType returning
-// nil (schema_parse.go:205-222, :514-524), and the spec:
+// every wrong underlying type, soft-drops and parses as bare underlying —
+// matching Java's fromSchemaIgnoreInvalid (Schema.java:1979), fastavro's
+// LOGICAL_*.get-then-fallthrough (_read_py.py:662), hamba's parse*LogicalType
+// returning nil (schema_parse.go:205-222), and the spec: "If a logical type is
+// invalid, … implementations should ignore the logical type and use the
+// underlying Avro type." Without it, a producer schema carrying a legacy typo
+// like {"type":"long","logicalType":"uuid"} would be unreadable by twmb.
 //
-//	"If a logical type is invalid, … implementations should ignore the
-//	 logical type and use the underlying Avro type."
-//
-// Without soft-drop, a Java/fastavro producer schema carrying a legacy typo like
-// {"type":"long","logicalType":"uuid"} would be unreadable by twmb consumers.
-//
-// The matrix crosses every (logical, valid-underlying) -> (logical,
-// wrong-underlying) pair and pins the wire encoding and Canonical() form against
-// the bare-underlying schema. TestParity_AcceptedLeniencies holds the
-// representative subset; TestParity_SchemaRejectionMatrix retained none of these
-// rows.
+// The matrix crosses every (logical, valid-underlying) -> wrong-underlying pair
+// and pins the wire encoding and Canonical() against the bare-underlying schema.
 func TestMatrix_LogicalTypeSoftDropMatrix(t *testing.T) {
 	// (logical, underlying) -> isValidPair
 	validPairs := map[string]map[string]bool{
@@ -6379,18 +6349,12 @@ func TestMatrix_LogicalTypeSoftDropMatrix(t *testing.T) {
 
 // TestMatrix_SchemaNodeCycleDetection pins that programmatic SchemaNode
 // construction with pointer cycles via Items/Values does not crash the process.
-// The cycle guard at toJSONDedup protects the dedup-aware walk, but the
-// snapshot-via-toJSON forks (named-type conflict-check + definition snapshot)
-// must be cycle-aware too: a programmatic recursive named type crashed with
-// "fatal error: stack overflow ... (*SchemaNode).toJSON schema_node.go:328".
-//
-// Expected: named-type ancestor cycles emit as a name reference, mirroring the
-// Avro JSON canonical form ({"items":"Node"}); unnamed cycles (array of self,
-// map of self) return a "cyclic SchemaNode detected" error.
-//
-// TestSchemaNodeCyclicItems/Values/Indirect/Cyclic3Node cover only unnamed
-// cycles, which hit the toJSONDedup guard; the named-type path is structurally
-// invisible to them.
+// The toJSONDedup guard protects the dedup-aware walk, but the snapshot-via-
+// toJSON forks must be cycle-aware too: a programmatic recursive named type
+// crashed with "fatal error: stack overflow ... (*SchemaNode).toJSON". Expected:
+// named-type ancestor cycles emit as a name reference ({"items":"Node"});
+// unnamed cycles return a "cyclic SchemaNode detected" error. The existing
+// cyclic tests cover only unnamed cycles, which hit the dedup guard.
 func TestMatrix_SchemaNodeCycleDetection(t *testing.T) {
 	t.Run("programmatic_recursive_node_via_array_items", func(t *testing.T) {
 		// The natural shape: a recursive Node with children:array<Node>.
@@ -6805,18 +6769,12 @@ func TestSpecJSONDecodeHonorsFieldAliases(t *testing.T) {
 
 // TestSpecJSONDecodeFillsDefaultForMissingField locks that DecodeJSON applies a
 // schema-declared default for an absent record field AND materializes it as the
-// schema-typed Go value, not the raw json.Number/string from the parser. All
-// three callers route through applyFieldDefault; otherwise the *any path would
-// assign raw f.defaultVal and diverge from the present path (present:int32 vs
-// missing:json.Number).
-//
+// schema-typed Go value, not the raw json.Number/string. All three callers route
+// through applyFieldDefault; otherwise the *any path assigns raw f.defaultVal
+// and diverges from the present path (present:int32 vs missing:json.Number).
 // fastavro matches the fill behavior (io/json_decoder.py:55-78); Java rejects
-// missing fields outright (JsonDecoder.java:498-530). twmb fills when a default
-// exists and still errors when none does.
-//
-// Subtests reach each record-decode path: *any -> decodeRecordAny,
-// *map[string]any and *map[string]int32 -> decodeRecordMap, *struct ->
-// decodeRecordStruct.
+// missing fields outright. Subtests reach each record-decode path: *any,
+// *map[string]any, *map[string]int32, *struct.
 func TestSpecJSONDecodeFillsDefaultForMissingField(t *testing.T) {
 	schema := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"present","type":"int"},
@@ -6951,20 +6909,13 @@ func TestRegression_DecodeJSONIntoAnyDefaultFillTypeConsistency(t *testing.T) {
 }
 
 // TestMatrix_JSONDecodeFillsZeroByteDefault locks DecodeJSON's default-fill for
-// record fields whose schema-encoded default is exactly 0 wire bytes —
-// null-typed fields, empty-record fields, and records whose every field is
-// null-typed. applyFieldDefault must accept empty defaultBytes for these:
-// rejecting would conflate "no default registered" (the caller already gated on
-// hasDefault) with "valid 0-byte default".
-//
-// Binary resolved decode and JSON encode both handle these already, so the bug
-// was a JSON-decode-only divergence from twmb's own binary path and from
-// fastavro parity (io/json_decoder.py:55-78 returns get_default() for any
-// default including None). Java is irrelevant — JsonDecoder rejects all missing
-// fields.
-//
-// Subtests cross the three default-fill target paths with the three zero-byte
-// shapes.
+// record fields whose schema-encoded default is exactly 0 wire bytes.
+// applyFieldDefault must accept empty defaultBytes: rejecting would conflate "no
+// default registered" — the caller already gated on hasDefault — with "valid
+// 0-byte default". Binary resolved decode and JSON encode both handle these
+// already, so the bug was a JSON-decode-only divergence from twmb's own binary
+// path and from fastavro parity. Subtests cross the three default-fill target
+// paths with the three zero-byte shapes.
 func TestMatrix_JSONDecodeFillsZeroByteDefault(t *testing.T) {
 	t.Run("null_field_default_into_any", func(t *testing.T) {
 		s := mustParse(t, `{"type":"record","name":"R","fields":[
@@ -7518,20 +7469,17 @@ func TestMatrix_MetadataAPIBytesFixedDefaultRoundTrip(t *testing.T) {
 }
 
 // TestMatrix_ErrorTypeMetadataDefaultCoercion pins that bytes/fixed defaults
-// nested inside an "error"-typed record (reached as a field's type, a union
-// branch, or an array's items) surface as []byte uniformly with "record". Avro
-// treats error types as the record kind with an isError flag, and the schema
-// builder normalizes node.kind to "record" for both — so the wire form is
-// already identical. The metadata-API surface uses SchemaNode.Type, which
-// preserves the JSON-as-written "error", so coerceMetadataDefault and
-// branchAcceptsDefault each need their `case "record"` arm to include "error".
+// nested inside an "error"-typed record surface as []byte uniformly with
+// "record". Avro treats error types as the record kind with an isError flag and
+// the schema builder normalizes node.kind for both, so the wire form is already
+// identical — but the metadata API uses SchemaNode.Type, which preserves the
+// as-written "error", so coerceMetadataDefault and branchAcceptsDefault each
+// need their `case "record"` arm to include it.
 //
-// Drift sentinel: SchemaField.Default's docstring states "Bytes and fixed
-// defaults decode as []byte (the wire form)", and that must hold across
-// record/error nesting. The user-impactful subcase is fixed+uuid, where a
-// string-form Default fails parseUUID at re-encode — so the Root().Fields
-// default-collection pattern breaks asymmetrically: fine for record nesting,
-// broken for error nesting.
+// Drift sentinel: SchemaField.Default's docstring states bytes and fixed
+// defaults decode as []byte, and that must hold across record/error nesting. The
+// user-impactful subcase is fixed+uuid, where a string-form Default fails
+// parseUUID at re-encode.
 func TestMatrix_ErrorTypeMetadataDefaultCoercion(t *testing.T) {
 	uuidBytes := []byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
 	rs := make([]rune, len(uuidBytes))
@@ -7857,21 +7805,17 @@ func TestMatrix_Float32NarrowingEncodeIsLossy(t *testing.T) {
 }
 
 // TestMatrix_BytesFixedDefaultParityNumericString locks binary/JSON encode
-// parity for record fields whose default is a string that happens to look like a
-// number, against bytes/fixed schemas with logical types. The JSON encoder's
-// logical-aware arms (decimal, big-decimal, uuid) must route default strings
-// through codepoint mapping (avroJSONBytesToBytes) instead of interpreting them
-// semantically (decimalRatFor / parseUUID).
-//
-// Per the Avro 1.12 spec, a logical type is always serialized using its
-// underlying Avro type, so bytes/fixed defaults are JSON strings interpreted as
-// codepoint-mapped bytes regardless of any overlay. Java's
+// parity for record fields whose default is a string that looks like a number,
+// against bytes/fixed schemas with logical types. The JSON encoder's
+// logical-aware arms must route default strings through codepoint mapping
+// instead of interpreting them semantically. Per the spec a logical type is
+// always serialized using its underlying Avro type, so bytes/fixed defaults are
+// codepoint-mapped strings regardless of any overlay; Java's
 // ResolvingGrammarGenerator.java:323 writes default text via
-// ISO_8859_1.getBytes(); fastavro stores defaults as raw bytes.
+// ISO_8859_1.getBytes() and fastavro stores defaults as raw bytes.
 //
-// Covers the 4 affected arms at top level and nested in record/array/map. The
-// runtime-input path is intentionally unchanged: there decimalRatFor/parseUUID
-// still apply, matching binary's lenient runtime acceptance.
+// Covers the 4 affected arms at top level and nested. The runtime-input path is
+// intentionally unchanged, matching binary's lenient runtime acceptance.
 func TestMatrix_BytesFixedDefaultParityNumericString(t *testing.T) {
 	roundTripBoth := func(t *testing.T, schemaStr string, lookFor string) {
 		t.Helper()
@@ -8001,20 +7945,14 @@ func TestMatrix_BytesFixedDefaultParityNumericString(t *testing.T) {
 	})
 }
 
-// TestMatrix_NamedTypeRefDefaultParity locks parity for record
-// fields whose type is a *named-type reference* (forward or backward)
-// to a bytes/fixed schema. convertDefaultBytes must follow name-ref
-// canon (`aschema{primitive: "MyName"}`) through the cache so the
-// string default reaches the JSON encoder pre-converted; otherwise
-// the JSON encoder's logical-type-aware arms misinterpret the
-// codepoint string.
-//
-// Sibling sweep: every shape that produces a named-type reference in
-// the field's resolved schema. Fwd-ref means the field references a
-// name declared LATER in the schema (resolved via finalize fixup);
-// backward name-ref means the name was declared earlier inline.
-// Both reach the same buggy state because both produce a canon with
-// primitive=<name>.
+// TestMatrix_NamedTypeRefDefaultParity locks parity for record fields whose type
+// is a named-type reference, forward or backward, to a bytes/fixed schema.
+// convertDefaultBytes must follow name-ref canon (`aschema{primitive:"MyName"}`)
+// through the cache so the string default reaches the JSON encoder
+// pre-converted; otherwise the JSON encoder's logical-aware arms misinterpret the
+// codepoint string. Sibling sweep: every shape producing a named-type reference
+// in the field's resolved schema — both forward and backward reach the same
+// buggy state, since both produce a canon with primitive=<name>.
 func TestMatrix_NamedTypeRefDefaultParity(t *testing.T) {
 	roundTripBoth := func(t *testing.T, schemaStr string, val any) {
 		t.Helper()
@@ -8171,24 +8109,18 @@ func TestMatrix_NamedTypeRefDefaultValidation(t *testing.T) {
 	})
 }
 
-// TestMatrix_TimeOfDayLogicalRoundTripsTimeTime locks symmetric
-// time.Time support on the time-millis / time-micros logical types
-// across every encode AND decode path. Encoder and decoder both
-// accept time.Time (extracting / reconstructing wall-clock fields
-// for time-of-day encoding); decoder rejection would break the
-// round-trip while leaving the encoder's path intact.
+// TestMatrix_TimeOfDayLogicalRoundTripsTimeTime locks symmetric time.Time
+// support on the time-millis / time-micros logicals across every encode AND
+// decode path. Both sides accept time.Time, extracting and reconstructing
+// wall-clock fields; decoder rejection would break the round trip while leaving
+// the encoder intact.
 //
-// Sibling sweep covers: binary safe path (deserTimeMillis,
-// deserTimeMicros), JSON safe path (decodeInt + decodeLong arms),
-// unsafe struct-field path (udTimeMillis, udTimeMicros), and the
-// matching unsafe encode dispatch (usTimeMillis, usTimeMicros which
-// must dispatch on the field's reflect.Type, not assume *time.Duration
-// — casting unsafe.Pointer as *time.Duration when the field is
-// `time.Time` would scramble the field).
-//
-// Conversion: decode produces a time.Time at the Unix epoch (UTC)
-// plus the time-of-day duration — the encoder strips date components
-// regardless, so the base date is arbitrary but stable.
+// Sibling sweep: binary safe (deserTimeMillis/Micros), JSON safe (decodeInt +
+// decodeLong arms), unsafe decode (udTimeMillis/Micros), and the matching unsafe
+// encode dispatch, which must dispatch on the field's reflect.Type rather than
+// assume *time.Duration — casting the pointer as *time.Duration on a time.Time
+// field would scramble it. Decode produces a time.Time at the Unix epoch plus
+// the time-of-day duration; the encoder strips date components regardless.
 func TestMatrix_TimeOfDayLogicalRoundTripsTimeTime(t *testing.T) {
 	// 14:30:45.123456 — non-zero in every field, exercise micros precision.
 	tm := time.Date(2020, 6, 15, 14, 30, 45, 123_456_000, time.UTC)
@@ -8367,20 +8299,15 @@ func TestMatrix_SchemaForLogicalBaseType(t *testing.T) {
 	}
 }
 
-// TestMatrix_OmitzeroJSONEncodeValueFieldNullUnion locks binary
-// ↔ JSON parity for the `omitzero` struct-tag on value-typed
-// null-union fields. The JSON encoder's struct branch
-// (appendAvroJSONRecord) must enforce the `omitzero + nullunion +
-// valueIsZero → emit null` check that ser.go's slow path and
-// unsafe.go's fast path both apply; without it, a zero string /
-// bool / record / time.Time value would go out as its zero literal,
-// while the binary encoder correctly emits the null-branch byte.
-// Pointer-typed fields are unaffected because the nil-pointer
-// indirection independently routes through the null branch.
-//
-// Sibling sweep: every value-typed null-union shape — first-branch
-// null, second-branch null, IsZero() on time.Time, nested record
-// — plus the working pointer paths as regression-guard controls.
+// TestMatrix_OmitzeroJSONEncodeValueFieldNullUnion locks binary/JSON parity for
+// the `omitzero` struct tag on value-typed null-union fields. The JSON encoder's
+// struct branch must enforce the omitzero + nullunion + valueIsZero → emit null
+// check that ser.go's slow path and unsafe.go's fast path both apply; without
+// it, a zero string / bool / record / time.Time goes out as its zero literal
+// while binary emits the null-branch byte. Pointer-typed fields are unaffected,
+// the nil-pointer indirection routing through null independently. Sibling sweep:
+// every value-typed null-union shape, plus the working pointer paths as
+// controls.
 func TestMatrix_OmitzeroJSONEncodeValueFieldNullUnion(t *testing.T) {
 	t.Run("string with null-first union", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"name","type":["null","string"]}]}`)
@@ -8632,22 +8559,15 @@ func TestMatrix_JSONEnumDecodeIntoIntTargetParity(t *testing.T) {
 	})
 }
 
-// TestMatrix_UnsafeOverflowErrorsPreserveAvroType locks safe/
-// unsafe parity on the *SemanticError.AvroType field for overflow
-// and format errors. The us*/ud* unsafe paths must return
-// *SemanticError so recordFieldError's errors.As(*SemanticError)
-// check finds it and preserves the leaf AvroType; raw fmt.Errorf
-// would let recordFieldError wrap the field error with
-// AvroType="record", clobbering the safe path's documented invariant
-// (errors.go:60: "type information is preserved, avoiding misleading
-// intermediate 'record' types in the error chain"). Code that
-// programmatically inspects (*SemanticError).AvroType to categorize
-// encode/decode failures must see the same leaf type on struct and
-// map targets for the same logical condition.
-//
-// Sibling sweep: each sub-test exercises a distinct site family
-// (usInt, usLong, usFloat, usTimeMillis, udInt, udLong) so every
-// unsafe site is covered.
+// TestMatrix_UnsafeOverflowErrorsPreserveAvroType locks safe/unsafe parity on
+// *SemanticError.AvroType for overflow and format errors. The us*/ud* paths must
+// return *SemanticError so recordFieldError's errors.As finds it and preserves
+// the leaf AvroType; a raw fmt.Errorf would let recordFieldError wrap with
+// AvroType="record", clobbering the documented invariant (errors.go:60). Code
+// that inspects AvroType to categorize failures must see the same leaf type on
+// struct and map targets for the same condition. Sibling sweep: each subtest
+// exercises a distinct site family (usInt, usLong, usFloat, usTimeMillis, udInt,
+// udLong).
 func TestMatrix_UnsafeOverflowErrorsPreserveAvroType(t *testing.T) {
 	avroTypeOf := func(t *testing.T, err error) string {
 		t.Helper()
@@ -8750,19 +8670,13 @@ func TestMatrix_UnsafeOverflowErrorsPreserveAvroType(t *testing.T) {
 	})
 }
 
-// TestRegression_UnionStringDefaultBinaryJSONParity locks the binary/
-// JSON parity for union defaults that are JSON strings. Per spec 1.12
-// §"Record" default-values table, a JSON string default matches only
-// branches whose Avro type's permitted JSON type is `string` —
-// string, bytes, enum, fixed. Numeric branches (int/long/float/double)
-// are skipped because their permitted JSON type is `integer` or
-// `number`. The first-matching-branch rule (line 80) then picks the
-// earliest-declared string-accepting branch on BOTH the binary and
-// JSON encoders.
-//
-// For unions whose only branches are numeric (or numeric + null), no
-// branch's JSON type matches a string default → schema parse fails.
-// See TestMatrix_UnionDefaultStringMatchesOnlyStringAcceptingBranches.
+// TestRegression_UnionStringDefaultBinaryJSONParity locks binary/JSON parity for
+// union defaults that are JSON strings. Per the spec's §"Record" default-values
+// table, a JSON string default matches only branches whose permitted JSON type
+// is `string` — string, bytes, enum, fixed — so numeric branches are skipped,
+// and the first-matching-branch rule then picks the earliest-declared
+// string-accepting branch on BOTH encoders. For unions whose only branches are
+// numeric, no branch's JSON type matches and the schema parse fails.
 func TestRegression_UnionStringDefaultBinaryJSONParity(t *testing.T) {
 	t.Run("[float,string] picks string on both encoders", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[
@@ -8812,19 +8726,17 @@ func TestRegression_UnionStringDefaultBinaryJSONParity(t *testing.T) {
 }
 
 // TestMatrix_UnionDefaultMetadataMatchesWireBranch pins that for a union
-// default, the metadata path (Root().Fields[i].Default) and the wire path
-// (auto-filling the default) select the SAME branch. branchAcceptsDefault
-// delegates to the wire-side defaultAsInt32 / defaultAsInt64 / defaultAsFloat so
-// both surfaces apply the same predicates, and coerceMetadataDefault converts to
-// float64 when the chosen branch is float/double so Default's Go type matches
-// the wire form.
+// default, the metadata path and the wire auto-fill select the SAME branch.
+// branchAcceptsDefault delegates to the wire-side defaultAsInt32 / defaultAsInt64
+// / defaultAsFloat so both surfaces apply the same predicates, and
+// coerceMetadataDefault converts to float64 when the chosen branch is
+// float/double so Default's Go type matches the wire form.
 //
 // Each subtest pins the chosen branch on both surfaces, the wire bytes' branch
-// index, and the metadata Default's Go type, across float/double/int/long-first
-// unions with integer-form defaults (the primary bug shape), fractional-form
-// defaults, and int64 magnitudes overflowing int32. Java's Schema.parseField +
-// isValidDefault and fastavro's _default_matches_schema are both first-match-wins
-// and pick the same branches.
+// index, and the Default's Go type, across float/double/int/long-first unions
+// with integer-form defaults (the primary bug shape), fractional-form defaults,
+// and int64 magnitudes overflowing int32. Java and fastavro are both
+// first-match-wins and pick the same branches.
 func TestMatrix_UnionDefaultMetadataMatchesWireBranch(t *testing.T) {
 	type wantKind int
 	const (
@@ -9264,20 +9176,16 @@ func TestMatrix_UnionDefaultMetadataMatchesWireBranch_StructuralArms(t *testing.
 
 // TestRegression_UnionDefaultMetadataMatchesWireBranch_EnumArm locks the enum
 // arm between branchAcceptsDefault (metadata) and validateLeaf (wire). The wire
-// side rejects an enum default that is not in node.symbols, so the metadata side
-// must reject the same string; lumping enum with string
-// (`case "string", "enum": _, ok := val.(string)`) would accept any string.
-//
-// Union [enum:{A,B}, bytes] default "Z": the wire side rejects the enum branch
-// and wins at the bytes branch, so the metadata side must too — observable as
-// Default["u"] surfacing []byte rather than string.
+// side rejects an enum default not in node.symbols, so the metadata side must
+// reject the same string; lumping enum with string would accept any. Union
+// [enum:{A,B}, bytes] default "Z": the wire side wins at the bytes branch, so
+// the metadata side must too — observable as Default["u"] surfacing []byte.
 //
 // The membership check is twmb-stricter-than-references: Java accepts any
 // textual enum default (Schema.java:1755-1759; containment is enforced only for
-// the enum-level "default" attribute at :1100) and fastavro 1.12.2 parses a
-// non-member field default outright. twmb validates at parse because a
-// non-member default can never encode — and that check is what lets the union
-// pick a later branch instead of mis-selecting the enum.
+// the enum-level attribute at :1100) and fastavro 1.12.2 parses a non-member
+// field default outright. twmb validates at parse because a non-member default
+// can never encode — and that check is what lets the union pick a later branch.
 func TestRegression_UnionDefaultMetadataMatchesWireBranch_EnumArm(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -9346,21 +9254,17 @@ func TestRegression_UnionDefaultMetadataMatchesWireBranch_EnumArm(t *testing.T) 
 }
 
 // TestMatrix_UnionContainerNestedFloatDefaultSelectionMatchesWire pins that the
-// metadata branch selector (branchAcceptsDefault) coerces a CONTAINER branch's
-// nested float/double STRING child the way the wire selector (validateLeaf via
-// coerceDefault) does, so both pick the same branch.
-//
-// The wire selector rewrites each nested child via coerceDefault before the
-// accept-check, so "5" in a nested double field becomes float64(5). The metadata
+// metadata branch selector coerces a CONTAINER branch's nested float/double
+// STRING child the way the wire selector does, so both pick the same branch. The
+// wire selector rewrites each nested child via coerceDefault before the
+// accept-check, so "5" in a nested double field becomes float64(5); the metadata
 // selector left it a string, rejected that branch, and picked a later string
-// branch — so Root().Default reported a different branch and Go type than the
-// wire auto-fill decoded, on both wires.
+// branch, so Root().Default reported a different branch and Go type than the
+// wire auto-fill decoded.
 //
-// The coercion is a real predicate: "abc" still rejects on both surfaces. It
-// lives only in the container arms, so a direct scalar union (["double","string"]
-// default "5") still picks string on both. Companion to the
-// TestRegression_UnionDefaultMetadataMatchesWireBranch_* family, which covers
-// the non-coercing arms.
+// The coercion is a real predicate — "abc" still rejects on both surfaces — and
+// lives only in the container arms, so a direct scalar union still picks string
+// on both.
 func TestMatrix_UnionContainerNestedFloatDefaultSelectionMatchesWire(t *testing.T) {
 	// autofillProbe parses schema, auto-fills an EMPTY outer record on BOTH wire
 	// formats and reads the metadata Default, returning the value at probe() for
@@ -9807,18 +9711,14 @@ func TestMatrix_UnionDefaultEncodeMatchesValidateBranch(t *testing.T) {
 	}
 }
 
-// TestRegression_TaggedUnionShortNameBinaryParity locks binary ↔ JSON
-// parity on the unqualified-short-name tagged-union shape (a twmb
-// leniency for hand-written input; no reference implementation emits
-// or reads short-name union tags — fastavro 1.12.2's tuple notation
-// and JSON reader both require the fullname, observed).
-// The binary `serUnion.tryUnwrapTagged` must apply the same short-
-// name fallback (with ambiguity guard) as the JSON encoder's
-// `findUnionBranch` (json_codec.go:775-789). Otherwise binary's
-// plain map lookup on `serUnion.branchNames` (populated with only
-// the canonical fully-qualified name + the goavro "type.logical"
-// form) would reject an input shape that round-trips through JSON.
-// `TestRegression_DecodeJSONUnionTagShortName` locks the
+// TestRegression_TaggedUnionShortNameBinaryParity locks binary/JSON parity on
+// the unqualified-short-name tagged-union shape, a twmb leniency for
+// hand-written input: no reference emits or reads short-name union tags —
+// fastavro 1.12.2's tuple notation and JSON reader both require the fullname
+// (observed). The binary serUnion.tryUnwrapTagged must apply the same short-name
+// fallback, with ambiguity guard, as the JSON encoder's findUnionBranch;
+// otherwise binary's plain map lookup on branchNames rejects an input shape that
+// round-trips through JSON. TestRegression_DecodeJSONUnionTagShortName locks the
 // JSON-decode side.
 func TestRegression_TaggedUnionShortNameBinaryParity(t *testing.T) {
 	t.Run("namespaced record short-name in tagged union", func(t *testing.T) {
@@ -9934,17 +9834,13 @@ func TestRegression_LogicalDecimalDeserByteFallback(t *testing.T) {
 	})
 }
 
-// TestMatrix_UnionEncodeTypeNameDispatch locks the union-encode
-// branch selection policy. serUnion.ser dispatches by the value's
-// Go-type canonical Avro name first, falling back to try-each-branch
-// only when no name match exists — matching Java
-// (GenericData.resolveUnion), fastavro (write_union), and hamba
-// (encoderOfResolverUnion). Pure try-each in declaration order would
-// pick the wrong branch for ["double","long"] with int64(42)
-// (appendAvroFloat64 accepts CanInt for the documented whole-number-
-// float divergence, encoding the double branch); the decoder would
-// then reject int64 targets reading double-branch bytes — round-trip
-// broken.
+// TestMatrix_UnionEncodeTypeNameDispatch locks the union-encode branch selection
+// policy: serUnion.ser dispatches by the value's Go-type canonical Avro name
+// first and falls back to try-each only with no name match, matching Java's
+// resolveUnion, fastavro's write_union, and hamba's encoderOfResolverUnion. Pure
+// try-each in declaration order picks the wrong branch for ["double","long"]
+// with int64(42), and the decoder then rejects int64 targets reading
+// double-branch bytes.
 func TestMatrix_UnionEncodeTypeNameDispatch(t *testing.T) {
 	t.Run("[double,long] + int64 picks long", func(t *testing.T) {
 		s := avro.MustParse(`["double","long"]`)
@@ -10070,19 +9966,13 @@ func TestMatrix_IntLongDecodeIntoFloatJSONNumber(t *testing.T) {
 }
 
 // TestMatrix_NonFiniteFloatRejectedForJSONNumberTarget pins the rejection of
-// ±Inf and NaN when decoding wire float/double into a json.Number target.
-// setFloatValue's json.Number arm mirrors the integer arm's reject at
-// deser.go:1426: the target cannot represent non-finite floats. Without it,
-// strconv.FormatFloat would produce "+Inf"/"NaN" — not valid JSON number
-// literals per RFC 8259 — and json.Marshal would fail far from the real source.
-// Users needing ±Inf/NaN round-trip decode into typed float and pick their own
-// convention.
-//
-// Sibling-safe: setIntegerWire uses FormatInt, total over int64; setDecimalRat
-// uses big.Rat, which cannot represent ±Inf/NaN.
-//
-// Covers binary deser, JSON decode, and the promotion paths, which all route
-// through setFloatValue.
+// ±Inf and NaN when decoding wire float/double into a json.Number target, which
+// cannot represent them; setFloatValue's arm mirrors the integer reject at
+// deser.go:1426. Without it, FormatFloat produces "+Inf"/"NaN" — not valid JSON
+// number literals — and json.Marshal fails far from the real source. Users
+// needing the round trip decode into typed float. Sibling-safe: setIntegerWire
+// uses FormatInt, total over int64, and setDecimalRat uses big.Rat, which cannot
+// represent ±Inf/NaN. Covers binary deser, JSON decode, and the promotion paths.
 func TestMatrix_NonFiniteFloatRejectedForJSONNumberTarget(t *testing.T) {
 	floatPlusInf := float32(math.Inf(1))
 	floatMinusInf := float32(math.Inf(-1))
@@ -10189,14 +10079,9 @@ func TestMatrix_NonFiniteFloatRejectedForJSONNumberTarget(t *testing.T) {
 // TestParity_SchemaRejectionMatrix asserts that Parse rejects every malformed
 // schema shape the spec forbids or the references reject — the rejection-side
 // sibling of TestParity_RoundTripMatrix, holding twmb no more lenient than Java
-// / hamba / avro-rs.
-//
-// The recurring bug class is "validation that silently falls back instead of
-// erroring": invalid logical-type bases, malformed defaults, missing required
-// fields, union shape violations, name violations. Each failing cell on first
-// run is a real bug, or a documented intentional leniency, which moves to
-// TestParity_KnownLeniencies. Each cell gives a schema and an optional substring
-// the error must contain; `wantSubstr: ""` asserts only that an error came back.
+// / hamba / avro-rs. The recurring bug class is "validation that silently falls
+// back instead of erroring". Each failing cell on first run is a real bug, or a
+// documented intentional leniency, which moves to TestParity_KnownLeniencies.
 func TestParity_SchemaRejectionMatrix(t *testing.T) {
 	cells := []struct {
 		name       string
@@ -10856,18 +10741,13 @@ func TestRegression_BigDecimalJSONOpaquePassThrough(t *testing.T) {
 }
 
 // TestMatrix_BigDecimalJSONBareNumberParity locks JSON-decode parity between
-// decimal and big-decimal on the bare-number arm. decimal-bytes already accepted
-// bare numbers; big-decimal was missing from both the per-arm gate in
-// decodeBytes and the union token dispatcher, so a producer emitting `1.5` for a
-// big-decimal-bytes schema got "expected string at offset 0" standalone, or "no
-// union branch matched" inside a union, where the decimal sibling accepted it.
-//
-// Big-decimal carries no schema-level scale, so the bare-number arm derives it
-// via finiteScale(r) — used only where a formatted display needs one.
-//
-// Three-impl note: fastavro has no big-decimal; Java's JsonDecoder goes through
-// the bytes layer with no bare-number leniency. The argument here is sibling
-// parity with twmb's own decimal-bytes leniency, not cross-impl alignment.
+// decimal and big-decimal on the bare-number arm. big-decimal was missing from
+// both the per-arm gate in decodeBytes and the union token dispatcher, so a
+// producer emitting `1.5` got "expected string at offset 0" where the decimal
+// sibling accepted it. Big-decimal carries no schema-level scale, so the arm
+// derives it via finiteScale(r). fastavro has no big-decimal and Java's
+// JsonDecoder has no bare-number leniency, so the argument is sibling parity
+// with twmb's own decimal-bytes leniency, not cross-impl alignment.
 func TestMatrix_BigDecimalJSONBareNumberParity(t *testing.T) {
 	s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
 	t.Run("standalone bare-number into *big.Rat", func(t *testing.T) {
@@ -10920,21 +10800,17 @@ func TestMatrix_BigDecimalJSONBareNumberParity(t *testing.T) {
 // TestMatrix_UnionBareNumberDispatchByLogicalCarrier crosses the union JSON
 // dispatcher's digit-token arm with every verdict its predicate can produce, in
 // every container context that can hold a union. A bare number must be OFFERED
-// to a branch whose bytes/fixed carrier accepts the lenient form and must NOT be
-// offered to one that does not. The offered set is derived from
-// hasDecimalBareNumberArm rather than listed: "decimal" qualifies on bytes AND
-// fixed, "big-decimal" is bytes-only per spec, so a big-decimal-on-fixed branch
-// — reachable only when a CustomType resurrects that pairing — must stay
-// unoffered.
+// to a branch whose bytes/fixed carrier accepts the lenient form and not to one
+// that does not; the offered set is derived from hasDecimalBareNumberArm rather
+// than listed, so a big-decimal-on-fixed branch — reachable only when a
+// CustomType resurrects that pairing — stays unoffered.
 //
 // Oracle: the SAME branch schema decoded STANDALONE. The union wrapper
 // contributes dispatch, not semantics, and the standalone path never consults
 // the dispatcher, so it stays correct while the dispatcher is wrong. The
-// unoffered cells assert the SHAPE of the refusal, so a downstream parse failure
-// cannot stand in for the dispatch decision.
-// bareUnionDeclinedEveryBranch matches the error produced when NO branch was
-// entered — decodeUnionBare wraps the entered branch's cause after the offset
-// when one was, so the anchor is what separates the two.
+// unoffered cells assert the SHAPE of the refusal —
+// bareUnionDeclinedEveryBranch anchors on the end of the message, since
+// decodeUnionBare appends the entered branch's cause only when one was entered.
 var bareUnionDeclinedEveryBranch = regexp.MustCompile(`no union branch matched at offset \d+$`)
 
 func TestMatrix_UnionBareNumberDispatchByLogicalCarrier(t *testing.T) {
@@ -11460,17 +11336,13 @@ func TestMatrix_LenientInputAudit(t *testing.T) {
 		{"decimal / string", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, "0.33", "0.33", ""},
 		{"decimal / json.Number", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, json.Number("0.33"), json.Number("0.33"), ""},
 
-		// Opaque-bytes pass-through for bytes/fixed-backed logicals.
-		// serBytesDecimal / serFixedDecimal / serBigDecimal / serDuration all fall
-		// through to plain bytes encoding when the input isn't structured, so
-		// decoders must mirror — JSON assignBytes's "big-decimal" arm in
-		// particular must fall through to setBytesValue rather than surfacing the
-		// parse error for byte-like targets.
-		//
-		// Decimal opaque pass-through only fires for byte-like targets:
-		// setDecimalRat has a *string arm that formats the rat as the canonical
-		// decimal string, so a *string target always gets that form rather than
-		// the original bytes.
+		// Opaque-bytes pass-through for bytes/fixed-backed logicals: the
+		// serializers all fall through to plain bytes when the input isn't
+		// structured, so decoders must mirror — JSON assignBytes's "big-decimal"
+		// arm must fall through to setBytesValue rather than surfacing the parse
+		// error for byte-like targets. Decimal pass-through fires only for
+		// byte-like targets, setDecimalRat's *string arm always formatting the
+		// canonical decimal string instead.
 		{"decimal-bytes / []byte opaque", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, []byte{0x21}, []byte{0x21}, ""},
 		{"decimal-fixed / [N]byte opaque", `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":4,"scale":2}`, [4]byte{0, 0, 0, 0x21}, [4]byte{0, 0, 0, 0x21}, ""},
 		{"big-decimal / []byte opaque", `{"type":"bytes","logicalType":"big-decimal"}`, []byte("hello world"), []byte("hello world"), ""},
@@ -11553,19 +11425,13 @@ func TestMatrix_LenientInputAudit(t *testing.T) {
 }
 
 // TestMatrix_UnionDispatchAmbiguous locks the encoder's branch-selection rule
-// for unions where multiple branches could accept the same Go input. The
-// dispatch (serUnion.ser) is:
-//
-//  1. Tagged-map unwrap: map[string]any{"branch": value} routes to that branch.
-//  2. Go-type natural Avro kind via unionTypeNameForValue: a reflect.Kind maps
-//     to one Avro primitive name, and branchKinds picks that branch regardless
-//     of schema order.
-//  3. Fall-through try-each in schema order — reached only for Go types whose
-//     natural kind isn't in branchKinds (json.Number, time.Time, *big.Rat, …).
-//
-// This enumerates the natural-kind-first vs schema-order-first distinction.
-// Both encoders share unionTypeNameForValue, so the cells assert the same
-// wantBranch across binary AND JSON.
+// where multiple branches could accept the same Go input. serUnion.ser tries a
+// tagged-map unwrap, then the Go-type natural Avro kind via unionTypeNameForValue
+// (branchKinds picks that branch regardless of schema order), then try-each in
+// schema order — reached only for Go types whose natural kind isn't in
+// branchKinds. This enumerates the natural-kind-first vs schema-order-first
+// distinction; both encoders share unionTypeNameForValue, so the cells assert
+// the same wantBranch on both wires.
 func TestMatrix_UnionDispatchAmbiguous(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -12338,15 +12204,11 @@ func TestRegression_CaseVariantKeysNoPickAmbiguity(t *testing.T) {
 
 // TestMatrix_SchemaCacheCustomTypeRefRejected locks that SchemaCache +
 // CustomType fails LOUD at Parse time rather than silently dropping the user's
-// CustomType on cached named-type fields. Pre-loading "Inner" into a cache and
-// then parsing "Outer" with a CustomType that would match Inner's fields must
-// error; otherwise the cache hits at buildPrimitive reuse the cached *schemaNode
-// whose codecs were baked without the CT, and Encode silently emits raw on both
-// wires.
-//
-// Parse walks the cached subtree, and if any descendant would match any of this
-// Parse's customTypes it errors with a directive: re-parse Inner with the
-// CustomType, or include it in this same build.
+// CustomType on cached named-type fields: otherwise the cache hits at
+// buildPrimitive reuse the cached *schemaNode whose codecs were baked without
+// the CT, and Encode silently emits raw on both wires. Parse walks the cached
+// subtree and errors with a directive — re-parse Inner with the CustomType, or
+// include it in this same build.
 func TestMatrix_SchemaCacheCustomTypeRefRejected(t *testing.T) {
 	innerSchema := `{"type":"record","name":"Inner","fields":[{"name":"amt","type":{"type":"bytes","logicalType":"money"}}]}`
 	outerSchema := `{"type":"record","name":"Outer","fields":[{"name":"inner","type":"Inner"}]}`
@@ -14456,17 +14318,13 @@ func TestParity_AcceptedLeniencies(t *testing.T) {
 		}
 	})
 	t.Run("all known logical types on wrong base soft-drop", func(t *testing.T) {
-		// Without uniform soft-drop, only the decimal arm would soft-drop while
-		// the other seven hard-rejected — diverging from the
-		// Java/fastavro/hamba/spec consensus. References:
-		//   - Spec: "If a logical type is invalid, … implementations should
-		//     ignore the logical type and use the underlying Avro type."
-		//   - Java (Schema.java:1979): fromSchemaIgnoreInvalid catches the
-		//     RuntimeException from every per-type validate() and drops silently.
-		//   - fastavro (_read_py.py:662): LOGICAL_READERS.get returns None for
-		//     unknown combos and falls through to bare underlying decode.
-		//   - hamba (schema_parse.go:205-222, :514-524): the (typ, ltyp) switch
-		//     returns nil for any combo not explicitly listed.
+		// Without uniform soft-drop only the decimal arm would soft-drop while the
+		// other seven hard-rejected, diverging from the spec and all three
+		// references: the spec says an invalid logical type should be ignored in
+		// favor of the underlying type; Java's fromSchemaIgnoreInvalid
+		// (Schema.java:1979) catches every per-type validate() throw; fastavro's
+		// LOGICAL_READERS.get returns None and falls through (_read_py.py:662); and
+		// hamba's (typ, ltyp) switch returns nil for any unlisted combo.
 		schemas := []string{
 			// timestamp-* on non-long
 			`{"type":"string","logicalType":"timestamp-millis"}`,
@@ -14661,24 +14519,17 @@ func TestParity_AcceptedLeniencies(t *testing.T) {
 
 // TestMatrix_UnionDefaultStringMatchesOnlyStringAcceptingBranches locks the
 // Avro 1.12 rule that a union field's default JSON type must match one branch's
-// permitted JSON type per the §"Record" table (int/long → integer, float/double
-// → number, string/enum → string, bytes/fixed → codepoint-mapped string). A JSON
-// string default therefore matches ONLY string / bytes / enum / fixed branches.
+// permitted JSON type per the §"Record" table, so a JSON string default matches
+// ONLY string / bytes / enum / fixed branches.
 //
 // Cross-impl consensus, all rejecting union+numeric-string defaults: Java's
 // text→DoubleNode coercion (Schema.java:1899-1902) fires only when the OUTER
-// type is FLOAT/DOUBLE directly, so under a union the TextNode reaches
-// isValidDefault's isNumber() arms and fails; avro-rs's resolve_float/double
+// type is FLOAT/DOUBLE directly; avro-rs's resolve_float/double
 // (types.rs:960-986) accept Value::String only for the IEEE special tokens;
-// goavro's validator (record.go:79-101) type-asserts float64 and fails.
-//
-// Single-field float/double with a string-numeric default REMAINS accepted —
-// Java's parseField coercion, the one deployed-Java behavior the wider ecosystem
-// doesn't share but twmb preserves for interop.
-//
-// First-accept-wins dispatch still applies: for ["float","string"] default "1.5"
-// the float branch's JSON-type requirement is number, so it is skipped and the
-// string branch wins.
+// goavro's validator type-asserts float64. Single-field float/double with a
+// string-numeric default REMAINS accepted — Java's parseField coercion, the one
+// deployed-Java behavior twmb preserves for interop. First-accept-wins still
+// applies: for ["float","string"] default "1.5" the float branch is skipped.
 func TestMatrix_UnionDefaultStringMatchesOnlyStringAcceptingBranches(t *testing.T) {
 	t.Run("single-field float + string-numeric default accepts (Java parity)", func(t *testing.T) {
 		// Schema.java:1899-1902 coerces TextNode → DoubleNode for outer
@@ -14940,15 +14791,9 @@ func TestRegression_OCFDecodeMapNegationOverflow(t *testing.T) {
 // every (Avro schema, Go target type, code path) cell the library claims to
 // support. The recurring bug shape is "encode accepts type X, decode rejects
 // type X" — every prior instance was caught one at a time by a dedicated
-// TestRegression_*; the matrix catches the pattern wholesale.
-//
-// Each cell exercises three paths: binary safe (top-level value), JSON safe, and
-// binary unsafe (a one-field struct, reaching the us*/ud* fast path or its
-// safe-path fallback where no specialization exists).
-//
-// Cells are paired by (encode value, decode target, expected). Identity cells
-// share the Go type; lenient-acceptance cells differ, and `expect` records what
-// the target should hold after a successful round-trip.
+// TestRegression_*. Each cell exercises binary safe, JSON safe, and binary
+// unsafe (a one-field struct reaching the us*/ud* fast path), paired by (encode
+// value, decode target, expected).
 func TestParity_RoundTripMatrix(t *testing.T) {
 	type cell struct {
 		name      string
@@ -15336,18 +15181,13 @@ func TestParity_RoundTripMatrix(t *testing.T) {
 }
 
 // TestMatrix_SchemaMetadataNumericPrecisionPreserved locks that JSON integer
-// literals > 2^53 survive parsing intact when surfaced via the metadata API
-// (Root().Props, Fields[].Props, Fields[].Default, and CustomType callbacks'
-// schema.Props). Both schema_node.go:108 and schema.go:289 route through
+// literals > 2^53 survive parsing intact when surfaced via the metadata API.
+// Both schema_node.go:108 and schema.go:289 route through
 // unmarshalAnyPreservePrecision; without UseNumber, 9007199254740993 silently
-// rounds to ...92. Java preserves via Jackson's LongNode (Schema.java:1985);
-// fastavro via Python int. Internal encode/decode already used UseNumber — the
-// user-facing surfaces had to as well.
-//
-// unmarshalAnyPreservePrecision decodes with UseNumber then normalizes:
-// integer-form json.Number to int64 (or json.Number beyond int64), fractional
-// and exponent forms to float64. TestSchemaNodeRoundTrip and
-// TestSchemaNodeCustomPropsExtended moved from float64(N) to int64(N) to match.
+// rounds to ...92. Java preserves via Jackson's LongNode (Schema.java:1985) and
+// fastavro via Python int; internal encode/decode already used UseNumber, so the
+// user-facing surfaces had to as well. Integer-form json.Number normalizes to
+// int64 (or json.Number beyond int64), fractional and exponent forms to float64.
 func TestMatrix_SchemaMetadataNumericPrecisionPreserved(t *testing.T) {
 	const wantVal = int64(9007199254740993) // 2^53 + 1
 	// Helper: type-assert v as the canonical int (int64 or json.Number
@@ -15470,23 +15310,16 @@ func TestMatrix_SchemaMetadataNumericPrecisionPreserved(t *testing.T) {
 
 // TestMatrix_SchemaMetadataExponentOverflowNormalizesToInf locks the
 // metadata-API surfaces on the ±Inf-from-overflow case for exponent-form
-// literals. normalizeJSONNumber routes through parseFloatAcceptOverflow so
-// "1e1000" surfaces as float64(±Inf), honoring the [SchemaField.Default] /
-// [SchemaNode.Props] docstring contract on the overflow subcase and matching
-// Java (Jackson DoubleNode → +Inf) and fastavro (float("1e1000") → inf).
+// literals: normalizeJSONNumber routes through parseFloatAcceptOverflow so
+// "1e1000" surfaces as float64(±Inf), honoring the docstring contract and
+// matching Java (Jackson DoubleNode → +Inf) and fastavro.
 //
-// This is the metadata-observability axis of pattern 1b's four-axis rule
-// (encode, decode, schema-parse-time validate, metadata observability); the
-// other three already route through parseFloatAcceptOverflow, so
-// normalizeJSONNumber must use the same helper for all four to agree.
-//
-// SchemaNode.toJSONWalk routes through jsonSerializableValue, which converts
-// ±Inf back to a json.Number literal so Schema() round-trip keeps working —
-// encoding/json.Marshal rejects ±Inf unconditionally.
-//
-// The same shape applies to Root().Props, Fields[].Props, CustomType callbacks'
-// Props, and values nested inside any of those; all five share
-// normalizeJSONNumber, so the single-site routing covers them.
+// This is the metadata-observability axis of pattern 1b's four-axis rule; the
+// other three already use that helper, so all four agree. toJSONWalk routes
+// through jsonSerializableValue, which converts ±Inf back to a json.Number
+// literal so Schema() round-trip keeps working, json.Marshal rejecting ±Inf
+// unconditionally. All five Props/Default surfaces share normalizeJSONNumber, so
+// the single-site routing covers them.
 func TestMatrix_SchemaMetadataExponentOverflowNormalizesToInf(t *testing.T) {
 	t.Run("default 1e1000 normalizes to +Inf", func(t *testing.T) {
 		s := mustParse(t, `{
@@ -15886,20 +15719,14 @@ func TestMatrix_SchemaMetadataExponentOverflowNormalizesToInf(t *testing.T) {
 }
 
 // TestMatrix_NumberGrammarParityMatrix pins the JSON-number grammar gate across
-// every entry point converting a [json.Number] to an Avro primitive on both
-// encode paths. The codebase historically accumulated parallel parsers —
-// strconv.ParseInt base=10, strconv.ParseFloat, big.Rat.SetString — each with a
-// subtly different accepted set. Multiple bug classes landed here because no
-// single test pinned "a json.Number is accepted iff it is an RFC 8259 number".
-//
-// Rows: input equivalence classes (valid JSON, value-overflow, JSON-invalid
-// grammar). Columns: 4 target types x 2 encode directions. Cell: whether encode
-// succeeds. Java's JsonParser rejects every JSON-invalid form at parse time and
-// fastavro's int()/float() raise on the same set; the matrix targets that
+// every entry point converting a json.Number to an Avro primitive on both encode
+// paths. The codebase accumulated parallel parsers — ParseInt base=10,
+// ParseFloat, big.Rat.SetString — each with a subtly different accepted set, and
+// multiple bug classes landed here because no single test pinned "a json.Number
+// is accepted iff it is an RFC 8259 number". Rows are input equivalence classes,
+// columns are 4 target types x 2 encode directions; Java's JsonParser and
+// fastavro's int()/float() reject the same set, and the matrix targets that
 // consensus.
-//
-// Adding an entry point is a column; adding an input class is a row. A
-// surprising cell should grow a comment.
 func TestMatrix_NumberGrammarParityMatrix(t *testing.T) {
 	// Each input is classified by whether the JSON encoder for each
 	// target type should accept it. "accept" requires the value to also
@@ -16097,18 +15924,14 @@ func TestMatrix_NumberGrammarParityMatrix_Decimal(t *testing.T) {
 	}
 }
 
-// TestMatrix_Float32DecimalInputUsesSourcePrecision pins that float32-typed
-// inputs to decimal / big-decimal format with the source's natural float32
-// precision when materializing the big.Rat, not with hardcoded float64
-// precision. tryCoerceToRat calls FormatFloat(f, 'f', -1, v.Type().Bits()), so
-// float32 inputs use float32's shortest-decimal: reflect.Value.Float() widens
-// losslessly but with up to 53 mantissa bits of binary noise, and bitSize=64
-// would expose every digit ("0.33000001311302185"), which big.Rat parses as a
-// fraction non-terminating at the schema scale, so ratToUnscaled rejects. The
-// same call with float64(0.33) succeeds because Go's shortest-decimal is "0.33".
-//
-// Java's reference for float-as-decimal is `new BigDecimal(Float.toString(f))`,
-// which uses float32's shortest-decimal and yields 33/100 for 0.33f.
+// TestMatrix_Float32DecimalInputUsesSourcePrecision pins that float32 inputs to
+// decimal / big-decimal materialize the big.Rat at float32 precision:
+// tryCoerceToRat calls FormatFloat(f, 'f', -1, v.Type().Bits()), so float32 uses
+// its own shortest-decimal. reflect.Value.Float() widens losslessly but with up
+// to 53 mantissa bits of binary noise, and bitSize=64 would expose every digit
+// ("0.33000001311302185"), a fraction non-terminating at the schema scale that
+// ratToUnscaled rejects. Java's reference is `new BigDecimal(Float.toString(f))`,
+// which likewise yields 33/100 for 0.33f.
 func TestMatrix_Float32DecimalInputUsesSourcePrecision(t *testing.T) {
 	// Main case: float32(0.33) against scale=2. Source-precision
 	// formatting accepts (33/100 fits scale 2); a precision-leak
@@ -16197,17 +16020,13 @@ func TestMatrix_Float32DecimalInputUsesSourcePrecision(t *testing.T) {
 
 // TestMatrix_DecimalExponentOverflowRejectsAcrossArms pins that a numeric string
 // whose exponent magnitude exceeds int64 routes through the same reject path as
-// the equivalent json.Number, instead of falling through to raw-bytes encoding.
+// the equivalent json.Number, instead of falling through to raw-bytes encoding:
 // boundedRatFromString must propagate the ParseInt error through the
-// (nil, false, err) "IS-numeric but rejected" lane: tryCoerceToRat's string arm
-// reads (nil, false, nil) as "not a number form at all → opaque bytes".
-//
-// The corruption mode: "1e99999999999999999999" (22 ASCII chars) against
-// fixed(22)+decimal encodes as 22 raw bytes, which round-trip decode reads as a
-// two's-complement unscaled int (3.7e51) at scale 2 — unrelated to the input.
-//
-// Java's BigDecimal(String) rejects it with NumberFormatException ("Too many
-// nonzero exponent digits", BigDecimal.java:558).
+// (nil, false, err) "IS-numeric but rejected" lane, since tryCoerceToRat's string
+// arm reads (nil, false, nil) as "not a number form at all". The corruption mode:
+// "1e99999999999999999999" against fixed(22)+decimal encodes as 22 raw bytes,
+// which decode reads as an unrelated 3.7e51 at scale 2. Java's BigDecimal(String)
+// rejects it outright.
 func TestMatrix_DecimalExponentOverflowRejectsAcrossArms(t *testing.T) {
 	// (input, mustReject) — all should reject; this matrix locks the
 	// shapes so a future regression that loosens any arm immediately
@@ -16445,18 +16264,13 @@ func TestMatrix_NumberGrammarParityMatrix_JSONDecode_AllTypes(t *testing.T) {
 
 // TestMatrix_UnionDispatchMatrix pins branch selection for every (input, union
 // schema) combination that has historically surfaced bugs or could under future
-// drift. Avro union encode is try-each in schema order, and the matrix locks
-// which branch wins where multiple could plausibly accept — bytes-vs-string for
-// raw bytes, the four numeric branches for json.Number, null shapes against
-// [null,T]/T-only unions.
-//
-// "Branch picked" is verified by decoding the wire back through DecodeJSON into
-// a *any target with TaggedUnions, which wraps the value with its branch name.
-//
-// These asymmetries have caused real bugs: the prior nil-Map-against-
-// multi-branch-union didn't reach case "null" because the try-each loop had a
-// `continue` on null kinds, and the binary try-each was independent of the JSON
-// one, so they drifted on which inputs land on which branch.
+// drift, locking which branch wins where multiple could plausibly accept —
+// bytes-vs-string for raw bytes, the four numeric branches for json.Number, null
+// shapes against [null,T]/T-only unions. "Branch picked" is verified by decoding
+// the wire back through DecodeJSON with TaggedUnions, which wraps the value with
+// its branch name. These asymmetries have caused real bugs: the try-each loop's
+// `continue` on null kinds kept nil Maps from reaching case "null", and the
+// binary and JSON try-each loops drifted independently.
 func TestMatrix_UnionDispatchMatrix(t *testing.T) {
 	type expect struct {
 		picked string // expected branch kind/name
@@ -16691,17 +16505,13 @@ func TestMatrix_LogicalTypeRoundTripMatrix(t *testing.T) {
 }
 
 // TestMatrix_PromotionMatrix locks the promotion rules for every writer→reader
-// pair the spec permits — int→{long,float,double}, long→{float,double},
-// float→{double}, string↔bytes — plus the evolution surfaces resolved decode
-// handles: removed fields, default-fill, aliases, enum-symbol widening, and
-// union widening.
-//
-// Each case encodes with the writer, decodes through Resolve(writer, reader),
-// and asserts the spec'd promoted shape, so drift in any arm surfaces
-// immediately. Java: ResolvingGrammarGenerator + Symbol.RESOLVED. fastavro:
-// _read_py.py's read_resolved. twmb is fail-fast on writer-union →
-// reader-non-union (intentional divergence), and the matrix avoids that case so
-// it cannot conflate the divergence with a regression.
+// pair the spec permits, plus the evolution surfaces resolved decode handles:
+// removed fields, default-fill, aliases, enum-symbol widening, union widening.
+// Each case encodes with the writer, decodes through Resolve, and asserts the
+// spec'd promoted shape. Java: ResolvingGrammarGenerator + Symbol.RESOLVED;
+// fastavro: read_resolved. twmb is fail-fast on writer-union → reader-non-union
+// (intentional divergence), so the matrix avoids that case rather than conflate
+// it with a regression.
 func TestMatrix_PromotionMatrix(t *testing.T) {
 	cases := []struct {
 		writer, reader string
@@ -17822,14 +17632,11 @@ func TestMatrix_JSONDecodeFixedSizeArrayTarget(t *testing.T) {
 }
 
 // TestMatrix_IntegerDefaultExactValueAccepted pins the value-based normalization
-// rule for int/long schema defaults: whole-number defaults written in fractional
-// ("2.0") or exponent ("4e1") form are accepted regardless of magnitude as long
-// as the exact mathematical value fits the target. normalizeJSONNumber routes
-// those forms through big.Rat and surfaces exact integers fitting int64 as
-// int64, so the metadata Default matches the wire-fill value with no float-route
-// precision loss. Exact integers that do not fit are rejected; float64
-// representability is irrelevant because the metadata path never uses float64
-// for exact-integer values.
+// rule for int/long schema defaults: whole-number defaults in fractional ("2.0")
+// or exponent ("4e1") form are accepted regardless of magnitude as long as the
+// exact value fits the target. normalizeJSONNumber routes those forms through
+// big.Rat and surfaces exact integers fitting int64 as int64, so the metadata
+// Default matches the wire-fill value with no float-route precision loss.
 //
 //	"9.2233720368547758e18"   -> 9223372036854775800, fits int64. Accept.
 //	"9.223372036854775808e18" -> 2^63, does not. Schema parse rejects.
@@ -17986,17 +17793,13 @@ func TestMatrix_IntegerDefaultExactValueAccepted(t *testing.T) {
 }
 
 // TestMatrix_DefaultSchemaWidthFaithful pins Option Y: the metadata-API Default
-// Go type matches the schema's wire width — int → int32, long → int64, float →
-// float32, double → float64 — matching Java's JacksonUtils.toObject
-// (JacksonUtils.java:150-155), which narrows DoubleNode → Float for FLOAT.
-// Without this, a user writing a float32 field with a default would get
-// Default.(float64) and have to cast at every metadata-read site, and a
-// {"default":1e100,"type":"float"} would surface as float64(1e100) while the
-// wire emitted float32(+Inf).
-//
-// Subtests cover the four-axis cells: pure-int literal default, boundary value
-// at the wire-width edge, finite-overflow for the float arm, and the
-// union-branch case where the chosen branch's natural Go type wins.
+// Go type matches the schema's wire width — int → int32, float → float32, and so
+// on — matching Java's JacksonUtils.toObject (:150-155), which narrows DoubleNode
+// → Float for FLOAT. Without it a float32 field's default surfaces as float64 and
+// must be cast at every metadata-read site, and {"default":1e100,"type":"float"}
+// reads float64(1e100) while the wire emitted float32(+Inf). Subtests cover the
+// four-axis cells: pure-int literal, boundary at the wire-width edge,
+// finite-overflow for the float arm, and the union-branch case.
 func TestMatrix_DefaultSchemaWidthFaithful(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -18067,17 +17870,12 @@ func TestMatrix_DefaultSchemaWidthFaithful(t *testing.T) {
 
 // TestRegression_ParseFloatLengthCapDoS pins the schema-parse-time length cap on
 // float-default literals. parseFloatAcceptOverflow wraps strconv.ParseFloat,
-// which is O(n) at ~30-50ms per MiB, and is called twice per schema parse
-// (validateDefault and encodeDefault, each via defaultAsFloat), so a 1 MiB
-// hostile default would drive ~130-150ms per Parse — past the 100ms threshold.
-// Sibling helpers boundedRatFromString (128KiB) and parseInt64Lenient (64 bytes)
-// carry caps for the same reason; this locks the 1024-byte cap at the single
-// chokepoint every float-parser callsite flows through.
-//
-// Two parts: a behavioral check that the cap fires with the expected message,
-// which runs under every mode including -race; and a wall-clock check that the
-// post-cap rejection is fast, skipped under -race because instrumentation makes
-// JSON parsing of 1 MiB slow regardless of the downstream cap.
+// O(n) at ~30-50ms per MiB, called twice per schema parse, so a 1 MiB hostile
+// default drove ~130-150ms per Parse. Sibling helpers boundedRatFromString
+// (128KiB) and parseInt64Lenient (64 bytes) carry caps for the same reason. Two
+// parts: a behavioral check that the cap fires, which runs under every mode, and
+// a wall-clock check skipped under -race, where instrumentation makes JSON
+// parsing of 1 MiB slow regardless of the downstream cap.
 func TestRegression_ParseFloatLengthCapDoS(t *testing.T) {
 	hostile := "1." + strings.Repeat("0", (1<<20)-2) // 1 MiB digit string
 	schemaJSON := fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":"double","default":%s}]}`, hostile)
@@ -18158,16 +17956,13 @@ func raceRelaxed(normal time.Duration) time.Duration {
 }
 
 // TestRegression_OCFWriterPreservesLogicalTypeInHeader pins that the OCF writer
-// writes the full schema JSON — logicalType, precision, scale, doc, aliases,
-// default — to the avro.schema header, matching Java's DataFileWriter
-// (Schema.toString) and fastavro (json.dumps). writeHeader must use
-// Schema.String(), not Canonical(): PCF is defined for fingerprinting and strips
-// all of those. Three observable failure modes if it used PCF:
-//  1. consumers relying on the self-describing header get the raw underlying
-//     type;
-//  2. ocf.NewReader(..., WithSchemaOpts(CustomType{LogicalType:X})) silently
-//     never matches, the header schema having no logical type to dispatch on;
-//  3. Root().Fields[i].Type.Precision reads zero on a decoded OCF.
+// writes the full schema JSON to the avro.schema header, matching Java's
+// DataFileWriter and fastavro. writeHeader must use Schema.String(), not
+// Canonical(): PCF is defined for fingerprinting and strips logicalType,
+// precision, scale, doc, aliases and default. With PCF, consumers relying on the
+// self-describing header get the raw underlying type,
+// WithSchemaOpts(CustomType{LogicalType:X}) silently never matches, and
+// Root().Fields[i].Type.Precision reads zero.
 func TestRegression_OCFWriterPreservesLogicalTypeInHeader(t *testing.T) {
 	// We can't import the ocf package from package avro_test (would
 	// create an import cycle through this test file's package), so
@@ -18203,19 +17998,13 @@ func TestRegression_OCFWriterPreservesLogicalTypeInHeader(t *testing.T) {
 
 // TestRegression_DecodeJSONFloatLengthCapDoS pins the decode-JSON length cap on
 // float literals. parseFloatAcceptOverflow (maxParseFloatLen=1024) is the shared
-// cap-applying helper at four sites consuming strconv.ParseFloat on
-// user-controllable input: binary encode jsonNumberToFloat, JSON encode
-// jsonCoerceToFloat64, schema-parse defaultAsFloat (both arms), and metadata-API
-// normalizeJSONNumber. decodeJSONFloat was the fifth caller and the only one
-// open-coding ParseFloat without the cap — so a 2k-char literal was rejected
-// everywhere else and ACCEPTED at DecodeJSON, and 50 MiB drove ~450ms. Pattern
-// 14b plus pattern 1b's axis rule extended to decode-JSON.
-//
-// Java's JsonDecoder and fastavro both lack this cap, so there is no parity
-// requirement; the cap is a twmb DoS-resistance convention. decodeJSONFloat
-// applies the predicate inline to preserve decodeFloat's bitSize=32
-// double-rounding semantics (parseFloatAcceptOverflow is always bitSize=64), and
-// shares the 1024 constant so future drift is structural.
+// helper at four sites consuming ParseFloat on user-controllable input;
+// decodeJSONFloat was the fifth caller and the only one open-coding ParseFloat
+// without the cap, so a 2k-char literal was rejected everywhere else and ACCEPTED
+// at DecodeJSON, and 50 MiB drove ~450ms. Java and fastavro both lack this cap,
+// so it is a twmb DoS-resistance convention, not parity. decodeJSONFloat applies
+// the predicate inline to preserve decodeFloat's bitSize=32 double-rounding
+// semantics, sharing the 1024 constant so drift is structural.
 func TestRegression_DecodeJSONFloatLengthCapDoS(t *testing.T) {
 	t.Parallel()
 
@@ -18322,18 +18111,13 @@ func TestRegression_DecodeJSONFloatLengthCapDoS(t *testing.T) {
 }
 
 // TestMatrix_CustomTypeBuiltinPreservedPerDirection pins the per-direction
-// suppression contract on the bytes.decimal / bytes.big-decimal / fixed.decimal
-// / fixed.duration / fixed.uuid paths. Per the docstrings, an Encode-nil
-// CustomType keeps the enriched built-in encoder, so users registering only a
-// Decode can still encode *big.Rat / avro.Duration, while a Decode-nil one drops
-// to raw bytes, so users registering only Encode get unprocessed wire values.
-//
-// Every logSer/logDeser site (schema.go:1587 / :1607 / :2107) uses a split-gate
-// shape — logSer unconditional unless the user supplied Encode, logDeser gated
-// on any matching CustomType — mirroring the timestamp/uuid path at :1660+. A
-// single-gate `if hasMatchingCustomType` would suppress BOTH directions on any
-// match, breaking the Encode-side contract for Decode-only registrations. This
-// covers all five split-gate paths.
+// suppression contract on the five bytes/fixed logical paths. Per the docstrings
+// an Encode-nil CustomType keeps the enriched built-in encoder, so a Decode-only
+// registration can still encode *big.Rat / avro.Duration, while a Decode-nil one
+// drops to raw bytes. Every logSer/logDeser site uses a split-gate shape — logSer
+// unconditional unless the user supplied Encode, logDeser gated on any matching
+// CustomType — since a single-gate `if hasMatchingCustomType` would suppress BOTH
+// directions and break the Encode-side contract.
 func TestMatrix_CustomTypeBuiltinPreservedPerDirection(t *testing.T) {
 	// Pass-through Decode: doesn't transform values, just verifies the
 	// callback is wired. Returning v unchanged means the user sees the
@@ -19328,16 +19112,12 @@ func TestRegression_EnumJSONNumberRejectStillEncodesString(t *testing.T) {
 // TestMatrix_JSONNumberMapKeyRejected pins that map targets keyed by json.Number
 // reject any key that is not a valid JSON number literal. The rejection is
 // per-key — the failing key appears in the error — rather than blanket-by-type,
-// so a map<int> wire with all-numeric keys round-trips into
-// map[json.Number]int. That preserves json.Number's RFC 8259 contract while
-// still letting UseNumber-pipeline users decode generic maps.
-//
-// Record-as-map decode keyed by json.Number always rejects on the first field
-// name, since Avro field names can never satisfy the JSON-number grammar — the
-// same observable outcome as a blanket reject, but the error names the key.
-//
-// Covers five entry points: binary deserMap, binary deserRecord-to-map, JSON
-// decodeMap, JSON decodeRecordMap, and resolved record-to-map.
+// so a map<int> wire with all-numeric keys round-trips into map[json.Number]int,
+// preserving json.Number's RFC 8259 contract while still letting UseNumber
+// pipelines decode generic maps. Record-as-map always rejects on the first field
+// name, Avro field names never satisfying the JSON-number grammar. Covers five
+// entry points: binary deserMap and deserRecord-to-map, JSON decodeMap and
+// decodeRecordMap, and resolved record-to-map.
 func TestMatrix_JSONNumberMapKeyRejected(t *testing.T) {
 	t.Run("binary_map", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"map","values":"int"}`)
@@ -19411,17 +19191,11 @@ func TestMatrix_JSONNumberMapKeyRejected(t *testing.T) {
 }
 
 // TestLogicalNumericTargetJSONNumberWritesRawWire pins that decoding a
-// logical-on-numeric schema (date, time-*, timestamp-*, local-timestamp-*) into
-// a *json.Number target writes the RAW numeric wire value as a
-// JSON-number-valid string, NOT the logical-formatted RFC3339/DateOnly string.
-// That preserves json.Number's RFC 8259 contract while still letting users
-// decode logical-numeric schemas for JSON-Marshal pipelines. Encode accepts
-// json.Number for the same schemas, so encode+decode through json.Number
-// round-trips identically.
-//
-// Covers safe binary (deserDate, deserTimeMillis/Micros, deserTimeAsLong),
-// unsafe binary (udTimeFromVarint/Varlong), JSON (decodeInt's date arm,
-// decodeLong's timestamp arm), and resolved.
+// logical-on-numeric schema into a *json.Number target writes the RAW numeric
+// wire value, NOT the logical-formatted RFC3339/DateOnly string — preserving
+// json.Number's RFC 8259 contract while letting users feed JSON-Marshal
+// pipelines. Encode accepts json.Number for the same schemas, so the round trip
+// closes. Covers safe binary, unsafe binary, JSON, and resolved.
 func TestLogicalNumericTargetJSONNumberWritesRawWire(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -19721,20 +19495,13 @@ func TestMatrix_JSONNumberUnsafeStructFieldRejected(t *testing.T) {
 
 // TestMatrix_JSONNumberSliceMapElementRejected pins that decoding into
 // []json.Number or map[string]json.Number rejects when the schema's
-// element/value type is a string-like wire kind. json.Number's stdlib contract
-// requires a valid RFC 8259 literal, and Avro string content is any UTF-8;
-// writing it would produce values that fail json.Marshal at the user's first
-// downstream call, far from the decode site.
-//
-// rejectJSONNumberStringTarget enforces this for every wire string-like setter.
-// The binary array/map block paths are siblings of those setters, so routing
-// json.Number element targets through the per-element path — instead of the fast
-// block loop's bare SetString — makes the policy uniform.
-//
-// Covers top-level slice/map targets and struct fields holding them: the unsafe
-// path's json.Number guard is per-leaf-field and does not peek into element
-// types, so struct fields fall back to safe deserArray/deserMap and inherit the
-// same rule.
+// element/value type is a string-like wire kind: json.Number requires a valid
+// RFC 8259 literal and Avro string content is any UTF-8, so writing it produces
+// values that fail json.Marshal far from the decode site.
+// rejectJSONNumberStringTarget enforces this for every string-like setter, and
+// routing element targets through the per-element path instead of the fast block
+// loop's bare SetString makes the policy uniform. Struct fields fall back to safe
+// deserArray/deserMap and inherit the rule, the unsafe guard being per-leaf-field.
 func TestMatrix_JSONNumberSliceMapElementRejected(t *testing.T) {
 	arraySchema := avro.MustParse(`{"type":"array","items":"string"}`)
 	mapSchema := avro.MustParse(`{"type":"map","values":"string"}`)
@@ -20072,18 +19839,12 @@ func TestMatrix_ErrorMessageBoundedForHostileInput(t *testing.T) {
 
 // TestMatrix_SchemaParseErrorBoundedForHostileInput pins that every schema-parse
 // error interpolating a user-controllable name, symbol, or default literal caps
-// it via truncForError. Without the cap, a hostile Schema Registry pull — the
-// documented use case in doc.go and README.md — carrying a 1+ MiB field name or
-// enum symbol emits a 1+ MiB error: 1:1 amplification through logs, gRPC
-// trailers (default cap 4 KiB), metric labels, and tracing.
-//
-// Every schema-parse-time interpolation site reachable from avro.Parse is
-// exercised. TestMatrix_ErrorMessageBoundedForHostileInput covers the encode-
-// and decode-time sites; this covers the parse- and resolution-time sites that
-// take the same input shape by a different path.
-//
-// Each subtest also confirms a SHORT input still produces an informative
-// message.
+// it via truncForError. Without the cap a hostile Schema Registry pull — the
+// documented use case in doc.go — carrying a 1+ MiB field name emits a 1+ MiB
+// error: 1:1 amplification through logs, gRPC trailers, metric labels and
+// tracing. Every parse-time interpolation site reachable from avro.Parse is
+// exercised; TestMatrix_ErrorMessageBoundedForHostileInput covers the encode- and
+// decode-time ones. Each subtest also confirms a SHORT input stays informative.
 func TestMatrix_SchemaParseErrorBoundedForHostileInput(t *testing.T) {
 	const maxErrLen = 4096
 	const huge1MiB = 1 << 20
@@ -20608,16 +20369,14 @@ func TestRegression_OverCapDecimalFixedParsesAndSkips(t *testing.T) {
 }
 
 // A field default that cannot be WRITTEN must not stop its schema being PARSED.
-// The two are different questions and only one is the reader's: a reader that
-// DROPS the field never writes the default and decodes such data correctly, so
-// refusing the schema at parse breaks a working reader to prevent a write it
-// never performs. The verdict is therefore recorded when the default is
-// pre-encoded and surfaced at the moment it would reach the wire.
-//
-// Four fill routes reach the pre-encoded bytes and they are not one path: an
-// absent key in a map[string]any, an absent key in a typed map, a struct field
-// tagged omitzero through reflect, and the same field through the COMPILED
-// unsafe record path, which copies those bytes at compile time.
+// Only one of those is the reader's question: a reader that DROPS the field never
+// writes the default and decodes such data correctly, so refusing at parse breaks
+// a working reader to prevent a write it never performs. The verdict is recorded
+// when the default is pre-encoded and surfaced at the moment it would reach the
+// wire. Four fill routes reach those bytes: an absent key in a map[string]any, an
+// absent key in a typed map, an omitzero struct field through reflect, and the
+// same field through the COMPILED unsafe record path, which copies the bytes at
+// compile time.
 func TestMatrix_DecimalDefaultVerdictDefersToEncode(t *testing.T) {
 	const cap = 32 << 10
 
@@ -21441,22 +21200,13 @@ func TestRegression_CanonicalBackspaceFormfeedShortForm(t *testing.T) {
 // ---------- differential_test.go ----------
 
 // Tier-1 differential testing against fastavro. Everything is compared as Avro
-// bytes, so there is no fragile cross-language value coercion:
-//
-//   - encode parity:      twmb.Encode(v) bytes == fastavro encode(v) bytes
-//                         (skipped for map-containing schemas: entry order is
-//                          unspecified, so bytes legitimately differ)
-//   - fastavro reads twmb: fastavro decodes twmb's bytes without error
-//   - twmb reads fastavro:  twmb.Decode succeeds on fastavro's bytes
-//
-// The test SKIPS rather than fails when fastavro is absent, so `go test ./...`
-// stays green without the toolchain; set AVRO_FASTAVRO_PYTHON to a python with
-// it. See CORRECTNESS_PLAN.md §T1b/§T1c and testdata/oracle/README.md.
-//
-// Binary- and logical-typed values are covered by
-// TestDifferentialFastavroBinaryLogical via the Kind-tagged transport. Still NOT
-// covered: ambiguous multi-numeric unions, where encode branch-selection can
-// legitimately differ by impl.
+// bytes, so there is no fragile cross-language value coercion: twmb's encode
+// bytes must equal fastavro's (skipped for map-containing schemas, entry order
+// being unspecified), fastavro must decode twmb's bytes, and twmb must decode
+// fastavro's. The test SKIPS rather than fails when fastavro is absent; set
+// AVRO_FASTAVRO_PYTHON to a python with it. Binary- and logical-typed values are
+// covered by TestDifferentialFastavroBinaryLogical; still NOT covered are
+// ambiguous multi-numeric unions, where branch selection can legitimately differ.
 
 type oracleJob struct {
 	Op     string          `json:"op"`
@@ -21658,25 +21408,19 @@ func TestDifferentialFastavro(t *testing.T) {
 // ---------- differential_json_test.go ----------
 
 // ---------------------------------------------------------------------------
-// JSON-wire differential vs fastavro's json_writer / json_reader: executes
-// the JSON-encoding behaviors this package documents against the reference
-// implementations, instead of citing them. Three cell classes:
+// JSON-wire differential vs fastavro's json_writer / json_reader: executes the
+// JSON-encoding behaviors this package documents against the references instead
+// of citing them. Three cell classes:
 //
-//   - PARITY cells: twmb's EncodeJSON text must equal fastavro's
-//     json_writer text (bytes/fixed codepoint strings, tagged-union
-//     envelopes keyed by fullname), and each engine must read the other's
-//     text back to the same value.
-//   - REJECT-PARITY cells: both engines must reject the same malformed or
-//     unrepresentable inputs (bare value against a tagged-union reader,
-//     JSON null against a union without a null branch, lowercase "nan",
-//     trailing content).
-//   - CALIBRATION cells: documented divergences pinned at fastavro's
-//     OBSERVED verdict (1.12.2) so an upgrade that changes fastavro's
-//     behavior flips the cell and forces a deliberate recalibration —
-//     never a silently rotting claim: fastavro emits BARE NaN where twmb
-//     emits the quoted Java form, and fastavro's json_reader returns
-//     twmb's quoted "NaN" as a plain string (it applies no float
-//     validation) where twmb parses NaN.
+//   - PARITY: twmb's EncodeJSON text must equal fastavro's, and each engine must
+//     read the other's text back to the same value.
+//   - REJECT-PARITY: both must reject the same malformed or unrepresentable
+//     inputs (a bare value against a tagged-union reader, JSON null against a
+//     union with no null branch, lowercase "nan", trailing content).
+//   - CALIBRATION: documented divergences pinned at fastavro's OBSERVED verdict
+//     (1.12.2) so an upgrade flips the cell and forces a deliberate
+//     recalibration — fastavro emits BARE NaN where twmb emits the quoted Java
+//     form, and its json_reader returns twmb's quoted "NaN" as a plain string.
 // ---------------------------------------------------------------------------
 
 func TestDifferentialFastavroJSON(t *testing.T) {
@@ -22060,17 +21804,12 @@ var nullSpellDiffUnions = []struct{ name, union string }{
 // TestDifferentialFastavroSchemaForNullSpelling drives a foreign implementation
 // over the schemas SchemaFor EMITS for each null spelling. The emitted text is
 // the artifact a caller publishes, so a foreign reader is the oracle that
-// matters — and it is the only one that can see the consequence of a dropped
-// "default":null: twmb synthesizes an implicit null default for a nullable union
-// at parse, while Java and fastavro require it written.
-//
-//   - canonical: fastavro must accept the emitted schema, and its own parsing
-//     canonical form must match twmb's Canonical(), which subsumes fingerprint
-//     equality with no byte-order presentation trap.
-//   - evolution: data written by a writer predating the field must still read
-//     through the emitted schema. This is the sharpest oracle for the default
-//     fill — with the default dropped, fastavro raises SchemaResolutionError
-//     while the bare spelling reads back a null.
+// matters — and the only one that can see the consequence of a dropped
+// "default":null, twmb synthesizing an implicit null default at parse where Java
+// and fastavro require it written. Two arms: fastavro must accept the schema and
+// agree on the parsing canonical form, and data written by a writer predating
+// the field must still read through the emitted schema — the sharpest oracle for
+// the fill, since a dropped default raises SchemaResolutionError.
 func TestDifferentialFastavroSchemaForNullSpelling(t *testing.T) {
 	o := startOracle(t)
 
@@ -22152,16 +21891,12 @@ func TestDifferentialFastavroSchemaForNullSpelling(t *testing.T) {
 // ---------- matrix_alias_differential_test.go ----------
 
 // TestDifferentialFastavroAliasResolution executes every cell of the alias
-// census against a real fastavro process: a value is encoded with the writer
-// schema and resolved-read with the reader schema, so fastavro's match_schemas
-// is the matcher under test on their side.
-//
-// fastavro's verdict table differs from twmb's on exactly one row, the
-// leading-dot alias spelling: fastavro compares alias strings as written, while
-// twmb applies Java's Name-constructor rule (Schema.java ~1455), under which
-// ".Old" is the null-namespace fullname "Old" — so twmb and Java accept the
-// null-namespace writer fastavro rejects. Every other row must agree exactly, on
-// both the accept and reject sides.
+// census against a real fastavro process, so fastavro's match_schemas is the
+// matcher under test on their side. Its verdict table differs from twmb's on
+// exactly one row, the leading-dot alias spelling: fastavro compares alias
+// strings as written, while twmb applies Java's Name-constructor rule
+// (Schema.java ~1455), under which ".Old" is the null-namespace fullname "Old".
+// Every other row must agree exactly, on both the accept and reject sides.
 func TestDifferentialFastavroAliasResolution(t *testing.T) {
 	o := startOracle(t)
 
@@ -22358,22 +22093,19 @@ func TestDifferentialFastavroAliasDotRule(t *testing.T) {
 // ---------- matrix_differential_test.go ----------
 
 // ---------------------------------------------------------------------------
-// External-oracle matrix: every (fragment × context) cell is validated
-// against a real fastavro process. The relational matrix core cannot catch
-// a bug that is SYMMETRIC across twmb's encoder and decoder (both agreeing
-// on the same wrong bytes); an independent implementation can. Two checks
-// per cell, neither needing any cross-language value comparison:
+// External-oracle matrix: every (fragment x context) cell is validated against a
+// real fastavro process. The relational matrix core cannot catch a bug that is
+// SYMMETRIC across twmb's encoder and decoder — both agreeing on the same wrong
+// bytes — and an independent implementation can. Two checks per cell, neither
+// needing cross-language value comparison:
 //
-//	rt        — twmb encodes; fastavro decodes those bytes and re-encodes;
-//	            the bytes must come back identical. Catches wire-layout
-//	            divergence (varints, lengths, union indices, logical byte
-//	            forms, container framing) in either implementation.
-//	canonical — fastavro's Parsing Canonical Form of the composed schema
-//	            must equal twmb's Canonical(), extending the vendored
-//	            vector oracle to every schema the matrix can compose.
+//	rt        — twmb encodes; fastavro decodes and re-encodes; the bytes must
+//	            come back identical, catching wire-layout divergence in either.
+//	canonical — fastavro's PCF of the composed schema must equal twmb's
+//	            Canonical(), extending the vendored vector oracle to every
+//	            schema the matrix can compose.
 //
-// Skips (does not fail) when fastavro is unavailable; CI provides it via
-// AVRO_FASTAVRO_PYTHON.
+// Skips when fastavro is unavailable; CI provides AVRO_FASTAVRO_PYTHON.
 // ---------------------------------------------------------------------------
 
 func TestDifferentialMatrix(t *testing.T) {
@@ -22808,16 +22540,13 @@ func TestProperty_LogicalCustomTypeParseNeverPanics(t *testing.T) {
 }
 
 // TestProperty_BinaryJSONRoundTripAgree asserts that for every generated
-// (schema, value), decoding the binary encoding and decoding the JSON encoding
-// yield the SAME Go value — a within-twmb oracle that fails for a whole class of
-// inputs at once where audits keep finding one example at a time.
-//
-// Unions are round-tripped in TAGGED form on both paths. A bare JSON union value
-// carries no branch tag, so a multi-numeric union legitimately resolves to the
-// first token-matching branch on bare-JSON decode while the binary wire carries
-// the exact branch — a documented leniency. TaggedUnions carries the branch on
-// both sides, so all union shapes are compared without conflating that behavior
-// with a real bug.
+// (schema, value), decoding the binary encoding and the JSON encoding yield the
+// SAME Go value — a within-twmb oracle that fails for a whole class of inputs at
+// once where audits keep finding one example at a time. Unions round-trip in
+// TAGGED form on both paths: a bare JSON union value carries no branch tag, so a
+// multi-numeric union legitimately resolves to the first token-matching branch,
+// and TaggedUnions carries the branch on both sides so that documented leniency
+// is not conflated with a real bug.
 func TestProperty_BinaryJSONRoundTripAgree(t *testing.T) {
 	const iters = 3000
 	tagged := avro.TaggedUnions()
@@ -22858,20 +22587,17 @@ func TestProperty_BinaryJSONRoundTripAgree(t *testing.T) {
 
 // ---------- invariants_test.go ----------
 
-// Tier-4 executable invariant (CORRECTNESS_PLAN.md): the encode/decode
-// target-type parity rule from BUG_AUDIT.md pattern 12 — "for every Go type the
-// encoder accepts as input to a schema, the decoder MUST accept it as a target,
-// else a value round-trips one way but not back." The single most recurring bug
-// shape in the audit history, driven across a schema x Go-type matrix rather
-// than hand-picked.
+// Tier-4 executable invariant: the encode/decode target-type parity rule from
+// BUG_AUDIT.md pattern 12 — "for every Go type the encoder accepts as input to a
+// schema, the decoder MUST accept it as a target" — the single most recurring bug
+// shape in the audit history, driven across a schema x Go-type matrix rather than
+// hand-picked.
 //
 // The sound form is round-trip-PER-TYPE: encode a type's own sample value, then
 // decode THAT wire back into the same type. Value-consistent by construction, so
-// a flag is a genuine "cannot read it back into the type that produced it" and
-// never a content/range artifact — a naive "mint one wire, try all target types"
-// matrix instead conflates type rejection with value rejection (a 1000ms
-// timestamp overflows int8, raw 0x01 is not a number literal). Asymmetries that
-// are DOCUMENTED intentional policy live in the allowlist with a citation.
+// a flag is never a content/range artifact — a naive "mint one wire, try all
+// target types" matrix instead conflates type rejection with value rejection.
+// DOCUMENTED intentional asymmetries live in the allowlist with a citation.
 
 type goTypeCand struct {
 	name   string
@@ -23858,21 +23584,17 @@ func TestDecimalFloat32SourcePrecision(t *testing.T) {
 }
 
 // TestMatrix_DecimalCarrierNumericTextContract is the generative net for the
-// decimal carrier contract: for a decimal logical on bytes AND fixed, a Go
-// string and a json.Number are the numeric-text form ONLY — a non-numeric one is
-// REJECTED on encode, on both wires, in EVERY encode context — rather than
-// silently written as opaque raw bytes, keeping encode symmetric with decode,
-// whose string target always reads numeric decimal text. []byte is the sole
-// opaque carrier and encodes in every cell. big-decimal has the same contract;
-// the whole logical-on-bytes/fixed carrier class is covered by
-// TestMatrix_LogicalStringCarrierRoundTripContract.
+// decimal carrier contract: for a decimal logical on bytes AND fixed, a Go string
+// and a json.Number are the numeric-text form ONLY — a non-numeric one is
+// REJECTED on encode, on both wires, in EVERY encode context — keeping encode
+// symmetric with decode, whose string target always reads numeric decimal text.
+// []byte is the sole opaque carrier.
 //
-// Axes: carrier {string, []byte, json.Number} x content {numeric, non-numeric} x
-// backing {bytes, fixed} x wire x encode context {top-level, record field, array
-// element, map value} — the path-divergence axis. The oracle is
-// calibration-free. Neuter: reverting rejectNonNumericStructuredString reds every
-// string/json.Number + non-numeric cell across contexts, backings and wires; the
-// numeric and []byte controls stay green.
+// Axes: carrier x content x backing {bytes, fixed} x wire x encode context
+// {top-level, record field, array element, map value}, the path-divergence axis.
+// Neuter: reverting rejectNonNumericStructuredString reds every
+// string/json.Number + non-numeric cell across contexts, backings and wires,
+// while the numeric and []byte controls stay green.
 func TestMatrix_DecimalCarrierNumericTextContract(t *testing.T) {
 	// leaf schemas: a fixed sized to hold both a numeric value's unscaled bytes
 	// and the 6-byte non-numeric raw string.
@@ -24274,19 +23996,13 @@ func TestMatrix_FixedDecimalByteTargetPreservesRemainder(t *testing.T) {
 // accepts, the decoded value must match the leaf's contract AND the stream
 // position after it must be exact. Position is asserted two ways — trailing
 // bytes after a top-level value must come back as Decode's rest, and data
-// following the value inside one stream (a later record field, further array
-// elements or map entries, a field-reordered resolved record) must still decode.
-// JSON runs the same value grid and, having no stream remainder, doubles as the
-// value oracle for the typed setter arms.
+// following the value inside one stream must still decode. JSON runs the same
+// value grid and, having no stream remainder, doubles as the value oracle.
 //
 // Leaves: fixed+decimal (the historical drift site), with bytes+decimal and
-// plain fixed as always-green controls. Targets: []byte and [4]byte (the opaque
-// escape hatch pair), string, *big.Rat, json.Number, and any as the independent
-// oracle.
-//
-// Non-vacuity, verified by re-introducing the wrong remainder return in
-// deserFixedDecimal's fall-back: every fixed_decimal byte-target binary cell
-// reds while both control leaves and all structured-target cells stay green.
+// plain fixed as always-green controls. Non-vacuity, verified by re-introducing
+// the wrong remainder return in deserFixedDecimal's fall-back: every
+// fixed_decimal byte-target binary cell reds while the controls stay green.
 func TestMatrix_FixedDecimalTargetConsumptionContract(t *testing.T) {
 	// One payload for every leaf: unscaled 456 at scale 2 -> 4.56.
 	payload := []byte{0, 0, 1, 200}

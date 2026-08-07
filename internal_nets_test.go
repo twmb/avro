@@ -564,20 +564,17 @@ var censusRegistry = []censusQuestion{
 			{pattern: `bareEmissionExempt`, counts: map[string]int{
 				"schema_node.go": 3,
 			}},
-			// Rejected tell: `len(n.Props) == 0` — the shape the OLD
-			// hand-written lists shared. It still appears in unrelated emptiness
-			// checks, so it would fire on unrelated changes, and after the fix it
-			// no longer marks this question's sites at all.
+			// Rejected tell: `len(n.Props) == 0` — the shape the OLD hand-written
+			// lists shared. It still appears in unrelated emptiness checks, and
+			// after the fix it no longer marks this question's sites at all.
 			//
-			// The durable guard here is not a tell but
-			// TestInvariant_BareEmissionCoversEverySchemaNodeField, which sets
-			// every exported field in turn and requires the predicate to notice
-			// BOTH halves — that the field blocks, and that the object form it
-			// falls through to actually carries the value through an emit →
-			// re-parse round trip. Proving only the blocking half left the emitter
-			// free to drop the value with nothing but the render changed, which is
-			// exactly what EnumDefault did. A field added later fails there until
-			// classified, which a tell count cannot do.
+			// The durable guard is not a tell but
+			// TestInvariant_BareEmissionCoversEverySchemaNodeField, which sets every
+			// exported field in turn and requires the predicate to notice BOTH
+			// halves — that the field blocks, and that the object form it falls
+			// through to carries the value through an emit → re-parse round trip.
+			// Proving only the blocking half left the emitter free to drop the value
+			// with nothing but the render changed, which is what EnumDefault did.
 		},
 	},
 	{
@@ -611,17 +608,15 @@ var censusRegistry = []censusQuestion{
 				"schema_node.go": 3,
 			}},
 			// Rejected tell: `n.refTarget` — it marks the STAMP, which is
-			// nodeRefTargetAgrees's question, asked immediately beside this one at
-			// the same call site, so counting it would make this question fire on
-			// stamp changes.
+			// nodeRefTargetAgrees's question, asked beside this one at the same call
+			// site, so counting it would make this question fire on stamp changes.
 			//
 			// As with Q16 the durable guard is not a tell:
 			// TestInvariant_NameRefSpliceCoversEverySchemaNodeField sets each
-			// exported field on an EXTRACTED reference and requires the predicate
-			// to notice, and TestMatrix_CallerComposedAndEditedNodes crosses that
-			// with the recursive, diamond, forward-reference and cache-cross-parse
-			// structures. A tell watches where a rule is WRITTEN; this class's
-			// failure mode is a member the rule never mentioned.
+			// exported field on an EXTRACTED reference and requires the predicate to
+			// notice, and TestMatrix_CallerComposedAndEditedNodes crosses that with
+			// the recursive, diamond, forward-reference and cross-parse structures.
+			// This class's failure mode is a member the rule never mentioned.
 		},
 	},
 	{
@@ -655,16 +650,14 @@ var censusRegistry = []censusQuestion{
 				"schema_parse.go": 5,
 			}},
 			// Rejected tell: `== nil` — the most common comparison in the package,
-			// answering "is this pointer/error/interface unset" almost everywhere
-			// it appears. The question here is about a DECODED JSON BODY
-			// specifically, which is what the named predicate marks.
+			// answering "is this pointer/error/interface unset" almost everywhere.
+			// The question here is about a DECODED JSON BODY specifically, which is
+			// what the named predicate marks.
 			//
-			// The durable guard is not a tell either:
-			// TestMatrix_ReservedKeyBodyPresence crosses every reserved key with a
-			// typed destination against {absent, valid, null, wrong-typed, quoted}
-			// at both levels and requires the null verdict to equal the wrong-typed
-			// one on every surface. This class's failure mode is a new typed read
-			// that never asks it.
+			// The durable guard is TestMatrix_ReservedKeyBodyPresence, which crosses
+			// every reserved key with a typed destination against {absent, valid,
+			// null, wrong-typed, quoted} at both levels and requires the null verdict
+			// to equal the wrong-typed one on every surface.
 		},
 	},
 	{
@@ -1048,18 +1041,15 @@ func TestCensus_OutstandingIsRecorded(t *testing.T) {
 // recursion level: the body of every self-calling function, and the body of
 // every func literal called through the variable holding it. The second shape is
 // what a name-only scan misses, and it is the one that matters — a function can
-// DECLARE a recursive closure and still run a rule outside it, which is exactly
-// the correct arrangement. callGraph is what the placement check is really
-// asking: not where a rule is WRITTEN, but whether a body that repeats per level
-// can reach it.
+// DECLARE a recursive closure and still run a rule outside it, which is the
+// correct arrangement. The question is not where a rule is WRITTEN but whether a
+// body that repeats per level can reach it.
 //
-// repeatingBody locates the body of the named walk in file and reports its byte
-// range plus the names it calls directly. The walk has to be NAMED rather than
-// derived: "reachable from some recursion" is a different question — schema
+// repeatingBody locates the named walk's body and reports its byte range plus
+// the names it calls. The walk has to be NAMED rather than derived: schema
 // inference recurses too, and a field collector running once per level of THAT
-// walk is correct, because each level is a different record. What makes a
-// placement right or wrong is the recursion whose collected set the rule ranges
-// over, and only the author knows which one that is.
+// walk is correct, each level being a different record. Only the author knows
+// which recursion's collected set the rule ranges over.
 func repeatingBody(t *testing.T, file, walk string) (lo, hi int, calls map[string]bool) {
 	t.Helper()
 	fset := token.NewFileSet()
@@ -1159,19 +1149,16 @@ func enclosingFunc(t *testing.T, file string, offset int) string {
 // checked fact.
 //
 // Some questions are answered by a rule that ranges over a whole collected SET,
-// not over one value: which promoted field owns a name cannot be decided from
-// one embedded struct's own fields, because a shallower field declared anywhere
+// not one value: which promoted field owns a name cannot be decided from one
+// embedded struct's own fields, because a shallower field declared anywhere
 // above takes it. Such a rule has a second property besides its content — WHERE
-// it runs — and two implementations can match on the rule and differ on that.
-// Nothing that compares answers can see it, because at the outermost call the
-// two placements agree; the divergence only shows one level deeper.
+// it runs — and nothing that compares answers can see a difference there,
+// because at the outermost call the two placements agree.
 //
 // So the registry states the placement and this asserts it against source in
-// both directions, at the position of the question's own tell rather than at its
-// function's name: a rule claiming to run over the complete set must not sit
-// inside a body that repeats per level, and one claiming to run per level must.
-// The distinction is finer than "does this function recurse" — a function may
-// declare a recursive closure and run the rule after it.
+// both directions, at the position of the question's own tell: a rule claiming
+// to run over the complete set must not sit inside a body that repeats per
+// level, and one claiming to run per level must.
 func TestCensus_PlacementFactsMatchSource(t *testing.T) {
 	stated := 0
 	for _, q := range censusRegistry {
@@ -1885,15 +1872,10 @@ func TestCensus_Q11_CorpusIsNotVacuous(t *testing.T) {
 // long its output is means producing that output, which is the allocation the
 // budget exists to prevent. A restatement is only allowed with an executed
 // differential over the authority's COMPLETE domain, and that is what this is.
-//
-// Expectations come from marshalSchemaTree — the package's own emitter — not
-// from json.Marshal named directly, so if this package ever switches to an
-// Encoder with SetEscapeHTML(false) the expected values move with it.
-//
-// Escaping below utf8.RuneSelf is byte-LOCAL: a byte's emitted cost never
-// depends on its neighbours, so testing all 256 single-byte values is a proof
-// over that part of the domain rather than a sample. The multi-byte cases are
-// enumerated separately.
+// Expectations come from marshalSchemaTree, the package's own emitter, so a
+// switch to an Encoder with SetEscapeHTML(false) moves them with it. Escaping
+// below utf8.RuneSelf is byte-LOCAL, so testing all 256 single-byte values is a
+// proof over that part of the domain rather than a sample.
 func emittedContentLen(t *testing.T, s string) int {
 	t.Helper()
 	out, err := marshalSchemaTree(s)
@@ -2615,13 +2597,10 @@ func TestCensus_Q13_CorpusIsNotVacuous(t *testing.T) {
 // schemas can reference. isNamedKind and isRecordKind are the shared predicates,
 // but the same classification is also written out as literal case sets — `case
 // "record", "enum", "fixed":` in compat.go and json_codec.go, `case "record",
-// "error":` in schema_canonical.go and schema_node.go — so the rule exists in
-// several hand-written copies.
-//
-// The observable is exact rather than a proxy: a kind is named iff a definition
-// of that kind can be REFERENCED by name from a sibling position. On an unnamed
-// kind a "name" key is a stray custom property, so the reference must fail to
-// resolve.
+// "error":` in schema_canonical.go and schema_node.go. The observable is exact
+// rather than a proxy: a kind is named iff a definition of that kind can be
+// REFERENCED by name from a sibling position, and on an unnamed kind a "name"
+// key is a stray custom property, so the reference must fail to resolve.
 type kindCell struct {
 	kind    string
 	def     string // a definition of this kind carrying "name":"N"
@@ -2744,17 +2723,15 @@ func TestCensus_Q15_CorpusIsNotVacuous(t *testing.T) {
 // Q8 — does this struct tag skip the field?
 // ---------------------------------------------------------------------
 
-// Two subsystems read avro struct tags and each reads them on two structurally
-// distinct paths: SchemaFor's named-field and anonymous-embed paths decide what
-// a GENERATED schema contains, and the runtime field mapper's two paths decide
-// what an encode/decode BINDS. All four spell the exact-match skip as
-// `tag == "-"`, and they must agree — a subsystem that stopped skipping would
-// put back a field the caller excluded, on one side only.
-//
-// This was flagged as a possible demotion (one answerer, no external authority).
-// Grepping the RULE's shape rather than the helper's name disproves that:
-// `tag == "-"` appears at reflect.go 481 and 510 and schema_for.go 725 and 784.
-// What IS single-answerer is the GRAMMAR guard, whose scope is deliberate.
+// Two subsystems read avro struct tags, each on two structurally distinct paths:
+// SchemaFor's named-field and anonymous-embed paths decide what a GENERATED
+// schema contains, and the runtime field mapper's two decide what an
+// encode/decode BINDS. All four spell the exact-match skip as `tag == "-"` and
+// must agree — a subsystem that stopped skipping would put back a field the
+// caller excluded, on one side only. Flagged as a possible demotion (one
+// answerer); grepping the RULE's shape rather than the helper's name disproves
+// it — `tag == "-"` appears at reflect.go 481 and 510 and schema_for.go 725 and
+// 784.
 type skipTagCell struct {
 	name string
 	// schemaFor renders a schema from a type carrying the tag; mapped
@@ -2911,17 +2888,14 @@ func TestCensus_Q8_CorpusIsNotVacuous(t *testing.T) {
 // ---------------------------------------------------------------------
 
 // The flat (goavro-style) field form puts a complex kind's defining key beside
-// the field's own keys instead of nesting a type object. Deciding whether to
-// lift is one predicate, flatFieldNeedsLift, and three representations call it:
-// the parser, the tree walker, and the metadata renderer. Sharing makes the
-// agreement structural, so what this drives is that the three consult it on the
-// SAME input — a walker that reconstructs the field map differently would reach
-// a different verdict from the same predicate.
-//
-// The discriminator is a MISMATCHED defining key: "symbols" beside
-// "type":"array" is not the array's key, so no lift happens. A corpus without
-// that cell would pass on a predicate that lifted whenever ANY complex key was
-// present.
+// the field's own keys instead of nesting a type object. One predicate,
+// flatFieldNeedsLift, decides whether to lift, and three representations call it
+// — parser, tree walker, metadata renderer — so agreement is structural and what
+// this drives is that the three consult it on the SAME input: a walker that
+// reconstructs the field map differently reaches a different verdict from the
+// same predicate. The discriminator is a MISMATCHED defining key ("symbols"
+// beside "type":"array"), without which the corpus would pass on a predicate
+// that lifted whenever ANY complex key was present.
 type flatFieldCell struct {
 	name     string
 	field    string // the field object as written inside a record's "fields"
@@ -3366,18 +3340,15 @@ func TestCensus_Q4_CorpusIsNotVacuous(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Q17 driver: the SPLICE question has two answerers on two representations.
-//
-// The metadata splice (toJSONWalk, gated by nodeIsNameRefShape) works on a
+// Q17 driver: the SPLICE question has two answerers on two representations. The
+// metadata splice (toJSONWalk, gated by nodeIsNameRefShape) works on a
 // SchemaNode tree; the cache splice (inlineTreeDefs's wrapper arm) works on the
 // raw JSON tree before any SchemaNode exists. Neither can call the other, so the
 // only thing keeping them in step is that they answer the same policy: a
 // RESERVED usage-site key cannot survive onto the definition, a CUSTOM property
-// merges onto it definition-wins.
-//
-// This drives both over the same corpus of wrapper keys and requires the same
-// verdict per key. The verdict is read off the OBSERVABLE, never off either
-// implementation, so the test cannot be satisfied by the two sharing a bug.
+// merges onto it definition-wins. This drives both over the same corpus and
+// requires the same verdict per key, read off the OBSERVABLE rather than off
+// either implementation, so the two cannot satisfy it by sharing a bug.
 type spliceWrapperCell struct {
 	key  string
 	body string
@@ -3438,15 +3409,12 @@ func spliceWrapperCells() []spliceWrapperCell {
 		{"default", `"D"`, false, "#63 splice-merge, definition-wins: an enum consumes \"default\" as its evolution default, so a usage site cannot supply a second one", enumCarrierDef},
 		// The SHAPE-CONDITIONAL key class. Every cell above is settled by the key
 		// alone or by the definition's logical type, so the routing answers each
-		// before it ever asks the third question — does this body parse as the
-		// key's schema shape? These keys are the only ones that reach it, and at a
-		// splice there is no recorded parse verdict to consult, so the body is
-		// decoded afresh here and nowhere else.
-		//
-		// The bodies are deliberately NOT schema-shaped: a shape-OK body on a
-		// reference wrapper stops the object being a bare reference at all, and
-		// the parse rejects it as a kind name before any splice runs. So every
-		// cell that reaches a splice at all is a merge.
+		// before it asks the third question — does this body parse as the key's
+		// schema shape? These keys are the only ones that reach it, and at a splice
+		// there is no recorded parse verdict, so the body is decoded afresh here
+		// and nowhere else. The bodies are deliberately NOT schema-shaped: a
+		// shape-OK body on a reference wrapper stops the object being a bare
+		// reference at all, so every cell that reaches a splice is a merge.
 		{"items", `123`, true, "#63(b): \"items\" is a stray on a fixed and its body does not parse as a schema, so it has no structural surface to take and rides in Props verbatim", ""},
 		{"values", `[1]`, true, "#63(b), same clause: a JSON array in schema position is a union, and 1 is not a schema, so the body is not schema-shaped", ""},
 		{"fields", `123`, true, "#63(b), same clause: a non-array cannot be a field list", ""},
@@ -3571,17 +3539,14 @@ func TestCensus_Q17_SpliceWrapperKeyVerdictAgreesAcrossRepresentations(t *testin
 	}
 }
 
-// verdictFromSpliced reads the observable off a spliced result. defKind is
-// the definition's own kind, so "did it splice" means the node carries that
-// kind's DEFINING content rather than still being a bare name reference —
-// every cell's definition is named x.y.F, but not every one is a fixed.
-//
-// The identity compared is the FULLNAME, not the raw Name: the metadata
-// splice preserves the definition's dotted spelling while the cache splice
-// re-emits it as name+namespace, and that normalization difference is not
-// this question's answer. Comparing the raw field made every cell disagree,
-// which is the tell that a driver is measuring the wrong thing — genuine
-// divergence is selective.
+// verdictFromSpliced reads the observable off a spliced result. defKind is the
+// definition's own kind, so "did it splice" means the node carries that kind's
+// DEFINING content rather than still being a bare name reference. The identity
+// compared is the FULLNAME, not the raw Name: the metadata splice preserves the
+// definition's dotted spelling while the cache splice re-emits it as
+// name+namespace, and that normalization is not this question's answer —
+// comparing the raw field made every cell disagree, which is the tell that a
+// driver is measuring the wrong thing, since genuine divergence is selective.
 func verdictFromSpliced(n SchemaNode, key, defKind string) spliceVerdict {
 	full := n.Name
 	if !strings.Contains(full, ".") && n.Namespace != "" {
@@ -3641,20 +3606,16 @@ func TestCensus_Q17_CorpusIsNotVacuous(t *testing.T) {
 	if !split {
 		t.Fatal("no key appears with both verdicts; the corpus cannot tell name-conditional routing from body-conditional routing")
 	}
-	// The shape-conditional class is the source's own list, not a sample of
-	// it: strayRoutedKeys names every key that has a structural field to
-	// land on, and a key in that list which no cell drives is a routing arm
-	// the two answerers can disagree on unwatched. The guard reds in BOTH
-	// directions — a key added to the source with no cell here, and a cell
-	// whose key has been dropped from the source (which would mean the
-	// corpus is driving a spelling the routing no longer treats as
-	// shape-conditional at all).
+	// The shape-conditional class is the source's own list, not a sample of it:
+	// strayRoutedKeys names every key with a structural field to land on, and a
+	// key in that list which no cell drives is a routing arm the two answerers
+	// can disagree on unwatched. The guard reds in BOTH directions — a key added
+	// to the source with no cell, and a cell whose key the source dropped.
 	//
-	// name/namespace/aliases carry a permanent exemption: they BIND on every
-	// named kind, and every definition a wrapper can reference is named, so
-	// no cell can carry one of them to the shape decode. They are recorded
-	// here rather than left to fall out of the count, so the exemption stays
-	// exactly three keys wide and a fourth cannot join it silently.
+	// name/namespace/aliases carry a permanent exemption: they BIND on every named
+	// kind, and every definition a wrapper can reference is named, so no cell can
+	// carry one of them to the shape decode. They are recorded here rather than
+	// left to fall out of the count, so a fourth cannot join them silently.
 	alwaysBoundOnNamedDefs := map[string]bool{"name": true, "namespace": true, "aliases": true}
 	driven := map[string]bool{}
 	for _, c := range spliceWrapperCells() {
@@ -4059,20 +4020,16 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 		return err
 	})
 
-	// A reserved structural key on a kind that does not bind it (a stray
-	// "items"/"values"/"fields" on an "int") is inert metadata the parser
-	// ACCEPTS, so it never reaches the bracket-depth reject above — but it is
-	// still decoded to decide whether it surfaces as-written or rides in
-	// Props. That decode must happen ONCE per level; a routing pass that
-	// re-decodes it re-enters the recursive schema decode, and two decodes per
-	// level compound to O(2^depth) — a sub-KB stray schema that hangs Parse.
-	// The bracket-depth arms above use the BINDING form (array/items), which
-	// never routes a stray, so they cannot see this; these arms exercise the
-	// stray form at every parse entry point and the metadata rebuild. Depth
-	// 1000 stays under the bracket pre-scan for all three keys (fields nests 3
-	// brackets/level); the bound is far above the linear cost (single-digit ms)
-	// and far below the exponential (unbounded) and quadratic (multi-hundred-ms
-	// at this depth) it exists to catch.
+	// A reserved structural key on a kind that does not bind it is inert metadata
+	// the parser ACCEPTS, so it never reaches the bracket-depth reject above — but
+	// it is still decoded to decide whether it surfaces as-written or rides in
+	// Props. That decode must happen ONCE per level: a routing pass that re-decodes
+	// it re-enters the recursive schema decode, and two decodes per level compound
+	// to O(2^depth), a sub-KB stray schema that hangs Parse. The bracket-depth arms
+	// use the BINDING form, which never routes a stray, so they cannot see this.
+	// Depth 1000 stays under the bracket pre-scan for all three keys, and the bound
+	// sits far above the linear cost and far below the quadratic and exponential
+	// ones it exists to catch.
 	const strayDepth = 1000
 	for _, key := range []string{"items", "values", "fields"} {
 		open, closeStr := `{"type":"int","`+key+`":`, `}`
@@ -4343,18 +4300,13 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 	// schema text expresses the fan-out directly, and it can be written flat —
 	// every level a sibling field wired by forward reference — which puts it past
 	// any bracket pre-scan or nesting bound. So this axis belongs to EVERY walk a
-	// schema drives, and the cells below cross it with the entry-point list
-	// rather than with the metadata walk alone.
+	// schema drives, and the cells below cross it with the entry-point list.
 	//
-	// The hand-built constructions still matter for the axes a caller cannot
-	// reach through Parse at all (deep VALUES inside Props, duplicate named
-	// definitions); those stay pinned by the dedicated battery in
-	// schema_node_test.go — SchemaNodeSchemaDeepValueBounded,
-	// SchemaNodeWalkDepthAllChannels, SchemaNodeSharedDAGExpansionBounded,
-	// SchemaNodeDuplicateNamedDefinitionBounded. Bounds: maxSchemaJSONNodes +
-	// maxSchemaJSONBytes (one shared walkBudget), valueWalkLimit, toJSONShared.
-	//
-	// This cell exercises the PUBLIC round-trip a normal caller reaches.
+	// The hand-built constructions still matter for the axes a caller cannot reach
+	// through Parse at all (deep VALUES inside Props, duplicate named definitions)
+	// and stay pinned by the dedicated battery in schema_node_test.go. Bounds:
+	// maxSchemaJSONNodes + maxSchemaJSONBytes (one shared walkBudget),
+	// valueWalkLimit, toJSONShared. This cell exercises the PUBLIC round trip.
 	s := MustParse(`{"type":"record","name":"R","doc":"d","x":{"a":[1,2,3],"b":"y"},"fields":[
 		{"name":"e","type":{"type":"enum","name":"E","symbols":["A","B","C"]},"default":"A"},
 		{"name":"f","type":"int","default":7}
@@ -4612,18 +4564,14 @@ func TestDoSBattery_C8_DirectByteAPIs(t *testing.T) {
 	})
 }
 
-// wantAcceptUnder asserts fn ACCEPTS (nil error) within bound. The C9 cells
-// pin a complexity CLASS on the accept path, so unlike the reject cells they
-// carry per-cell absolute bounds: generous multiples of the healthy cost
-// (linear parse lands well under a tenth of each bound on a laden host) yet
-// far below the quadratic cost the bound exists to catch — the two sit an
-// order of magnitude apart, so the exact value is not the point. Under -race
-// the bound gets the same ~3s ceiling every other wall-clock cell takes
-// (see avro_test's raceRelaxed for the canonical rationale):
-// instrumentation puts the healthy linear cost past the tight bound
-// (~350ms observed for the 200ms chain cells), while the quadratic classes
-// these cells catch are multi-second under -race; the tight bound stays in
-// force for normal runs.
+// wantAcceptUnder asserts fn ACCEPTS (nil error) within bound. The C9 cells pin
+// a complexity CLASS on the accept path, so unlike the reject cells they carry
+// per-cell absolute bounds: generous multiples of the healthy cost yet far below
+// the quadratic the bound exists to catch, the two sitting an order of magnitude
+// apart. Under -race the bound gets the same ~3s ceiling every other wall-clock
+// cell takes (see avro_test's raceRelaxed): instrumentation puts the healthy
+// linear cost past the tight bound — ~350ms observed for the 200ms chain cells —
+// while the quadratic classes are multi-second under -race.
 func wantAcceptUnder(t *testing.T, name string, bound time.Duration, fn func() error) {
 	t.Helper()
 	bound = raceRelaxed(bound)
@@ -4665,17 +4613,14 @@ func TestDoSBattery_C9_CustomTypeParseCost(t *testing.T) {
 	noMatch := CustomType{LogicalType: "no-such-logical", AvroType: "string"}
 	match := CustomType{AvroType: "long"} // matches every chain leaf
 
-	// The chain LENGTH is the factor, and it is driven at two values read from
-	// the registry. One value cannot tell the memo from its absence: the cost
-	// this bound caps is quadratic without the memo, so a single length only
-	// asks whether that length finishes, and a bound generous enough for the
-	// linear cost at 3000 is generous enough for the QUADRATIC cost at some
-	// smaller length. Doubling separates them — linear doubles, quadratic
-	// quadruples — and the per-length ceiling scales with the length so the
-	// comparison is against the right neighbourhood at both.
-	//
-	// Measured linear at both, on both arms: 28ms and 25ms at 3000, 55ms and
-	// 58ms at 6000.
+	// The chain LENGTH is the factor, driven at two values read from the registry.
+	// One value cannot tell the memo from its absence: the cost this bound caps is
+	// quadratic without the memo, so a single length only asks whether that length
+	// finishes, and a bound generous enough for the linear cost at 3000 is
+	// generous enough for the QUADRATIC cost at some smaller length. Doubling
+	// separates them — linear doubles, quadratic quadruples — and the per-length
+	// ceiling scales with the length. Measured linear at both, on both arms: 28ms
+	// and 25ms at 3000, 55ms and 58ms at 6000.
 	for _, n := range costFactorValues(t, "TestDoSBattery_C9_CustomTypeParseCost") {
 		chain := dosChainSchema(n) // ~60n bytes of well-formed schema text
 		bound := time.Duration(n/3000) * 200 * time.Millisecond
@@ -4739,16 +4684,15 @@ func TestDoSBattery_C9_CustomTypeParseCost(t *testing.T) {
 // missing. C2 drives hostile counts and lengths off the WIRE; nothing drove a
 // magnitude the SCHEMA TEXT declares. A `fixed` size is the one parse-time
 // quantity whose value is not bounded by the length of the text declaring it —
-// nineteen characters name 2^63, and the parser deliberately leaves the upper
-// bound open to match the lenient majority — so any entry point that does
-// arithmetic on it has to survive the top of the range.
+// nineteen characters name 2^63, the parser deliberately leaving the upper bound
+// open to match the lenient majority — so any entry point doing arithmetic on it
+// has to survive the top of the range.
 //
-// The bound is saturation at the producer (saturateSchemaMagnitude, deser.go),
-// and the shapes below are chosen so the arithmetic is reached in each of the
-// ways it can be: a magnitude standing alone, a SUM over record fields that
-// carries past the range, and a union whose smallest branch is one. dosRun's
-// "never panics" assertion is the operative one here — an unsaturated sum
-// reaches a divisor as zero.
+// The bound is saturation at the producer (saturateSchemaMagnitude), and the
+// shapes reach the arithmetic in each of the ways it can be: a magnitude
+// standing alone, a SUM over record fields that carries past the range, and a
+// union whose smallest branch is one. dosRun's "never panics" assertion is the
+// operative one — an unsaturated sum reaches a divisor as zero.
 func TestDoSBattery_C11_SchemaDeclaredMagnitude(t *testing.T) {
 	const huge = `{"type":"fixed","name":"BigF","size":9223372036854775807}`
 	// A record whose field minimums sum past the range and land on -1.
@@ -4854,35 +4798,28 @@ func TestDoSBattery_C11_SchemaDeclaredMagnitude(t *testing.T) {
 
 // ---------- race_bounds_test.go ----------
 
-// Wall-clock assertions have to account for the race detector, and the rule
-// for how is stated ONCE here. It used to be stated six times: a shared
-// helper applying an absolute FLOOR, a second copy of that floor written
-// inline, three hand-written ceilings using three different multipliers
-// (6x, 10x, 30x), and a pair of budget constants whose comment claimed to
-// mirror the floor and did not. Six statements of one rule agree only until
-// one of them is edited, and the floor is the form that fails silently:
-// raising a cell's NORMAL bound — which is done precisely when its
-// legitimate cost is large — shrinks the headroom the floor leaves it,
-// until the cell reds on correct code.
-//
-// So the rule is a MULTIPLIER with an absolute floor under it, and both
-// numbers live here. A cell asks; nothing restates.
+// Wall-clock assertions have to account for the race detector, and the rule for
+// how is stated ONCE here. It used to be stated six times: a shared helper
+// applying an absolute FLOOR, a second copy of that floor written inline, three
+// hand-written ceilings using three different multipliers, and a pair of budget
+// constants whose comment claimed to mirror the floor and did not. Six
+// statements of one rule agree only until one is edited, and the floor is the
+// form that fails silently: raising a cell's NORMAL bound — done precisely when
+// its legitimate cost is large — shrinks the headroom the floor leaves it. So
+// the rule is a MULTIPLIER with an absolute floor under it, and both numbers
+// live here.
 
 // raceCostMultiplier is how much the detector inflates this suite's own timed
 // work. It is MEASURED, not chosen: running the DoS battery with and without
-// -race gives per-cell ratios of 2.3x (C1 deep nesting), 2.9x (C9 custom-type
-// parse), 3.3x (C10a union-tag breadth), 5.0x (C5 error echo), 6.0x (C8 direct
-// byte APIs), 6.1x (C10b field lookup, C10d sibling kinds), 6.3x (C3 number
-// CPU) and 8.3x (C10c wide-record surfaces); a per-call measurement of the
-// widest parse cell gives 6.2x. Ten covers the measured maximum with margin
-// and matches what the suite's older hand-written relaxations assumed
-// ("race adds 5-10x").
+// -race gives per-cell ratios from 2.3x (C1 deep nesting) to 8.3x (C10c
+// wide-record surfaces), and a per-call measurement of the widest parse cell
+// gives 6.2x. Ten covers the measured maximum with margin and matches what the
+// suite's older hand-written relaxations assumed.
 //
-// It stays far below what it has to stay below. The class these ceilings
-// separate is a complexity CHANGE, and the quadratic the widest cell exists
-// to catch measured 1.9s to 32s unraced at that size — so even multiplied,
-// the ceiling sits more than 2x from the healthy cost on one side and the
-// broken cost on the other.
+// It stays far below what it has to: the class these ceilings separate is a
+// complexity CHANGE, and the quadratic the widest cell exists to catch measured
+// 1.9s to 32s unraced at that size, so even multiplied the ceiling sits more
+// than 2x from the healthy cost on one side and the broken cost on the other.
 const raceCostMultiplier = 10
 
 // raceCeilingFloor is the headroom a timed cell gets under -race no matter how
@@ -4923,15 +4860,11 @@ func raceInflated(allowance time.Duration) time.Duration {
 // to turn a HANG into a failure. It is a liveness detector, never a performance
 // assertion: the property under test is that an over-budget walk REJECTS, and
 // the goroutine plus deadline exist only so a regression that stopped bounding
-// the walk surfaces as a failure instead of wedging the suite.
-//
-// Those batteries are the one place in the suite whose work is at the budget by
-// construction — a cell must EXCEED maxSchemaJSONNodes or nothing is over
-// budget — so they are the slowest thing here and the detector multiplies that:
-// measured in isolation under -race, two of them run 21s and 33s, and under the
-// full suite's parallelism they go higher. It was a build-tagged 30s/4min pair,
-// which is the same rule stated an additional time with an additional number;
-// it asks the authority now.
+// the walk surfaces as a failure instead of wedging the suite. Those batteries
+// are the one place whose work is at the budget by construction — a cell must
+// EXCEED maxSchemaJSONNodes — so they are the slowest thing here and the
+// detector multiplies that: two run 21s and 33s in isolation under -race, higher
+// under the full suite's parallelism.
 var hangDeadline = raceInflated(30 * time.Second)
 
 //////////////////////////////////////////////////////////////////////////////
@@ -5000,18 +4933,15 @@ func raceConstrained(src string) bool {
 //
 // The predicate is identified by its defining SHAPE, not by which file it sits
 // in: a boolean declared `true` under a race build constraint and `false` under
-// the negated one. Keying on the file instead was the first thing tried here
-// and it was wrong in the expensive direction — it swept in every constant of
-// any race-tagged file, so an unrelated build-tagged DURATION became an
-// "answerer" and the guard reported five phantom consults in a file that
-// mentions none of this. A predicate is a build-switched BOOL; that is the rule.
+// the negated one. Keying on the file was tried first and was wrong in the
+// expensive direction — it swept in every constant of any race-tagged file, so
+// an unrelated build-tagged DURATION became an "answerer" and the guard reported
+// five phantom consults in a file that mentions none of this.
 //
-// The set is then closed transitively over the two ways an answer is passed on:
-// an identifier declared equal to an answerer (the bridge that hands the value
-// to the other test package), and a niladic bool function returning one (the
-// wrapper, including a qualified `pkg.Ident` form). Without the closure a
-// consult can hide one alias-hop from the declaration, which is exactly where
-// the two test packages put theirs.
+// The set is closed transitively over the two ways an answer is passed on: an
+// identifier declared equal to an answerer, and a niladic bool function
+// returning one. Without the closure a consult can hide one alias-hop from the
+// declaration, which is exactly where the two test packages put theirs.
 func raceAnswerers(t *testing.T, files []string) map[string]bool {
 	t.Helper()
 	boolDecl := regexp.MustCompile(`(?m)^(?:const|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\s*$`)
@@ -5057,19 +4987,17 @@ func raceAnswerers(t *testing.T, files []string) map[string]bool {
 	return out
 }
 
-// TestInvariant_EveryRaceRelaxationIsRowed derives every place the suite
-// decides something by asking whether the race detector is on, and requires
-// each to be rowed.
+// TestInvariant_EveryRaceRelaxationIsRowed derives every place the suite decides
+// something by asking whether the race detector is on, and requires each to be
+// rowed.
 //
-// SCOPE OF THIS DERIVATION, stated because it has one. It finds occurrences of
-// the identifiers that ANSWER the question — derived from what the build-tagged
-// mechanism files declare, plus any wrapper that returns one of them — inside
-// every *_test.go file the module walk reaches. It therefore cannot see a
-// wall-clock bound relaxed by any other means: a bound chosen generously enough
-// that -race never trips it, one keyed on GOMAXPROCS or an environment
-// variable, one hidden behind a build tag of its own, or a cell that simply
-// does not assert a time. Those are outside what this guard can promise, and
-// the promise is worth only what it names.
+// SCOPE, stated because it has one: it finds occurrences of the identifiers that
+// ANSWER the question — derived from what the build-tagged mechanism files
+// declare, plus any wrapper returning one — inside every *_test.go file the
+// module walk reaches. It therefore cannot see a bound relaxed by other means: a
+// bound generous enough that -race never trips it, one keyed on GOMAXPROCS or an
+// environment variable, one behind a build tag of its own, or a cell that does
+// not assert a time.
 func TestInvariant_EveryRaceRelaxationIsRowed(t *testing.T) {
 	files := moduleTestFiles(t)
 	answerers := raceAnswerers(t, files)
@@ -5182,11 +5110,10 @@ func TestInvariant_RaceRelaxationNeverTightens(t *testing.T) {
 // holding go.mod, found by walking up from the working directory, and the walk
 // takes every subdirectory except testdata, vendor and dot-directories. So the
 // set is "test files of this module", derived from the filesystem — not a list
-// of package directories, which is what it replaced and which is why a guard
-// built on it could not see the ocf package at all. What it still cannot see:
-// a test in a DIFFERENT module (the oracle harnesses under testdata are
-// deliberately excluded), source generated at run time, and anything a
-// non-test file does.
+// of package directories, which is what it replaced and why a guard built on it
+// could not see the ocf package at all. It still cannot see a test in a
+// DIFFERENT module, source generated at run time, or anything a non-test file
+// does.
 func moduleTestFiles(t *testing.T) []string {
 	t.Helper()
 	root, err := filepath.Abs(".")
@@ -6361,17 +6288,13 @@ func FuzzResolve(f *testing.F) {
 	})
 }
 
-// FuzzDecodeVariedTargets fuzzes binary decode against many target shapes,
-// not just *any. The pre-existing FuzzDecode only used `var v any` and
-// missed:
-//   - panics when decoding into *interface{Foo()} / *error / etc.
-//   - panics when decoding into a struct with non-empty-interface fields
-//   - panics on re-decode into a populated *any (the inner unwraps to
-//     unaddressable Value)
-//
-// The driver's `mode` byte selects the target shape; data bytes are the
-// wire input. All schemas come from fuzzSchemas. No panic is ever
-// expected — every target/data combo must surface as a returned error.
+// FuzzDecodeVariedTargets fuzzes binary decode against many target shapes, not
+// just *any. The pre-existing FuzzDecode used only `var v any` and missed panics
+// when decoding into *interface{Foo()} / *error, into a struct with non-empty-
+// interface fields, and on re-decode into a populated *any, where the inner
+// unwraps to an unaddressable Value. The driver's `mode` byte selects the target
+// shape and data bytes are the wire input; no panic is ever expected — every
+// combination must surface as a returned error.
 func FuzzDecodeVariedTargets(f *testing.F) {
 	type IfaceField struct {
 		X interface{ Foo() } `avro:"x"`
@@ -6964,17 +6887,14 @@ func FuzzDepthBounds(f *testing.F) {
 	})
 }
 
-// fuzzPromoteLogicalPairs enumerates the (writer wire kind, reader
-// logical-typed schema) cells that promotionDeserForLogical wraps.
-// The fuzz driver picks one cell by index, encodes arbitrary input
-// against the writer, then resolves writer→reader and decodes into
-// several Go target shapes. Locks the int→long+timestamp-*, int→
-// long+time-micros, string→bytes+decimal, string→bytes+big-decimal,
-// and bytes→string+uuid promotion-plus-logical paths under fuzz
-// inputs — the regression tests pin specific values; this fuzz
-// surfaces variants. Without the wrap, the decode produces the raw
-// wire type (int64 / []byte / string) instead of the logical-typed
-// result (time.Time / *big.Rat / [16]byte).
+// fuzzPromoteLogicalPairs enumerates the (writer wire kind, reader logical-typed
+// schema) cells that promotionDeserForLogical wraps. The driver picks one by
+// index, encodes arbitrary input against the writer, then resolves writer→reader
+// and decodes into several Go target shapes — locking the int→long+timestamp-*,
+// int→long+time-micros, string→bytes+decimal, string→bytes+big-decimal, and
+// bytes→string+uuid paths under fuzz input, where the regression tests pin
+// specific values. Without the wrap the decode produces the raw wire type
+// instead of the logical-typed result.
 var fuzzPromoteLogicalPairs = []struct {
 	writer    string
 	reader    string
@@ -7213,17 +7133,13 @@ func FuzzBareSpecialFloat(f *testing.F) {
 	})
 }
 
-// FuzzBytesFixedUTF8RoundTrip exercises the JSON encoder bytes/fixed
-// arms that take Go strings as input. The JSON bytes/fixed arms route
-// through avroStringValue so the wire form is codepoint-per-byte and
-// round-trips; without this routing, Encode("é") against avro "bytes"
-// would serialize the UTF-8 bytes c3 a9 on binary but emit the
-// pre-mapping codepoint string "é" on JSON, producing JSON byte
-// strings that re-decode to two-codepoint garbage. The fuzz seeds
-// cover multibyte runes (2/3/4-byte UTF-8) inside arrays, maps,
-// unions, records, and verifies binary↔JSON parity: encoding the
-// same input through both paths and decoding back must produce the
-// same Go value.
+// FuzzBytesFixedUTF8RoundTrip exercises the JSON encoder bytes/fixed arms that
+// take Go strings as input. Those arms route through avroStringValue so the wire
+// form is codepoint-per-byte and round-trips; without it, Encode("é") against
+// avro "bytes" serializes the UTF-8 bytes c3 a9 on binary but emits the
+// pre-mapping codepoint string on JSON, producing JSON byte strings that
+// re-decode to two-codepoint garbage. The seeds cover multibyte runes inside
+// arrays, maps, unions and records, and verify binary/JSON parity.
 func FuzzBytesFixedUTF8RoundTrip(f *testing.F) {
 	// Fixed sizes that fit common rune lengths.
 	fixed2 := MustParse(`{"type":"fixed","name":"F2","size":2}`)
@@ -7313,18 +7229,12 @@ func FuzzBytesFixedUTF8RoundTrip(f *testing.F) {
 	})
 }
 
-// FuzzOCFBlockEnvelope is an ocf-package counterpart that lives here
-// for proximity to FuzzOCFReader; the ocf-side variant is in
-// ocf/fuzz_test.go. This fuzz target is in the avro package and
-// exercises the avro.Schema decode path through OCF-style block
-// framing: a (count, size, data, sync) envelope. It targets the
-// readBlock's count=0 sync-validation path indirectly by encoding
-// arbitrary count/size combinations the reader has to navigate;
-// the ocf-side fuzz (FuzzOCFBlockEnvelope) wraps this in a full OCF.
-// Kept here so devs can see all fuzz coverage in one place.
-//
-// (Implementation: see ocf/fuzz_test.go for the real fuzz target —
-// this comment block documents the cross-package coverage map.)
+// FuzzOCFBlockEnvelope is an ocf-package counterpart that lives here for
+// proximity to FuzzOCFReader; the real target is in ocf/fuzz_test.go. This one
+// exercises the avro.Schema decode path through OCF-style block framing — a
+// (count, size, data, sync) envelope — reaching readBlock's count=0
+// sync-validation path indirectly by encoding arbitrary count/size combinations.
+// Kept here so all fuzz coverage is visible in one place.
 
 // FuzzSetValueTargets fuzzes Decode/DecodeJSON across the new
 // set{Float,Bytes,String}Value target arms with adversarial Go target
@@ -7442,19 +7352,16 @@ func FuzzSetValueTargets(f *testing.F) {
 // negative matches (no branch should match, error not panic), and
 // ambiguity (two branches differ only by namespace short-name).
 func FuzzFindUnionBranch(f *testing.F) {
-	// Schemas exercising every fallback class. Per spec a union may not
-	// contain two schemas with the same primitive type even if their
-	// logical types differ, so the same-kind disambiguation surface is
-	// exercised by single-branch unions paired with adversarial tag
-	// inputs (the wrong tag must miss). Fixed branches differ by named
-	// type so the same-kind, different-logical-type case is reachable
-	// for "fixed" kind only.
+	// Schemas exercising every fallback class. Per spec a union may not contain
+	// two schemas with the same primitive type even if their logical types
+	// differ, so the same-kind disambiguation surface is exercised by
+	// single-branch unions paired with adversarial tag inputs; fixed branches
+	// differ by named type, so the same-kind different-logical case is reachable
+	// for "fixed" only.
 	// 0: single long+timestamp-millis (logical-tag match positive)
 	// 1: plain long (logical-tag-on-plain miss case)
-	// 2: two fixed branches differing by logical type (same kind, same-
-	//    kind pair-match: only legal for fixed)
-	// 3: two records with the same short name in different namespaces
-	//    (short-name-leniency ambiguity guard)
+	// 2: two fixed branches differing by logical type (same-kind pair-match)
+	// 3: two records, same short name, different namespaces (ambiguity guard)
 	// 4: enum + record (short-name fallback)
 	unions := []string{
 		`[{"type":"long","logicalType":"timestamp-millis"}]`,
@@ -7752,22 +7659,19 @@ func FuzzDecodeUnionObjectDeep(f *testing.F) {
 	})
 }
 
-// FuzzNumberCarriers fuzzes the json.Number / *big.Rat / *big.Int /
-// *big.Float carrier surface across primitive Avro types. These
-// carriers are reachable via setFloatValue (jsonNumberType branch),
-// setDecimalRat, and the big-decimal payload path. The fuzz seeds
-// each carrier with adversarial numeric strings ("1e1000", "NaN",
-// "0.0000000000000000000000000001", "9".Repeat(40)) and asserts no
-// panic on encode or decode.
+// FuzzNumberCarriers fuzzes the json.Number / *big.Rat / *big.Int / *big.Float
+// carrier surface across primitive Avro types — reachable via setFloatValue's
+// jsonNumberType branch, setDecimalRat, and the big-decimal payload path. The
+// seeds are adversarial numeric strings ("1e1000", "NaN", forty nines) and the
+// assertion is no panic on encode or decode.
+//
 // safeForBigNum reports whether s is small enough to hand to the stdlib
-// big.Rat.SetString / big.ParseFloat parsers without risking a multi-minute
-// or multi-gigabyte materialization. Those parsers eagerly build the full
-// mantissa and 10^exponent, so a 20-million-digit mantissa costs big.Rat
-// ~8 minutes and a short "1e2000000000" allocates gigabytes. twmb's own
-// numeric entry points are bounded (maxRatInputLen / decimalScaleLimit);
-// this mirrors that bound for the fuzzer's DIRECT stdlib construction so the
-// harness cannot DoS itself. (twmb's json.Number path above is exercised
-// unbounded since it is internally capped.)
+// big.Rat.SetString / big.ParseFloat parsers without risking a multi-minute or
+// multi-gigabyte materialization: they eagerly build the full mantissa and
+// 10^exponent, so a 20-million-digit mantissa costs big.Rat ~8 minutes and a
+// short "1e2000000000" allocates gigabytes. twmb's own entry points are bounded,
+// and this mirrors that bound for the fuzzer's DIRECT stdlib construction so the
+// harness cannot DoS itself.
 func safeForBigNum(s string) bool {
 	if len(s) > 1024 {
 		return false

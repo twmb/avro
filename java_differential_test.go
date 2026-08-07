@@ -30,18 +30,14 @@ import (
 // SchemaOracle.java against the avro-tools fat jar and sets AVRO_TOOLS_JAR;
 // see .github/workflows/test.yml.
 
-// TestDifferentialJavaFingerprint cross-checks twmb's Parsing Canonical Form
-// and CRC-64-AVRO (Rabin) fingerprint against Apache Avro's reference Java
-// implementation (org.apache.avro.SchemaNormalization), via the SchemaOracle
-// subprocess. Unlike the static schema-tests.txt vectors, this exercises the
-// cases those vectors omit — named types referenced multiple times and
-// forward references — i.e. the canonical first-occurrence behavior (the F5
-// class) against live Java.
-//
-// When Java rejects a schema twmb accepts (or vice versa), that parse-level
-// divergence is logged (not failed): there is no Java fingerprint to compare,
-// and the acceptance difference is surfaced for maintainer triage rather than
-// asserted away.
+// TestDifferentialJavaFingerprint cross-checks twmb's Parsing Canonical Form and
+// CRC-64-AVRO fingerprint against org.apache.avro.SchemaNormalization via the
+// SchemaOracle subprocess. Unlike the static schema-tests.txt vectors, it
+// exercises the cases those omit — named types referenced multiple times, and
+// forward references — i.e. the canonical first-occurrence behavior against live
+// Java. When Java rejects a schema twmb accepts, that parse-level divergence is
+// logged rather than failed: there is no Java fingerprint to compare, and the
+// acceptance difference is surfaced for triage rather than asserted away.
 func TestDifferentialJavaFingerprint(t *testing.T) {
 	jar := os.Getenv("AVRO_TOOLS_JAR")
 	if jar == "" {
@@ -627,21 +623,17 @@ func jsonValueEqual(a, b []byte) (bool, error) {
 
 // TestDifferentialJavaValueMatrix sweeps a (schema x value) corpus through the
 // SchemaOracle RT command, asserting VALUE-level wire parity with Java on both
-// formats:
-//
-//   - binary: Java binary-decodes twmb's Encode output and re-encodes it; the
-//     re-encode must be byte-identical, proving Java reads our binary AND agrees
-//     on the bytes. Multi-entry maps are exempt from the byte comparison (entry
-//     order is unspecified on both sides) and compare decoded-back.
-//   - JSON: twmb's EncodeJSON (TaggedUnions — the spec form Java emits) must
-//     match Java's JsonEncoder. cmpJSON selects byte-identical comparison where
-//     the text is canonical, value-equal where equally-valid texts differ (float
-//     formatting, \u00XX escaping style, U+2028, map key order).
+// formats. On binary, Java decodes twmb's Encode output and re-encodes it, and
+// the re-encode must be byte-identical — multi-entry maps compare decoded-back,
+// entry order being unspecified on both sides. On JSON, twmb's EncodeJSON
+// (TaggedUnions, the spec form Java emits) must match Java's JsonEncoder, with
+// cmpJSON choosing byte-identical comparison where the text is canonical and
+// value-equal where equally-valid texts differ.
 //
 // Logical-typed values ride as their RAW base-type wire values through Java's
-// generic datum path (no Conversions registered), which is exactly what the Avro
-// JSON encoding of a logical type is. Every case failure is reported with Errorf
-// so one CI run yields the complete divergence list.
+// generic datum path, which is exactly what the Avro JSON encoding of a logical
+// type is. Failures are reported with Errorf so one CI run yields the complete
+// divergence list.
 func TestDifferentialJavaValueMatrix(t *testing.T) {
 	rt := startSchemaOracle(t)
 
@@ -816,19 +808,14 @@ func TestDifferentialJavaValueMatrix(t *testing.T) {
 	}
 }
 
-// TestDifferentialJavaInvalidUTF8 cross-checks, against the Apache Avro Java
-// reference, the JSON encode of invalid-UTF-8 string content: twmb writes such
-// bytes VERBATIM on the binary wire but coerces each invalid byte to U+FFFD on
-// the JSON wire (appendJSONString, json_codec.go). A raw 0xff cannot appear in
-// an RFC 8259 JSON string, so JSON cannot be byte-faithful; this split is
-// DOCUMENTED POLICY (Schema.EncodeJSON doc; BUG_AUDIT.md §Known intentional
-// divergences; pinned locally by
-// TestRegression_InvalidUTF8StringBinaryVerbatimJSONCoercion) precisely
-// BECAUSE it matches Java byte-for-byte — verified live by this test.
-//
-// The per-case parity is ASSERTED: if a future avro-tools upgrade changes
-// Java's behavior, or a twmb encode change breaks the match, CI fails loudly
-// and the documented rationale must be revisited rather than silently rotting.
+// TestDifferentialJavaInvalidUTF8 cross-checks the JSON encode of invalid-UTF-8
+// string content against Java: twmb writes such bytes VERBATIM on the binary
+// wire but coerces each invalid byte to U+FFFD on the JSON wire, since a raw
+// 0xff cannot appear in an RFC 8259 JSON string. That split is DOCUMENTED POLICY
+// precisely BECAUSE it matches Java byte-for-byte, which this verifies live. The
+// per-case parity is ASSERTED, so an avro-tools upgrade that changes Java's
+// behavior fails CI and forces the rationale to be revisited rather than
+// silently rotting.
 func TestDifferentialJavaInvalidUTF8(t *testing.T) {
 	rt := startSchemaOracle(t)
 
@@ -954,17 +941,13 @@ func TestDifferentialJavaWireLeniencies(t *testing.T) {
 
 // TestDifferentialJavaAcceptanceAttributePlacement drives a representative
 // subset of the attribute x placement census through the Java oracle: Java
-// accepts every cell (stray attributes are either reserved-and-ignored via
-// SCHEMA_RESERVED or kept as props — including the structural-key cells
-// twmb rejects per NOT_BUGS #63 and the stray name/namespace-on-container
-// cells), and for every cell twmb also accepts, Java's Parsing Canonical
-// Form must equal twmb's Canonical() — proving both implementations strip
-// the stray attribute identically, which is why the Rabin fingerprints
-// agree cross-impl.
-//
-// The "error" kind is excluded: standalone error schemas are a
-// protocol-context type in Java's parser, not a plain-schema kind; twmb's
-// record-alias handling for it is pinned against the record twin locally.
+// accepts every cell — stray attributes are either reserved-and-ignored via
+// SCHEMA_RESERVED or kept as props, including the structural-key cells twmb
+// rejects per NOT_BUGS #63 — and for every cell twmb also accepts, Java's
+// Parsing Canonical Form must equal twmb's, proving both strip the stray
+// identically and so the Rabin fingerprints agree. The "error" kind is excluded:
+// standalone error schemas are a protocol-context type in Java's parser, and
+// twmb's record-alias handling for it is pinned against the record twin locally.
 func TestDifferentialJavaAcceptanceAttributePlacement(t *testing.T) {
 	_, fpCanon := startMatrixJavaOracle(t)
 
