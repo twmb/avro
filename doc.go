@@ -51,13 +51,12 @@
 // # Schema evolution
 //
 // Avro data is always written with a specific schema — the "writer schema."
-// When you read that data later, your application may expect a different
-// schema — the "reader schema." For example, you may have added a field,
-// removed one, or widened a type from int to long.
+// When you read it later your application may expect a different one — the
+// "reader schema" — having added a field, removed one, or widened an int to a
+// long.
 //
-// [Resolve] bridges this gap. Given the writer and reader schemas, it returns
-// a new schema that knows how to decode the old wire format and produce
-// values in the reader's layout:
+// [Resolve] bridges the two: given writer and reader, it returns a schema that
+// decodes the old wire format into the reader's layout.
 //
 //   - Fields in the reader but not the writer are filled from defaults.
 //   - Fields in the writer but not the reader are skipped.
@@ -108,16 +107,14 @@
 // A null union branch decodes to the target's Go zero value, always replacing
 // any prior value. Use *T to distinguish null from zero.
 //
-// The reader schema is the user's contract for precision. When the reader
-// schema is lossy — float or double — encode and decode both silently
-// IEEE-round to the destination's representable range, and an out-of-range
-// finite input becomes ±Inf on the wire. When the reader schema is exact —
-// int, long, bytes, string — decode requires the Go target to represent the
-// wire value without loss; values outside the target's range or values the
-// target can't represent exactly (for example, a long above 2^53 decoded into
-// a float64) return an error. Users who need exact round-trip of large
-// integers should choose a long reader schema with an int64 target rather
-// than relying on a float to round.
+// The reader schema is your contract for precision. A lossy reader schema —
+// float or double — silently IEEE-rounds on both encode and decode, and an
+// out-of-range finite input becomes ±Inf on the wire. An exact one — int, long,
+// bytes, string — requires the Go decode target to hold the wire value without
+// loss: a value outside the target's range, or one it cannot represent exactly
+// such as a long above 2^53 decoded into a float64, is an error. For exact
+// round-trip of large integers choose a long reader schema with an int64
+// target rather than relying on a float to round.
 //
 // # Struct tags
 //
@@ -147,29 +144,26 @@
 // writer schema uses a different name for the same type — for example, a legacy
 // schema naming a record "r508" instead of "FieldSummary".
 //
-// When encoding a map[string]any as a record, missing keys are filled from the
-// schema's default values. A ["null", T] union field declared without a
-// default has an implicit null default (Parse infers it for the canonical
-// nullable pattern), so a missing key there fills null rather than erroring.
-// The omitzero tag applies the same fill to a struct's zero-valued fields
-// (or fields whose IsZero() method returns true): a zero value encodes the
-// field's default, or null for a nullable field that has no default, or —
-// for a non-nullable field with no default — the zero value itself (there
-// is nothing to fill with). The one difference from map fill is the
-// nullable field with no EFFECTIVE default — a [T, "null"] union declared
-// without one, where no null default can exist (a union default must match
-// the first branch) and none is inferred: omitzero encodes null where map
-// fill instead errors on the missing key.
+// When encoding a map[string]any as a record, missing keys fill from the
+// schema's defaults. A ["null", T] field declared without a default has an
+// implicit null default, so a missing key there fills null rather than
+// erroring. The omitzero tag applies the same fill to a struct's zero-valued
+// fields, and to fields whose IsZero() reports true: a zero value encodes the
+// field's default, or null for a nullable field with no default, or — for a
+// non-nullable field with no default — the zero value itself, there being
+// nothing to fill with. It differs from map fill in one case, a [T, "null"]
+// union declared without a default: no null default can exist there, since a
+// union default must match the first branch, so omitzero encodes null where map
+// fill errors on the missing key.
 //
-// Embedded (anonymous) struct fields are automatically inlined. To prevent
-// inlining, give the field an explicit name tag. When multiple fields
-// resolve to the same name, a tagged field wins over an untagged one at any
-// depth; among fields with the same tagged status, the shallowest wins. Two
-// fields that resolve to the same name at the same depth with the same tagged
-// status are an ambiguous collision. twmb errors rather than silently selecting
-// one: [SchemaFor] rejects the type, while encode and decode reject only when
-// the schema actually resolves a field to the ambiguous name — a coincidental
-// collision on a name the schema never references does not break the type.
+// Embedded (anonymous) struct fields are inlined automatically; an explicit
+// name tag prevents it. When several fields resolve to one name, a tagged field
+// wins over an untagged one at any depth, and among equally tagged fields the
+// shallowest wins. Two fields at the same depth with the same tagged status are
+// an ambiguous collision, and this package errors rather than pick one:
+// [SchemaFor] rejects the type, while encode and decode reject only when the
+// schema actually resolves a field to that name, so a coincidental collision on
+// a name the schema never references does not break the type.
 //
 // # Custom types
 //
