@@ -559,23 +559,18 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 // not), then parse via [parseFloatAcceptOverflow] (±Inf from ErrRange
 // counts as success per the wire-format lossy-destination policy).
 //
-// Single source of truth for every site that turns a JSON-number string
-// into a float64: binary encode (ser.go's [jsonNumberToFloat]), JSON
-// encode (json_codec.go's [jsonCoerceToFloat64] json.Number arm),
-// schema-parse default validation (schema.go's [defaultAsFloat]
-// json.Number arm), and the JSON decode arm ([decodeJSONFloat]). A
-// future tightening of float-literal validation lands once, here.
+// Single source of truth for every site turning a JSON-number string into a
+// float64 — binary encode, JSON encode, schema-parse default validation, and
+// JSON decode — so a future tightening lands once.
 //
-// bitSize is 64 for every caller except decodeJSONFloat against a
-// "float" schema, which passes 32 to parse at float32 precision directly
-// (avoiding a float64→float32 double-rounding shift). The isJSONNumber
-// gate is bitSize-independent — it is the grammar check the int/long
-// arms and goavro's numberLength both apply before ParseFloat, so a
-// trailing-dot literal like "5." is rejected uniformly.
+// bitSize is 64 for every caller but decodeJSONFloat against a "float" schema,
+// which passes 32 to parse at float32 precision and avoid a double rounding.
+// The isJSONNumber gate is bitSize-independent, the same grammar check the
+// int/long arms and goavro's numberLength apply, so a trailing-dot "5." is
+// rejected uniformly.
 //
-// User-controllable input is routed through [truncForError] before
-// interpolation so a 1 MiB hostile input doesn't produce a 1 MiB error
-// string.
+// Input routes through [truncForError] so a 1 MiB hostile literal cannot
+// produce a 1 MiB error string.
 func parseJSONNumberAsFloat(s string, bitSize int) (float64, error) {
 	if !isJSONNumber(s) {
 		return 0, fmt.Errorf("invalid JSON number %q", truncForError(s))
@@ -658,12 +653,11 @@ func truncValueForError(v any) string {
 // Rejects invalid grammar, out-of-int64 values, non-zero fractional parts,
 // and exponents beyond decimalScaleLimit (DoS bound).
 //
-// Slow path goes through [boundedRatFromString] (arbitrary precision via
-// big.Rat IsInt+IsInt64) instead of strconv.ParseFloat+[floatFitsInt64],
-// which silently corrupted values near the int64 boundary — float64 lacks
-// the precision to distinguish int64.Min from int64.Min-1024, and rounded
-// valid exponent-form int64s across the boundary. Java's BigDecimal and
-// fastavro's Cython long64 check use the same arbitrary-precision approach.
+// The slow path uses [boundedRatFromString], not
+// strconv.ParseFloat+[floatFitsInt64]: float64 cannot distinguish int64.Min
+// from int64.Min-1024 and rounds valid exponent-form int64s across the
+// boundary. Java's BigDecimal and fastavro's long64 check are also
+// arbitrary-precision.
 //
 // Shared by [jsonNumberToInt64], [defaultAsInt64], [jsonCoerceToInt64],
 // and [parseJSONInt64]'s exponent/fractional branch.
@@ -991,14 +985,10 @@ var serString = serPrim(appendAvroString)
 //  6. Anything else → SemanticError.
 //
 // Text interfaces come BEFORE the reflect.String fast path so a string-kind
-// type implementing TextMarshaler uses its marshaled form, matching
-// encoding/json's preference.
-//
-// Used by serString (top-level), serArray.serString (array items),
-// and serMap.serString (map values). The JSON encoder uses
-// avroStringValue (parallel helper) since it always materializes
-// the string for JSON-escaping; both helpers must remain in
-// lockstep on precedence.
+// type implementing TextMarshaler uses its marshaled form, as encoding/json
+// does. The JSON encoder's avroStringValue must stay in lockstep on this
+// precedence; it exists separately only because JSON always materializes the
+// string for escaping.
 func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 	// One Type() read serves both discriminators:
 	// json.Number is rejected, and the builtin (unnamed) string — the common
@@ -1025,20 +1015,18 @@ func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 		if err != nil {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "string", Err: err}
 		}
-		// A contract-violating AppendText that returns a slice SHORTER than
-		// its input (typically `return []byte(s), nil` — a fresh slice
-		// instead of an append) would drive the backfill arithmetic below
-		// out of bounds: textLen goes negative and dst[mark:] indexes past
-		// the end of the returned slice, a slice-bounds panic through
-		// Encode. Name the violation instead. A fresh return that is >= the
-		// input length is NOT detectable without comparing prefix bytes on
-		// every encode (a per-string memcmp of everything encoded so far);
-		// that cost is deliberately not paid for the caller's own contract
-		// violation, so an over-long fresh return silently replaces earlier
-		// output — encoding/json/v2's jsontext.AppendRaw takes the same
-		// trusting posture (executed, go1.26.2: identical slice-bounds
-		// panic on the short shape). Observed outputs for the undetectable
-		// shapes are pinned in text_appender_contract_test.go.
+		// A contract-violating AppendText returning a slice SHORTER than its
+		// input — typically `return []byte(s), nil`, a fresh slice instead of
+		// an append — drives the backfill arithmetic below out of bounds and
+		// panics through Encode. Name the violation instead.
+		//
+		// A fresh return at or above the input length is undetectable without
+		// a per-string memcmp of everything encoded so far, which is not paid
+		// for a caller's own contract violation, so it silently replaces
+		// earlier output. encoding/json/v2's jsontext.AppendRaw is equally
+		// trusting (executed, go1.26.2: identical panic on the short shape).
+		// The undetectable shapes are pinned in
+		// text_appender_contract_test.go.
 		if len(dst) < mark+hdrLen {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "string", Err: errAppendTextShrunk}
 		}
@@ -1706,18 +1694,15 @@ func appendArrayPrimitive(
 
 // appendMapPrimitive encodes a map whose values are an Avro primitive.
 //
-// Fast path: when the key is exactly string and the value is the exact
-// natural Go type for the Avro primitive, the whole map is a known concrete
-// type (e.g. map[string]int32), so we type-assert and range it natively —
-// no reflect.MapRange, no per-entry Value allocation, no reflect accessor
-// calls. This is gated on CanInterface: a map read from an unexported struct
-// field is not interfaceable and takes the reflect path.
+// Fast path: an exactly-string key and an exactly-natural value type make the
+// whole map a known concrete type, so it type-asserts and ranges natively with
+// no reflect at all. Gated on CanInterface, since a map read from an unexported
+// field is not interfaceable.
 //
-// Reflect fallback: non-string keys (named string, json.Number), named /
-// other-width / pointer / text value types, and non-interfaceable maps.
-// SetIterKey/SetIterValue reuse two addressable Values so iteration costs 2
-// heap allocs per encode rather than the 2 per entry that
-// iter.Key()/iter.Value() would.
+// Reflect fallback: non-string keys, named / other-width / pointer / text value
+// types, and non-interfaceable maps. SetIterKey/SetIterValue reuse two
+// addressable Values, costing 2 heap allocs per encode instead of the 2 per
+// ENTRY that iter.Key()/iter.Value() would.
 func appendMapPrimitive(
 	dst []byte, v reflect.Value, avroType string,
 	appendFn func([]byte, reflect.Value) ([]byte, error),
