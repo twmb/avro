@@ -2,7 +2,6 @@ package avro
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +12,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // Schema is a compiled Avro schema. Create one with [Parse] or [MustParse],
@@ -23,18 +24,40 @@ type Schema struct {
 	deser deserfn
 
 	c    aschema     // canonical form, used for fingerprinting and schema comparison
-	soe  [10]byte    // Single Object Encoding header: 2-byte magic (0xC3, 0x01) + 8-byte LE CRC64-Avro fingerprint
 	node *schemaNode // full metadata tree (aliases, defaults, etc.) for schema introspection and evolution
 	full string      // original schema JSON, returned by String()
 
-	// writerSoe is the writer schema's SOE header — populated only by
-	// Resolve(writer, reader) and consulted by DecodeSingleObject so a
-	// resolved schema can decode wire bytes bearing the writer's
-	// fingerprint (the wire fingerprint identifies the schema that
-	// produced the bytes, which is the writer when a resolution is
-	// involved). Zero value (writerSoe[0] == 0x00) means "not a resolved
-	// schema; accept only s.soe."
-	writerSoe [10]byte
+	// soe is the Single Object Encoding header: 2-byte magic (0xC3, 0x01)
+	// + 8-byte LE CRC64-Avro fingerprint of the canonical form. Computed on
+	// first use by soeHeader (soe.go), never at parse: hashing the canonical
+	// form was 11-31% of Parse depending on schema shape, and only the three
+	// SOE entry points ever read it. Read it ONLY through soeHeader — a bare
+	// field read races with a concurrent first use, and Schema is documented
+	// safe for concurrent use.
+	//
+	// The header is a pure function of c, so the two sites that adopt
+	// another schema's canonical form (Resolve, SchemaCache's self-contained
+	// splice) adopt its header by assigning c and leaving soe alone.
+	soeHashed atomic.Bool
+	soeOnce   sync.Once
+	soe       [10]byte
+
+	// soeWriter is the writer schema of a resolution, consulted by
+	// DecodeSingleObject so a resolved schema can decode wire bytes bearing
+	// the WRITER's fingerprint (the wire fingerprint identifies the schema
+	// that produced the bytes, which is the writer when a resolution is
+	// involved). Populated only by Resolve(writer, reader) when the writer
+	// and reader differ; nil means "not a resolved schema; accept only this
+	// schema's own header". Held as the schema rather than a copied header
+	// so the writer's fingerprint stays lazy too — a resolved schema that
+	// never decodes SOE never hashes either canonical form.
+	//
+	// Always the same schema resolveWriter below holds, kept as its own
+	// field because the two answer different questions: resolveWriter exists
+	// for DecodeJSON and has a diverging sibling (resolveWriterRaw), so a
+	// future change deciding DecodeJSON needs only the raw view would
+	// silently take SOE's writer acceptance with it.
+	soeWriter *Schema
 
 	// resolveWriter is the writer schema, populated only by
 	// Resolve(writer, reader) when the writer and reader differ (an identity
@@ -319,11 +342,6 @@ func parse(schema string, b *builder) (*Schema, error) {
 		customBaked: len(b.custom) > 0 || b.sawInheritedCustom,
 	}
 	s.slabFree = slabFreeKinds[b.node.kind] && !s.customBaked
-	s.soe[0] = 0xC3
-	s.soe[1] = 0x01
-	h := NewRabin()
-	h.Write(s.Canonical())
-	binary.LittleEndian.PutUint64(s.soe[2:], h.Sum64())
 	return s, nil
 }
 

@@ -74,9 +74,13 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 		}
 		s.resolveWriterRaw = raw
 	}
-	s.soe = reader.soe
+	// s.soe needs no assignment: the header is a pure function of the
+	// canonical form, and s.c is the reader's, so s's own lazy hash produces
+	// the reader's header byte for byte — without forcing the reader to hash
+	// at all when nothing here ever touches single-object bytes.
+	//
 	// SOE wire bytes carry the WRITER's fingerprint per the spec, so storing
-	// writer.soe lets DecodeSingleObject accept writer-produced bytes and
+	// the writer lets DecodeSingleObject accept writer-produced bytes and
 	// resolve them into reader-shaped Go. Java's BinaryMessageDecoder does the
 	// equivalent through a fingerprint registry; the single-schema model bakes
 	// it into the resolved Schema's own check.
@@ -88,7 +92,7 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 	// default-fills added ones, exactly as reader-shaped JSON does to a
 	// resolved DecodeJSON. Use the reader schema directly for reader-shaped
 	// data.
-	s.writerSoe = writer.soe
+	s.soeWriter = writer
 	return s, nil
 }
 

@@ -191,9 +191,12 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 					}
 					if rerr == nil {
 						selfContained = s2.full
+						// Adopting s2's canonical form adopts its SOE header
+						// too: the header is a pure function of c, hashed on
+						// first use, and nothing has reached that first use on
+						// this still-unpublished schema.
 						s.c = s2.c
 						s.full = s2.full
-						s.soe = s2.soe
 					}
 				}
 			}

@@ -4618,6 +4618,312 @@ func TestMatrix_ConcurrentFirstUse(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Single-object header matrix: schema shape x construction path x first-use
+// trigger, against an oracle that never reads the header.
+//
+// The header is hashed on first use rather than at parse, so the schema a
+// caller holds may reach its first SOE call through any of three entry points,
+// from any number of goroutines at once, and after any of four construction
+// paths — two of which (Resolve, SchemaCache's self-contained splice) install
+// a canonical form the header must follow. Every cell must produce the one
+// header the spec formula names: magic + little-endian CRC-64-AVRO of the
+// canonical form.
+//
+// The oracle is independent of the code under test: it hashes Canonical()
+// with NewRabin() directly, which is the formula, not a second reading of the
+// same cached bytes. Neuter check: make computeSOEHeader skip the hash (or
+// hash String() instead of Canonical()) and every cell fails.
+// ---------------------------------------------------------------------------
+
+// soeOracle returns the header the Avro spec defines for s: 0xC3 0x01 then the
+// CRC-64-AVRO of the canonical form, little-endian.
+func soeOracle(s *avro.Schema) [10]byte {
+	var want [10]byte
+	want[0], want[1] = 0xC3, 0x01
+	h := avro.NewRabin()
+	h.Write(s.Canonical())
+	binary.LittleEndian.PutUint64(want[2:], h.Sum64())
+	return want
+}
+
+func soeShapes() []struct {
+	name   string
+	schema string
+	val    any
+} {
+	return []struct {
+		name   string
+		schema string
+		val    any
+	}{
+		{"primitive", `"string"`, "hi"},
+		{"record", `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`,
+			map[string]any{"a": int32(1)}},
+		{"namespaced", `{"type":"record","name":"R","namespace":"a.b","fields":[{"name":"a","type":"long"}]}`,
+			map[string]any{"a": int64(1)}},
+		{"nested", `{"type":"record","name":"R","fields":[{"name":"in","type":{"type":"record","name":"I","fields":[{"name":"x","type":"string"}]}}]}`,
+			map[string]any{"in": map[string]any{"x": "s"}}},
+		{"recursive", `{"type":"record","name":"N","fields":[{"name":"v","type":"int"},{"name":"next","type":["null","N"]}]}`,
+			map[string]any{"v": int32(1), "next": nil}},
+		{"diamond", `{"type":"record","name":"D","fields":[{"name":"p","type":{"type":"fixed","name":"F","size":2}},{"name":"q","type":"F"}]}`,
+			map[string]any{"p": []byte{1, 2}, "q": []byte{3, 4}}},
+		// A forward reference is the one shape where the parse-time canon
+		// tree and Java's first-occurrence PCF disagree before rewriting, so
+		// it pins that the lazy hash still runs over the REWRITTEN form.
+		{"forwardref", `{"type":"record","name":"R","fields":[{"name":"a","type":"F"},{"name":"b","type":{"type":"fixed","name":"F","size":2}}]}`,
+			map[string]any{"a": []byte{1, 2}, "b": []byte{3, 4}}},
+		{"enum", `{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`, "B"},
+		{"union", `["null","int"]`, int32(3)},
+		{"logical", `{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}`,
+			big.NewRat(123, 100)},
+		{"map", `{"type":"map","values":"long"}`, map[string]any{"k": int64(1)}},
+	}
+}
+
+// TestMatrix_SingleObjectHeaderLazy crosses every schema shape with every
+// construction path and every first-use entry point.
+func TestMatrix_SingleObjectHeaderLazy(t *testing.T) {
+	t.Parallel()
+	for _, sh := range soeShapes() {
+		t.Run(sh.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Parse: the header must be the oracle's, and a schema whose
+			// first touch is Decode/Canonical/String must still produce it.
+			for _, warm := range []string{"cold", "canonical-first", "encode-first", "root-first"} {
+				t.Run("parse/"+warm, func(t *testing.T) {
+					s := mustParse(t, sh.schema)
+					switch warm {
+					case "canonical-first":
+						_ = s.Canonical()
+						_ = s.Fingerprint(avro.NewRabin())
+					case "encode-first":
+						mustAppendEncode(t, s, nil, sh.val)
+					case "root-first":
+						_ = s.Root()
+						_ = s.String()
+					}
+					want := soeOracle(s)
+					got := mustAppendSingleObject(t, s, nil, sh.val)
+					if [10]byte(got[:10]) != want {
+						t.Fatalf("header %x, want %x", got[:10], want)
+					}
+					// Entry point 2: DecodeSingleObject must accept it.
+					var back any
+					if rest := mustDecodeSingleObject(t, s, got, &back); len(rest) != 0 {
+						t.Fatalf("DecodeSingleObject left %d bytes", len(rest))
+					}
+					// Entry point 3: the exported extractor must read the
+					// same 8 bytes back out.
+					fp, rest, err := avro.SingleObjectFingerprint(got)
+					if err != nil {
+						t.Fatalf("SingleObjectFingerprint: %v", err)
+					}
+					if fp != [8]byte(want[2:]) || len(rest) != len(got)-10 {
+						t.Fatalf("SingleObjectFingerprint %x rest %d, want %x rest %d", fp, len(rest), want[2:], len(got)-10)
+					}
+					// A schema that reached the header first through
+					// DecodeSingleObject must produce the same bytes.
+					fresh := mustParse(t, sh.schema)
+					if _, err := fresh.DecodeSingleObject(got, &back); err != nil {
+						t.Fatalf("decode-first DecodeSingleObject: %v", err)
+					}
+					if got2 := mustAppendSingleObject(t, fresh, nil, sh.val); [10]byte(got2[:10]) != want {
+						t.Fatalf("decode-first header %x, want %x", got2[:10], want)
+					}
+				})
+			}
+
+			// Identity Resolve returns the reader itself; a non-identity
+			// Resolve installs the reader's canonical form on a NEW schema,
+			// whose header must follow the canonical form it adopted and
+			// which must additionally accept the writer's.
+			t.Run("resolve", func(t *testing.T) {
+				reader := mustParse(t, sh.schema)
+				if id := mustResolve(t, mustParse(t, sh.schema), reader); id != reader {
+					t.Fatalf("identity Resolve did not return the reader")
+				}
+				widened := `{"type":"record","name":"W","fields":[
+					{"name":"only","type":` + sh.schema + `},
+					{"name":"extra","type":"string"}]}`
+				narrowed := `{"type":"record","name":"W","fields":[
+					{"name":"only","type":` + sh.schema + `}]}`
+				w := mustParse(t, widened)
+				r := mustParse(t, narrowed)
+				res := mustResolve(t, w, r)
+				if got, want := soeOracle(res), soeOracle(r); got != want {
+					t.Fatalf("resolved oracle %x, want reader oracle %x", got, want)
+				}
+				// Writer-shaped SOE wire must decode through the resolved
+				// schema, which forces BOTH lazy headers.
+				wire := mustAppendSingleObject(t, w, nil, map[string]any{"only": sh.val, "extra": "e"})
+				var out map[string]any
+				if _, err := res.DecodeSingleObject(wire, &out); err != nil {
+					t.Fatalf("resolved DecodeSingleObject(writer wire): %v", err)
+				}
+				// And so must reader-fingerprinted wire, since a resolved
+				// schema accepts its own header too.
+				readerHdr := soeOracle(r)
+				readerWire := append(append([]byte{}, readerHdr[:]...), wire[10:]...)
+				if _, err := res.DecodeSingleObject(readerWire, &out); err != nil {
+					t.Fatalf("resolved DecodeSingleObject(reader header): %v", err)
+				}
+				// A third schema's header must still be rejected: laziness
+				// must not turn the writer slot into "accept anything".
+				alien := soeOracle(mustParse(t, `{"type":"record","name":"Z","fields":[{"name":"z","type":"int"}]}`))
+				alienWire := append(append([]byte{}, alien[:]...), wire[10:]...)
+				if _, err := res.DecodeSingleObject(alienWire, &out); err == nil {
+					t.Fatalf("resolved DecodeSingleObject accepted an alien fingerprint")
+				}
+				if _, err := r.DecodeSingleObject(alienWire, &out); err == nil {
+					t.Fatalf("unresolved DecodeSingleObject accepted an alien fingerprint")
+				}
+			})
+
+			// SchemaCache's splice replaces the parsed canonical form with a
+			// self-contained one after parse() returns. The header must
+			// describe the SPLICED form -- i.e. match a standalone parse of
+			// String() -- not the bare-reference form parse() saw.
+			t.Run("cache-splice", func(t *testing.T) {
+				var c avro.SchemaCache
+				if _, err := c.Parse(`{"type":"record","name":"Leaf","namespace":"n","fields":[{"name":"l","type":` + sh.schema + `}]}`); err != nil {
+					t.Fatalf("cache parse leaf: %v", err)
+				}
+				parent, err := c.Parse(`{"type":"record","name":"Parent","namespace":"n","fields":[{"name":"p","type":"n.Leaf"}]}`)
+				if err != nil {
+					t.Fatalf("cache parse parent: %v", err)
+				}
+				val := map[string]any{"p": map[string]any{"l": sh.val}}
+				got := mustAppendSingleObject(t, parent, nil, val)
+				if want := soeOracle(parent); [10]byte(got[:10]) != want {
+					t.Fatalf("cache header %x, want %x", got[:10], want)
+				}
+				// Cross-product oracle: a cacheless parse of the spliced
+				// text is a different Schema built by a different path, and
+				// must land on the same header.
+				standalone := mustParse(t, parent.String())
+				alone := mustAppendSingleObject(t, standalone, nil, val)
+				if !bytes.Equal(got[:10], alone[:10]) {
+					t.Fatalf("cache header %x != standalone header %x", got[:10], alone[:10])
+				}
+			})
+		})
+	}
+}
+
+// TestMatrix_ConcurrentFirstUseSOE races the lazily-hashed single-object
+// header from many goroutines at once, over every entry point that can force
+// it, and over a writer schema shared by two resolved schemas so one Once is
+// raced from two owners. Every goroutine must observe the same header, and
+// -race must stay silent.
+func TestMatrix_ConcurrentFirstUseSOE(t *testing.T) {
+	t.Parallel()
+	const goroutines = 12
+	schema := `{"type":"record","name":"CFU","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"string"}]}},
+		{"name":"c","type":["null","Inner"]}]}`
+	val := map[string]any{"a": int32(7), "b": map[string]any{"x": "s"}, "c": nil}
+
+	for round := 0; round < 25; round++ {
+		// Every goroutine reaches the header of a schema none of them has
+		// touched, through a different mix of entry points.
+		s := mustParse(t, schema)
+		want := soeOracle(mustParse(t, schema)) // oracle from a SEPARATE schema
+		var wg sync.WaitGroup
+		errs := make(chan error, goroutines*2)
+		start := make(chan struct{})
+		for g := 0; g < goroutines; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				<-start
+				switch g % 4 {
+				case 0:
+					b, err := s.AppendSingleObject(nil, val)
+					if err != nil {
+						errs <- fmt.Errorf("AppendSingleObject: %v", err)
+						return
+					}
+					if [10]byte(b[:10]) != want {
+						errs <- fmt.Errorf("racing header %x, want %x", b[:10], want)
+					}
+				case 1:
+					wire := append(append([]byte{}, want[:]...), mustAppendEncode(t, mustParse(t, schema), nil, val)...)
+					var out map[string]any
+					if _, err := s.DecodeSingleObject(wire, &out); err != nil {
+						errs <- fmt.Errorf("DecodeSingleObject: %v", err)
+					}
+				case 2:
+					// Canonical() is what the header hashes; racing it
+					// against the hash pins that the hash does not mutate
+					// the tree it reads.
+					if !bytes.Equal(s.Canonical(), mustParse(t, schema).Canonical()) {
+						errs <- errors.New("racing Canonical differs")
+					}
+				default:
+					// A bad header must be rejected without ever reaching
+					// the payload, racing everyone else's first use.
+					var out map[string]any
+					bad := append(append([]byte{}, 0xC3, 0x01), make([]byte, 20)...)
+					if _, err := s.DecodeSingleObject(bad, &out); err == nil {
+						errs <- errors.New("bad fingerprint accepted")
+					}
+				}
+			}(g)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Error(err)
+		}
+	}
+
+	// One writer, two resolved readers: both resolutions consult the SAME
+	// writer schema's lazy header, so its Once is raced across owners.
+	for round := 0; round < 25; round++ {
+		w := mustParse(t, `{"type":"record","name":"SW","fields":[
+			{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":"long"}]}`)
+		r1 := mustParse(t, `{"type":"record","name":"SW","fields":[{"name":"a","type":"int"}]}`)
+		r2 := mustParse(t, `{"type":"record","name":"SW","fields":[{"name":"b","type":"string"}]}`)
+		res1 := mustResolve(t, w, r1)
+		res2 := mustResolve(t, w, r2)
+		wire := mustAppendSingleObject(t, mustParse(t, w.String()), nil,
+			map[string]any{"a": int32(1), "b": "s", "c": int64(2)})
+		var wg sync.WaitGroup
+		errs := make(chan error, goroutines)
+		start := make(chan struct{})
+		for g := 0; g < goroutines; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				<-start
+				res := res1
+				field, exp := "a", any(int32(1))
+				if g%2 == 1 {
+					res, field, exp = res2, "b", any("s")
+				}
+				var out map[string]any
+				if _, err := res.DecodeSingleObject(wire, &out); err != nil {
+					errs <- fmt.Errorf("shared-writer DecodeSingleObject: %v", err)
+					return
+				}
+				if out[field] != exp {
+					errs <- fmt.Errorf("shared-writer decoded %#v, want %s=%v", out, field, exp)
+				}
+			}(g)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Error(err)
+		}
+	}
+}
+
 // ---------- matrix_custom_test.go ----------
 
 // ---------------------------------------------------------------------------
