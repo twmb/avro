@@ -1097,6 +1097,33 @@ var (
 // referencing the same type, while rejecting contradictory ones.
 type appliedTypeAliases map[string][]string
 
+// tagDefaultValue reads a `default=` struct tag's raw text as a JSON value,
+// falling back to the text verbatim as a string.
+//
+// The fallback is what makes an unquoted tag (`default=hello`) usable, and it
+// takes the WHOLE text: a decode that stopped after the first JSON value would
+// turn `42 oops` into the number 42, silently dropping what the author wrote.
+// Trailing content therefore means "this was never JSON", not "this is JSON
+// plus junk" — the same verdict decimal()'s trailing-junk guard reaches.
+//
+// Numbers come back as their literal, which is what keeps a long default like
+// 9223372036854775807 from round-tripping through float64 into
+// 9.223372036854776e+18 and being rejected by the parse it feeds.
+func tagDefaultValue(raw string) any {
+	v, n, err := decodeSchemaAny(raw)
+	if err != nil {
+		return raw
+	}
+	for ; n < len(raw); n++ {
+		switch raw[n] {
+		case ' ', '\t', '\n', '\r':
+		default:
+			return raw
+		}
+	}
+	return v
+}
+
 // inferField builds the Avro field definition for a single struct field.
 func inferField(f schemaField, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType, applied appliedTypeAliases) (map[string]any, error) {
 	fieldDef := map[string]any{
@@ -1130,26 +1157,7 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]seenForm,
 		fieldDef["aliases"] = f.aliases
 	}
 	if f.dflt != nil {
-		var v any
-		raw := *f.dflt
-		// Try JSON parse first; fall back to bare string. UseNumber
-		// preserves long precision: a default like "9223372036854775807"
-		// (MaxInt64) round-trips through float64 → "9.223372036854776e+18"
-		// without it, which Parse then rejects via floatFitsInt64.
-		// Mirrors unmarshalDefault (schema.go) on the Parse side; the
-		// two sites must stay in lockstep on number-precision handling.
-		dec := json.NewDecoder(strings.NewReader(raw))
-		dec.UseNumber()
-		if err := dec.Decode(&v); err != nil {
-			v = raw
-		} else if dec.More() {
-			// Decode stops at the end of the first JSON value and ignores
-			// the rest, so a valid JSON prefix followed by trailing content
-			// (e.g. "42 oops") would silently truncate to the prefix. Treat
-			// the whole tag as a verbatim string instead — matching the
-			// non-JSON fallback above and decimal()'s trailing-junk guard.
-			v = raw
-		}
+		v := tagDefaultValue(*f.dflt)
 		fieldDef["default"] = v
 		// A narrow Go integer kind maps to a WIDER Avro type (int8/16 and
 		// uint8/16 → int; uint32 / uint → long), so a default that is a

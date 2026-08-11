@@ -4,9 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"reflect"
-	"strings"
 )
 
 // parseSchemaTree decodes a schema JSON string into the aschema parse tree in a
@@ -19,19 +17,13 @@ import (
 // matches the typed decode by construction. That re-marshal is O(leaf) and
 // stays O(n) summed.
 func parseSchemaTree(schema string) (*aschema, error) {
-	dec := json.NewDecoder(strings.NewReader(schema))
-	dec.UseNumber() // preserve integer precision in defaults and extras
-	var v any
-	if err := dec.Decode(&v); err != nil {
+	// decodeSchemaAnyStrict preserves every number as its literal, which is
+	// what the arms below re-marshal into o.Default / f.Default and what the
+	// size / precision / scale reads decode; see that decoder for the two
+	// silent failures a resolving decode produces here.
+	v, err := decodeSchemaAnyStrict(schema)
+	if err != nil {
 		return nil, boundJSONErrorEcho(err)
-	}
-	// json.Unmarshal rejects trailing non-whitespace; replicate by
-	// requiring the next decode to be EOF (trailing whitespace is
-	// consumed, anything else is content). Mirrors SchemaCache.Parse's
-	// normalization check.
-	var tail json.RawMessage
-	if err := dec.Decode(&tail); !errors.Is(err, io.EOF) {
-		return nil, errors.New("invalid schema: unexpected trailing content")
 	}
 	var s aschema
 	if err := aschemaFromAny(v, &s, nil); err != nil {

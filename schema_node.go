@@ -264,7 +264,7 @@ type deduper struct {
 // Root re-parses the JSON on each call. Cache the result if you access it
 // repeatedly (e.g. in a per-message loop).
 func (s *Schema) Root() *SchemaNode {
-	raw, err := unmarshalAnyPreservePrecision([]byte(s.full))
+	raw, err := unmarshalAnyPreservePrecision(s.full)
 	if err != nil {
 		panic("avro: Schema.Root: invalid stored JSON: " + err.Error())
 	}

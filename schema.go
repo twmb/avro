@@ -3698,17 +3698,15 @@ var (
 func logicalSer(logical string) serfn     { return logicalSers[logical] }
 func logicalDeser(logical string) deserfn { return logicalDesers[logical] }
 
-// unmarshalDefault parses a field's raw JSON default. Uses
-// json.Decoder.UseNumber() so that numeric literals are preserved as
-// json.Number rather than rounded through float64 — int64 / long
-// defaults > 2^53 would otherwise silently lose precision (e.g. 9007199254740993
-// → 9007199254740992).
+// unmarshalDefault parses a field's raw JSON default. Numeric literals stay
+// json.Number rather than rounding through float64 — long defaults above 2^53
+// would otherwise silently lose precision (9007199254740993 → …92) — which is
+// what the shared decoder returns for every number anyway.
 func unmarshalDefault(raw json.RawMessage) any {
-	var dv any
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
 	// Cannot fail: raw is preserved from the initial parse and is valid JSON.
-	_ = dec.Decode(&dv)
+	// Lenient rather than strict for the same reason — whatever the parse
+	// accepted into these bytes is what comes back out.
+	dv, _, _ := decodeSchemaAny(string(raw))
 	return dv
 }
 
@@ -3852,11 +3850,9 @@ func applyResolvedDefault(defaultVal any, node *schemaNode, fieldName string,
 // SchemaNode.Props, and Root()'s re-parse — where a bare Unmarshal silently
 // rounds JSON ints above 2^53. unmarshalDefault already gives the encode/decode
 // path the same guarantee.
-func unmarshalAnyPreservePrecision(raw []byte) (any, error) {
-	var v any
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	if err := dec.Decode(&v); err != nil {
+func unmarshalAnyPreservePrecision(raw string) (any, error) {
+	v, err := decodeSchemaAnyStrict(raw)
+	if err != nil {
 		return nil, err
 	}
 	return normalizeJSONValue(v), nil
