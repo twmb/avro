@@ -409,22 +409,14 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 
 	if k == reflect.Pointer {
 		// Bound the pointer-chain peel before recursing on the element type.
-		// A cyclic non-struct pointer type (type P *P, whose reflect graph has
-		// P.Elem() == P) would recurse here forever AT COMPILE TIME and
-		// overflow the goroutine stack — a fatal, unrecoverable crash. A
-		// non-cyclic chain too deep for the reflect encoder also matters: the
-		// reflect path (serIndirect → indirect) peels at most maxIndirectDepth
-		// levels and accepts a chain bottoming at a non-pointer base within
-		// that cap — maxIndirectDepth pointer levels — erroring only beyond it.
-		// An unbounded fast path would instead accept arbitrarily deep chains,
-		// diverging from the reflect encoder it must mirror byte-for-byte.
-		// Counting the consecutive pointer levels and declining BEYOND
-		// maxIndirectDepth terminates the cycle and keeps the fast path's accept
-		// set identical to the reflect encoder's: a chain within the cap
-		// compiles, a deeper one routes to the reflect slow path, which errors
-		// uniformly (errIndirectDeep / errIndirectNil). Mirrors
-		// tryCompileFieldDeser (declines all pointers) and the multi-pointer
-		// nullunion/array arms.
+		// A cyclic pointer type (type P *P, where P.Elem() == P) recurses here
+		// forever AT COMPILE TIME and overflows the stack, unrecoverably. Depth
+		// matters too: the reflect encoder peels at most maxIndirectDepth
+		// levels, so an unbounded fast path would accept chains it rejects and
+		// stop mirroring it byte-for-byte. Counting levels and declining beyond
+		// the cap ends the cycle and keeps both accept sets identical — within
+		// the cap compiles, deeper routes to the reflect path, which errors
+		// uniformly.
 		levels := 1
 		for e := goType.Elem(); e.Kind() == reflect.Pointer; e = e.Elem() {
 			levels++
@@ -1471,22 +1463,15 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type, valIdx int, nullByte
 
 // udNullUnionRecord handles null-union deser for *T where T is a record.
 //
-// The union node bumps sl.depth once here (matching deserNullUnionAt,
-// deserUnion.deser, and the encode side usNullUnionRecord). The inner
-// record node bumps separately on its own entry (deserRecordFastPtr or
-// rec.deser via deserRecordVia), so a ["null", Record] link costs two
-// depth units — one for the union edge, one for the record edge — on
-// every encode/decode/JSON path. See the depth-uniformity invariant in
-// deserNullUnionAt.
+// The union node bumps sl.depth once here and the inner record bumps on its own
+// entry, so a ["null", Record] link costs two depth units on every path. See
+// the depth-uniformity invariant in deserNullUnionAt.
 //
-// The decrement is inline (not deferred) on this and udNullUnionPtr: this
-// is the recursive-decode hot path (a linked-list "next" field decodes
-// through here once per link), and benchstat showed the open-coded defer
-// adds ~10% per link on BenchmarkDeserializeRecursive. Every post-bump
-// return point decrements first (the err/isNull early return and the
-// after-inner-branch return), so sl.depth is restored on success and on
-// error alike — identical net effect to a defer. The over-bound abort
-// returns before the bump, so there is nothing to undo there.
+// The decrement is inline rather than deferred, here and in udNullUnionPtr:
+// this is the recursive-decode hot path, and benchstat showed the open-coded
+// defer costs ~10% per link on BenchmarkDeserializeRecursive. Every post-bump
+// return decrements first, so depth is restored on success and error alike. The
+// over-bound abort returns before the bump.
 func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		if sl.depth >= maxDepth {
@@ -1721,15 +1706,12 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 // udArrayDirect so the depth bookkeeping, length overflow guard,
 // MakeSlice/SetLen growth, and block-bounds check live in one place.
 //
-// minItemBytes is the schema-derived per-item wire-byte minimum (1 for
-// varint primitives, 4 for float, 8 for double, etc.) — bounds block
-// count to len(src)/minItemBytes, mirroring deserArray.deser. Without
-// it the loose count > len(src) check would let a hostile float-array
-// stream drive a 4× MakeSlice allocation per wire byte before the
-// per-element readUint32 loop fails on short buffer.
+// minItemBytes bounds block count to len(src)/minItemBytes, mirroring
+// deserArray.deser. Without it the loose count > len(src) check lets a hostile
+// float-array stream drive a 4x MakeSlice allocation per wire byte before the
+// per-element readUint32 loop fails short.
 //
-// Benchstat verified perf-neutral on BenchmarkLargeArrayDecode (sister
-// of LargeArrayEncode, exercising []*Record fast-path decode).
+// Benchstat-verified perf-neutral on BenchmarkLargeArrayDecode.
 func udArrayBlocks(
 	src []byte, p unsafe.Pointer, sl *slab,
 	sliceType reflect.Type, minItemBytes int,

@@ -41,30 +41,19 @@ func promoteRead[Wire any](
 	}
 }
 
-// promoteIntFloatMantissa is the int→float conversion shared by the
-// four int/long→float/double promotion arms. The READER schema is the
-// user's evolved-to type — by writing a reader schema of float/double
-// the user explicitly opted into IEEE-precision semantics, so wire
-// magnitudes the reader can't represent exactly silently IEEE-round.
-// Matches Java's ResolvingDecoder.readDouble's `(double) in.readLong()`
-// (`lang/java/avro/src/main/java/org/apache/avro/io/ResolvingDecoder.
-// java:192`), fastavro's `maybe_promote` returning `float(data)`
-// (`fastavro/_read_py.py:619-621`), and hamba's createDoubleConverter
-// `float64(r.ReadLong())` (`hamba/avro/converter.go:28`).
+// promoteIntFloatMantissa is the int→float conversion shared by the four
+// int/long→float/double promotion arms. A float/double READER schema opts into
+// IEEE precision, so wire magnitudes it cannot hold exactly IEEE-round
+// silently. Matches Java's ResolvingDecoder.readDouble, fastavro's
+// maybe_promote, and hamba's createDoubleConverter.
 //
-// Asymmetric with the natural same-schema decode case: `s.Decode(wire,
-// &f float64)` against `s = MustParse("long")` still rejects via
-// setLongValue's CanFloat arm because there the READER schema IS long
-// (exact) — the user did NOT evolve the schema, only chose a Go type
-// the wire doesn't fit. The principle: lossiness on decode is
-// acceptable when the READER SCHEMA (the user's contract) is lossy;
-// when the reader schema is exact and only the Go type is lossy, the
-// wire preserved a value the user shouldn't silently lose.
+// Asymmetric with the same-schema decode: s.Decode(wire, &f float64) against
+// MustParse("long") still rejects. Lossiness is acceptable when the READER
+// SCHEMA is lossy; when only the Go type is, the wire held a value the user
+// should not silently lose.
 //
-// Float32 narrowing for the bitSize=32 arm happens at setFloatValue's
-// `v.SetFloat(f)` when the Go target is *float32; the float64 cast
-// here preserves the long's full value before the assignment narrows
-// it to the reader-schema's float32 precision.
+// The float64 cast keeps the long's full value; setFloatValue's SetFloat
+// narrows to float32 for the bitSize=32 arm.
 func promoteIntFloatMantissa(v reflect.Value, n int64, avroType string, bitSize int) error {
 	var f float64
 	if bitSize == 32 {
@@ -94,17 +83,14 @@ var (
 		})
 )
 
-// readBytesPrefix reads a varlong length prefix and validates it against
-// the remaining buffer. Shared by the four promote*-with-length-prefix
-// helpers (promoteStringToBytes, promoteStringToBytesDecimal,
-// promoteStringToBytesBigDecimal, promoteBytesToStringUUID,
-// promoteBytesToString) so the trio of error shapes (varlong, negative,
-// overrun) is in one place. destAvroType labels the SemanticError for a
-// negative length; wireTypeName labels the ShortBufferError for buffer
-// overrun. They differ across promotion directions: a string→bytes
-// promotion tags negative-length as "bytes" (destination) and short-
-// buffer as "string" (writer's wire type), and vice versa for bytes→
-// string.
+// readBytesPrefix reads a varlong length prefix and validates it against the
+// remaining buffer, keeping the three error shapes (varlong, negative, overrun)
+// in one place for every length-prefixed promotion.
+//
+// destAvroType labels the negative-length SemanticError; wireTypeName labels
+// the overrun ShortBufferError. The two swap by direction: string→bytes tags
+// negative as "bytes" (destination) and short-buffer as "string" (the writer's
+// wire type).
 func readBytesPrefix(src []byte, destAvroType, wireTypeName string) (n int, rest []byte, err error) {
 	length, rest, err := readVarlong(src)
 	if err != nil {
@@ -130,28 +116,28 @@ func promoteStringToBytes(src []byte, v reflect.Value, _ *slab) ([]byte, error) 
 	return src[n:], nil
 }
 
-// promotionDeserForLogical returns a deserfn that reads the writer's
-// wire type AND applies the reader's logical-type conversion, or nil
-// if the reader has no logical type (or none that's reachable via the
-// promotion paths). Without this, a writer int → reader
-// {"long","logicalType":"timestamp-millis"} resolution would produce
-// raw int64 instead of time.Time — the basic promotion deser uses
-// setLongValue / setBytesValue / setStringValue, which know nothing
-// about logical conversions. The wrappers below read the writer's
-// wire (varint for int→long, length-prefixed for string↔bytes) and
-// dispatch through the same target arms the natural logical
-// deserializers use.
+// promotionDeserForLogical returns a deserfn that reads the writer's wire type
+// AND applies the reader's logical conversion, or nil when the reader has no
+// logical reachable through a promotion. The bare promotion desers know nothing
+// about logicals, so without this a writer int → reader {"long",
+// "logicalType":"timestamp-millis"} yields raw int64 instead of time.Time.
 func promotionDeserForLogical(writerKind string, r *schemaNode) deserfn {
 	if r.logical == "" {
 		return nil
 	}
-	switch r.kind {
-	case "long":
-		if writerKind != "int" {
-			// long→float, long→double, float→double don't have
-			// logical-type readers (no logicals on float/double).
-			return nil
-		}
+	// Keyed on the PROMOTION, using the same "writer>reader" key the
+	// promotions table itself is keyed by — not on the reader kind alone.
+	// Each wrapper below reads the WRITER's wire form (a varint for
+	// int→long, a varlong length prefix for string↔bytes) before applying
+	// the reader's conversion, so it is correct only for the exact pair it
+	// is written for. Keying on the pair is what makes that structural: a
+	// promotion added to the table with no arm here falls through to the
+	// bare widening deser instead of reaching a wrapper that would misread
+	// the wire. The pairs absent here have no reachable logical reader —
+	// long→float, long→double and float→double all land on float/double,
+	// which carry no logical types.
+	switch writerKind + ">" + r.kind {
+	case "int>long":
 		switch r.logical {
 		case "timestamp-millis", "local-timestamp-millis":
 			return promoteIntToLongTime(timestampMillisToTime)
@@ -162,20 +148,14 @@ func promotionDeserForLogical(writerKind string, r *schemaNode) deserfn {
 		case "time-micros":
 			return promoteIntToLongTimeMicros
 		}
-	case "bytes":
-		if writerKind != "string" {
-			return nil
-		}
+	case "string>bytes":
 		switch r.logical {
 		case "decimal":
 			return promoteStringToBytesDecimal(r.scale)
 		case "big-decimal":
 			return promoteStringToBytesBigDecimal
 		}
-	case "string":
-		if writerKind != "bytes" {
-			return nil
-		}
+	case "bytes>string":
 		switch r.logical {
 		case "uuid":
 			return promoteBytesToStringUUID
@@ -254,12 +234,8 @@ func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byt
 	return src[n:], nil
 }
 
-// promoteBytesToStringUUID reads the writer's varlong-length-prefixed
-// bytes and parses them as a canonical UUID string, dispatching to
-// the same target arms as deserFixedUUIDReflect (string / [16]byte /
-// []byte / interface). Mirrors how the natural string+uuid logical
-// deserializer would handle the bytes if they'd been written as the
-// 36-char hex-dash form.
+// promoteBytesToStringUUID reads the writer's length-prefixed bytes as a
+// canonical UUID string, dispatching to deserFixedUUIDReflect's target arms.
 func promoteBytesToStringUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	n, src, err := readBytesPrefix(src, "string", "bytes")
 	if err != nil {

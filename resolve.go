@@ -17,15 +17,13 @@ import (
 // removal (skip), renaming (aliases), reordering, and type promotion.
 // Encoding with it uses the reader's format.
 //
-// [CheckCompatibility] is called first and any incompatibility is returned as a
-// [*CompatibilityError]; if it passes and the schemas have identical canonical
-// forms, reader is returned as-is. The compatibility check must precede the
-// canonical-form fast path because the parsing canonical form strips logical-
-// type attributes (logicalType, precision, scale): two schemas can have equal
-// canonical forms yet be logically incompatible — most importantly a decimal
-// precision/scale mismatch — which would otherwise pass the fast path and
-// silently rescale the decoded value. See the package-level documentation for
-// a full example.
+// [CheckCompatibility] runs first, and any incompatibility comes back as a
+// [*CompatibilityError]; if it passes and the canonical forms are identical,
+// reader is returned as-is. The check must precede that fast path: the parsing
+// canonical form strips logicalType, precision and scale, so two schemas with
+// equal canonical forms can still be logically incompatible — a decimal
+// precision/scale mismatch most of all — and would otherwise pass the fast path
+// and silently rescale the decoded value.
 //
 // Note: the argument order is (writer, reader), matching source-then-destination
 // convention and Java's GenericDatumReader. This differs from the Avro spec
@@ -77,23 +75,19 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 		s.resolveWriterRaw = raw
 	}
 	s.soe = reader.soe
-	// SOE wire bytes carry the writer's fingerprint per the Avro spec
-	// (the schema that produced the wire IS the writer). Storing
-	// writer.soe lets DecodeSingleObject accept writer-produced bytes
-	// and resolve them into reader-shaped Go. Java's BinaryMessageDecoder
-	// dispatches the wire fingerprint into a resolved (writer→reader)
-	// codec via a fingerprint registry; twmb's single-schema model bakes
-	// the equivalent dispatch into the resolved Schema's own check.
+	// SOE wire bytes carry the WRITER's fingerprint per the spec, so storing
+	// writer.soe lets DecodeSingleObject accept writer-produced bytes and
+	// resolve them into reader-shaped Go. Java's BinaryMessageDecoder does the
+	// equivalent through a fingerprint registry; the single-schema model bakes
+	// it into the resolved Schema's own check.
 	//
-	// The resolved Schema also accepts the reader's fingerprint, but the
-	// payload after it must still be WRITER-shaped: a resolved Schema
-	// decodes via the resolving s.deser, which consumes writer bytes.
-	// Feeding back reader.AppendSingleObject output (reader-shaped) is
-	// therefore NOT a supported round-trip — it errors on dropped writer
-	// fields or silently default-fills added ones, the same way feeding
-	// reader-shaped JSON to a resolved DecodeJSON does (see the resolved
-	// DecodeJSON divergence note). Use the reader schema directly for
-	// reader-shaped data.
+	// The resolved Schema also accepts the READER's fingerprint, but the
+	// payload after it must still be WRITER-shaped, since s.deser consumes
+	// writer bytes. Feeding back reader.AppendSingleObject output is NOT a
+	// supported round-trip: it errors on dropped writer fields or silently
+	// default-fills added ones, exactly as reader-shaped JSON does to a
+	// resolved DecodeJSON. Use the reader schema directly for reader-shaped
+	// data.
 	s.writerSoe = writer.soe
 	return s, nil
 }
@@ -231,9 +225,12 @@ func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, err
 			return resolveArray(r, w, path, ctx)
 		case "map":
 			return resolveMap(r, w, path, ctx)
-		case "fixed":
-			return maybeWrapResolvedNode(r, ctx), nil
 		default:
+			// Everything else — the primitives, and fixed — resolves to the
+			// reader node itself. fixed needs no arm of its own despite being
+			// a named type: CheckCompatibility ran first and already required
+			// the names and the sizes to match (checkSameKind), so there is
+			// nothing left to reconcile.
 			return maybeWrapResolvedNode(r, ctx), nil
 		}
 	}
@@ -241,22 +238,16 @@ func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, err
 	pd := promotionDeser(w.kind, r.kind)
 	if pd != nil {
 		deser := deserfn(pd)
-		// If the reader has a logical type, the bare promotion deser
-		// drops it — Java's Resolver.Action carries logicalType +
-		// conversion orthogonally to Promote and applies the conversion
-		// after the widening (Resolver.java:154-165). Without this wrap,
-		// writer "int" → reader {"long","logicalType":"timestamp-millis"}
-		// would produce int64 instead of time.Time at every position
-		// (top-level, record field, array item, map value, reader-union
-		// branch). Wrap the promotion deser to re-apply the conversion.
-		// A matching CustomType that suppresses the reader's built-in logical
-		// decoder (the binary build fed the user the raw Avro-native value via
-		// hasMatchingCustomType) must keep suppressing through promotion: the
-		// bare promotion deser feeds the custom decoder (or, with no Decode
-		// callback, the user) the raw value, exactly as a direct, non-promoted
-		// decode does. Without this gate the custom decoder receives the
-		// enriched logical type (time.Time / *big.Rat) on a promoted wire but
-		// the raw type on a direct wire for the same reader+custom.
+		// The bare promotion deser drops the reader's logical type, so writer
+		// "int" → reader {"long","logicalType":"timestamp-millis"} would give
+		// int64 instead of time.Time. Java applies the conversion after the
+		// widening the same way (Resolver.java:154-165).
+		//
+		// A CustomType that suppresses the reader's built-in logical decoder
+		// must keep suppressing through promotion, so the custom decoder — or,
+		// with no Decode callback, the user — sees the raw value on a promoted
+		// wire exactly as on a direct one. Without the gate it gets the
+		// enriched type on one and the raw type on the other.
 		if pdLogical := promotionDeserForLogical(w.kind, r); pdLogical != nil {
 			if cw := ctx.custom[r]; cw == nil || !cw.suppressLogical {
 				deser = pdLogical
@@ -394,14 +385,13 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 // an alias on the same field. A single merged map cannot express that: a
 // writer name that is one reader field's alias and a LATER reader field's name
 // would resolve to whichever entry was written last, silently reversing the
-// routing. That routing is what the parse-time rejection of field name/alias
-// collisions is justified by, so it is a contract, not an implementation
-// detail. Within each map the FIRST field wins, matching the scan this
-// replaced; a parse rejects the collisions that would make that observable.
+// routing. That routing is the contract the parse-time rejection of field
+// name/alias collisions is justified by. Within each map the FIRST field wins,
+// and a parse rejects the collisions that would make it observable.
 //
-// It is built once per reader record and asked once per writer field. Building
-// it per question would be the same scan-inside-a-loop it exists to avoid,
-// since a record's field count is set by the schema text.
+// Built once per reader record, asked once per writer field: building it per
+// question is the scan-inside-a-loop it exists to avoid, over a field count the
+// schema text picks.
 type readerFieldLookup struct {
 	byName  map[string]int
 	byAlias map[string]int
@@ -689,16 +679,12 @@ func resolveMap(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, er
 //
 // Spec ("Schema Resolution"): "if writer's is a union, but reader's is
 // not: if the reader's schema matches the selected writer's schema, it
-// is recursively resolved against it. If they do not match, an error
-// is signalled." Java's Resolver.WriterUnion uses the "selected" wording
-// to defer per-branch failures to decode time via ErrorAction; we
-// instead require all branches to be compatible at resolve time,
-// matching the rest of the package's fail-fast posture (resolveEnum,
-// resolveReaderUnion, resolveUnionUnion, resolveNode, validateDefault,
-// etc.). A user with a producer that narrowed during evolution but
-// never emits the dropped branch must update their schema before
-// Resolve will accept the pair. The benefit is that schema mismatches
-// surface at config time rather than mid-stream.
+// is recursively resolved against it. If they do not match, an error is
+// signalled." Java reads "selected" as license to defer per-branch failures to
+// decode time via ErrorAction; this requires every branch compatible at resolve
+// time, matching the package's fail-fast posture. A producer that narrowed
+// during evolution but never emits the dropped branch must update its schema,
+// and in exchange mismatches surface at config time rather than mid-stream.
 func resolveWriterUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
 	branchDesers := make([]deserfn, len(w.branches))
 	bnames := make([]string, len(w.branches))
@@ -983,7 +969,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 		}
 		// Ask the array encoders' own shared compliance helper, whose doc
 		// requires exactly this: every array encoder routes through it, or the
-		// paths drift. The default walk is one, and was the third to be missed.
+		// paths drift. This default walk is one of them.
 		sink.record(arrayZeroByteEncodeCompliance(len(dst) == bodyStart, len(arr)))
 		return append(dst, 0), nil
 	case "map":
@@ -1029,19 +1015,14 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 		// order and pick the first that accepts; encode its index as the
 		// wire prefix.
 		//
-		// No type-name fast path here. The runtime serUnion.ser and
-		// appendAvroJSONUnion dispatchers use unionTypeNameForValue to
-		// pick a kind-matching branch — correct for user-supplied values
-		// (the Go type names the user's intended branch). For stored
-		// defaults the chosen branch was decided at parse time by
-		// firstUnionBranchAcceptingDefault (used by validateDefault,
-		// coerceDefault, convertDefaultBytes, walkDefault, and the
-		// metadata-side branchAcceptsDefault), which iterates in
-		// declaration order without a kind filter. The wire branch index
-		// MUST agree with that picker; otherwise an [enum, string] default
-		// "A" picks enum at validate-time (the symbol matches) but the
-		// type-name shortcut picks the later string branch on the wire,
-		// producing wire bytes that name a different branch than the
+		// No type-name fast path. The runtime dispatchers use
+		// unionTypeNameForValue, correct for user values because the Go type
+		// names the intended branch, but a stored default's branch was already
+		// chosen at parse time by firstUnionBranchAcceptingDefault, which
+		// iterates declaration order with no kind filter. The wire index MUST
+		// agree with that picker: an [enum, string] default "A" picks enum at
+		// validate time, while the type-name shortcut picks the later string
+		// branch, emitting wire bytes that name a different branch than the
 		// metadata API reports.
 		if len(node.branches) == 0 {
 			return nil, fmt.Errorf("empty union")
@@ -1057,8 +1038,8 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 			// back as the attempt's err would look like a fix (no unreadable
 			// wire is emitted) while silently selecting a LATER branch, and the
 			// metadata API would then report a different branch than the wire
-			// names. Passing nil instead, as this loop first did, keeps
-			// selection right and charges nothing at all.
+			// names. Passing nil instead keeps selection right but charges
+			// nothing at all.
 			var attemptSink defaultChargeSink
 			if encoded, err := encodeDefaultDepth(attempt, val, branch, depth+1, &attemptSink); err == nil {
 				sink.record(attemptSink.err)

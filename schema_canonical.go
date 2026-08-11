@@ -100,8 +100,13 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 	dst = key(dst, "type")
 	dst = appendCanonString(dst, o.Type)
 
-	switch o.Type {
-	case "record", "error":
+	// One rule per required array: the kind that REQUIRES the key always
+	// emits it (even empty — a record with no "fields" or an enum with no
+	// "symbols" is unparseable), and any other kind emits it only when it
+	// carries one. Stated as a single condition because both halves emit
+	// identically; the metadata emitter states its "fields" rule the same
+	// way (toJSONWalk, schema_node.go).
+	if isRecordKind(o.Type) || len(o.Fields) > 0 {
 		dst = key(dst, "fields")
 		dst = append(dst, '[')
 		for i := range o.Fields {
@@ -111,24 +116,9 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 			dst = appendCanonField(dst, &o.Fields[i])
 		}
 		dst = append(dst, ']')
-	default:
-		if len(o.Fields) > 0 {
-			dst = key(dst, "fields")
-			dst = append(dst, '[')
-			for i := range o.Fields {
-				if i > 0 {
-					dst = append(dst, ',')
-				}
-				dst = appendCanonField(dst, &o.Fields[i])
-			}
-			dst = append(dst, ']')
-		}
 	}
 
-	if o.Type == "enum" {
-		dst = key(dst, "symbols")
-		dst = appendCanonStringArray(dst, o.Symbols)
-	} else if len(o.Symbols) > 0 {
+	if o.Type == "enum" || len(o.Symbols) > 0 {
 		dst = key(dst, "symbols")
 		dst = appendCanonStringArray(dst, o.Symbols)
 	}
@@ -182,52 +172,39 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 // mode (symmetric with appendCanonObject).
 func appendCanonField(dst []byte, f *afield) []byte {
 	dst = append(dst, '{')
+	// "name" leads, so every later key is comma-preceded — no first-key
+	// bookkeeping, unlike appendCanonObject's key closure.
+	key := func(dst []byte, k string) []byte {
+		dst = append(dst, ',')
+		dst = appendCanonString(dst, k)
+		return append(dst, ':')
+	}
 	dst = appendCanonString(dst, "name")
 	dst = append(dst, ':')
 	dst = appendCanonString(dst, f.Name)
-	dst = append(dst, ',')
-	dst = appendCanonString(dst, "type")
-	dst = append(dst, ':')
+	dst = key(dst, "type")
 	if f.Type != nil {
 		dst = appendCanonSchema(dst, f.Type)
 	} else {
 		dst = append(dst, '"', '"')
 	}
 	if len(f.Aliases) > 0 {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "aliases")
-		dst = append(dst, ':')
-		dst = appendCanonStringArray(dst, f.Aliases)
+		dst = appendCanonStringArray(key(dst, "aliases"), f.Aliases)
 	}
 	if len(f.Default) > 0 {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "default")
-		dst = append(dst, ':')
-		dst = appendCompactJSON(dst, f.Default)
+		dst = appendCompactJSON(key(dst, "default"), f.Default)
 	}
 	if f.Order != "" {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "order")
-		dst = append(dst, ':')
-		dst = appendCanonString(dst, f.Order)
+		dst = appendCanonString(key(dst, "order"), f.Order)
 	}
 	if f.Logical != "" {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "logicalType")
-		dst = append(dst, ':')
-		dst = appendCanonString(dst, f.Logical)
+		dst = appendCanonString(key(dst, "logicalType"), f.Logical)
 	}
 	if f.Precision != nil {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "precision")
-		dst = append(dst, ':')
-		dst = strconv.AppendInt(dst, int64(*f.Precision), 10)
+		dst = strconv.AppendInt(key(dst, "precision"), int64(*f.Precision), 10)
 	}
 	if f.Scale != nil {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "scale")
-		dst = append(dst, ':')
-		dst = strconv.AppendInt(dst, int64(*f.Scale), 10)
+		dst = strconv.AppendInt(key(dst, "scale"), int64(*f.Scale), 10)
 	}
 	return append(dst, '}')
 }

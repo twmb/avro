@@ -28,55 +28,26 @@ func TestSchemaForBasic(t *testing.T) {
 	}
 
 	t.Run("with namespace", func(t *testing.T) {
-		s, err := SchemaFor[User](WithNamespace("com.example"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[User](t, WithNamespace("com.example"))
 		u := User{Name: "Alice", Age: 30, Score: 100}
-		data, err := s.Encode(&u)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
-		var got User
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if got != u {
-			t.Errorf("got %+v, want %+v", got, u)
-		}
+		roundTripEq(t, s, u)
 	})
 
 	t.Run("no namespace", func(t *testing.T) {
-		s, err := SchemaFor[User]()
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := s.Encode(&User{Name: "Bob", Age: 25, Score: 50})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		s := mustSchemaFor[User](t)
+		data := mustEncode(t, s, &User{Name: "Bob", Age: 25, Score: 50})
 		var got User
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Name != "Bob" {
 			t.Errorf("got %q, want Bob", got.Name)
 		}
 	})
 
 	t.Run("pointer to struct", func(t *testing.T) {
-		s, err := SchemaFor[*User]()
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := s.Encode(&User{Name: "C", Age: 1, Score: 2})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		s := mustSchemaFor[*User](t)
+		data := mustEncode(t, s, &User{Name: "C", Age: 1, Score: 2})
 		var got User
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Name != "C" {
 			t.Errorf("got %q, want C", got.Name)
 		}
@@ -84,26 +55,14 @@ func TestSchemaForBasic(t *testing.T) {
 }
 
 func TestSchemaForNullable(t *testing.T) {
-	type Record struct {
-		Name  string  `avro:"name"`
-		Email *string `avro:"email"`
-	}
-	s, err := SchemaFor[Record]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Record](t)
 
 	t.Run("non-nil", func(t *testing.T) {
 		email := "alice@example.com"
 		r := Record{Name: "Alice", Email: &email}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Email == nil || *got.Email != *r.Email {
 			t.Errorf("got %+v, want %+v", got, r)
 		}
@@ -111,14 +70,9 @@ func TestSchemaForNullable(t *testing.T) {
 
 	t.Run("nil", func(t *testing.T) {
 		r := Record{Name: "Bob", Email: nil}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Email != nil {
 			t.Errorf("expected nil email, got %v", *got.Email)
 		}
@@ -139,10 +93,7 @@ func TestSchemaForMultiLevelPointer(t *testing.T) {
 		type Rec struct {
 			V **int32 `avro:"v"`
 		}
-		s, err := SchemaFor[Rec]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Rec](t)
 		// The emitted schema must itself parse.
 		if _, err := Parse(s.String()); err != nil {
 			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
@@ -150,14 +101,9 @@ func TestSchemaForMultiLevelPointer(t *testing.T) {
 		n := int32(7)
 		p := &n
 		in := Rec{V: &p}
-		data, err := s.Encode(&in)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &in)
 		var got Rec
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.V == nil || *got.V == nil || **got.V != 7 {
 			t.Fatalf("round-trip mismatch: got %v, want **int32(7)", got.V)
 		}
@@ -170,10 +116,7 @@ func TestSchemaForMultiLevelPointer(t *testing.T) {
 		type Rec struct {
 			V **Inner `avro:"v"`
 		}
-		s, err := SchemaFor[Rec]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Rec](t)
 		if _, err := Parse(s.String()); err != nil {
 			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
 		}
@@ -183,10 +126,7 @@ func TestSchemaForMultiLevelPointer(t *testing.T) {
 		type Rec struct {
 			V ***int32 `avro:"v"`
 		}
-		s, err := SchemaFor[Rec]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Rec](t)
 		if _, err := Parse(s.String()); err != nil {
 			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
 		}
@@ -263,16 +203,11 @@ func TestSchemaForNullableDefaultNull(t *testing.T) {
 		Name  string  `avro:"name"`
 		Email *string `avro:"email"` // should get default null automatically
 	}
-	reader, err := SchemaFor[V2]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustSchemaFor[V2](t)
 
 	// Verify the default appears in the schema.
 	var raw any
-	if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
-		t.Fatal(err)
-	}
+	mustUnmarshal(t, []byte(reader.String()), &raw)
 	fields := raw.(map[string]any)["fields"].([]any)
 	emailField := fields[1].(map[string]any)
 	if emailField["default"] != nil {
@@ -283,24 +218,13 @@ func TestSchemaForNullableDefaultNull(t *testing.T) {
 	}
 
 	// Verify backward compatibility: reader has email, writer does not.
-	writer, err := Parse(`{"type":"record","name":"V2","fields":[
+	writer := mustParse(t, `{"type":"record","name":"V2","fields":[
 		{"name":"name","type":"string"}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{"name": "Alice"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{"name": "Alice"})
 	var got V2
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.Name != "Alice" {
 		t.Errorf("name: got %q, want Alice", got.Name)
 	}
@@ -314,14 +238,9 @@ func TestSchemaForNullableExplicitDefault(t *testing.T) {
 	type R struct {
 		Value *string `avro:"value,default=hello"`
 	}
-	s, err := SchemaFor[R]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[R](t)
 	var raw any
-	if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
-		t.Fatal(err)
-	}
+	mustUnmarshal(t, []byte(s.String()), &raw)
 	fields := raw.(map[string]any)["fields"].([]any)
 	dflt := fields[0].(map[string]any)["default"]
 	if dflt != "hello" {
@@ -336,14 +255,9 @@ func TestSchemaForFixedTypeName(t *testing.T) {
 		type R struct {
 			Hash MyHash `avro:"hash"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		var raw any
-		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(s.String()), &raw)
 		fields := raw.(map[string]any)["fields"].([]any)
 		fixed := fields[0].(map[string]any)["type"].(map[string]any)
 		if fixed["name"] != "MyHash" {
@@ -358,14 +272,9 @@ func TestSchemaForFixedTypeName(t *testing.T) {
 		type R struct {
 			Hash [16]byte `avro:"hash"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		var raw any
-		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(s.String()), &raw)
 		fields := raw.(map[string]any)["fields"].([]any)
 		fixed := fields[0].(map[string]any)["type"].(map[string]any)
 		if fixed["name"] != "fixed_16" {
@@ -377,19 +286,11 @@ func TestSchemaForFixedTypeName(t *testing.T) {
 		type R struct {
 			Hash MyHash `avro:"hash"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		input := R{Hash: MyHash{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}}
-		data, err := s.Encode(&input)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, &input)
 		var got R
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Hash != input.Hash {
 			t.Errorf("got %v, want %v", got.Hash, input.Hash)
 		}
@@ -405,14 +306,9 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 			A MD5  `avro:"a"`
 			B SHA1 `avro:"b"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		var raw any
-		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(s.String()), &raw)
 		fields := raw.(map[string]any)["fields"].([]any)
 		a := fields[0].(map[string]any)["type"].(map[string]any)
 		b := fields[1].(map[string]any)["type"].(map[string]any)
@@ -425,17 +321,7 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 
 		// Round-trip.
 		input := R{A: MD5{1}, B: SHA1{2}}
-		data, err := s.Encode(&input)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var got R
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
-		if got != input {
-			t.Errorf("got %+v, want %+v", got, input)
-		}
+		roundTripEq(t, s, input)
 	})
 
 	t.Run("same type dedup", func(t *testing.T) {
@@ -445,22 +331,9 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 			A MD5 `avro:"a"`
 			B MD5 `avro:"b"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		input := R{A: MD5{1}, B: MD5{2}}
-		data, err := s.Encode(&input)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var got R
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
-		if got != input {
-			t.Errorf("got %+v, want %+v", got, input)
-		}
+		roundTripEq(t, s, input)
 	})
 
 	t.Run("same type with alias dedup", func(t *testing.T) {
@@ -469,22 +342,9 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 			A MD5 `avro:"a,type-alias=old_hash"`
 			B MD5 `avro:"b"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		input := R{A: MD5{1}, B: MD5{2}}
-		data, err := s.Encode(&input)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var got R
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
-		if got != input {
-			t.Errorf("got %+v, want %+v", got, input)
-		}
+		roundTripEq(t, s, input)
 	})
 }
 
@@ -495,10 +355,7 @@ func TestSchemaForTimestamp(t *testing.T) {
 		UpdatedAt time.Time `avro:"updated_at,timestamp-micros"`
 		Birthday  time.Time `avro:"birthday,date"`
 	}
-	s, err := SchemaFor[Event]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Event](t)
 	now := time.Now().Truncate(time.Millisecond)
 	e := Event{
 		ID:        "abc",
@@ -506,14 +363,9 @@ func TestSchemaForTimestamp(t *testing.T) {
 		UpdatedAt: now,
 		Birthday:  time.Date(2000, 1, 15, 0, 0, 0, 0, time.UTC),
 	}
-	data, err := s.Encode(&e)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &e)
 	var got Event
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if !got.CreatedAt.Equal(e.CreatedAt) {
 		t.Errorf("created_at: got %v, want %v", got.CreatedAt, e.CreatedAt)
 	}
@@ -524,35 +376,20 @@ func TestSchemaForDuration(t *testing.T) {
 		Millis time.Duration `avro:"millis"`
 		Micros time.Duration `avro:"micros,time-micros"`
 	}
-	s, err := SchemaFor[Record]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Record](t)
 	r := Record{Millis: 5 * time.Second, Micros: 5 * time.Second}
-	data, err := s.Encode(&r)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	var got Record
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got != r {
-		t.Errorf("got %+v, want %+v", got, r)
-	}
+	roundTripEq(t, s, r)
 }
 
-// avro.Duration is the dedicated Go type for the Avro "duration" logical type
-// (a fixed(12) carrying little-endian months/days/milliseconds — distinct from
-// the time.Duration→time-millis mapping in [TestSchemaForDuration] above).
-// SchemaFor recognizes it BY TYPE, with no tag, and must emit the duration
-// fixed wherever the type appears — bare field, *avro.Duration (nullable
-// union), slice/array element, map value, and nested-record field — never
-// decompose its exported uint32 fields into a {Months,Days,Milliseconds}
-// record. The metadata-tree assertions below are the neuter target: reverting
-// inferType's avroDurationType case turns every leaf back into that record and
-// reddens this test (the round-trips would still pass as a record, so the
-// shape assertion is what locks the behavior).
+// avro.Duration is the dedicated Go type for the Avro "duration" logical type —
+// a fixed(12) carrying little-endian months/days/milliseconds, distinct from the
+// time.Duration→time-millis mapping above. SchemaFor recognizes it BY TYPE, with
+// no tag, and must emit the duration fixed wherever it appears — bare field,
+// *avro.Duration, slice/array element, map value, nested-record field — never
+// decompose its exported uint32 fields into a record. The metadata-tree
+// assertions are the neuter target: reverting inferType's avroDurationType case
+// turns every leaf back into that record, and since the round trips would still
+// pass as a record, the shape assertion is what locks the behavior.
 func TestSchemaForAvroDuration(t *testing.T) {
 	dur := Duration{Months: 5, Days: 10, Milliseconds: 1234}
 
@@ -579,27 +416,19 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			D Duration `avro:"d"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		assertDurationFixed(t, s.Root().Fields[0].Type)
 		// A single-field record's wire IS the field's encoding (no framing),
 		// so it must be exactly the 12-byte duration fixed — a decomposed
 		// record would emit three zig-zag varint longs (4 bytes here), so the
 		// length alone separates the two even before the byte compare.
-		w, err := s.Encode(R{D: dur})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		w := mustEncode(t, s, R{D: dur})
 		b := dur.Bytes()
 		if string(w) != string(b[:]) {
 			t.Fatalf("wire = %x, want the 12-byte duration fixed %x", w, b)
 		}
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 		if got.D != dur {
 			t.Errorf("round-trip: got %v, want %v", got.D, dur)
 		}
@@ -609,10 +438,7 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			D *Duration `avro:"d"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		ft := s.Root().Fields[0].Type
 		if ft.Type != "union" || len(ft.Branches) != 2 || ft.Branches[0].Type != "null" {
 			t.Fatalf("pointer field type = %+v, want [\"null\", duration]", ft)
@@ -624,9 +450,7 @@ func TestSchemaForAvroDuration(t *testing.T) {
 				t.Fatalf("encode %v: %v", v, err)
 			}
 			var got R
-			if _, err := s.Decode(w, &got); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
+			mustDecode(t, s, w, &got)
 			if (v == nil) != (got.D == nil) || (v != nil && *got.D != *v) {
 				t.Errorf("round-trip ptr: got %v want %v", got.D, v)
 			}
@@ -637,24 +461,16 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			D []Duration `avro:"d"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		ft := s.Root().Fields[0].Type
 		if ft.Type != "array" || ft.Items == nil {
 			t.Fatalf("slice field type = %+v, want array of duration", ft)
 		}
 		assertDurationFixed(t, *ft.Items)
 		rt := R{D: []Duration{dur, {}}}
-		w, err := s.Encode(rt)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		w := mustEncode(t, s, rt)
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 		if len(got.D) != 2 || got.D[0] != dur || got.D[1] != (Duration{}) {
 			t.Errorf("round-trip slice: got %v", got.D)
 		}
@@ -664,23 +480,15 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			D [2]Duration `avro:"d"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		ft := s.Root().Fields[0].Type
 		if ft.Type != "array" || ft.Items == nil {
 			t.Fatalf("array field type = %+v, want array of duration", ft)
 		}
 		assertDurationFixed(t, *ft.Items)
-		w, err := s.Encode(R{D: [2]Duration{dur, {}}})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		w := mustEncode(t, s, R{D: [2]Duration{dur, {}}})
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 		if got.D[0] != dur || got.D[1] != (Duration{}) {
 			t.Errorf("round-trip array: got %v", got.D)
 		}
@@ -690,23 +498,15 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			D map[string]Duration `avro:"d"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		ft := s.Root().Fields[0].Type
 		if ft.Type != "map" || ft.Values == nil {
 			t.Fatalf("map field type = %+v, want map of duration", ft)
 		}
 		assertDurationFixed(t, *ft.Values)
-		w, err := s.Encode(R{D: map[string]Duration{"k": dur}})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		w := mustEncode(t, s, R{D: map[string]Duration{"k": dur}})
 		var got R
-		if _, err := s.Decode(w, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, w, &got)
 		if got.D["k"] != dur {
 			t.Errorf("round-trip map: got %v", got.D)
 		}
@@ -719,10 +519,7 @@ func TestSchemaForAvroDuration(t *testing.T) {
 		type R struct {
 			In Inner `avro:"in"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[R](t)
 		inner := s.Root().Fields[0].Type
 		if inner.Type != "record" {
 			t.Fatalf("inner field type = %q, want record", inner.Type)
@@ -758,19 +555,11 @@ func TestSchemaForDecimal(t *testing.T) {
 		Name  string  `avro:"name"`
 		Price big.Rat `avro:"price,decimal(10,2)"`
 	}
-	s, err := SchemaFor[Product]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Product](t)
 	p := Product{Name: "Widget", Price: *new(big.Rat).SetFrac64(314, 100)}
-	data, err := s.Encode(&p)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &p)
 	var got Product
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got.Price.Cmp(&p.Price) != 0 {
 		t.Errorf("price: got %s, want %s", got.Price.RatString(), p.Price.RatString())
 	}
@@ -781,19 +570,11 @@ func TestSchemaForDefault(t *testing.T) {
 		Name  string `avro:"name,default=unknown"`
 		Score int32  `avro:"score,default=42"`
 	}
-	s, err := SchemaFor[Record]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Record](t)
 	// Encode from map with missing fields — both defaults should apply.
-	data, err := s.Encode(map[string]any{})
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, map[string]any{})
 	var got Record
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got.Name != "unknown" {
 		t.Errorf("name: got %q, want %q", got.Name, "unknown")
 	}
@@ -807,29 +588,15 @@ func TestSchemaForAlias(t *testing.T) {
 		EmailAddress string `avro:"email_address,alias=email"`
 		Name         string `avro:"name"`
 	}
-	reader, err := SchemaFor[V2]()
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer, err := Parse(`{"type":"record","name":"V2","fields":[
+	reader := mustSchemaFor[V2](t)
+	writer := mustParse(t, `{"type":"record","name":"V2","fields":[
 		{"name":"email","type":"string"},
 		{"name":"name","type":"string"}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{"email": "a@b.com", "name": "Alice"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{"email": "a@b.com", "name": "Alice"})
 	var got V2
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.EmailAddress != "a@b.com" {
 		t.Errorf("email: got %q, want %q", got.EmailAddress, "a@b.com")
 	}
@@ -883,26 +650,14 @@ func TestSchemaForAliasMultiple(t *testing.T) {
 		EmailAddress string `avro:"email_address,alias=[email,e_mail]"`
 		Name         string `avro:"name"`
 	}
-	reader, err := SchemaFor[V2]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustSchemaFor[V2](t)
 	for _, writerName := range []string{"email", "e_mail"} {
-		writer, err := Parse(`{"type":"record","name":"V2","fields":[
-			{"name":"` + writerName + `","type":"string"},
+		writer := mustParse(t, `{"type":"record","name":"V2","fields":[
+			{"name":"`+writerName+`","type":"string"},
 			{"name":"name","type":"string"}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resolved, err := Resolve(writer, reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := writer.Encode(map[string]any{writerName: "a@b.com", "name": "Alice"})
-		if err != nil {
-			t.Fatal(err)
-		}
+		resolved := mustResolve(t, writer, reader)
+		data := mustEncode(t, writer, map[string]any{writerName: "a@b.com", "name": "Alice"})
 		var got V2
 		if _, err := resolved.Decode(data, &got); err != nil {
 			t.Fatalf("decode with writer field %q: %v", writerName, err)
@@ -923,16 +678,11 @@ func TestSchemaForTypeAlias(t *testing.T) {
 		List  []Inner `avro:"list"`
 	}
 
-	reader, err := SchemaFor[Outer]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustSchemaFor[Outer](t)
 
 	// Verify the alias appears in the generated schema.
 	var raw any
-	if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
-		t.Fatal(err)
-	}
+	mustUnmarshal(t, []byte(reader.String()), &raw)
 	fields := raw.(map[string]any)["fields"].([]any)
 	innerField := fields[1].(map[string]any)["type"].(map[string]any)
 	aliases, _ := innerField["aliases"].([]any)
@@ -941,32 +691,21 @@ func TestSchemaForTypeAlias(t *testing.T) {
 	}
 
 	// Verify resolution works against a writer using the old name.
-	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+	writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 		{"name":"name","type":"string"},
 		{"name":"inner","type":{"type":"record","name":"legacy_inner","fields":[
 			{"name":"value","type":"int"}
 		]}},
 		{"name":"list","type":{"type":"array","items":"legacy_inner"}}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{
 		"name":  "test",
 		"inner": map[string]any{"value": int32(42)},
 		"list":  []any{map[string]any{"value": int32(7)}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var got Outer
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.Inner.Value != 42 {
 		t.Errorf("inner.value: got %d, want 42", got.Inner.Value)
 	}
@@ -983,33 +722,19 @@ func TestSchemaForTypeAliasNullable(t *testing.T) {
 		Inner *Inner `avro:"inner,type-alias=old_inner"`
 	}
 
-	reader, err := SchemaFor[Outer]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustSchemaFor[Outer](t)
 
-	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+	writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 		{"name":"inner","type":["null",{"type":"record","name":"old_inner","fields":[
 			{"name":"value","type":"int"}
 		]}]}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{
 		"inner": map[string]any{"value": int32(99)},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var got Outer
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.Inner == nil || got.Inner.Value != 99 {
 		t.Errorf("inner: got %+v, want &{Value:99}", got.Inner)
 	}
@@ -1023,33 +748,19 @@ func TestSchemaForTypeAliasMap(t *testing.T) {
 		Items map[string]Inner `avro:"items,type-alias=old_inner"`
 	}
 
-	reader, err := SchemaFor[Outer]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := mustSchemaFor[Outer](t)
 
-	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+	writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 		{"name":"items","type":{"type":"map","values":{"type":"record","name":"old_inner","fields":[
 			{"name":"value","type":"int"}
 		]}}}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{
 		"items": map[string]any{"k": map[string]any{"value": int32(5)}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var got Outer
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.Items["k"].Value != 5 {
 		t.Errorf("items[k].value: got %d, want 5", got.Items["k"].Value)
 	}
@@ -1068,19 +779,14 @@ func TestSchemaForTypeAliasEnum(t *testing.T) {
 	type Outer struct {
 		State Status `avro:"state,type-alias=OldStatus"`
 	}
-	reader, err := SchemaFor[Outer](CustomType{
+	reader := mustSchemaFor[Outer](t, CustomType{
 		GoType: reflect.TypeFor[Status](),
 		Schema: &enumNode,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	// Verify the alias appears on the enum type.
 	var raw any
-	if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
-		t.Fatal(err)
-	}
+	mustUnmarshal(t, []byte(reader.String()), &raw)
 	fields := raw.(map[string]any)["fields"].([]any)
 	enumType := fields[0].(map[string]any)["type"].(map[string]any)
 	if enumType["type"] != "enum" {
@@ -1092,24 +798,13 @@ func TestSchemaForTypeAliasEnum(t *testing.T) {
 	}
 
 	// Verify resolution against a writer using the old name.
-	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+	writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 		{"name":"state","type":{"type":"enum","name":"OldStatus","symbols":["ACTIVE","INACTIVE"]}}
 	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := Resolve(writer, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := writer.Encode(map[string]any{"state": "ACTIVE"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolved := mustResolve(t, writer, reader)
+	data := mustEncode(t, writer, map[string]any{"state": "ACTIVE"})
 	var got Outer
-	if _, err := resolved.Decode(data, &got); err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, resolved, data, &got)
 	if got.State != "ACTIVE" {
 		t.Errorf("state: got %q, want ACTIVE", got.State)
 	}
@@ -1196,9 +891,7 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 			A Inner `avro:"a,type-alias=old_inner"`
 			B Inner `avro:"b,type-alias=old_inner"`
 		}
-		if _, err := SchemaFor[Outer](); err != nil {
-			t.Fatal(err)
-		}
+		mustSchemaFor[Outer](t)
 	})
 
 	t.Run("two fields same type conflicting aliases", func(t *testing.T) {
@@ -1216,34 +909,20 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 			A Inner `avro:"a,type-alias=old_inner"`
 			B Inner `avro:"b"`
 		}
-		reader, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
-		writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+		reader := mustSchemaFor[Outer](t)
+		writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 			{"name":"a","type":{"type":"record","name":"old_inner","fields":[
 				{"name":"value","type":"int"}
 			]}},
 			{"name":"b","type":"old_inner"}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resolved, err := Resolve(writer, reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := writer.Encode(map[string]any{
+		resolved := mustResolve(t, writer, reader)
+		data := mustEncode(t, writer, map[string]any{
 			"a": map[string]any{"value": int32(1)},
 			"b": map[string]any{"value": int32(2)},
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
 		var got Outer
-		if _, err := resolved.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, resolved, data, &got)
 		if got.A.Value != 1 || got.B.Value != 2 {
 			t.Errorf("got A=%d B=%d, want A=1 B=2", got.A.Value, got.B.Value)
 		}
@@ -1268,9 +947,7 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 			Direct Inner   `avro:"direct,type-alias=old_inner"`
 			List   []Inner `avro:"list,type-alias=old_inner"`
 		}
-		if _, err := SchemaFor[Outer](); err != nil {
-			t.Fatal(err)
-		}
+		mustSchemaFor[Outer](t)
 	})
 
 	t.Run("array of named ref only first aliased", func(t *testing.T) {
@@ -1278,34 +955,20 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 			Direct Inner   `avro:"direct,type-alias=old_inner"`
 			List   []Inner `avro:"list"`
 		}
-		reader, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
-		writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+		reader := mustSchemaFor[Outer](t)
+		writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 			{"name":"direct","type":{"type":"record","name":"old_inner","fields":[
 				{"name":"value","type":"int"}
 			]}},
 			{"name":"list","type":{"type":"array","items":"old_inner"}}
 		]}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resolved, err := Resolve(writer, reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := writer.Encode(map[string]any{
+		resolved := mustResolve(t, writer, reader)
+		data := mustEncode(t, writer, map[string]any{
 			"direct": map[string]any{"value": int32(10)},
 			"list":   []any{map[string]any{"value": int32(20)}},
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
 		var got Outer
-		if _, err := resolved.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, resolved, data, &got)
 		if got.Direct.Value != 10 {
 			t.Errorf("direct.value: got %d, want 10", got.Direct.Value)
 		}
@@ -1318,25 +981,17 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 		type Outer struct {
 			M *map[string][]Inner `avro:"m,type-alias=old_inner"`
 		}
-		_, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		mustSchemaFor[Outer](t)
 	})
 
 	t.Run("fixed type", func(t *testing.T) {
 		type Outer struct {
 			Hash [16]byte `avro:"hash,type-alias=old_hash"`
 		}
-		reader, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		reader := mustSchemaFor[Outer](t)
 		// Verify the alias appears on the fixed type.
 		var raw any
-		if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(reader.String()), &raw)
 		fields := raw.(map[string]any)["fields"].([]any)
 		hashField := fields[0].(map[string]any)["type"].(map[string]any)
 		if hashField["type"] != "fixed" {
@@ -1361,15 +1016,10 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 			A Inner `avro:"a,type-alias=old_inner"`
 			B Inner `avro:"b,type-alias=old_inner"`
 		}
-		s, err := SchemaFor[Outer](WithNamespace("com.example"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Outer](t, WithNamespace("com.example"))
 		// The alias must be present on the (namespaced) Inner definition.
 		var raw map[string]any
-		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(s.String()), &raw)
 		aField := raw["fields"].([]any)[0].(map[string]any)["type"].(map[string]any)
 		aliases, _ := aField["aliases"].([]any)
 		if len(aliases) != 1 || aliases[0] != "old_inner" {
@@ -1390,16 +1040,13 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 }
 
 // TestSchemaForTypeAliasCrossRecord pins type-alias dedup scope ACROSS record
-// boundaries. The dedup state (which type-aliases have been applied to each
-// named type) is keyed on a type's fullname and must span the whole inference,
-// exactly like the named-type registry (seen): a named type is defined once and
-// may be referenced from any record. TestSchemaForTypeAliasNamedRef covers only
-// the same-record case (defining and referencing field in one struct); this
-// covers a named type defined in one record and referenced — with the SAME
-// alias — from a DIFFERENT (nested) record reached through every inferType
-// recursion arm. Per-record dedup state spuriously rejected these: the nested
-// record never saw the earlier application, so a reference fell into the
-// "defined without type-alias" branch with a factually false message.
+// boundaries. The dedup state is keyed on a type's fullname and must span the
+// whole inference, exactly like the named-type registry: a named type is defined
+// once and may be referenced from any record. TestSchemaForTypeAliasNamedRef
+// covers only the same-record case; this covers a named type defined in one
+// record and referenced with the SAME alias from a DIFFERENT nested record
+// reached through every inferType recursion arm, which per-record dedup state
+// spuriously rejected.
 func TestSchemaForTypeAliasCrossRecord(t *testing.T) {
 	type Inner struct {
 		Value int32 `avro:"value"`
@@ -1429,9 +1076,7 @@ func TestSchemaForTypeAliasCrossRecord(t *testing.T) {
 		// Structural proof: the defining field's type is the Inner object with the
 		// alias; the nested field's Ref is the bare string "Inner".
 		var raw map[string]any
-		if err := json.Unmarshal([]byte(js), &raw); err != nil {
-			t.Fatal(err)
-		}
+		mustUnmarshal(t, []byte(js), &raw)
 		fields := raw["fields"].([]any)
 		defType := fields[0].(map[string]any)["type"].(map[string]any)
 		if defType["name"] != "Inner" {
@@ -1576,22 +1221,9 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 			Base
 			Name string `avro:"name"`
 		}
-		s, err := SchemaFor[User]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[User](t)
 		u := User{Base: Base{ID: 123}, Name: "Alice"}
-		data, err := s.Encode(&u)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
-		var got User
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if got != u {
-			t.Errorf("got %+v, want %+v", got, u)
-		}
+		roundTripEq(t, s, u)
 	})
 
 	t.Run("inline", func(t *testing.T) {
@@ -1599,124 +1231,62 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 			Name    string `avro:"name"`
 			Address Addr   `avro:",inline"`
 		}
-		s, err := SchemaFor[User]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[User](t)
 		u := User{Name: "Alice", Address: Addr{City: "Seattle", Zip: 98101}}
-		data, err := s.Encode(&u)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
-		var got User
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if got != u {
-			t.Errorf("got %+v, want %+v", got, u)
-		}
+		roundTripEq(t, s, u)
 	})
 
 	t.Run("pointer inline", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type Outer struct {
 			Name  string `avro:"name"`
 			Inner *Inner `avro:",inline"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Outer](t)
 		o := Outer{Name: "test", Inner: &Inner{X: 42}}
-		data, err := s.Encode(&o)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &o)
 		var got Outer
 		got.Inner = &Inner{}
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Inner.X != 42 {
 			t.Errorf("got %d, want 42", got.Inner.X)
 		}
 	})
 
 	t.Run("pointer embedded", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type Outer struct {
 			*Inner
 			Y int32 `avro:"y"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Outer](t)
 		o := Outer{Inner: &Inner{X: 1}, Y: 2}
-		data, err := s.Encode(&o)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &o)
 		var got Outer
 		got.Inner = &Inner{}
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Inner.X != 1 || got.Y != 2 {
 			t.Errorf("got %+v, want x=1 y=2", got)
 		}
 	})
 
 	t.Run("named embedded", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type Outer struct {
 			Inner `avro:"inner"`
 			Y     int32 `avro:"y"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Outer](t)
 		o := Outer{Inner: Inner{X: 1}, Y: 2}
-		data, err := s.Encode(&o)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
-		var got Outer
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if got != o {
-			t.Errorf("got %+v, want %+v", got, o)
-		}
+		roundTripEq(t, s, o)
 	})
 
 	t.Run("ignored embedded", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type Outer struct {
 			Inner `avro:"-"`
 			Y     int32 `avro:"y"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := s.Encode(&Outer{Y: 42})
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		s := mustSchemaFor[Outer](t)
+		data := mustEncode(t, s, &Outer{Y: 42})
 		var got Outer
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Y != 42 {
 			t.Errorf("got %d, want 42", got.Y)
 		}
@@ -1732,22 +1302,9 @@ func TestSchemaForNestedRecord(t *testing.T) {
 		Name    string  `avro:"name"`
 		Address Address `avro:"address"`
 	}
-	s, err := SchemaFor[User]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[User](t)
 	u := User{Name: "Alice", Address: Address{City: "Seattle", Zip: 98101}}
-	data, err := s.Encode(&u)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	var got User
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got != u {
-		t.Errorf("got %+v, want %+v", got, u)
-	}
+	roundTripEq(t, s, u)
 }
 
 func TestSchemaForDeepNesting(t *testing.T) {
@@ -1763,22 +1320,9 @@ func TestSchemaForDeepNesting(t *testing.T) {
 		Name    string  `avro:"name"`
 		Address Address `avro:"address"`
 	}
-	s, err := SchemaFor[User]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[User](t)
 	u := User{Name: "Alice", Address: Address{City: "Seattle", Street: Street{Name: "Main St", Number: 42}}}
-	data, err := s.Encode(&u)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	var got User
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got != u {
-		t.Errorf("got %+v, want %+v", got, u)
-	}
+	roundTripEq(t, s, u)
 }
 
 func TestSchemaForDuplicateNestedType(t *testing.T) {
@@ -1790,22 +1334,9 @@ func TestSchemaForDuplicateNestedType(t *testing.T) {
 		Home Address `avro:"home"`
 		Work Address `avro:"work"`
 	}
-	s, err := SchemaFor[User]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[User](t)
 	u := User{Name: "Alice", Home: Address{City: "Seattle"}, Work: Address{City: "Portland"}}
-	data, err := s.Encode(&u)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	var got User
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got != u {
-		t.Errorf("got %+v, want %+v", got, u)
-	}
+	roundTripEq(t, s, u)
 }
 
 func TestSchemaForFourLevelWithReuse(t *testing.T) {
@@ -1824,10 +1355,7 @@ func TestSchemaForFourLevelWithReuse(t *testing.T) {
 		Name string `avro:"name"`
 		Sub  L4     `avro:"sub"`
 	}
-	s, err := SchemaFor[L1]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[L1](t)
 	v := L1{
 		Name: "test",
 		Sub: L4{
@@ -1835,33 +1363,15 @@ func TestSchemaForFourLevelWithReuse(t *testing.T) {
 			Reuse: L2{V: 2},
 		},
 	}
-	data, err := s.Encode(&v)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	var got L1
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got != v {
-		t.Errorf("got %+v, want %+v", got, v)
-	}
+	roundTripEq(t, s, v)
 }
 
 func TestSchemaForEmptyStruct(t *testing.T) {
 	type Empty struct{}
-	s, err := SchemaFor[Empty]()
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := s.Encode(&Empty{})
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	s := mustSchemaFor[Empty](t)
+	data := mustEncode(t, s, &Empty{})
 	var got Empty
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 }
 
 func TestSchemaForCollections(t *testing.T) {
@@ -1870,22 +1380,14 @@ func TestSchemaForCollections(t *testing.T) {
 			Tags     []string          `avro:"tags"`
 			Metadata map[string]string `avro:"metadata"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{
 			Tags:     []string{"go", "avro"},
 			Metadata: map[string]string{"env": "prod"},
 		}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if !reflect.DeepEqual(got, r) {
 			t.Errorf("got %+v, want %+v", got, r)
 		}
@@ -1898,19 +1400,11 @@ func TestSchemaForCollections(t *testing.T) {
 		type Record struct {
 			Items []Item `avro:"items"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{Items: []Item{{ID: 1}, {ID: 2}}}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if !reflect.DeepEqual(got, r) {
 			t.Errorf("got %+v, want %+v", got, r)
 		}
@@ -1920,19 +1414,11 @@ func TestSchemaForCollections(t *testing.T) {
 		type Record struct {
 			Data []byte `avro:"data"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{Data: []byte{1, 2, 3}}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if !reflect.DeepEqual(got.Data, r.Data) {
 			t.Errorf("got %v, want %v", got.Data, r.Data)
 		}
@@ -1942,41 +1428,20 @@ func TestSchemaForCollections(t *testing.T) {
 		type Record struct {
 			A [3]int32 `avro:"a"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{A: [3]int32{1, 2, 3}}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
-		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if got != r {
-			t.Errorf("got %+v, want %+v", got, r)
-		}
+		roundTripEq(t, s, r)
 	})
 
 	t.Run("fixed byte array", func(t *testing.T) {
 		type Record struct {
 			Hash [32]byte `avro:"hash"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{Hash: [32]byte{1, 2, 3}}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != r {
 			t.Errorf("got %v, want %v", got, r)
 		}
@@ -1998,22 +1463,9 @@ func TestSchemaForAllPrimitives(t *testing.T) {
 		F64 float64 `avro:"f64"`
 		S   string  `avro:"s"`
 	}
-	s, err := SchemaFor[Prims]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Prims](t)
 	p := Prims{B: true, I8: 1, I16: 2, I32: 3, I64: 4, I: 5, U8: 6, U16: 7, U32: 8, F32: 1.5, F64: 3.14, S: "hello"}
-	data, err := s.Encode(&p)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	var got Prims
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got != p {
-		t.Errorf("got %+v, want %+v", got, p)
-	}
+	roundTripEq(t, s, p)
 }
 
 func TestSchemaForUUID(t *testing.T) {
@@ -2021,19 +1473,11 @@ func TestSchemaForUUID(t *testing.T) {
 		type Record struct {
 			ID string `avro:"id,uuid"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{ID: "550e8400-e29b-41d4-a716-446655440000"}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.ID != r.ID {
 			t.Errorf("got %q, want %q", got.ID, r.ID)
 		}
@@ -2043,19 +1487,11 @@ func TestSchemaForUUID(t *testing.T) {
 		type Record struct {
 			ID [16]byte `avro:"id,uuid"`
 		}
-		s, err := SchemaFor[Record]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[Record](t)
 		r := Record{ID: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}}
-		data, err := s.Encode(&r)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		data := mustEncode(t, s, &r)
 		var got Record
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != r {
 			t.Errorf("got %v, want %v", got, r)
 		}
@@ -2076,81 +1512,54 @@ func TestSchemaForInlineRejectsOtherOptions(t *testing.T) {
 		fn   func() (*Schema, error)
 	}{
 		{"inline + default=", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,default=foo"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + alias=", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,alias=old"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + type-alias=", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,type-alias=old"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + omitzero", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,omitzero"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + date", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,date"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + uuid", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,uuid"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + timestamp-millis", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,timestamp-millis"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + decimal(10,2)", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,decimal(10,2)"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"explicit name + inline", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:"Name,inline"`
 			}
@@ -2168,17 +1577,11 @@ func TestSchemaForInlineRejectsOtherOptions(t *testing.T) {
 
 	// Positive control: plain inline (no other options) still works.
 	t.Run("plain inline still accepted", func(t *testing.T) {
-		type Embed struct {
-			A int32 `avro:"a"`
-		}
 		type Outer struct {
 			Embed `avro:",inline"`
 			B     string `avro:"b"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		s := mustSchemaFor[Outer](t)
 		got := s.String()
 		// Flattened: should have both a and b at the top level.
 		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"b"`) {
@@ -2195,15 +1598,14 @@ func TestSchemaForInlineRejectsOtherOptions(t *testing.T) {
 // to reach the regular field-handling code path.
 type InlineScalarAlias string
 
-// TestSchemaForInlineRejectsNonStructFieldType locks the rule that the
-// inline directive requires a struct (or pointer-to-struct) field type.
-// Inline flattens an embedded struct's fields into the parent — on a
-// non-struct field there is no struct to flatten, so the user's tag has
-// no defensible meaning and the prior silent-drop produced a schema in
-// which the field simply disappeared. The rejection rationale mirrors
-// the sibling "inline is incompatible with X" errors: inline has nothing
-// to apply itself to. Covers Go scalar, slice, map, pointer-to-scalar,
-// and anonymous embed of a named non-struct exported type.
+// TestSchemaForInlineRejectsNonStructFieldType locks the rule that the inline
+// directive requires a struct (or pointer-to-struct) field type. Inline flattens
+// an embedded struct's fields into the parent, so on a non-struct field there is
+// no struct to flatten, the user's tag has no defensible meaning, and the prior
+// silent-drop produced a schema in which the field simply disappeared — the
+// rejection mirrors the sibling "inline is incompatible with X" errors. Covers Go
+// scalar, slice, map, pointer-to-scalar, and anonymous embed of a named
+// non-struct exported type.
 func TestSchemaForInlineRejectsNonStructFieldType(t *testing.T) {
 	cases := []struct {
 		name string
@@ -2264,34 +1666,22 @@ func TestSchemaForInlineRejectsNonStructFieldType(t *testing.T) {
 	// Positive controls: ,inline on a struct and on a pointer-to-struct
 	// still flattens the embed's fields into the parent.
 	t.Run("struct field + ,inline still flattens", func(t *testing.T) {
-		type Embed struct {
-			A int32 `avro:"a"`
-		}
 		type R struct {
 			Foo Embed `avro:",inline"`
 			Bar int32 `avro:"bar"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		got := s.String()
 		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"bar"`) {
 			t.Errorf("expected flattened a + bar fields; got %s", got)
 		}
 	})
 	t.Run("*struct field + ,inline still flattens", func(t *testing.T) {
-		type Embed struct {
-			A int32 `avro:"a"`
-		}
 		type R struct {
 			Foo *Embed `avro:",inline"`
 			Bar int32  `avro:"bar"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		got := s.String()
 		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"bar"`) {
 			t.Errorf("expected flattened a + bar fields; got %s", got)
@@ -2429,17 +1819,13 @@ func TestSchemaForDecimalRejectsNonBigRat(t *testing.T) {
 	}
 }
 
-// TestSchemaForLogicalOnNumericKind locks the rule that integer-wire
-// logical types (date, time-millis, time-micros, timestamp-*,
-// local-timestamp-*) attached to a plain Go integer field produce a
-// schema carrying the logicalType annotation when the Go field's
-// natural Avro wire type matches the logical's required wire type.
-// Mismatched Go kinds (e.g., date on int64 — date requires int wire
-// but int64 naturally maps to long) are rejected at SchemaFor time
-// rather than silently dropping the user's logical-type tag.
-//
-// Acceptance and rejection both round-trip end-to-end for the
-// accepted shape: encode + decode against the inferred schema.
+// TestSchemaForLogicalOnNumericKind locks the rule that integer-wire logical
+// types attached to a plain Go integer field produce a schema carrying the
+// logicalType annotation when the field's natural Avro wire type matches the
+// logical's required one. Mismatched Go kinds — date on int64, where date
+// requires int wire — are rejected at SchemaFor time rather than silently
+// dropping the user's tag. Acceptance and rejection both round-trip end to end
+// for the accepted shape.
 func TestSchemaForLogicalOnNumericKind(t *testing.T) {
 	intWireAccepted := []struct {
 		name     string
@@ -2611,18 +1997,10 @@ func TestSchemaForLogicalOnNumericKind(t *testing.T) {
 		type R struct {
 			D int32 `avro:"d,date"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
-		enc, err := s.Encode(&R{D: 19723})
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
+		s := mustSchemaFor[R](t)
+		enc := mustEncode(t, s, &R{D: 19723})
 		var got R
-		if _, err := s.Decode(enc, &got); err != nil {
-			t.Fatalf("Decode: %v", err)
-		}
+		mustDecode(t, s, enc, &got)
 		if got.D != 19723 {
 			t.Errorf("got %d, want 19723", got.D)
 		}
@@ -2632,18 +2010,10 @@ func TestSchemaForLogicalOnNumericKind(t *testing.T) {
 		type R struct {
 			T int64 `avro:"t,timestamp-millis"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
-		enc, err := s.Encode(&R{T: 1700000000000})
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
+		s := mustSchemaFor[R](t)
+		enc := mustEncode(t, s, &R{T: 1700000000000})
 		var got R
-		if _, err := s.Decode(enc, &got); err != nil {
-			t.Fatalf("Decode: %v", err)
-		}
+		mustDecode(t, s, enc, &got)
 		if got.T != 1700000000000 {
 			t.Errorf("got %d, want 1700000000000", got.T)
 		}
@@ -2733,10 +2103,7 @@ func TestSchemaForIgnored(t *testing.T) {
 		Name    string `avro:"name"`
 		Ignored int    `avro:"-"`
 	}
-	s, err := SchemaFor[Record]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Record](t)
 	var m map[string]any
 	json.Unmarshal([]byte(s.Canonical()), &m)
 	fields := m["fields"].([]any)
@@ -2772,90 +2139,53 @@ type recMutualB struct {
 
 func TestSchemaForRecursive(t *testing.T) {
 	t.Run("linked list", func(t *testing.T) {
-		s, err := SchemaFor[recNode]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[recNode](t)
 		// Round-trip encode/decode a 3-node list.
 		head := &recNode{Value: 1, Next: &recNode{Value: 2, Next: &recNode{Value: 3}}}
-		data, err := s.Encode(head)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, head)
 		var got recNode
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Value != 1 || got.Next == nil || got.Next.Value != 2 || got.Next.Next == nil || got.Next.Next.Value != 3 || got.Next.Next.Next != nil {
 			t.Errorf("decoded list mismatch: %+v", got)
 		}
 	})
 
 	t.Run("with namespace", func(t *testing.T) {
-		s, err := SchemaFor[recNode](WithNamespace("com.example"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[recNode](t, WithNamespace("com.example"))
 		// Ensure the namespace is applied to the root and the recursive
 		// reference resolves to the namespaced name.
 		head := &recNode{Value: 42}
-		if _, err := s.Encode(head); err != nil {
-			t.Fatal(err)
-		}
+		mustEncode(t, s, head)
 	})
 
 	t.Run("tree via slice", func(t *testing.T) {
-		s, err := SchemaFor[recTree]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[recTree](t)
 		root := &recTree{Value: 1, Children: []*recTree{{Value: 2}, {Value: 3, Children: []*recTree{{Value: 4}}}}}
-		data, err := s.Encode(root)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, root)
 		var got recTree
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Value != 1 || len(got.Children) != 2 || got.Children[1].Children[0].Value != 4 {
 			t.Errorf("decoded tree mismatch: %+v", got)
 		}
 	})
 
 	t.Run("recursion via map", func(t *testing.T) {
-		s, err := SchemaFor[recMap]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[recMap](t)
 		root := &recMap{Name: "root", Branches: map[string]*recMap{"a": {Name: "leaf"}}}
-		data, err := s.Encode(root)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, root)
 		var got recMap
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.Name != "root" || got.Branches["a"].Name != "leaf" {
 			t.Errorf("decoded map mismatch: %+v", got)
 		}
 	})
 
 	t.Run("mutual recursion", func(t *testing.T) {
-		s, err := SchemaFor[recMutualA]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[recMutualA](t)
 		in := &recMutualA{AVal: 1, B: &recMutualB{BVal: 2, A: &recMutualA{AVal: 3}}}
-		data, err := s.Encode(in)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := mustEncode(t, s, in)
 		var got recMutualA
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatal(err)
-		}
+		mustDecode(t, s, data, &got)
 		if got.AVal != 1 || got.B.BVal != 2 || got.B.A.AVal != 3 {
 			t.Errorf("mutual recursion mismatch: %+v", got)
 		}
@@ -2888,15 +2218,9 @@ func TestSchemaForWithName(t *testing.T) {
 	type UserV2 struct {
 		Name string `avro:"name"`
 	}
-	s, err := SchemaFor[UserV2](WithNamespace("com.example"), WithName("User"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[UserV2](t, WithNamespace("com.example"), WithName("User"))
 	// The schema should be compatible with a writer using the name "User".
-	writer, err := Parse(`{"type":"record","name":"User","namespace":"com.example","fields":[{"name":"name","type":"string"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	writer := mustParse(t, `{"type":"record","name":"User","namespace":"com.example","fields":[{"name":"name","type":"string"}]}`)
 	if err := CheckCompatibility(writer, s); err != nil {
 		t.Fatalf("schemas should be compatible: %v", err)
 	}
@@ -2910,19 +2234,11 @@ func TestSchemaForFieldConflict(t *testing.T) {
 		Base
 		FullName string `avro:"Name"` // tagged as "Name", depth 0
 	}
-	s, err := SchemaFor[User]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[User](t)
 	u := User{FullName: "direct"}
-	data, err := s.Encode(&u)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	data := mustEncode(t, s, &u)
 	var got User
-	if _, err := s.Decode(data, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &got)
 	if got.FullName != "direct" {
 		t.Errorf("got %q, want %q", got.FullName, "direct")
 	}
@@ -2953,10 +2269,7 @@ type namedEmbeddedBadTag struct {
 
 func TestSchemaForUnexportedFields(t *testing.T) {
 	t.Run("unexported field", func(t *testing.T) {
-		s, err := SchemaFor[unexportedFieldStruct]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[unexportedFieldStruct](t)
 		data, _ := s.Encode(&unexportedFieldStruct{Name: "test"})
 		var got unexportedFieldStruct
 		s.Decode(data, &got)
@@ -2966,10 +2279,7 @@ func TestSchemaForUnexportedFields(t *testing.T) {
 	})
 
 	t.Run("unexported embed", func(t *testing.T) {
-		s, err := SchemaFor[unexportedEmbedStruct]()
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := mustSchemaFor[unexportedEmbedStruct](t)
 		data, _ := s.Encode(&unexportedEmbedStruct{Name: "test"})
 		var got unexportedEmbedStruct
 		s.Decode(data, &got)
@@ -3201,10 +2511,7 @@ func TestSchemaForTextMarshalerInferredAsString(t *testing.T) {
 	type Record struct {
 		A customString `avro:"a"`
 	}
-	s, err := SchemaFor[Record]()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustSchemaFor[Record](t)
 	root := s.Root()
 	if len(root.Fields) == 0 {
 		t.Fatal("expected fields")
@@ -3218,9 +2525,7 @@ func TestSchemaForOmitzeroTag(t *testing.T) {
 	type Record struct {
 		Name string `avro:"name,omitzero"`
 	}
-	if _, err := SchemaFor[Record](); err != nil {
-		t.Fatal(err)
-	}
+	mustSchemaFor[Record](t)
 }
 
 func TestSchemaForDuplicateUUID(t *testing.T) {
@@ -3238,9 +2543,7 @@ func TestSchemaForDuplicateUUID(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out TwoUUIDs
-	if _, err := s.Decode(enc, &out); err != nil {
-		t.Fatal(err)
-	}
+	mustDecode(t, s, enc, &out)
 	if out != input {
 		t.Fatalf("round-trip: got %v, want %v", out, input)
 	}
@@ -3283,32 +2586,21 @@ func TestSchemaForCustomTypeNoAvroType(t *testing.T) {
 	}
 }
 
-// TestRegression_SchemaForShadowedEmbedShallowestWins pins the
-// shadowed-embed precedence rule: doc.go:147-149 documents "the
-// shallowest wins" for same-name fields, and reflect.go's
-// typeFieldMapping (line 322-323) implements it at runtime. Without
-// this, schema_for.go's collectFields dedup (line 313-321) would only
-// special-case tagged-beats-untagged and keep first-seen for
-// same-tagged-status — the deeper embedded field, because
-// collectFields appends nested-struct fields BEFORE outer fields.
-//
-// Observable consequence without the rule: encode of a legal outer.X
-// int64 value against the inferred schema fails with "overflows int32"
-// because the schema declares the embedded int32 type while the
-// runtime encoder uses the outer int64 value.
+// TestRegression_SchemaForShadowedEmbedShallowestWins pins the shadowed-embed
+// precedence rule: doc.go documents "the shallowest wins" for same-name fields
+// and reflect.go's typeFieldMapping implements it at runtime. Without it,
+// collectFields' dedup would only special-case tagged-beats-untagged and keep
+// first-seen otherwise — the deeper embedded field, because collectFields
+// appends nested-struct fields BEFORE outer ones. The observable consequence:
+// encode of a legal outer int64 fails with "overflows int32", the schema
+// declaring the embedded int32 type while the encoder uses the outer value.
 func TestRegression_SchemaForShadowedEmbedShallowestWins(t *testing.T) {
 	t.Run("both_tagged_outer_wins", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type Outer struct {
 			Inner
 			X int64 `avro:"x"`
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[Outer](t)
 		js := s.String()
 		if !strings.Contains(js, `"type":"long"`) {
 			t.Fatalf("expected outer field's int64→long; got: %s", js)
@@ -3330,10 +2622,7 @@ func TestRegression_SchemaForShadowedEmbedShallowestWins(t *testing.T) {
 			Inner
 			X int64
 		}
-		s, err := SchemaFor[Outer]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[Outer](t)
 		js := s.String()
 		if !strings.Contains(js, `"type":"long"`) {
 			t.Fatalf("expected outer field's int64→long for untagged shadowed embed; got: %s", js)
@@ -3374,9 +2663,7 @@ func TestRegression_SchemaForSameDepthTaggedBeatsUntagged(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 	var got Collide
-	if _, err := s.Decode(b, &got); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
+	mustDecode(t, s, b, &got)
 	if got.Renamed != 7 {
 		t.Fatalf("tagged field should own the Avro name: got Renamed=%d want 7", got.Renamed)
 	}
@@ -3406,24 +2693,16 @@ func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
 			A ID `avro:"a,uuid"`
 			B ID `avro:"b"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		// Two distinct fixed(16) definitions, not one definition + a
 		// dangling reference.
 		if c := strings.Count(s.String(), `"size":16`); c != 2 {
 			t.Fatalf("want 2 fixed(16) definitions, got %d in %s", c, s.String())
 		}
 		in := R{A: ID{1, 2, 3}, B: ID{4, 5, 6}}
-		data, err := s.Encode(&in)
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
+		data := mustEncode(t, s, &in)
 		var got R
-		if _, err := s.Decode(data, &got); err != nil {
-			t.Fatalf("Decode: %v", err)
-		}
+		mustDecode(t, s, data, &got)
 		if got != in {
 			t.Fatalf("round trip: got %+v want %+v", got, in)
 		}
@@ -3434,9 +2713,7 @@ func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
 			B ID `avro:"b"`
 			A ID `avro:"a,uuid"`
 		}
-		if _, err := SchemaFor[R](); err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		mustSchemaFor[R](t)
 	})
 
 	// Boundary: the same type used the SAME way twice still collapses to
@@ -3446,10 +2723,7 @@ func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
 			A ID `avro:"a,uuid"`
 			B ID `avro:"b,uuid"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		if c := strings.Count(s.String(), `"size":16`); c != 1 {
 			t.Fatalf("want 1 fixed(16) definition (rest references), got %d in %s", c, s.String())
 		}
@@ -3464,7 +2738,7 @@ func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
 // Sibling of TestRegression_SchemaForMixedUUIDAndPlainSameType, which uses a
 // distinct name (ID) where the two forms coexist; the distinct-name pin
 // structurally cannot reach this name coincidence.
-func TestRegression_SchemaForUUIDNamedTypeMemoCollision(t *testing.T) {
+func TestMatrix_SchemaForUUIDNamedTypeMemoCollision(t *testing.T) {
 	type uuid [16]byte // Name() == "uuid", colliding with the hard-coded logical name
 
 	t.Run("uuid then plain rejected", func(t *testing.T) {
@@ -3554,14 +2828,12 @@ func TestRegression_SchemaForNamedTypeNameCollision(t *testing.T) {
 // The avro.Duration realization of the collision class the comment above
 // anticipates: avro.Duration infers a fixed named "duration" WITH
 // logicalType:"duration", and a plain `type duration [12]byte` field infers a
-// DIFFERENT fixed (size 12, no logicalType) also named "duration". Two
-// definitions claiming one Avro name is rejected by the same general
-// dedupNamedTypes check — not by any duration-specific code. The "two different"
-// assertion proves SchemaFor's dedup fired and not Parse's weaker
-// duplicate-name fallback: both messages contain "duration", so a bare
-// err != nil + name check would pass even with dedupNamedTypes' conflict arm
-// reverted (the exact hollow-pin failure mode a prior round shipped). Neuter-
-// confirm by reverting that arm: this pin must redden.
+// DIFFERENT fixed also named "duration". Two definitions claiming one Avro name
+// is rejected by the same general dedupNamedTypes check, not by any
+// duration-specific code. The "two different" assertion proves SchemaFor's dedup
+// fired rather than Parse's weaker fallback: both messages contain "duration",
+// so a bare err != nil + name check would pass even with the conflict arm
+// reverted — the exact hollow-pin failure mode a prior round shipped.
 func TestRegression_SchemaForAvroDurationCollision(t *testing.T) {
 	type duration [12]byte // plain fixed named "duration", NO logicalType
 	type R struct {
@@ -3585,15 +2857,12 @@ func TestRegression_SchemaForAvroDurationCollision(t *testing.T) {
 // object braces — must be preserved rather than rejected by the tag
 // bracket-balance scan (which exists only for the alias=[...] / decimal(...)
 // option forms).
-func TestRegression_SchemaForDefaultWithBrackets(t *testing.T) {
+func TestMatrix_SchemaForDefaultWithBrackets(t *testing.T) {
 	t.Run("unbalanced open paren", func(t *testing.T) {
 		type R struct {
 			X string `avro:"x,default=note (a"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		if !strings.Contains(s.String(), "note (a") {
 			t.Fatalf("default not preserved: %s", s.String())
 		}
@@ -3603,10 +2872,7 @@ func TestRegression_SchemaForDefaultWithBrackets(t *testing.T) {
 		type R struct {
 			X string `avro:"x,default=a]b"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		if !strings.Contains(s.String(), "a]b") {
 			t.Fatalf("default not preserved: %s", s.String())
 		}
@@ -3616,10 +2882,7 @@ func TestRegression_SchemaForDefaultWithBrackets(t *testing.T) {
 		type R struct {
 			X string `avro:"x,default=a,b,c"`
 		}
-		s, err := SchemaFor[R]()
-		if err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		s := mustSchemaFor[R](t)
 		if !strings.Contains(s.String(), "a,b,c") {
 			t.Fatalf("default not preserved: %s", s.String())
 		}
@@ -3631,9 +2894,7 @@ func TestRegression_SchemaForDefaultWithBrackets(t *testing.T) {
 		type R struct {
 			M map[string]int32 `avro:"m,default={\"a\":1,\"b\":2}"`
 		}
-		if _, err := SchemaFor[R](); err != nil {
-			t.Fatalf("SchemaFor: %v", err)
-		}
+		mustSchemaFor[R](t)
 	})
 
 	// Boundary: a malformed bracketed NON-default option still errors — the
@@ -3648,14 +2909,100 @@ func TestRegression_SchemaForDefaultWithBrackets(t *testing.T) {
 	})
 }
 
-// A narrow Go integer kind maps to a wider Avro type (int8/16, uint8/16 ->
-// int; uint32, uint -> long), so a default that fits the Avro type but not
-// the Go field would build a schema whose own default overflows the field
-// at decode-fill time. SchemaFor rejects it at build time, consistent with
-// its other Go-type/tag compatibility checks. The default is parsed with
-// the same lenient parser the wire path uses, so exponent / whole-number-
-// float forms are caught too.
-func TestRegression_SchemaForNarrowIntDefaultBounds(t *testing.T) {
+// sfDefaultClass is the JSON-parse class of a default= tag body. The tag text is
+// offered to a JSON decoder, and what comes back decides whether the default is
+// a decoded VALUE or the verbatim TEXT. The bracket cells above vary the tag's
+// punctuation — a different question, since every one of them is non-JSON and so
+// takes the verbatim arm without ever reaching the decision.
+//
+//	whole-json      the decoder consumes the entire tag -> the decoded value
+//	json-then-space trailing WHITESPACE only, still whole -> the decoded value
+//	json-then-junk  a valid JSON PREFIX with content after it -> verbatim
+//	not-json        the decoder fails outright -> verbatim
+//
+// json-then-junk separates "decoded the whole tag" from "decoded as much as it
+// could": the decoder stops at the end of the first value and reports no error,
+// so without the trailing check the tag would silently truncate to its prefix.
+// json-then-space is its boundary twin and must land on the OTHER side.
+//
+// The JSON spellings are quote-free: a struct tag cannot carry a raw double
+// quote, so a bare JSON string is not expressible as a default= tag and an array
+// stands in for the container shape.
+//
+// Each class is paired with a field type its decoded form is valid for, since a
+// default that survives the parse must still typecheck. The verbatim classes sit
+// on a string field: the only type their fallback text is valid for, and also
+// what makes truncation visible — a truncated "42 oops" would emit the number
+// 42, which a string field rejects.
+type sfDefaultClass struct {
+	name string
+	tag  string
+	typ  reflect.Type
+	// verbatim says the whole tag text must survive as a JSON string.
+	// Otherwise the tag is decoded and decodedWant is the emitted form.
+	verbatim    bool
+	decodedWant string
+}
+
+var sfDefaultClasses = []sfDefaultClass{
+	{name: "whole-json-number", tag: `42`, typ: reflect.TypeFor[int64](), decodedWant: `"default":42`},
+	{name: "whole-json-array", tag: `[1,2]`, typ: reflect.TypeFor[[]int64](), decodedWant: `"default":[1,2]`},
+	{name: "whole-json-true", tag: `true`, typ: reflect.TypeFor[bool](), decodedWant: `"default":true`},
+	{name: "json-then-space", tag: "42 ", typ: reflect.TypeFor[int64](), decodedWant: `"default":42`},
+	{name: "json-then-junk-word", tag: `42 oops`, typ: reflect.TypeFor[string](), verbatim: true},
+	{name: "json-then-junk-number", tag: `42 43`, typ: reflect.TypeFor[string](), verbatim: true},
+	{name: "json-then-junk-array", tag: `[1,2] there`, typ: reflect.TypeFor[string](), verbatim: true},
+	{name: "not-json-bare", tag: `oops`, typ: reflect.TypeFor[string](), verbatim: true},
+	{name: "not-json-leading-junk", tag: `oops 42`, typ: reflect.TypeFor[string](), verbatim: true},
+}
+
+// TestMatrix_SchemaForDefaultParseClass drives the class axis above. A
+// verbatim cell's expected text comes from marshalling the tag as a JSON
+// string rather than from hand-escaping it, so the cell asserts "the whole
+// tag survived" without restating the emitter's escaping rules.
+func TestMatrix_SchemaForDefaultParseClass(t *testing.T) {
+	t.Parallel()
+	verbatim, decoded := 0, 0
+	for _, c := range sfDefaultClasses {
+		t.Run(c.name, func(t *testing.T) {
+			fields := []reflect.StructField{{
+				Name: "X",
+				Type: c.typ,
+				Tag:  reflect.StructTag(`avro:"x,default=` + c.tag + `"`),
+			}}
+			s, err := schemaForScopeCell(t, fields, "", nil)
+			if err != nil {
+				t.Fatalf("SchemaFor: %v", err)
+			}
+			want := c.decodedWant
+			if c.verbatim {
+				b, err := json.Marshal(c.tag)
+				if err != nil {
+					t.Fatalf("marshal tag: %v", err)
+				}
+				want = `"default":` + string(b)
+			}
+			if got := s.String(); !strings.Contains(got, want) {
+				t.Fatalf("emitted default is not %s:\n %s", want, got)
+			}
+			if c.verbatim {
+				verbatim++
+			} else {
+				decoded++
+			}
+		})
+	}
+	// Both arms must occur: a build that stopped decoding altogether, or
+	// stopped falling back, would satisfy every cell on one side.
+	if verbatim == 0 || decoded == 0 {
+		t.Fatalf("the parse-class axis collapsed: %d verbatim, %d decoded", verbatim, decoded)
+	}
+	if verbatim < 3 || decoded < 3 {
+		t.Errorf("the axis has thinned: %d verbatim, %d decoded", verbatim, decoded)
+	}
+}
+
+func TestMatrix_SchemaForNarrowIntDefaultBounds(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		fn     func() (*Schema, error)
@@ -3783,15 +3130,13 @@ func TestRegression_SchemaForDefaultTrailingContentVerbatim(t *testing.T) {
 }
 
 // TestSchemaForRejectsJSONNumber locks the rule that json.Number cannot be a
-// SchemaFor field type. json.Number's Kind() is reflect.String and it
-// implements no text interface, so the Kind switch's String arm would emit
-// an Avro "string" schema — but the package's documented json.Number policy
-// is numeric-only: string/bytes/fixed/enum reject json.Number on both encode
-// and decode. SchemaFor is the package's one builder; emitting the single
-// Avro type its own codec is guaranteed to reject for that Go type is a
-// build-accepts / encode-rejects deferred failure, exactly the shape the
-// uuid/decimal/time SchemaFor strictness eliminated. So SchemaFor rejects
-// json.Number up front, naming the alternatives.
+// SchemaFor field type. json.Number's Kind() is reflect.String and it implements
+// no text interface, so the Kind switch's String arm would emit an Avro "string"
+// schema — but the package's documented json.Number policy is numeric-only, with
+// string/bytes/fixed/enum rejecting it on both encode and decode. SchemaFor is
+// the package's one builder, so emitting the single Avro type its own codec is
+// guaranteed to reject is a build-accepts / encode-rejects deferred failure,
+// exactly the shape the uuid/decimal/time SchemaFor strictness eliminated.
 func TestSchemaForRejectsJSONNumber(t *testing.T) {
 	type Event struct {
 		Seq json.Number `avro:"seq"`
@@ -3902,9 +3247,8 @@ func sampleValuePath(t reflect.Type, onPath map[reflect.Type]bool) reflect.Value
 		// SchemaFor rightly builds for the explicit tag — would then reject the
 		// zero value at Encode, masking a correct schema as a build-accepts/
 		// encode-rejects. A whole-second 2020 time is representable by every
-		// time/date logical (millis/micros/nanos, date, time-of-day) without
-		// overflow or sub-unit truncation. No monotonic reading, UTC location,
-		// so it round-trips identically.
+		// time/date logical without overflow or sub-unit truncation, with no
+		// monotonic reading and a UTC location, so it round-trips identically.
 		return reflect.ValueOf(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC))
 	}
 	if t == avroDurationType {
@@ -3981,20 +3325,17 @@ func withSamplePath(onPath map[reflect.Type]bool, t reflect.Type) map[reflect.Ty
 }
 
 // TestSchemaForEncodeParity is the generative net for the build-accepts /
-// encode-rejects bug class (the shape of the json.Number SchemaFor bug):
-// SchemaFor is the package's one Go-type → schema builder, and it has no
-// wire-format counterpart, so the encode/decode-parity and oracle lenses
-// never reach it. The invariant that DOES reach it: if SchemaFor ACCEPTS a
-// field type, Encode of a value of that type MUST also accept — otherwise
-// the schema builds but every Encode fails far from the SchemaFor call.
+// encode-rejects bug class, the shape of the json.Number SchemaFor bug:
+// SchemaFor is the package's one Go-type → schema builder and has no
+// wire-format counterpart, so the encode/decode-parity and oracle lenses never
+// reach it. The invariant that DOES: if SchemaFor ACCEPTS a field type, Encode
+// of a value of that type MUST also accept, or the schema builds and every
+// Encode fails far from the SchemaFor call.
 //
-// The sweep crosses every codec-special-cased / Kind-misleading Go type
-// (the high-risk surface — stdlib types whose reflect.Kind does not match
-// the Avro type the codec wants) plus named aliases, pointers, slices,
-// maps, and nesting. For each accepted type it encodes the zero value and
-// confirms the wire is readable; a reject is always safe (build-time
-// strictness cannot defer a failure to Encode). New field types are one
-// table line and inherit the invariant automatically.
+// The sweep crosses every codec-special-cased / Kind-misleading Go type — the
+// high-risk surface, stdlib types whose reflect.Kind does not match the Avro
+// type the codec wants — plus named aliases, pointers, slices, maps, and
+// nesting. A reject is always safe. New field types are one table line.
 func TestSchemaForEncodeParity(t *testing.T) {
 	type namedString string
 	type namedInt int64
@@ -4077,20 +3418,133 @@ func TestSchemaForEncodeParity(t *testing.T) {
 	}
 }
 
-// Recursive non-struct Go types have a cyclic type graph (sfRecursiveSlice's
-// element is itself, etc.). inferType's pointer/slice/map arms recurse on the
-// element type, so without a depth bound SchemaFor recurses until the
-// goroutine stack overflows and the whole process dies. The bound makes it
-// return a clean error instead. A recursive STRUCT is unaffected — inferRecord
-// registers the type name before recursing, so a self-reference becomes a name
-// reference (pinned by TestSchemaForRecursiveStructStillBuilds below).
-//
-// Non-vacuity: reverting the inferType depth bound makes each of these
-// stack-overflow at SchemaFor time, which kills the test binary rather than
-// failing one case — so these pins assert the post-fix clean error directly.
+// Recursive non-struct Go types have a cyclic type graph. inferType's
+// pointer/slice/map arms recurse on the element type, so without a depth bound
+// SchemaFor recurses until the goroutine stack overflows and the process dies;
+// the bound makes it return a clean error. A recursive STRUCT is unaffected —
+// inferRecord registers the type name before recursing, so a self-reference
+// becomes a name reference. Non-vacuity: reverting the depth bound makes each of
+// these stack-overflow at SchemaFor time, killing the test binary rather than
+// failing one case, so these pins assert the post-fix clean error directly.
 type sfRecursiveSlice []sfRecursiveSlice
 type sfRecursivePtr *sfRecursivePtr
 type sfRecursiveMap map[string]sfRecursiveMap
+
+// sfCyclicFamilies are the three shapes a Go type graph can close a cycle
+// in without a struct to break it. A struct terminates by registering its
+// name before recursing into its fields; these register nothing, so every
+// walker over a Go type graph has to carry its own ceiling.
+var sfCyclicFamilies = []struct {
+	name string
+	typ  reflect.Type
+}{
+	{"slice", reflect.TypeFor[sfRecursiveSlice]()},
+	{"pointer", reflect.TypeFor[sfRecursivePtr]()},
+	{"map", reflect.TypeFor[sfRecursiveMap]()},
+}
+
+// TestMatrix_CyclicGoTypeBoundedAtEveryEntryPoint crosses the cyclic families
+// with the ENTRY POINTS that walk a Go type graph. Each entry point carries its
+// own ceiling, constant and error, and the suite reached them one at a time: the
+// schema builder had a cell per family, the custom-decode pointer walk a single
+// pointer cell, and the plain decode and encode walks none.
+//
+// The axis is the entry-point set, because a ceiling is not a property of the
+// type but of each walker, and a walker added without one does not fail anywhere
+// else. Every cell asserts the same thing: the call TERMINATES, with an error
+// rather than a panic or stack overflow. An unbounded walk takes the process
+// down, so "returned at all" is the assertion and the timeout is a hang
+// detector.
+func TestMatrix_CyclicGoTypeBoundedAtEveryEntryPoint(t *testing.T) {
+	t.Parallel()
+	// Generous, because it is only distinguishing "returned" from "did
+	// not"; a bounded walk over these types returns in microseconds.
+	const hangTimeout = 10 * time.Second
+
+	customLong := CustomType{AvroType: "long", Decode: func(v any, _ *SchemaNode) (any, error) { return v, nil }}
+	plainLong := MustParse(`"long"`)
+	customSchema := MustParse(`"long"`, customLong)
+	wire, err := plainLong.Encode(int64(5))
+	if err != nil {
+		t.Fatalf("encode probe wire: %v", err)
+	}
+
+	entries := []struct {
+		name string
+		// namesBound marks an entry point whose error must say WHY, so a
+		// user hitting the ceiling can act on it. The decode and encode
+		// walks report the ordinary type mismatch instead, which is the
+		// documented shape there.
+		namesBound bool
+		run        func(reflect.Type) error
+	}{
+		{"schemafor", true, func(ft reflect.Type) error {
+			fields := []reflect.StructField{{Name: "F", Type: ft, Tag: `avro:"f"`}}
+			st := reflect.StructOf(fields)
+			seen := make(map[reflect.Type]seenForm)
+			_, err := inferRecord(st, "Top", "", seen, nil, make(appliedTypeAliases))
+			return err
+		}},
+		{"custom-decode", false, func(ft reflect.Type) error {
+			_, err := customSchema.Decode(wire, reflect.New(ft).Interface())
+			return err
+		}},
+		{"plain-decode", false, func(ft reflect.Type) error {
+			_, err := plainLong.Decode(wire, reflect.New(ft).Interface())
+			return err
+		}},
+		{"encode", false, func(ft reflect.Type) error {
+			_, err := plainLong.Encode(reflect.New(ft).Elem().Interface())
+			return err
+		}},
+	}
+
+	// Liveness floor, counted inside the cell: an entry point that started
+	// returning nil, or a family that stopped being cyclic, would leave
+	// its walker's ceiling unexercised.
+	bounded := 0
+
+	for _, fam := range sfCyclicFamilies {
+		for _, e := range entries {
+			t.Run(fam.name+"/"+e.name, func(t *testing.T) {
+				type result struct {
+					err   error
+					panic any
+				}
+				done := make(chan result, 1)
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							done <- result{panic: r}
+						}
+					}()
+					done <- result{err: e.run(fam.typ)}
+				}()
+				select {
+				case got := <-done:
+					if got.panic != nil {
+						t.Fatalf("walking a cyclic %s panicked instead of hitting a ceiling: %v", fam.name, got.panic)
+					}
+					if got.err == nil {
+						t.Fatalf("walking a cyclic %s returned no error; the walk either found a schema for a type that has none, or silently truncated one", fam.name)
+					}
+					if e.namesBound &&
+						!strings.Contains(got.err.Error(), "recursive") &&
+						!strings.Contains(got.err.Error(), "nests too deeply") &&
+						!strings.Contains(got.err.Error(), "nests deeper") {
+						t.Fatalf("error does not name the recursion or depth cause: %v", got.err)
+					}
+					bounded++
+				case <-time.After(hangTimeout):
+					t.Fatalf("walking a cyclic %s did not terminate: the %s walk has no ceiling", fam.name, e.name)
+				}
+			})
+		}
+	}
+	if want := len(sfCyclicFamilies) * len(entries); bounded != want {
+		t.Errorf("%d of %d entry-point cells reached a ceiling", bounded, want)
+	}
+}
 
 func TestRegression_SchemaForRecursiveNonStructTypeErrors(t *testing.T) {
 	wantErr := func(t *testing.T, _ *Schema, err error) {
@@ -4164,9 +3618,7 @@ func TestSchemaForRecursiveStructStillBuilds(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var got LinkedNode
-	if _, err := s.Decode(b, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, b, &got)
 	if got.Val != 1 || got.Next == nil || got.Next.Val != 2 {
 		t.Fatalf("round-trip mismatch: %+v", got)
 	}
@@ -4201,16 +3653,13 @@ func TestRegression_SchemaForRecursivePtrDefaultTerminates(t *testing.T) {
 
 // A CustomType.Schema is an independently-authored schema tree with its own
 // namespace scoping. SchemaFor embeds it into the tree it infers, so the
-// composed schema must preserve every declared fullname exactly: the Avro
-// spec ("Names") defines a type's identity as its FULLNAME, with the dotted
-// name and the split name+namespace spellings denoting the same name, and
-// bare references resolving in the namespace of the enclosing definition.
-// These pins hold SchemaFor to that contract for the three composition
-// shapes that exercise it: a namespaced type shared across fields (the
-// second occurrence must reference the first by a spelling that re-binds to
-// the same fullname), distinct fullnames sharing a short name (they must
-// coexist), and a null-namespace type embedded under WithNamespace (its
-// identity must not be captured by the surrounding namespace).
+// composed schema must preserve every declared fullname exactly: the spec
+// defines a type's identity as its FULLNAME, with the dotted and split
+// spellings denoting the same name and bare references resolving in the
+// enclosing definition's namespace. These pins hold SchemaFor to that contract
+// for the three composition shapes that exercise it — a namespaced type shared
+// across fields, distinct fullnames sharing a short name, and a null-namespace
+// type embedded under WithNamespace.
 
 type scopePinMoney struct{ Cents int64 }
 
@@ -4502,7 +3951,7 @@ func TestRegression_SchemaForOverBudgetCustomSchemaErrors(t *testing.T) {
 // (the same deduper-carrying walk): the BYTES axis (scalar payload), the
 // NODES axis (emitted node count), and the unnamed-cycle detection. A
 // modest schema stays well under every budget (the success control).
-func TestRegression_SchemaForCustomSchemaBudgetAxes(t *testing.T) {
+func TestMatrix_SchemaForCustomSchemaBudgetAxes(t *testing.T) {
 	build := func(node *SchemaNode) error {
 		ct := CustomType{GoType: reflect.TypeFor[scopePinMoney](), Schema: node}
 		_, err := SchemaFor[scopePinOneField](ct)
@@ -4598,14 +4047,9 @@ func realNXNode() *SchemaNode {
 // compare structurally.
 func jsonReencode(t *testing.T, v any) any {
 	t.Helper()
-	b, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
+	b := mustMarshal(t, v)
 	var out any
-	if err := json.Unmarshal(b, &out); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
+	mustUnmarshal(t, b, &out)
 	return out
 }
 
@@ -4791,24 +4235,20 @@ func TestStrayStructuralKeyControl(t *testing.T) {
 // stray-key custom plus two same-definition customs.
 type strayMatrixThird struct{ C int64 }
 
-// TestMatrix_SchemaForStrayStructuralKey crosses every carrier kind with
-// every structural key the kind does NOT bind, a spread of stray bodies,
-// both build scopes, and one-vs-two occurrences of a genuine same-fullname
-// definition. The per-cell oracle is the parser itself:
+// TestMatrix_SchemaForStrayStructuralKey crosses every carrier kind with every
+// structural key the kind does NOT bind, a spread of stray bodies, both build
+// scopes, and one-vs-two occurrences of a genuine same-fullname definition. The
+// per-cell oracle is the parser itself:
 //
-//   - verdict parity: SchemaFor's accept/reject equals Parse's verdict on
-//     the hand-composed counterfactual tree carrying the same stray
-//     verbatim (kind-keyed grammar: a container kind carrying another
-//     kind's defining key hard-rejects; a primitive captures it inert);
-//   - preservation: on accepted cells the stray survives byte-identical
-//     in the composed schema text — never walked, never rewritten, never
-//     injected into;
-//   - genuine behavior: the real definition stays a full inline body and
-//     a second occurrence still dedups to a name reference.
+//   - verdict parity: SchemaFor's accept/reject equals Parse's verdict on the
+//     hand-composed counterfactual tree carrying the same stray verbatim;
+//   - preservation: on accepted cells the stray survives byte-identical in the
+//     composed text — never walked, rewritten, or injected into;
+//   - genuine behavior: the real definition stays a full inline body and a
+//     second occurrence still dedups to a name reference.
 //
-// The cells where the key IS the kind's defining key (array items, map
-// values, record fields) are the genuine-schema controls pinned by the
-// scope and casefold matrices, so they are skipped here.
+// Cells where the key IS the kind's defining key are the genuine-schema controls
+// pinned by the scope and casefold matrices, so they are skipped.
 func TestMatrix_SchemaForStrayStructuralKey(t *testing.T) {
 	// bodyJSON builds a FRESH tree per call: the planted copy and the
 	// counterfactual copy must be independent so a (hypothetically)
@@ -4896,18 +4336,14 @@ func TestMatrix_SchemaForStrayStructuralKey(t *testing.T) {
 								name += "/typed"
 							}
 							t.Run(name, func(t *testing.T) {
-								// Two planting routes for a key the node's
-								// kind does not bind. "props": the value rides
-								// in Props and the render emits it verbatim.
-								// "typed": the caller sets the STRUCTURAL
-								// field (Items/Values/Fields) directly; the
-								// render preserves it as-written too — the
-								// bare-string emission requires structural
-								// emptiness, so a stray-carrying primitive
-								// takes the object render. Both routes
-								// compose the same schema text.
-								// A "fields" stray wraps its body in a proper
-								// field list so the stray itself decodes.
+								// Two planting routes for a key the node's kind does
+								// not bind. "props": the value rides in Props and the
+								// render emits it verbatim. "typed": the caller sets
+								// the STRUCTURAL field directly, and the render
+								// preserves it as-written too, since bare-string
+								// emission requires structural emptiness. Both routes
+								// compose the same schema text. A "fields" stray wraps
+								// its body in a proper field list so it decodes.
 								strayFor := func() any {
 									switch {
 									case body == "nonschema":
@@ -5123,68 +4559,50 @@ func TestMatrix_TypeAliasAliasOwnership(t *testing.T) {
 // ===========================================================================
 // The generative SchemaFor round-trip self-consistency net.
 //
-// SchemaFor (Go type -> Avro schema) is twmb-unique: there is no spec, no Java,
-// and no fastavro counterpart to differential against (Go->Avro inference is not
-// a standardized transform), so the schema->value matrix, the encode/decode
-// parity invariant, the fastavro/Java oracles, and a byte-fuzzer all sail past
-// it (a fuzzer cannot synthesize a Go field type; SchemaFor[T] is compile-time
-// generic). Its one machine-checkable contract is ROUND-TRIP SELF-CONSISTENCY:
-// for every Go type T, SchemaFor[T] must EITHER
+// SchemaFor (Go type -> Avro schema) is twmb-unique: Go->Avro inference is not a
+// standardized transform, so there is no spec, Java, or fastavro counterpart to
+// differential against, and the schema->value matrix, the encode/decode parity
+// invariant, the external oracles, and a byte-fuzzer all sail past it (a fuzzer
+// cannot synthesize a Go field type; SchemaFor[T] is compile-time generic). Its
+// one machine-checkable contract is ROUND-TRIP SELF-CONSISTENCY: for every Go
+// type T, SchemaFor[T] must EITHER
 //
 //	(a) build a schema that twmb's OWN codecs round-trip a value of T — through
-//	    BOTH the binary (Encode/Decode) AND the JSON (EncodeJSON/DecodeJSON)
-//	    wire, so a binary-vs-JSON path divergence is caught too — OR
-//	(b) reject cleanly at build time (a non-empty error, no panic).
+//	    BOTH the binary AND the JSON wire, so a path divergence is caught too —
+//	(b) or reject cleanly at build time (a non-empty error, no panic).
 //
-// The forbidden outcome is the highest-yield SchemaFor bug shape, build-accepts/
-// encode-rejects: SchemaFor returns a schema, but Encode (or Decode) of a value
-// of that very type fails far from the SchemaFor call — the schema "lies" about
-// the Go type. Every historical SchemaFor bug is an instance: json.Number
-// inferred as "string" (the codec rejects it), a one-directional text type
-// inferred as "string" (encode XOR decode fails), a pointer chain deeper than
-// the codec unwraps inferred as ["null",T] (Encode of a non-nil value fails).
+// The forbidden outcome is the highest-yield SchemaFor bug shape,
+// build-accepts/encode-rejects: the schema "lies" about the Go type and the
+// failure lands far from the SchemaFor call. Every historical SchemaFor bug is
+// an instance — json.Number inferred as "string", a one-directional text type
+// inferred as "string", a pointer chain deeper than the codec unwraps inferred
+// as ["null",T].
 //
-// ONE generator crosses the four axes those bugs live at, and the SAME oracle
-// runs on every cell:
-//
-//	Go type shape  x  struct tag  x  text interface  x  logical type
+// ONE generator crosses the four axes those bugs live at, same oracle per cell:
 //
 //	shape   : direct, *L, **L, at-cap and past-cap pointer chains, []L, [N]L,
-//	          map[string]L, []*L (and recursive-struct + named-struct leaves)
+//	          map[string]L, []*L (plus recursive-struct and named-struct leaves)
 //	tag     : none, rename, alias=, default=, every logical (valid- AND
 //	          wrong-underlying for the leaf), decimal(p,s), and malformed forms
-//	          (unknown option, unclosed bracket, decimal trailing junk, empty
-//	          alias, the "-,opt" skip-with-options)
 //	text    : a leaf implementing none / MarshalText-only / UnmarshalText-only /
 //	          both, over string / []byte / non-string(struct) base kinds
-//	logical : a logical whose required underlying wire MATCHES the leaf
-//	          (date-on-int, uuid-on-[16]byte, timestamp-on-time.Time) and one
-//	          whose underlying is WRONG for it (uuid-on-int, decimal-on-string)
+//	logical : one whose required underlying MATCHES the leaf (date-on-int,
+//	          uuid-on-[16]byte) and one whose underlying is WRONG (uuid-on-int)
 //
-// RECONCILIATION (not duplication): this net reuses the package's existing
-// SchemaFor infrastructure rather than re-deriving it —
-//   - schemaForType (embed_shape_generative_test.go): the reflect.Type-driven
-//     replica of SchemaFor, pinned byte-identical to the generic entry point by
-//     TestGenerative_SchemaForReplicaParity. The bulk of the cross is built from
-//     reflect.StructOf types that SchemaFor[T] cannot take at run time;
-//     rtRealEntryPointCells additionally drives the REAL SchemaFor[T] on the
-//     compile-time-nameable leaves so the replica's fidelity is bridged.
-//   - sampleValue (schema_for_test.go, made cycle-safe): the non-empty value
-//     builder, so a leaf buried in *T / []T / map[K]T actually reaches the codec.
-//   - the malformed-tag alphabet is the same family embed_shape_tagedge_test.go's
-//     tagDefects pins for WALKER AGREEMENT; here the same tags are crossed with
-//     the whole leaf x shape space under the ROUND-TRIP oracle instead.
+// RECONCILIATION, not duplication: it reuses schemaForType (the reflect.Type
+// replica of SchemaFor, pinned byte-identical by
+// TestGenerative_SchemaForReplicaParity, since the bulk of the cross is
+// reflect.StructOf types SchemaFor[T] cannot take at run time —
+// rtRealEntryPointCells drives the REAL SchemaFor[T] on the nameable leaves to
+// bridge the replica's fidelity), sampleValue (made cycle-safe) so a leaf buried
+// in *T / []T / map[K]T reaches the codec, and the same malformed-tag alphabet
+// embed_shape_tagedge_test.go pins for WALKER AGREEMENT.
 //
-// The per-axis nets each fix ONE axis: TestGenerative_EmbedShapeWalkerAgreement
-// crosses struct SHAPE with an int32 leaf (field-selection), TestSchemaFor-
-// EncodeParity crosses LEAF TYPE at direct depth (no tag/shape/text cross),
-// TestGenerative_TagEdgeWalkerAgreement crosses TAGS with int leaves. None
-// crosses leaf x shape x tag x text x logical, where the build-accepts/encode-
-// rejects interactions hide (a one-way-text type behind a pointer or inside a
-// slice; a logical tag on a pointer-to-named-int; uuid on []string; decimal on a
-// map). That product is this net's job. Non-vacuity is recorded at the bottom:
-// reverting the one-way-text refusal, the json.Number reject, or the pointer-
-// chain cap each turns a measured set of cells red.
+// The per-axis nets each fix ONE axis, and none crosses leaf x shape x tag x
+// text x logical, where the build-accepts/encode-rejects interactions hide.
+// Non-vacuity is recorded at the bottom: reverting the one-way-text refusal, the
+// json.Number reject, or the pointer-chain cap each turns a measured set of
+// cells red.
 // ===========================================================================
 
 // ---- text-interface leaf alphabet -----------------------------------------
@@ -5361,14 +4779,13 @@ func rtShapes() []rtShape {
 
 // ---- tag specs -------------------------------------------------------------
 //
-// "f" is the field name so a missing-name fallback never masks a tag effect.
-// The logical set is applied uniformly: for a leaf whose wire matches it the
-// cell must round-trip; for a leaf whose wire is wrong the cell must REJECT
+// "f" is the field name so a missing-name fallback never masks a tag effect. The
+// logical set is applied uniformly: for a leaf whose wire matches it the cell
+// must round-trip, and for a leaf whose wire is wrong the cell must REJECT
 // (uuid-on-int, decimal-on-bool) — never build a schema the codec then fights.
-// The malformed forms must all reject. omitzero is deliberately absent: it is a
-// runtime encode directive (skip-when-zero) that does not shape the schema, and
-// is netted by omitzero_bsoft_test.go + tag_grammar_runtime_test.go; the only
-// omitzero here is the malformed "-,omitzero" build-reject.
+// omitzero is deliberately absent: it is a runtime encode directive that does not
+// shape the schema, netted by omitzero_bsoft_test.go + tag_grammar_runtime_test.go,
+// so the only omitzero here is the malformed "-,omitzero" build-reject.
 
 type rtTag struct {
 	label string
@@ -5694,14 +5111,12 @@ func TestGenerative_SchemaForRoundTripRealEntryPoint(t *testing.T) {
 // The main generator builds field types with reflect.StructOf, which cannot
 // anonymously embed an UNNAMED per-leaf carrier, so the diamond/equal-depth
 // embed shape over varying leaves is covered here with hand-declared carriers
-// driven through the REAL SchemaFor[T]. The composition under test: a
-// single-arm embed resolves the promoted field, then inferType runs on its
-// LEAF type exactly as for a direct field — so the one-way-text refusal, the
-// pointer-chain cap, the json.Number reject, and decimal acceptance must all
-// compose through the embed. (TestGenerative_EmbedShapeWalkerAgreement owns
-// embed FIELD SELECTION with an int32 leaf; this owns embed x leaf INFERENCE.)
-// The diamond case pins that an equal-depth ambiguous collision still rejects
-// independent of the leaf type.
+// driven through the REAL SchemaFor[T]. The composition under test: a single-arm
+// embed resolves the promoted field, then inferType runs on its LEAF type
+// exactly as for a direct field — so the one-way-text refusal, the pointer-chain
+// cap, the json.Number reject, and decimal acceptance must all compose through
+// the embed. The diamond case pins that an equal-depth ambiguous collision still
+// rejects independent of the leaf type.
 
 // Special-leaf carriers: value-embedded or reject-at-build, so unexported is
 // fine (a value embed of an unexported struct decodes; the refused cases never
@@ -5840,77 +5255,72 @@ func TestRegression_SchemaForUnexportedEmbedPointerDecodeConstraint(t *testing.T
 // ---- neutering record (non-vacuity proof) ----------------------------------
 //
 // The round-trip oracle is proven to FAIL when each historical SchemaFor fix is
-// reverted in inferType (schema_for.go). Counts below are MEASURED over the
-// 7326-cell leaf x shape x tag cross by switching the divergence report from
-// t.Fatal to a count. With every fix intact, divergences == 0.
+// reverted in inferType. Counts are MEASURED over the 7326-cell leaf x shape x
+// tag cross by switching the divergence report from t.Fatal to a count. With
+// every fix intact, divergences == 0.
 //
-//	NEUTER-1  One-way-text refusal (the text-interface x shape axis). Replace the
-//	          inferType text block's enc/dec switch with an unconditional
-//	          `return "string", nil` (revert 962f7b6):
-//	            48 cells red (24 encode-rejects + 24 typed-decode) — the
-//	            rtStructMarshal (encode-only) and rtStructUnmarshal (decode-only)
-//	            non-string-base leaves now infer "string" and build, then Encode
-//	            (decode-only) or typed Decode (encode-only) fails, across all 8
-//	            leaf-materializing shapes (direct, ptr, ptr2, ptrAtCap, slice,
-//	            array2, map, slicePtr) x the 3 string-building tags (none, name,
-//	            alias). The string- and []byte-base one-directional leaves stay
-//	            GREEN (their kind covers the missing direction), and the inline
-//	            tag flattens the struct rather than inferring a string — proving
-//	            the refusal is scoped to exactly the non-round-trippable types.
+//	NEUTER-1  One-way-text refusal: replace the inferType text block's enc/dec
+//	          switch with an unconditional `return "string", nil` (revert
+//	          962f7b6). 48 cells red (24 encode-rejects + 24 typed-decode) — the
+//	          encode-only and decode-only non-string-base leaves infer "string"
+//	          and build, then the missing direction fails, across all 8
+//	          leaf-materializing shapes x the 3 string-building tags. The string-
+//	          and []byte-base one-directional leaves stay GREEN (their kind
+//	          covers the missing direction) and the inline tag flattens the
+//	          struct — the refusal is scoped to exactly the non-round-trippable
+//	          types.
 //
-//	NEUTER-2  json.Number reject. Make the `case jsonNumberType:` arm return
-//	          `"string", nil` (revert the json.Number fix):
-//	            68 cells red, all encode-rejects, all on the json.Number leaf —
-//	            it infers "string" (its Kind) and builds for every non-malformed
-//	            tag (the case returns before the logical/text checks, so even
-//	            uuid/timestamp-*/decimal build as a bare string), but the codec
-//	            rejects json.Number against a string schema on encode, across
-//	            every shape that materializes the leaf.
+//	NEUTER-2  json.Number reject: make `case jsonNumberType:` return
+//	          `"string", nil`. 68 cells red, all encode-rejects, all on the
+//	          json.Number leaf — it infers its Kind and builds for every
+//	          non-malformed tag (the case returns before the logical/text
+//	          checks), but the codec rejects json.Number against a string schema.
 //
-//	NEUTER-3  Pointer-chain cap. Remove the `ptrChain >= maxIndirectDepth`
-//	          refusal in inferType's pointer arm:
-//	            179 cells red, all encode-rejects, all on the ptrPastCap shape
-//	            (6 pointer levels) — every leaf that itself builds now produces a
-//	            ["null",T], then Encode of the non-nil sampled value fails with
-//	            errIndirectDeep. ptr2 / ptrAtCap (within the cap) stay GREEN, so
-//	            the boundary is exactly at the codec's unwrap depth. (The
-//	            depth>=maxDepth ceiling still prevents any stack overflow, so the
-//	            measurement is a clean count, not a crash.)
+//	NEUTER-3  Pointer-chain cap: remove the `ptrChain >= maxIndirectDepth`
+//	          refusal. 179 cells red, all encode-rejects, all on ptrPastCap (6
+//	          levels) — every leaf that builds now produces a ["null",T] and
+//	          Encode of the non-nil sample fails with errIndirectDeep. ptr2 /
+//	          ptrAtCap stay GREEN, so the boundary is exactly the codec's unwrap
+//	          depth. The depth>=maxDepth ceiling still prevents a stack overflow,
+//	          so the measurement is a clean count, not a crash.
 //
 // The three counts are unchanged whether or not the JSON wire is exercised: each
-// of these bugs manifests on the BINARY path, which rtRunCell checks first and
-// which short-circuits the cell — so the JSON checks add coverage only for a
-// hypothetical binary-passes/JSON-fails bug (none of the three are), and the
-// full net currently finds zero such cells.
+// manifests on the BINARY path, which rtRunCell checks first and which
+// short-circuits the cell. The JSON checks add coverage only for a hypothetical
+// binary-passes/JSON-fails bug, of which the net currently finds none.
 
 // ---------- schemafor_skip_directive_test.go ----------
 
 // The avro struct tag is validated on two structurally distinct paths in
 // collectFields: the NAMED-FIELD path (an ordinary field, and an anonymous
 // non-struct field, which falls through to it) and the ANONYMOUS EMBEDDED
-// STRUCT path, which handles its own tag before the named path is reached.
-// A validation that lives on only one path is a hole: the same tag string
-// then means different things depending on where it is written.
+// STRUCT path, which handles its own tag before the named path is reached. A
+// validation living on only one path is a hole: the same tag string then means
+// different things depending on where it is written.
 //
-// The census below is the executable form of that claim. Every row is a tag
-// whose verdict must NOT depend on which path reads it, exercised through
-// both a named field and an anonymous embed of the same struct type, under
-// strict AND lax name validation — lax matters because a guard that only
-// appears to work by way of Avro's name grammar (a field named "-" is not a
-// valid Avro name) stops working the moment a caller supplies their own
-// validator via WithLaxNames.
+// Every row is a tag whose verdict must NOT depend on which path reads it,
+// exercised through both a named field and an anonymous embed of the same struct
+// type, under strict AND lax name validation — lax matters because a guard that
+// only appears to work by way of Avro's name grammar stops working the moment a
+// caller supplies their own validator.
 
 type skipCensusInner struct{ A string }
 
 // skipCensusStruct builds `struct { F skipCensusInner "tag"; G string }` when
 // embed is false, and `struct { skipCensusInner "tag"; G string }` when true.
-func skipCensusStruct(tag string, embed bool) reflect.Type {
+func skipCensusStruct(tag string, embed bool, ft reflect.Type) reflect.Type {
+	if ft == nil {
+		ft = reflect.TypeFor[skipCensusInner]()
+	}
 	first := reflect.StructField{
 		Name: "F",
-		Type: reflect.TypeFor[skipCensusInner](),
+		Type: ft,
 		Tag:  reflect.StructTag(tag),
 	}
 	if embed {
+		// Only a struct type can be embedded and still carry fields, so
+		// the embed path keeps the census's own inner type; a row with a
+		// scalar field type is a named-path row.
 		first.Name = "SkipCensusInner"
 		first.Type = reflect.TypeFor[skipCensusInner]()
 		first.Anonymous = true
@@ -5924,12 +5334,25 @@ func skipCensusStruct(tag string, embed bool) reflect.Type {
 // skipCensusBuild runs the SchemaFor pipeline over a runtime-built struct.
 func skipCensusBuild(t *testing.T, tag string, embed bool, opts ...SchemaOpt) (*Schema, error) {
 	t.Helper()
-	st := skipCensusStruct(tag, embed)
+	return skipCensusBuildTyped(t, tag, embed, nil, nil, opts...)
+}
+
+// skipCensusBuildTyped is skipCensusBuild with the census field's Go type
+// chosen by the caller. The type decides which guards a tag can even reach:
+// a logical-type tag is checked against the Go type BEFORE the custom-match
+// question is asked, so a row that wants the custom-match verdict must
+// supply a type the logical tag is valid for.
+func skipCensusBuildTyped(t *testing.T, tag string, embed bool, ft reflect.Type, customs []CustomType, opts ...SchemaOpt) (*Schema, error) {
+	t.Helper()
+	st := skipCensusStruct(tag, embed, ft)
 	fields := make([]reflect.StructField, st.NumField())
 	for i := range fields {
 		fields[i] = st.Field(i)
 	}
-	return schemaForScopeCell(t, fields, "", nil, opts...)
+	// customs go to INFERENCE, which is where the custom-match question is
+	// asked; a CustomType handed in as a plain option reaches only the
+	// final parse and would never match a field.
+	return schemaForScopeCell(t, fields, "", customs, opts...)
 }
 
 // TestMatrix_SchemaForTagGuardPathCensus is the pattern-14a census: for every
@@ -5937,28 +5360,70 @@ func skipCensusBuild(t *testing.T, tag string, embed bool, opts ...SchemaOpt) (*
 // the same verdict. A row's wantErr is the substring the error must name; an
 // empty wantErr means the tag is valid and the build must succeed.
 func TestMatrix_SchemaForTagGuardPathCensus(t *testing.T) {
+	// The CUSTOM-MATCH axis. Every row below previously ran with no
+	// CustomType registered, so the field's match state had one value and
+	// the guard that rejects a logical-type tag on a custom-matched field
+	// — the field's tag has nothing to apply to, because the custom
+	// supplies the schema — was unreachable from this census. wantErrCustom
+	// is the verdict when a CustomType claims the field's Go type; an empty
+	// string means the same verdict as without one.
 	census := []struct {
-		guard   string
-		tag     string
-		wantErr string
+		guard         string
+		tag           string
+		wantErr       string
+		wantErrCustom string
+		customDiffers bool
+		// fieldType overrides the census field's Go type. Rows that want
+		// the custom-match verdict need a type their logical tag is valid
+		// for, since the Go-type check runs first.
+		fieldType reflect.Type
+		// namedOnly marks a row whose field type cannot be embedded.
+		namedOnly bool
 	}{
-		{"exact skip directive", `avro:"-"`, ""},
-		{"skip directive is exact-match only (options)", `avro:"-,omitzero"`, "exact-match only"},
-		{"skip directive is exact-match only (suffix)", `avro:"-foo"`, "exact-match only"},
-		{"splitTag unclosed bracket", `avro:"X,alias=[a"`, "unclosed"},
-		{"splitTag unexpected close", `avro:"X,alias=a]"`, "unexpected"},
-		{"inline with an explicit name", `avro:"X,inline"`, "inline is incompatible with an explicit field name"},
-		{"inline with another option", `avro:",inline,omitzero"`, "inline is incompatible with option"},
-		{"alias empty brackets", `avro:"X,alias=[]"`, "empty brackets"},
-		{"alias empty element", `avro:"X,alias=[a,]"`, "empty element"},
-		{"type-alias empty brackets", `avro:"X,type-alias=[]"`, "empty brackets"},
-		{"decimal trailing junk", `avro:"X,decimal(1,2,3)"`, "invalid decimal tag"},
-		{"unknown tag option", `avro:"X,bogusopt"`, "unknown avro tag option"},
-		{"uuid on an incompatible Go type", `avro:"X,uuid"`, "uuid logical type"},
-		{"decimal on an incompatible Go type", `avro:"X,decimal(4,2)"`, "decimal logical type requires"},
+		{guard: "exact skip directive", tag: `avro:"-"`, wantErr: ""},
+		{guard: "skip directive is exact-match only (options)", tag: `avro:"-,omitzero"`, wantErr: "exact-match only"},
+		{guard: "skip directive is exact-match only (suffix)", tag: `avro:"-foo"`, wantErr: "exact-match only"},
+		{guard: "splitTag unclosed bracket", tag: `avro:"X,alias=[a"`, wantErr: "unclosed"},
+		{guard: "splitTag unexpected close", tag: `avro:"X,alias=a]"`, wantErr: "unexpected"},
+		{guard: "inline with an explicit name", tag: `avro:"X,inline"`, wantErr: "inline is incompatible with an explicit field name"},
+		{guard: "inline with another option", tag: `avro:",inline,omitzero"`, wantErr: "inline is incompatible with option"},
+		{guard: "alias empty brackets", tag: `avro:"X,alias=[]"`, wantErr: "empty brackets"},
+		{guard: "alias empty element", tag: `avro:"X,alias=[a,]"`, wantErr: "empty element"},
+		{guard: "type-alias empty brackets", tag: `avro:"X,type-alias=[]"`, wantErr: "empty brackets"},
+		{guard: "decimal trailing junk", tag: `avro:"X,decimal(1,2,3)"`, wantErr: "invalid decimal tag"},
+		{guard: "unknown tag option", tag: `avro:"X,bogusopt"`, wantErr: "unknown avro tag option"},
+		// The custom-match question is asked BEFORE the Go-type check, so
+		// a matched field is rejected for the tag having nothing to apply
+		// to rather than for the type being wrong — even when the type is
+		// also wrong. The pair of verdicts per row is what records that
+		// order; a single verdict could not.
+		{guard: "uuid on an incompatible Go type", tag: `avro:"X,uuid"`, wantErr: "uuid logical type",
+			wantErrCustom: "has no effect", customDiffers: true},
+		{guard: "decimal on an incompatible Go type", tag: `avro:"X,decimal(4,2)"`, wantErr: "decimal logical type requires",
+			wantErrCustom: "has no effect", customDiffers: true},
+		// Compatible Go types, so the tag is valid on its own terms and
+		// the rejection can only be coming from the custom match. Without
+		// these the rows above could be rejecting for the type all along.
+		{guard: "uuid on a compatible Go type", tag: `avro:"X,uuid"`, wantErr: "",
+			wantErrCustom: "has no effect", customDiffers: true,
+			fieldType: reflect.TypeFor[string](), namedOnly: true},
+		{guard: "decimal on a compatible Go type", tag: `avro:"X,decimal(4,2)"`, wantErr: "",
+			wantErrCustom: "has no effect", customDiffers: true,
+			fieldType: reflect.TypeFor[big.Rat](), namedOnly: true},
+		// The control for the axis: with no logical tag, a custom-matched
+		// field builds. Without it the custom arm could reject everything
+		// and the rows above would pass for the wrong reason.
+		{guard: "no logical tag", tag: `avro:"X"`, wantErr: "", wantErrCustom: ""},
 	}
 
 	lax := WithLaxNames(func(string) error { return nil })
+	// A CustomType claiming the census field's own Go type, so the field
+	// arrives at inference already matched.
+	claimsField := customSchemaFor(t, reflect.TypeFor[skipCensusInner](),
+		`{"type":"record","name":"CM","fields":[{"name":"c","type":"long"}]}`)
+	// Liveness floor for the new axis: the rows whose verdict CHANGES under
+	// a matched custom must actually have been run on both sides.
+	differing := 0
 	for _, mode := range []struct {
 		name string
 		opts []SchemaOpt
@@ -5968,12 +5433,52 @@ func TestMatrix_SchemaForTagGuardPathCensus(t *testing.T) {
 	} {
 		for _, row := range census {
 			for _, embed := range []bool{false, true} {
+				if embed && row.namedOnly {
+					continue
+				}
 				path := "named"
 				if embed {
 					path = "embed"
 				}
+				for _, matched := range []bool{false, true} {
+					match := "unmatched"
+					opts := mode.opts
+					wantErr := row.wantErr
+					claim := claimsField
+					if row.fieldType != nil {
+						claim = customSchemaFor(t, row.fieldType,
+							`{"type":"record","name":"CM","fields":[{"name":"c","type":"long"}]}`)
+					}
+					var customs []CustomType
+					if matched {
+						match = "custom-matched"
+						customs = []CustomType{claim}
+						wantErr = row.wantErrCustom
+						if wantErr == "" && !row.customDiffers {
+							wantErr = row.wantErr
+						}
+					}
+					t.Run(fmt.Sprintf("%s/%s/%s/%s", mode.name, path, match, row.guard), func(t *testing.T) {
+						_, err := skipCensusBuildTyped(t, row.tag, embed, row.fieldType, customs, opts...)
+						switch {
+						case wantErr == "" && err != nil:
+							t.Fatalf("tag %s must build on the %s path (%s), got: %v", row.tag, path, match, err)
+						case wantErr == "":
+							return
+						case err == nil:
+							t.Fatalf("tag %s must be rejected on the %s path (%s) naming %q, but the build succeeded",
+								row.tag, path, match, wantErr)
+						case !strings.Contains(err.Error(), wantErr):
+							t.Fatalf("tag %s on the %s path (%s) rejected with %q, which does not name %q",
+								row.tag, path, match, err, wantErr)
+						}
+					})
+					if matched && row.customDiffers {
+						differing++
+					}
+				}
 				t.Run(fmt.Sprintf("%s/%s/%s", mode.name, path, row.guard), func(t *testing.T) {
-					_, err := skipCensusBuild(t, row.tag, embed, mode.opts...)
+					_, err := skipCensusBuildTyped(t, row.tag, embed, row.fieldType, nil, mode.opts...)
 					switch {
 					case row.wantErr == "" && err != nil:
 						t.Fatalf("tag %s must build on the %s path, got: %v", row.tag, path, err)
@@ -5990,9 +5495,18 @@ func TestMatrix_SchemaForTagGuardPathCensus(t *testing.T) {
 			}
 		}
 	}
+	// Rows whose verdict changes under a matched custom: 2 rows x 2 modes
+	// x 2 paths. A census that stopped registering the custom, or a row
+	// that stopped differing, would leave the custom-matched arm asserting
+	// only what the unmatched arm already did.
+	// 2 incompatible-type rows x 2 modes x 2 paths, plus 2 compatible-type
+	// rows x 2 modes x 1 path (a scalar field cannot be embedded).
+	if want := 2*2*2 + 2*2*1; differing != want {
+		t.Errorf("%d cells exercised a verdict that differs under a matched custom, want %d", differing, want)
+	}
 }
 
-// TestRegression_SchemaForEmbeddedSkipDirectiveExactMatch is the per-symptom
+// TestMatrix_SchemaForEmbeddedSkipDirectiveExactMatch is the per-symptom
 // pin for the census row that was open: the "-" skip directive is
 // exact-match only, and the anonymous-embed path must say so in the same
 // actionable terms as the named path rather than deferring to Avro's name
@@ -6000,7 +5514,7 @@ func TestMatrix_SchemaForTagGuardPathCensus(t *testing.T) {
 // the guard was shared the embed path emitted a field literally named "-"
 // carrying the whole embedded record — the opposite of the skip the tag
 // asked for.
-func TestRegression_SchemaForEmbeddedSkipDirectiveExactMatch(t *testing.T) {
+func TestMatrix_SchemaForEmbeddedSkipDirectiveExactMatch(t *testing.T) {
 	lax := WithLaxNames(func(string) error { return nil })
 
 	for _, mode := range []struct {
@@ -6092,35 +5606,28 @@ func TestRegression_SkipDirectiveGuardIsSchemaForScoped(t *testing.T) {
 
 // ---------- matrix_schemafor_exactcase_test.go ----------
 
-// TestMatrix_SchemaForReservedKeyExactCase pins the contract that SchemaFor's
-// composition walkers (resolveNameScope, pinCustomSchemaScope,
-// dedupNamedTypes, normalizeSchemaScope) read reserved attribute keys the
-// way the Parse they feed does: by exact lowercase name only. A Props key
-// differing from a reserved name only by letter case is an ordinary custom
-// property (see Schema.Root's doc) — the walkers must neither key, descend,
-// nor inject through it, and it must survive composition verbatim.
+// TestMatrix_SchemaForReservedKeyExactCase pins that SchemaFor's composition
+// walkers (resolveNameScope, pinCustomSchemaScope, dedupNamedTypes,
+// normalizeSchemaScope) read reserved attribute keys the way the Parse they feed
+// does: by exact lowercase name only. A Props key differing from a reserved name
+// only by letter case is an ordinary custom property, so the walkers must
+// neither key, descend, nor inject through it, and it must survive composition
+// verbatim.
 //
-// Axes: reserved key {namespace — the identity axis: only the exact
-// spelling scopes the type; items / values / a union slice under items —
-// the descent routes; fields — the field-descent axis} × spelling
-// {exact-case, UPPER, mIxed} × occurrences {1, 2} × SchemaFor scope
-// {default, WithNamespace}.
+// Axes: reserved key {namespace — the identity axis; items / values / a union
+// slice under items — the descent routes; fields — field descent} x spelling
+// {exact-case, UPPER, mIxed} x occurrences {1, 2} x SchemaFor scope {default,
+// WithNamespace}.
 //
-// Oracles per cell family:
-//   - namespace: the EXACT spelling declares identity x.y.F
-//     (canonical-visible, one definition + a dotted reference at two
-//     occurrences). A VARIANT spelling declares nothing: the identity is
-//     the null-namespace F for every variant cell — byte-identical to the
-//     no-namespace control — and the variant key rides to the composed
-//     definition's Props verbatim. The exact and variant identities MUST
-//     diverge; asserting that divergence is what makes a reintroduced
-//     case-fold visible.
-//   - items/values/union-slice/fields: an exact-spelled stray keeps the
-//     structural-key inertness posture (composition passes it through
-//     untouched), and a variant spelling is a plain prop — both compose
-//     verbatim with identical verdicts, canonicals, and inline-body
-//     counts, because NO spelling of a key on a kind that does not bind it
-//     may be walked, registered, or deduped.
+// Oracles: for namespace, the EXACT spelling declares identity x.y.F while a
+// VARIANT declares nothing — the identity is the null-namespace F, byte-identical
+// to the no-namespace control, with the variant key riding to Props verbatim.
+// The two identities MUST diverge; asserting that is what makes a reintroduced
+// case-fold visible. For items/values/union-slice/fields, an exact-spelled stray
+// keeps the structural-key inertness posture and a variant is a plain prop —
+// both compose verbatim with identical verdicts, canonicals, and inline-body
+// counts, because NO spelling of a key on a kind that does not bind it may be
+// walked, registered, or deduped.
 func TestMatrix_SchemaForReservedKeyExactCase(t *testing.T) {
 	primary := reflect.TypeFor[scopeMatrixPrimary]()
 	variants := map[string]func(string) string{
@@ -6445,31 +5952,23 @@ func TestRegression_TypeAliasVariantAliasesInert(t *testing.T) {
 	}
 }
 
-// TestMatrix_TypeAliasExactCase extends the reserved-key exact-case
-// contract (TestMatrix_SchemaForReservedKeyExactCase) with the type-alias
-// axis: the type-alias tag's walk routes through a container's binding key
-// and reads/extends the aliases attribute exactly as Parse binds them — by
+// TestMatrix_TypeAliasExactCase extends the reserved-key exact-case contract
+// with the type-alias axis: the tag's walk routes through a container's binding
+// key and reads/extends the aliases attribute exactly as Parse binds them, by
 // exact name only.
 //
-// Axes:
-//   - binding-key routing: carrier {array, map, union whose first named
-//     type sits behind the carrier's binding key} × spelling {exact,
-//     upper, mixed} × structural-field {nil — only the spelled Props key
-//     exists; set — the real field renders exact-case and the spelled
-//     Props key rides along}. Exact-spelling cells and every
-//     structural=set cell build with the alias on X; a variant-only cell
-//     (structural=nil, variant spelling) has no binding key and fails its
-//     parse loudly. All accepting cells of one carrier agree on canonical
-//     bytes (props are canonical-stripped).
-//   - aliases-attribute routes: the field route and the exact-Props route
-//     are EXTENDED identically; a variant-Props route gets a fresh exact
-//     "aliases" with the variant preserved verbatim.
-//   - name/namespace case-variant Props riding beside the real attributes:
-//     inert (the exact attributes win; the variants ride as props).
+//   - binding-key routing: carrier {array, map, union whose first named type
+//     sits behind the carrier's binding key} x spelling {exact, upper, mixed} x
+//     structural-field {nil, set}. Exact cells and every structural=set cell
+//     build with the alias on X; a variant-only cell has no binding key and
+//     fails its parse loudly, and all accepting cells of one carrier agree on
+//     canonical bytes.
+//   - aliases-attribute routes: the field route and the exact-Props route are
+//     EXTENDED identically; a variant-Props route gets a fresh exact "aliases"
+//     with the variant preserved verbatim.
+//   - name/namespace case-variant Props beside the real attributes: inert.
 //   - two tagged fields sharing the custom type: the namespace-field route
-//     composes one x.y.X definition + one dotted reference; a "NameSpace"
-//     variant-Props route declares nothing — the type is null-namespace X,
-//     one definition + one bare reference, variant preserved.
+//     composes one x.y.X definition + one dotted reference.
 func TestMatrix_TypeAliasExactCase(t *testing.T) {
 	primary := reflect.TypeFor[scopeMatrixPrimary]()
 	tagged := []reflect.StructField{{Name: "L", Type: primary, Tag: `avro:"l,type-alias=Old"`}}
@@ -6701,34 +6200,28 @@ func assertOneIntValue(t *testing.T, name string, got map[string]int) {
 
 // ---------- matrix_schemafor_scope_test.go ----------
 
-// TestMatrix_SchemaForCustomSchemaScope crosses the namespace-composition
-// space of CustomType.Schema embedding: a custom schema is an independently
-// authored tree with its own namespace scoping, and SchemaFor must preserve
-// every declared fullname when composing it into the inferred tree.
+// TestMatrix_SchemaForCustomSchemaScope crosses the namespace-composition space
+// of CustomType.Schema embedding: a custom schema is an independently authored
+// tree with its own namespace scoping, and SchemaFor must preserve every
+// declared fullname when composing it into the inferred tree.
 //
 // Axes: custom-schema spelling {split Root()-derived, dotted hand-built
-// SchemaNode, null-namespace} × kind {record, enum, fixed} × occurrences
-// {one, two fields} × SchemaFor scope {default, WithNamespace} × shape
-// {flat; recursive — the custom schema references itself, so its internal
-// references must still bind after embedding; a nested named type in a
-// DIFFERENT namespace inside the custom subtree}, plus coexistence cells
-// (a.X + null-namespace X; a.X + b.X; two customs carrying IDENTICAL
-// definitions dedup to one definition + a reference) and the
-// unrepresentable corner: a null-namespace type recurring under
-// WithNamespace has no reference spelling (a bare name binds in the
-// enclosing namespace; references have no "namespace":"" escape), so that
-// cell must produce exactly the named error — never a dangling reference or
-// a namespace capture.
+// SchemaNode, null-namespace} x kind {record, enum, fixed} x occurrences {one,
+// two fields} x SchemaFor scope {default, WithNamespace} x shape {flat;
+// recursive, so internal references must still bind after embedding; a nested
+// named type in a DIFFERENT namespace inside the custom subtree}, plus
+// coexistence cells (a.X + null-namespace X; a.X + b.X; two customs carrying
+// IDENTICAL definitions dedup to one definition + a reference) and the
+// unrepresentable corner: a null-namespace type recurring under WithNamespace
+// has no reference spelling, so that cell must produce exactly the named error —
+// never a dangling reference or a namespace capture.
 //
-// Oracle per cell: the SchemaFor pipeline succeeds (or hits exactly the
-// corner error); the output re-parses; the parsed metadata preserves every
-// declared fullname; split and dotted spellings of the same schema produce
-// byte-identical Canonical() — the spec ("Names") makes the two spellings
-// one name, so their canonical forms must agree; and an EXECUTED fastavro
-// arm parses representative outputs (which carry dotted references and
-// "namespace":"" escapes) and must agree on the full parsing canonical
-// form, which subsumes fingerprint equality without any byte-order
-// presentation trap.
+// Oracle per cell: the pipeline succeeds (or hits exactly the corner error); the
+// output re-parses; the parsed metadata preserves every declared fullname; split
+// and dotted spellings produce byte-identical Canonical(), since the spec makes
+// the two spellings one name; and an EXECUTED fastavro arm parses representative
+// outputs and must agree on the full parsing canonical form, which subsumes
+// fingerprint equality without any byte-order presentation trap.
 
 // Marker Go types the matrix's CustomTypes match on. Identity only matters
 // within one cell, so two markers cover every layout.
@@ -6737,22 +6230,19 @@ type (
 	scopeMatrixPartner struct{ B int64 }
 )
 
-// schemaForScopeCell mirrors SchemaFor's pipeline (inferRecord →
-// dedupNamedTypes → Marshal → Parse with the same opts) over a
-// reflect.StructOf-built struct, so cells can vary field layout at runtime
-// where the compile-time-generic SchemaFor[T] cannot.
+// schemaForScopeCell mirrors SchemaFor's pipeline (inferRecord → dedupNamedTypes
+// → Marshal → Parse with the same opts) over a reflect.StructOf-built struct, so
+// cells can vary field layout at runtime where the compile-time-generic
+// SchemaFor[T] cannot.
 //
 // Every cell doubles as a mutation probe: each CustomType.Schema is
-// deep-snapshotted before the build and deep-compared after, pinning the
-// contract that a build never writes into caller-owned SchemaNode storage
-// (the metadata render hands Props containers over by reference, and the
-// composition walkers mutate the tree they are given — the boundary copy
-// in renderCustomSchemaTree is what keeps those writes off the caller's
-// maps). The comparison runs whether or not the build errors: a mutation
-// on an error path is just as much a contract break.
-// extra carries SchemaOpts beyond the customs (e.g. WithLaxNames) through to
-// the final Parse, so a cell can vary the name validator the emitted schema
-// is read back under.
+// deep-snapshotted before the build and deep-compared after, pinning that a
+// build never writes into caller-owned SchemaNode storage — the metadata render
+// hands Props containers over by reference and the composition walkers mutate
+// the tree they are given, so the boundary copy in renderCustomSchemaTree is
+// what keeps those writes off the caller's maps. The comparison runs whether or
+// not the build errors. extra carries SchemaOpts beyond the customs through to
+// the final Parse.
 func schemaForScopeCell(t *testing.T, fields []reflect.StructField, namespace string, customs []CustomType, extra ...SchemaOpt) (*Schema, error) {
 	t.Helper()
 	// Every []string reachable from a cell's SchemaNode gets one sentinel
@@ -7323,22 +6813,19 @@ func TestMatrix_SchemaForCustomSchemaScope(t *testing.T) {
 
 // ---------- null_spelling_schemafor_test.go ----------
 
-// Avro spells the null type two ways — the bare primitive string "null" and
-// the wrapped object {"type":"null"} — and they denote the same type: same
-// branch, same wire bytes, same canonical form. Props and a logicalType on a
-// wrapped null are inert (Avro defines no null logical type), so a
-// carrier-bearing wrapped null is still a null branch.
+// Avro spells the null type two ways — the bare primitive "null" and the wrapped
+// object {"type":"null"} — and they denote the same type: same branch, same wire
+// bytes, same canonical form. Props and a logicalType on a wrapped null are
+// inert, Avro defining no null logical type, so a carrier-bearing wrapped null
+// is still a null branch.
 //
-// SchemaFor decides "is this union branch null?" on a PRE-PARSE tree of
-// `any` — a representation distinct from the parsed aschema and the compiled
-// node — at two points: the pointer collapse (a nullable T inside a nullable
-// T must not nest a union inside a union) and the null-first default fill.
-// Both decisions must see both spellings, because the tree they decide on is
-// handed straight to the very parser that treats the two as one type.
-//
-// The renderer emits a wrapped null bare when it carries nothing, so only a
-// carrier-bearing wrapped null (props, or a logicalType) survives the render
-// as an object — those are the spellings these tests use.
+// SchemaFor decides "is this union branch null?" on a PRE-PARSE tree of `any` —
+// a representation distinct from the parsed aschema and the compiled node — at
+// two points: the pointer collapse and the null-first default fill. Both must
+// see both spellings, because the tree they decide on is handed straight to the
+// parser that treats the two as one type. The renderer emits a wrapped null bare
+// when it carries nothing, so only a carrier-bearing one survives the render as
+// an object.
 
 // nullSpellUnions returns the union spellings that must behave identically,
 // keyed by a subtest-safe name. "bare" is the control: it exercised the
@@ -7367,13 +6854,13 @@ func nullSpellCustom(t *testing.T, union string) CustomType {
 	return CustomType{GoType: reflect.TypeFor[nullSpellMarker](), Schema: root}
 }
 
-// TestRegression_SchemaForPointerCollapseWrappedNullBranch pins that the
+// TestCensus_SchemaForPointerCollapseWrappedNullBranch pins that the
 // pointer arm's union collapse recognizes a null first branch in either
 // spelling. A *T field whose CustomType supplies a null-first union must
 // collapse to that union; keying the collapse on the bare spelling alone
 // emits ["null", [<union>]], which Avro forbids — the build then fails on a
 // schema whose bare-spelled twin builds fine.
-func TestRegression_SchemaForPointerCollapseWrappedNullBranch(t *testing.T) {
+func TestCensus_SchemaForPointerCollapseWrappedNullBranch(t *testing.T) {
 	ptrTo := reflect.PointerTo(reflect.TypeFor[nullSpellMarker]())
 	fields := []reflect.StructField{{Name: "F", Type: ptrTo}}
 
@@ -7398,7 +6885,7 @@ func TestRegression_SchemaForPointerCollapseWrappedNullBranch(t *testing.T) {
 	}
 }
 
-// TestRegression_SchemaForNullFirstDefaultWrappedNullBranch pins that the
+// TestCensus_SchemaForNullFirstDefaultWrappedNullBranch pins that the
 // null-first default fill recognizes both spellings. The assertion is on the
 // EMITTED SCHEMA TEXT, not on twmb's decode behavior: twmb synthesizes an
 // implicit null default for a nullable union at parse, so the omission is
@@ -7406,7 +6893,7 @@ func TestRegression_SchemaForPointerCollapseWrappedNullBranch(t *testing.T) {
 // registry or hands to another implementation — and Java and fastavro do not
 // infer the default. Without "default":null those readers cannot read data
 // written before the field existed.
-func TestRegression_SchemaForNullFirstDefaultWrappedNullBranch(t *testing.T) {
+func TestCensus_SchemaForNullFirstDefaultWrappedNullBranch(t *testing.T) {
 	fields := []reflect.StructField{{Name: "F", Type: reflect.TypeFor[nullSpellMarker]()}}
 
 	for _, tc := range nullSpellUnions() {
@@ -7439,24 +6926,22 @@ func TestRegression_SchemaForNullFirstDefaultWrappedNullBranch(t *testing.T) {
 	}
 }
 
-// TestMatrix_SchemaForNullBranchSpellingParity crosses the null-SPELLING
-// axis into the SchemaFor composition space: for every union-bearing cell,
+// TestMatrix_SchemaForNullBranchSpellingParity crosses the null-SPELLING axis
+// into the SchemaFor composition space: for every union-bearing cell,
 // respelling the null branch must not change the built schema.
 //
-// Axes: spelling {bare, wrapped-plain, wrapped-props, wrapped-logicalType} ×
-// union shape {null-first 2-branch, null-first 3-branch, null-SECOND
-// 2-branch} × field shape {value, pointer} × occurrences {1, 2} × SchemaFor
-// scope {default, WithNamespace}.
+// Axes: spelling {bare, wrapped-plain, wrapped-props, wrapped-logicalType} x
+// union shape {null-first 2-branch, null-first 3-branch, null-SECOND 2-branch} x
+// field shape {value, pointer} x occurrences {1, 2} x scope {default,
+// WithNamespace}.
 //
-// The oracle is per-cell equivalence against the bare spelling, which is the
-// control the pre-fix code already handled: identical build verdict (both
-// succeed or both fail), identical Canonical() (PCF strips the inert
-// carriers, so the four spellings collapse to one form — a calibration-free
-// comparison), identical fingerprint, identical per-field default presence,
-// and identical wire bytes for a probe value. Cells whose bare form is
-// itself an error (a null-SECOND union at a pointer field nests a union in a
-// union in every spelling) must fail the same way in every spelling — the
-// invariant is agreement, not success.
+// The oracle is per-cell equivalence against the bare spelling, the control the
+// pre-fix code already handled: identical build verdict, identical Canonical()
+// (PCF strips the inert carriers, so the four spellings collapse — a
+// calibration-free comparison), identical fingerprint, identical per-field
+// default presence, and identical wire for a probe value. Cells whose bare form
+// is itself an error must fail the same way in every spelling — the invariant is
+// agreement, not success.
 func TestMatrix_SchemaForNullBranchSpellingParity(t *testing.T) {
 	marker := reflect.TypeFor[nullSpellMarker]()
 	ptrTo := reflect.PointerTo(marker)
@@ -7567,27 +7052,25 @@ func nullSpellDefaults(t *testing.T, s *Schema) string {
 
 // Embedded-field name collisions: WHERE the decision is made.
 //
-// Two implementations answer "which of two same-named promoted fields wins,
-// and when is the collision ambiguous?" — collectFields, for SchemaFor, and
+// Two implementations answer "which of two same-named promoted fields wins, and
+// when is the collision ambiguous?" — collectFields, for SchemaFor, and
 // typeFieldMapping, the shared field map for encode and decode. They agree on
-// the RULE. What this file guards is that they agree on where the rule RUNS.
+// the RULE; what this guards is that they agree on where the rule RUNS.
 //
-// The rule ranges over the whole collected field set: shallowest depth wins,
-// and only a tie at the winning depth is ambiguous. A resolution step that
-// ranges over the whole set but is written as the trailing block of the
-// RECURSIVE collector runs once per level instead of once per type, on a
-// partial set — so a collision one level below the root is decided before the
-// level that resolves it has been read, and any index the step resolves is in
-// the root's coordinate space while its receiver is the nested type.
-//
-// No verdict-comparison net can see that: at the root both placements agree.
-// The discriminating observation is the SAME construct at several nesting
+// The rule ranges over the whole collected field set: shallowest depth wins, and
+// only a tie at the winning depth is ambiguous. A resolution step written as the
+// trailing block of the RECURSIVE collector runs once per level instead of once
+// per type, on a partial set — so a collision one level below the root is
+// decided before the level that resolves it has been read, and any index it
+// resolves is in the root's coordinate space while its receiver is the nested
+// type. No verdict-comparison net can see that: at the root both placements
+// agree. The discriminating observation is the SAME construct at several nesting
 // depths, which is the axis this matrix drives.
 //
-// The oracle is Go itself. reflect.Type.FieldByName implements the language's
-// promotion rule and reports an ambiguous promoted name by returning false;
-// it is placement-blind by construction, so it decides every untagged cell
-// here without reference to anything this package does.
+// The oracle is Go itself: reflect.Type.FieldByName implements the language's
+// promotion rule and reports an ambiguous promoted name by returning false. It
+// is placement-blind by construction, so it decides every untagged cell without
+// reference to anything this package does.
 
 // ---------- the shapes ----------
 //
@@ -7796,11 +7279,11 @@ func TestMatrix_EmbedTagTierIsPlacementInvariant(t *testing.T) {
 	}
 }
 
-// TestRegression_EmbedCollisionBelowRootDoesNotPanic is the public-entry
+// TestMatrix_EmbedCollisionBelowRootDoesNotPanic is the public-entry
 // pin. SchemaFor is generic, so these are written out rather than generated;
 // the panic they lock is a reflect index path resolved against the wrong
 // type, and it needs no collision at the root to fire.
-func TestRegression_EmbedCollisionBelowRootDoesNotPanic(t *testing.T) {
+func TestMatrix_EmbedCollisionBelowRootDoesNotPanic(t *testing.T) {
 	cases := []struct {
 		name     string
 		fn       func() (*Schema, error)
@@ -7869,9 +7352,7 @@ func TestRegression_EmbedResolvedBelowRootRoundTrips(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var out epRootResolves
-	if _, err := s.Decode(b, &out); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, b, &out)
 	if out.V != 7 {
 		t.Errorf("round trip put the value in a different field: got V=%d, want 7", out.V)
 	}
@@ -7931,22 +7412,20 @@ type EmbedX1 struct{ EmbedX0 }
 type EmbedX2 struct{ EmbedX1 }
 type EmbedX3 struct{ EmbedX2 }
 
-// TestRegression_EmbedSelectionMatchesGoPromotion is the GENERATIVE net for
+// TestGenerative_EmbedSelectionMatchesGoPromotion is the GENERATIVE net for
 // embedded-field selection. It sweeps the embed lattice — structs embedding
-// every ordered subset of the depth carriers above, as value AND pointer
-// embeds, with and without a direct field — and for every shape asserts
-// twmb's selected field equals Go's OWN field promotion (reflect.FieldByName,
-// the resolver Go uses for v.X). That is the narrow, correct oracle for
-// doc.go's "shallowest wins": NOT encoding/json (whose tag namespace, tag
-// options, and case-insensitive decode differ from avro's), but Go promotion
+// every ordered subset of the depth carriers, as value AND pointer embeds, with
+// and without a direct field — and for every shape asserts twmb's selected field
+// equals Go's OWN field promotion (reflect.FieldByName). That is the narrow,
+// correct oracle for doc.go's "shallowest wins": NOT encoding/json, whose tag
+// namespace, tag options and case-insensitive decode differ, but Go promotion
 // itself, which is tag-independent.
 //
-// Oracle scope: every field's avro name equals its Go field name (no
-// rename), so "which field does name N resolve to" is a pure Go-promotion
-// question both twmb and reflect answer identically. Out of scope (no
-// external oracle — twmb-DEFINED policy, pinned separately): tagged renames
-// colliding with promoted names, and equal-depth ties where reflect abstains.
-func TestRegression_EmbedSelectionMatchesGoPromotion(t *testing.T) {
+// Oracle scope: every field's avro name equals its Go field name, so "which
+// field does name N resolve to" is a pure Go-promotion question. Out of scope,
+// pinned separately as twmb-DEFINED policy: tagged renames colliding with
+// promoted names, and equal-depth ties where reflect abstains.
+func TestGenerative_EmbedSelectionMatchesGoPromotion(t *testing.T) {
 	carriers := []reflect.Type{
 		reflect.TypeFor[EmbedX0](), reflect.TypeFor[EmbedX1](),
 		reflect.TypeFor[EmbedX2](), reflect.TypeFor[EmbedX3](),
@@ -8137,19 +7616,15 @@ func fieldList(t reflect.Type) string {
 
 // TestRegression_EmbedEqualDepthAmbiguity pins twmb's LAZY handling of an
 // equal-depth name collision through two embeds. The collision is genuinely
-// ambiguous (Go makes the selector a compile error; encoding/json silently
-// drops the field). twmb's contract:
-//   - SchemaFor REJECTS (eager — it must emit every field, and cannot emit two
-//     with the same name).
-//   - Runtime encode/decode (shared typeFieldMapping) reject ONLY when the
-//     schema actually resolves a field to the ambiguous name. A coincidental
-//     collision on a name the schema never references — e.g. two embedded
-//     library structs that happen to share a field name — does NOT break the
-//     struct; the other fields work. When the schema DOES use the ambiguous
-//     name, the error is loud and has encode/decode parity (vs json's silent
-//     drop, or the old silent first-win). The runtime is schema-driven, so it
-//     errors lazily; SchemaFor sees all fields, so it errors eagerly — a
-//     justified scoping difference, not a contradiction.
+// ambiguous — Go makes the selector a compile error, encoding/json silently
+// drops the field. twmb's contract: SchemaFor REJECTS, eagerly, since it must
+// emit every field and cannot emit two with the same name; the runtime rejects
+// ONLY when the schema actually resolves a field to the ambiguous name, so a
+// coincidental collision on a name the schema never references does not break
+// the struct. When the schema DOES use it, the error is loud and has
+// encode/decode parity. The runtime is schema-driven so it errors lazily;
+// SchemaFor sees all fields so it errors eagerly — a justified scoping
+// difference, not a contradiction.
 func TestRegression_EmbedEqualDepthAmbiguity(t *testing.T) {
 	type C struct {
 		Dup int32 `avro:"dup"`
@@ -8198,14 +7673,13 @@ func TestRegression_EmbedEqualDepthAmbiguity(t *testing.T) {
 
 // A name that a higher-priority field unambiguously OWNS is not an ambiguous
 // collision, even when lower-priority fields collide among themselves at a
-// deeper-or-equal level. SchemaFor must accept such a struct and infer the
-// single winning field, matching the runtime field mapper (typeFieldMapping)
-// and Go's own field promotion — both of which resolve the name. The
-// resolution is DEFERRED: the resolving field may be declared AFTER the
-// colliding pair (the common "embeds first, own fields after" layout), so
-// erroring the instant two deep fields collide wrongly rejects a struct whose
-// name a shallower or tagged field owns. The encode/decode round-trip is the
-// parity oracle: SchemaFor's inferred mapping must match what the codec uses.
+// deeper-or-equal level. SchemaFor must accept such a struct and infer the single
+// winning field, matching the runtime field mapper (typeFieldMapping) and Go's
+// own field promotion. The resolution is DEFERRED: the resolving field may be
+// declared AFTER the colliding pair (the common "embeds first, own fields after"
+// layout), so erroring the instant two deep fields collide wrongly rejects a
+// struct whose name a shallower or tagged field owns. The encode/decode round
+// trip is the parity oracle for SchemaFor's inferred mapping.
 func TestRegression_SchemaForResolvableCollisionNotAmbiguous(t *testing.T) {
 	t.Run("shallower field declared last resolves a deep collision", func(t *testing.T) {
 		type EmbA struct{ Name string } // depth 2, untagged
@@ -8229,9 +7703,7 @@ func TestRegression_SchemaForResolvableCollisionNotAmbiguous(t *testing.T) {
 			t.Fatalf("encode: %v", err)
 		}
 		var got Outer
-		if _, err := s.Decode(wire, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, wire, &got)
 		if got.Name != "direct" {
 			t.Fatalf("\"Name\" mapped to a shadowed field, not the direct one: %+v", got)
 		}
@@ -8261,9 +7733,7 @@ func TestRegression_SchemaForResolvableCollisionNotAmbiguous(t *testing.T) {
 			t.Fatalf("encode: %v", err)
 		}
 		var got Outer
-		if _, err := s.Decode(wire, &got); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		mustDecode(t, s, wire, &got)
 		if got.EmbTagged.Other != "tagged" {
 			t.Fatalf("\"Name\" mapped to an untagged field, not the tagged one: %+v", got)
 		}
@@ -8291,45 +7761,36 @@ func TestRegression_SchemaForResolvableCollisionNotAmbiguous(t *testing.T) {
 // The generative adversarial-struct-shape net for SchemaFor's field selection.
 //
 // ONE generator (genStructuralShapes / genTagEdgeShapes), not hand cases. Every
-// shape is a reflect.StructOf type built by crossing the axes that the embedded-
-// field selection bugs lived in:
-//
-//   - diamond embeds            (a base reached through two arms at EQUAL depth)
-//   - equal-depth collisions    (two DISTINCT types promoting the same name)
-//   - repeated-type two-depth   (one type reached directly AND through an embed)
-//   - embedded vs named fields  (a direct field colliding with a promoted one)
-//   - tagged vs untagged         (a rename colliding with a promoted Go name)
-//   - malformed / edge tags      (genTagEdgeShapes: inline-on-non-struct, name+
-//                                 inline, decimal trailing junk, dash+options,
-//                                 narrow-int default bounds, uuid/plain dedup)
+// shape is a reflect.StructOf type built by crossing the axes the embedded-field
+// selection bugs lived in: diamond embeds (a base reached through two arms at
+// EQUAL depth), equal-depth collisions, repeated-type two-depth (one type
+// reached directly AND through an embed), embedded vs named fields, tagged vs
+// untagged, and malformed / edge tags.
 //
 // For every shape the net asserts the two field-mapping walkers AGREE:
 //
-//     SchemaFor's    collectFields  (schema_for.go)   -- the schema builder
-//     the runtime's  typeFieldMapping (reflect.go)    -- shared by encode AND
-//                                                         decode (ser/deser/
-//                                                         json_codec/json_decode/
-//                                                         resolve/unsafe)
+//     SchemaFor's    collectFields    (schema_for.go)  -- the schema builder
+//     the runtime's  typeFieldMapping (reflect.go)     -- shared by encode AND
+//                                                         decode
 //
-// on (1) WHICH Go field each Avro name resolves to, and (2) the RESOLVED schema
-// (exercised end-to-end through the real Encode/Decode path). The two diverging
-// is the failure mode Family 5 keeps hitting (commits 692b039, a1c4b25,
-// 6ce8257): a silently-picked wrong field, an embed pruned by a marked-forever
-// visited map, an ambiguity one walker rejects and the other first-wins.
+// on (1) WHICH Go field each Avro name resolves to and (2) the RESOLVED schema,
+// exercised end-to-end through the real Encode/Decode path. The two diverging is
+// the failure mode Family 5 keeps hitting (692b039, a1c4b25, 6ce8257): a
+// silently-picked wrong field, an embed pruned by a marked-forever visited map,
+// an ambiguity one walker rejects and the other first-wins.
 //
 // Non-vacuity is NOT self-asserted: the walkers are cross-checked against an
 // INDEPENDENT oracle — Go's own field promotion (reflect.FieldByName) for the
 // untagged shapes, and a from-scratch precedence resolver (oracleResolve,
-// validated against FieldByName on the untagged shapes) for the tagged ones.
-// If the two walkers ever drifted in lockstep, the FieldByName oracle still
-// catches it. The neutering record at the bottom of this file documents the
-// exact reverts that turn cells red, and what they were measured to do.
+// validated against FieldByName on those) for the tagged ones. If the two
+// walkers drifted in lockstep, FieldByName still catches it. The neutering
+// record at the bottom documents the exact reverts that turn cells red.
 //
 // The eager/lazy split is part of the contract, not a divergence: SchemaFor
-// REJECTS any ambiguous collision (it must emit every field), while the runtime
-// defers — it errors only when a schema field actually RESOLVES to an ambiguous
-// name, so a coincidental collision the schema never references does not break
-// the struct. The net asserts BOTH halves.
+// REJECTS any ambiguous collision, since it must emit every field, while the
+// runtime defers and errors only when a schema field actually RESOLVES to an
+// ambiguous name, so a coincidental collision the schema never references does
+// not break the struct. The net asserts BOTH halves.
 // ===========================================================================
 
 // ---- carrier alphabet -----------------------------------------------------
@@ -8424,14 +7885,13 @@ func schemaForType(t reflect.Type, opts ...SchemaOpt) (*Schema, error) {
 //
 // oracleResolve computes, FROM SCRATCH, which Go field each Avro name resolves
 // to and which names are ambiguous, using a naive per-path walk (a cycle guard
-// on the on-path slice — per-path by construction, so it cannot share the
-// marked-forever prune bug) and the DOCUMENTED precedence rule applied to the
-// full candidate set at once (gather-all-then-argmin), as opposed to the two
-// walkers' single-pass iterative dedup. It calls NEITHER collectFields NOR
-// typeFieldMapping. Its structural walk is validated against reflect.FieldByName
-// (Go's own promotion) on every untagged shape; the only logic FieldByName does
-// not cover — tagged-beats-untagged — is small and additionally pinned by the
-// kept hand regressions.
+// on the on-path slice, so it cannot share the marked-forever prune bug) and the
+// DOCUMENTED precedence rule applied to the full candidate set at once, as
+// opposed to the two walkers' single-pass iterative dedup. It calls NEITHER
+// collectFields NOR typeFieldMapping. Its structural walk is validated against
+// reflect.FieldByName on every untagged shape; the only logic FieldByName does
+// not cover — tagged-beats-untagged — is additionally pinned by the kept hand
+// regressions.
 
 type oracleCand struct {
 	index  []int
@@ -8900,17 +8360,14 @@ func TestGenerative_EmbedShapeWalkerAgreement(t *testing.T) {
 // generator wraps carrier 0 in a pointer on half the shapes, but roundTripWinners
 // calls allocPointers before encoding, so for this net's whole history every
 // generated pointer embed reached the codecs ALLOCATED. A NIL embed takes a
-// different arm — fieldByIndexZero returns the zero of fieldTypeByIndex's
-// resolved type instead of walking — and that arm is reached from three distinct
-// encode sites (ser.go's reflect path, unsafe.go's compiled slow-field arm, and
-// json_codec.go), any of which could panic on a nil deref without the net
-// noticing.
+// different arm — fieldByIndexZero returns the zero of the resolved type instead
+// of walking — reached from three distinct encode sites, any of which could
+// panic on a nil deref without the net noticing.
 //
 // The expectation is not read off this package: a value whose fields are all
 // zero has one image, so the struct with the embed left NIL must encode to
-// exactly what the same schema produces for an explicit all-zero MAP — the map
-// encoder being a path that never touches fieldByIndexZero at all. Encode then
-// implies decode: the wire must read back, allocating the embed on the way in.
+// exactly what the same schema produces for an explicit all-zero MAP, the map
+// encoder never touching fieldByIndexZero. Encode then implies decode.
 func roundTripNilEmbed(t *testing.T, sh genShape, s *Schema, or oracleResult) {
 	t.Helper()
 
@@ -8999,22 +8456,19 @@ var embedIndexSites = map[string]int{
 //
 // The verdict is a property of the Go SHAPE, not of the wire, so every route
 // reaching those helpers owes the same answer — and the routes are not one path.
-// Binary decode reaches fieldByIndex only through the COMPILED record
-// (deserRecordFast's slow-field arm); JSON decode has a present-key arm and a
-// separate default-fill arm; the RESOLVED decoder has its own writer-op and
-// reader-default arms. Five decode sites, three encode sites, all in
-// embedIndexSites.
+// Binary decode reaches fieldByIndex only through the COMPILED record; JSON
+// decode has a present-key arm and a separate default-fill arm; the RESOLVED
+// decoder has its own writer-op and reader-default arms. Five decode sites,
+// three encode sites, all in embedIndexSites.
 //
-// AXES: occupancy {nil, pre-allocated} x embed exportedness {exported,
-// unexported} x route {the eight sites above}.
+// AXES: occupancy {nil, pre-allocated} x embed exportedness x route.
 //
-// ORACLE: encoding/json, decoded into the SAME Go types. It is an independent
+// ORACLE: encoding/json, decoded into the SAME Go types — an independent
 // implementation of the same Go-reflection constraint, and fieldByIndex's own
-// comment claims parity with it — so the accept/reject verdict is taken from it
-// cell for cell rather than read off this package. Its ENCODE behavior is
-// deliberately NOT the oracle: json omits a nil embed's promoted fields, while
-// an Avro record has no absent field and writes the zero. The encode arm uses
-// the all-zero map twin instead (a path that never touches fieldByIndexZero).
+// comment claims parity with it, so the verdict is taken from it cell for cell.
+// Its ENCODE behavior is deliberately NOT the oracle: json omits a nil embed's
+// promoted fields, while an Avro record has no absent field and writes the zero.
+// The encode arm uses the all-zero map twin instead.
 func TestMatrix_NilEmbedPointerRouteAgreement(t *testing.T) {
 	full := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"c","type":"int"}]}`)
 	// withDefault carries a default for "a" so the JSON decoder's default-fill
@@ -9423,57 +8877,52 @@ func TestGenerative_SchemaForReplicaParity(t *testing.T) {
 //
 // This net is proven to FAIL when each Family-5 fix is reverted in the
 // production walkers. Measured over the 16000 generated structural shapes with a
-// temporary count-don't-fatal harness (the live test fatals at the first red
-// cell). With both fixes intact all four counts below are 0.
+// temporary count-don't-fatal harness. With both fixes intact all four counts
+// are 0.
 //
-//	NEUTER-1  Remove `defer delete(visited, t)` from BOTH walkers
-//	          (reflect.go + schema_for.go) — revert 6ce8257, restoring the
-//	          marked-forever visited map:
-//	            collectFields wrong-winner ......... 200 shapes (100 of them inline)
+//	NEUTER-1  Remove `defer delete(visited, t)` from BOTH walkers (revert
+//	          6ce8257, restoring the marked-forever visited map):
+//	            collectFields wrong-winner ......... 200 shapes (100 inline)
 //	            collectFields accepted-ambiguous ... 304 shapes
 //	            typeFieldMapping mirrors both (200 / 304)
 //	          A type reached through two embed paths has its SHALLOW occurrence
-//	          pruned, so the deeper field wins (caught by the FieldByName oracle
-//	          on the embed shapes and by oracleResolve on the inline shapes, where
-//	          FieldByName does not apply — hence the 100 inline reds); a diamond's
-//	          second arm is pruned, so the collision is silently first-won instead
-//	          of flagged ambiguous.
+//	          pruned, so the deeper field wins — caught by FieldByName on the
+//	          embed shapes and by oracleResolve on the inline shapes, where
+//	          FieldByName does not apply, hence the 100 inline reds — and a
+//	          diamond's second arm is pruned, so the collision is silently
+//	          first-won instead of flagged ambiguous.
 //
-//	NEUTER-2  Drop the equal-depth `ambiguous[...]` mark in BOTH walkers
-//	          (revert 692b039 + a1c4b25), restoring silent first-win:
+//	NEUTER-2  Drop the equal-depth `ambiguous[...]` mark in BOTH walkers (revert
+//	          692b039 + a1c4b25), restoring silent first-win:
 //	            collectFields accepted-ambiguous ... 912 shapes
 //	            typeFieldMapping accepted-ambiguous  912 names
-//	          Every ambiguous shape the net asserts must reject is silently
-//	          first-won instead. 912 == the net's own ambiguity-rejection count,
-//	          i.e. EVERY ambiguous cell goes red.
+//	          912 == the net's own ambiguity-rejection count, i.e. EVERY
+//	          ambiguous cell goes red.
 
 // ---------- embed_shape_tagedge_test.go ----------
 
 // ===========================================================================
 // The tag-edge half of the generative net: malformed / edge struct tags.
 //
-// SchemaFor's parser (collectFields -> parseSchemaTag/splitTag, then
-// inferField/inferType) is STRICT: it rejects inline-on-non-struct, inline with
-// an explicit name, a decimal tag with trailing junk, a "-" skip carrying
-// options, an unknown option, a default that overflows the Go field's narrow
-// integer kind, a logical type on an incompatible Go type, an empty alias list.
-// The runtime field-mapper (typeFieldMapping -> splitFieldTag/parseTagOptions)
-// is LENIENT: it needs only the field name, inline, and omitzero, and ignores
-// everything else; on an unbalanced-bracket tag splitTag rejects but
-// splitFieldTag falls back to a naive split so the runtime never NEWLY errors
-// on a tag a hand-written-schema user already relies on.
+// SchemaFor's parser is STRICT: it rejects inline-on-non-struct, inline with an
+// explicit name, a decimal tag with trailing junk, a "-" skip carrying options,
+// an unknown option, a default overflowing the field's narrow integer kind, a
+// logical type on an incompatible Go type, an empty alias list. The runtime
+// field-mapper is LENIENT: it needs only name, inline, and omitzero, ignores the
+// rest, and on an unbalanced-bracket tag falls back to a naive split so the
+// runtime never NEWLY errors on a tag a hand-written-schema user already relies
+// on.
 //
 // That strict/lenient split is the tag-dimension analog of the eager/lazy
 // ambiguity split, and it is SAFE only as long as it never becomes a
 // both-succeed-DISAGREE: the two walkers share splitTag's tokenization and
 // extract name/inline/omitzero with identical logic, so whenever SchemaFor
 // builds a field the runtime must map the SAME name to the SAME Go field. This
-// family proves that across the cross-product (defect x placement): for every
-// shape where collectFields succeeds, typeFieldMapping agrees on every name; and
-// the documented SchemaFor verdict (accept/reject) is pinned so a regression in
-// the strict parser is caught. Where collectFields rejects, the runtime is
-// asserted non-corrupting — it errors loudly or maps a syntactically-valid name
-// to a real field, never silently picks a contradictory winner.
+// family proves that across defect x placement: where collectFields succeeds,
+// typeFieldMapping agrees on every name, and the documented verdict is pinned;
+// where collectFields rejects, the runtime is asserted non-corrupting — it
+// errors loudly or maps a syntactically-valid name to a real field, never
+// silently picks a contradictory winner.
 // ===========================================================================
 
 type GUUID [16]byte
@@ -9706,33 +9155,27 @@ func fieldNamesOf(t reflect.Type) []string {
 // The reflect collectors' cost is a PRODUCT, and only one of its factors was
 // ever driven.
 //
-// Both collectors — collectFieldsRaw (schema_for.go, behind SchemaFor) and
-// typeFieldMapping's collect (reflect.go, behind a record decode/encode) —
-// mark the type they are descending PER PATH and unmark on the way out
-// (`defer delete(visited, t)`). That is correct for embed CYCLES and
-// deliberate: a type reached through two SIBLING embed paths has to be
-// collected at each occurrence, so the shallower one reaches the
-// shallowest-wins dedup and a type genuinely inlined twice surfaces as the
-// duplicate-field collision it is. The consequence is that a Go type graph
-// which is a DAG — no cycle at all — is re-descended once per PATH, and a
-// diamond of embeds has 2^depth of them.
+// Both collectors — collectFieldsRaw (behind SchemaFor) and typeFieldMapping's
+// collect (behind a record decode/encode) — mark the type they are descending
+// PER PATH and unmark on the way out. That is correct for embed CYCLES and
+// deliberate: a type reached through two SIBLING embed paths has to be collected
+// at each occurrence, so the shallower one reaches the shallowest-wins dedup and
+// a type genuinely inlined twice surfaces as the duplicate-field collision it
+// is. The consequence is that a Go type graph which is a DAG is re-descended
+// once per PATH, and a diamond of embeds has 2^depth of them.
 //
-// That is a cost, not a bug: the carrier is a Go type, fixed at compile time,
-// so nothing an attacker sends can grow it. What made it worth a permanent
-// cell is that the ruling closing it rested on the two collectors being
-// equivalent, and they are not. The cost is
+// That is a cost, not a bug: the carrier is a Go type fixed at compile time, so
+// nothing an attacker sends can grow it. What made it worth a permanent cell is
+// that the ruling closing it rested on the two collectors being equivalent, and
+// they are not. The cost is paths-through-the-embed-DAG x CALLS, and the second
+// factor differs: typeFieldMapping's result is memoized per reflect.Type in a
+// sync.Map, so a decode pays the walk once; collectFieldsRaw has no memo, so
+// every SchemaFor call re-pays it in full. Driving depth alone cannot see that.
 //
-//	paths-through-the-embed-DAG  x  CALLS
-//
-// and the second factor differs between them: typeFieldMapping's result is
-// memoized per reflect.Type in a sync.Map (deser.go, ser.go), so a decode pays
-// the walk once and never again; collectFieldsRaw has no memo at all, so every
-// SchemaFor call re-pays it in full. Driving depth alone cannot see that, which
-// is why the cell drives both.
-// Sibling-embed diamond: T_k embeds A_k and B_k, both of which embed T_{k+1},
-// so T1 reaches the leaf by 2^depth distinct paths while the type GRAPH is
-// linear in the depth. The leaf is empty, so the type is ACCEPTED and the
-// walk runs to completion rather than stopping at a duplicate-field error.
+// Sibling-embed diamond: T_k embeds A_k and B_k, both embedding T_{k+1}, so T1
+// reaches the leaf by 2^depth distinct paths while the type GRAPH is linear in
+// the depth. The leaf is empty, so the type is ACCEPTED and the walk runs to
+// completion rather than stopping at a duplicate-field error.
 type embedDiamondLeaf struct{}
 
 type T13 = embedDiamondLeaf
@@ -9812,36 +9255,30 @@ type T1 struct {
 // TestInvariant_EmbedDiamondCostFactors drives BOTH factors of the reflect
 // collectors' cost.
 //
-// What it asserts, and what it deliberately does not. It does NOT assert the
-// depth factor is flat — it is not, by design, and a cell claiming otherwise
-// would be asserting a property the package does not have. It asserts the two
-// things that ARE invariants:
+// It does NOT assert the depth factor is flat — it is not, by design, and a cell
+// claiming otherwise would assert a property the package does not have. It
+// asserts the two things that ARE invariants:
 //
-//   - the DECODE collector is amortized. A second decode into the same Go type
-//     must cost a small fraction of the first.
+//   - the DECODE collector is amortized: a second decode into the same Go type
+//     must cost a small fraction of the first. TWO caches in SERIES produce
+//     that, and neither can be discriminated alone — deserRecord.fast holds the
+//     compiled unsafe path per Go type and is consulted first, and
+//     typeFieldMapping's sync.Map holds the field mapping behind it. Disabling
+//     either measured 375ns and 583ns on the second decode, unchanged, because
+//     the survivor still answers; disabling BOTH gives 3.9ms against a 4.3ms
+//     first decode. So what is asserted is the COMBINATION, and the naming
+//     matters: a comment crediting the mapping cache alone would name a bound it
+//     does not measure.
 //
-//     TWO caches in SERIES produce that, and neither can be discriminated
-//     alone: deserRecord.fast holds the compiled unsafe path per Go type and
-//     is consulted first, and typeFieldMapping's own sync.Map holds the field
-//     mapping behind it. Disabling either one measured 375ns and 583ns on the
-//     second decode — unchanged — because the survivor still answers.
-//     Disabling BOTH gives 3.9ms against a 4.3ms first decode, i.e. the walk
-//     running again. So what this asserts is the COMBINATION, and the naming
-//     matters: a comment crediting the mapping cache alone would be a cell
-//     named for a bound it does not measure, which is how the last one in this
-//     file got renamed.
-//
-//   - neither collector ACCUMULATES across calls. Call N must cost about what
-//     call 1 did, so a per-call cost that grew with the number of calls — a
-//     cache keyed on something that is not the type, a leak — reds. This is
-//     the form that leaves room for the improvement rather than forbidding it:
-//     adding a memo to collectFieldsRaw makes later calls cheaper, which
-//     passes.
+//   - neither collector ACCUMULATES across calls: call N must cost about what
+//     call 1 did, so a per-call cost growing with the number of calls — a cache
+//     keyed on something that is not the type, a leak — reds. This form leaves
+//     room for the improvement rather than forbidding it: adding a memo to
+//     collectFieldsRaw makes later calls cheaper, which passes.
 //
 // The depth pair is measured and LOGGED rather than bounded, so the 2^depth
-// shape is visible to a reader of the output instead of living only in a
-// comment, and the absolute ceiling still catches a regression that made the
-// walk worse than exponential in the depth.
+// shape is visible in the output instead of only in a comment, and the absolute
+// ceiling still catches a regression worse than exponential in the depth.
 func TestInvariant_EmbedDiamondCostFactors(t *testing.T) {
 	depths := costFactorValues(t, "TestInvariant_EmbedDiamondCostFactors")
 	if len(depths) < 2 {
@@ -9895,14 +9332,8 @@ func TestInvariant_EmbedDiamondCostFactors(t *testing.T) {
 	}
 
 	// Factor 2 again, on the DECODE collector, where the memo makes it free.
-	s, err := SchemaFor[T1]()
-	if err != nil {
-		t.Fatalf("SchemaFor: %v", err)
-	}
-	wire, err := s.Encode(T1{})
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	s := mustSchemaFor[T1](t)
+	wire := mustEncode(t, s, T1{})
 	var out T1
 	first := timeCall(func() {
 		if _, err := s.Decode(wire, &out); err != nil {
@@ -9961,9 +9392,7 @@ func TestRegression_RepeatedEmbedShallowestWins(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var out map[string]any
-	if _, err := s.Decode(data, &out); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	mustDecode(t, s, data, &out)
 	if out["X"] != int32(2) {
 		t.Fatalf("encode selected the DEEPER field: X=%v, want 2 (shallowest-wins / Go promotion)", out["X"])
 	}
@@ -10022,5 +9451,17 @@ func TestRegression_EmbedCycleStillTerminates(t *testing.T) {
 	}
 	if n.V != 7 {
 		t.Fatalf("cyclic-embed round-trip: V=%d, want 7", n.V)
+	}
+}
+
+// roundTripEq encodes v against s, decodes the wire back into a fresh T, and
+// requires the two to be equal.
+func roundTripEq[T comparable](t *testing.T, s *Schema, v T) {
+	t.Helper()
+	data := mustEncode(t, s, &v)
+	var got T
+	mustDecode(t, s, data, &got)
+	if got != v {
+		t.Errorf("got %+v, want %+v", got, v)
 	}
 }

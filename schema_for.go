@@ -292,37 +292,25 @@ func pinCustomSchemaScope(v any) {
 	}
 }
 
-// renderCustomSchemaTree renders a CustomType.Schema subtree for embedding
-// into a SchemaFor tree. Two boundary duties live here, both consequences
-// of the render being a metadata walk over a CALLER-owned SchemaNode
-// rather than a SchemaFor-built tree:
+// renderCustomSchemaTree renders a CustomType.Schema subtree for embedding into
+// a SchemaFor tree. It is a metadata walk over CALLER-owned storage, which
+// gives it two boundary duties:
 //
-//   - It uses the error-reporting (deduper-carrying) walk, the same one
-//     [SchemaNode.Schema] uses, so a subtree that exceeds the schema-tree
-//     budgets or contains an unnamed cycle fails the build with the named
-//     error. The bare walk truncates over-budget values to nil — the right
-//     posture for the error-LESS surfaces (Schema.String, MarshalJSON,
-//     where the alternative is a panic) — but SchemaFor has an error
-//     channel, and a truncated Props VALUE parses cleanly as a null prop,
-//     so no downstream Parse catches the silent alteration.
+//   - The error-reporting walk, not the bare one, so an over-budget or
+//     unnamed-cyclic subtree fails the build by name. The bare walk truncates
+//     to nil — correct for the error-LESS surfaces, where the alternative is a
+//     panic — but a truncated Props VALUE parses cleanly as a null prop, so
+//     nothing downstream would catch the alteration.
 //
-//   - It deep-copies AND canonicalizes the rendered tree before returning
-//     it. The walk hands Props container values (and SchemaField
-//     Props/Default containers) over BY REFERENCE whenever they need no
-//     JSON fixup (jsonSerializableValue's documented allocation-free fast
-//     path), and the composition walkers write into the tree they are
-//     given: pinCustomSchemaScope injects "namespace":"" at the named
-//     frontier, dedupNamedTypes rewrites items/values/union slots and
-//     field types into references. Without the copy those writes would
-//     land in the caller's own SchemaNode storage; without the
-//     canonicalization (canonicalizeTreeValue) a caller-typed value —
-//     `type M map[string]any`, whose marshal is identical to its
-//     canonical twin's — would pass through every walker type-switch
-//     untouched while Parse binds its marshal as real structure. This
-//     render is the only path caller-owned containers enter the pre-Parse
-//     tree — every other node comes fresh from inferType/inferRecord
-//     literals or toJSONWalk's own map construction — so the boundary
-//     covers them all.
+//   - Deep-copy AND canonicalize before returning. The walk hands Props
+//     containers over BY REFERENCE when they need no JSON fixup, and the
+//     composition walkers write into the tree they are given —
+//     pinCustomSchemaScope injects "namespace":"", dedupNamedTypes rewrites
+//     slots into references — so without the copy those writes land in the
+//     caller's SchemaNode. Without canonicalizeTreeValue, a caller-typed value
+//     like `type M map[string]any` passes every walker type-switch untouched
+//     while Parse binds its marshal as real structure. This render is the only
+//     way caller-owned containers enter the pre-Parse tree.
 func renderCustomSchemaTree(n *SchemaNode) (any, error) {
 	d := &deduper{
 		defined: make(map[string]*SchemaNode),
@@ -335,25 +323,23 @@ func renderCustomSchemaTree(n *SchemaNode) (any, error) {
 	return deepCopyJSONTree(tree), nil
 }
 
-// deepCopyJSONTree copies AND CANONICALIZES every container level of a
-// rendered schema tree so the composition walkers — which dispatch on the
-// canonical Go types — provably see every value the final Parse will bind,
-// and so mutating walkers cannot reach storage shared with the SchemaNode
-// that produced it. The copy duty: string slices ([]string
-// aliases/symbols) come over by reference from the render (emitStrings
-// returns the caller's slice) and MUST be copied — addTypeAliases appends
-// to a type's "aliases" value, and an append into a caller slice with
-// spare capacity writes the caller's backing array past its length, a
-// write no deep-equal of the caller's tree can see. The canonicalization
-// duty: the tree's semantics are defined by its json.Marshal output, and a
-// caller-typed value (`type M map[string]any` in Props) marshals
-// identically to its canonical twin — left as-is it would thread through
-// every walker type-switch untouched while Parse binds its marshal as real
-// structure (canonicalizeTreeValue). Nil-ness is part of the marshal image
-// (a nil map/slice marshals null, a non-nil empty one {}/[]), so every arm
-// preserves it exactly: nil in, nil out; empty in, empty out. Immutable
-// scalar leaves stay shared; []byte never survives a render (the walk's
-// JSON fixup converts it to the codepoint-string form).
+// deepCopyJSONTree copies AND CANONICALIZES every container level of a rendered
+// tree, so the composition walkers see every value Parse will bind and no
+// mutating walker reaches storage shared with the source SchemaNode.
+//
+// The copy: []string aliases/symbols arrive by reference (emitStrings returns
+// the caller's slice), and addTypeAliases appends to a type's "aliases" — an
+// append into a caller slice with spare capacity writes their backing array
+// past its length, which no deep-equal of the caller's tree can detect.
+//
+// The canonicalization: the tree's semantics are its json.Marshal output, and a
+// caller-typed `type M map[string]any` marshals identically to its canonical
+// twin, so left alone it threads through every walker type-switch untouched
+// while Parse binds its marshal as real structure.
+//
+// Nil-ness is part of the marshal image — a nil map marshals null, an empty one
+// {} — so every arm preserves it exactly. Scalar leaves stay shared; []byte
+// never survives a render.
 func deepCopyJSONTree(v any) any {
 	switch v := v.(type) {
 	case map[string]any:
@@ -485,28 +471,22 @@ func canonicalizeTreeValue(v any) any {
 // parser does (resolveNameScope: a named definition opens its own scope),
 // so:
 //
-//   - definitions are keyed by their RESOLVED FULLNAME — name equality is
-//     defined on the fullname (spec, "Names"), so distinct fullnames that
-//     share a short name (a.X and X) coexist rather than collide;
-//   - a repeated identical definition dedups to a DOTTED fullname
-//     reference, which re-binds position-independently anywhere; a
-//     null-namespace type's fullname has no dotted spelling, so its bare
-//     reference is emitted only where the enclosing scope is null — at any
+//   - definitions key on their RESOLVED FULLNAME, since name equality is
+//     defined on the fullname (spec, "Names"), so a.X and X coexist;
+//   - a repeat dedups to a DOTTED fullname reference, which re-binds
+//     position-independently. A null-namespace type has no dotted spelling, so
+//     its bare reference is emitted only in a null enclosing scope — at a
 //     namespaced position a bare name binds in the enclosing namespace and
-//     references have no "namespace":"" escape, so that corner returns a
-//     named error instead of a dangling or wrong-binding reference;
-//   - two occurrences of one fullname compare on their SCOPE-NORMALIZED
-//     forms (normalizeSchemaScope), since the same definition's relative
+//     references have no "namespace":"" escape, so that corner returns a named
+//     error rather than a wrong-binding reference;
+//   - two occurrences compare SCOPE-NORMALIZED, since one definition's relative
 //     JSON differs by position.
 //
-// It also enforces the named-type invariant: each Avro fullname must map to
-// exactly ONE definition. When two DIFFERENT definitions claim the same
-// fullname — two different Go types, or two forms of one type (a [16]byte
-// named "uuid" used both ,uuid and plain; or, once supported, an
-// avro.Duration alongside a plain [12]byte named "duration") — it returns
-// an error rather than emitting an unrepresentable schema. This is the
-// single, general collision check; the fixed/record/enum arms above need
-// not detect it.
+// It also enforces one definition per fullname. Two DIFFERENT definitions
+// claiming one name — two Go types, or two forms of one type, like a [16]byte
+// named "uuid" used both ,uuid and plain — error rather than emit an
+// unrepresentable schema. This is the single general collision check; the
+// fixed/record/enum arms above need not detect it.
 func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any, error) {
 	switch v := v.(type) {
 	case map[string]any:
@@ -695,22 +675,18 @@ type schemaField struct {
 // resolved (tagged wins over untagged, shallower wins over deeper, and a tie
 // at the winning depth is an ambiguity to report).
 //
-// The resolution is HERE and not inside the walk, and that placement is the
-// contract rather than a layout choice. The rule ranges over the whole
-// collected set: which field wins a name is not decidable from one embedded
-// struct's own fields, because a shallower field declared anywhere above it
-// takes the name. Run per recursion level, the rule decides on a partial set —
-// a collision is called ambiguous before the level that resolves it has been
-// read, rejecting a type Go's own promotion resolves — and the index paths it
-// resolves, which accumulate from the ROOT, are read against whichever nested
-// type the level happened to be visiting.
+// Resolving HERE rather than inside the walk is the contract, not a layout
+// choice. The rule ranges over the whole collected set, since a shallower field
+// declared anywhere above an embedded struct takes the name. Per recursion
+// level it would decide on a partial set — calling a collision ambiguous before
+// the level that resolves it is read, rejecting a type Go's own promotion
+// accepts — and would read root-accumulated index paths against whatever nested
+// type that level was visiting.
 //
-// typeFieldMapping (reflect.go) answers the same question for encode and
-// decode and keeps its resolution outside its own recursion for the same
-// reason. The two must agree, and agreeing on the rule is not enough: they
-// have to agree on where it runs, which is why collectFields takes no index
-// parameter. There is no root-relative path to mis-resolve when the only
-// caller-supplied coordinate space is the root's.
+// typeFieldMapping answers the same question for encode and decode and keeps
+// its resolution outside its recursion for the same reason. Agreeing on the
+// rule is not enough; they must agree on where it runs, which is why
+// collectFields takes no index parameter.
 func collectFields(root reflect.Type, visited map[reflect.Type]bool) ([]schemaField, error) {
 	raw, err := collectFieldsRaw(root, nil, visited)
 	if err != nil {
@@ -887,24 +863,19 @@ func resolvePromotedFields(t reflect.Type, raw []schemaField) ([]schemaField, er
 	// the encode/decode field-mapping contract: "a tagged field wins over an
 	// untagged one at any depth; among fields with the same tagged status,
 	// the shallowest wins"):
-	//   1. A tagged field beats an untagged one at ANY depth — a
-	//      tiebreaker, so NOT an ambiguous collision. This runs first.
-	//   2. Among same-tagged-status fields, the shallower (shorter index
-	//      path) wins. Without this, dedup keeps first-seen — the deeper
-	//      embedded field — because nested-struct fields are appended to
-	//      raw BEFORE outer fields.
-	//   3. Only a same-depth collision with the SAME tagged status AT THE
-	//      WINNING DEPTH is genuinely ambiguous: two sibling fields disagree
-	//      on who owns the name, so silently picking one would cause data
-	//      loss at encode time. Java's RecordSchema.setFields rejects a true
-	//      duplicate with "Duplicate field" (Schema.java:981); hamba rejects
-	//      similarly. The ambiguity decision is DEFERRED, not eager: a
-	//      shallower field declared LATER (the common "embeds first, own
-	//      fields after" layout) resolves a same-depth deep collision, so it
-	//      must be allowed to clear the ambiguity — exactly as typeFieldMapping
-	//      and Go's own field promotion do. Erroring the instant two deep
-	//      fields collide would reject a struct whose name a shallower field
-	//      unambiguously owns.
+	//   1. Tagged beats untagged at ANY depth. A tiebreaker, so not ambiguous.
+	//      Runs first.
+	//   2. Among same-tagged-status fields the shallower wins. Without this,
+	//      dedup keeps first-seen — the DEEPER field, since nested-struct
+	//      fields are appended to raw before outer ones.
+	//   3. Only a same-depth, same-tagged-status collision AT THE WINNING DEPTH
+	//      is ambiguous; picking one silently loses data at encode. Java's
+	//      setFields rejects a duplicate (Schema.java:981) and hamba likewise.
+	//      The decision is DEFERRED: a shallower field declared LATER — the
+	//      common "embeds first, own fields after" layout — resolves a
+	//      same-depth deep collision, so erroring the instant two deep fields
+	//      collide would reject a struct whose name a shallower field
+	//      unambiguously owns. typeFieldMapping and Go's promotion defer too.
 	type entry struct {
 		idx int
 		schemaField
@@ -1258,15 +1229,12 @@ var avroPrimitives = map[string]bool{
 // can consume either key and the branch's type and wire form are unchanged —
 // so a carrier-bearing wrapped null is still a null branch.
 //
-// This is the `any`-tree mirror of [aschema.isNullBranch] (schema.go), which
-// answers the same question on the parsed tree. The two must agree because
-// this tree is handed directly to that parser: a branch this predicate calls
-// non-null but the parser calls null produces a schema whose emitted shape
-// contradicts its parsed meaning. The question is answered once per schema
-// representation — isNullBranch for the parsed tree, the normalized node kind
-// for the compiled and metadata trees, and this for the pre-Parse tree — so a
-// new asker on this representation belongs here rather than in a fresh
-// comparison against the bare spelling.
+// The `any`-tree mirror of [aschema.isNullBranch]. The two must agree, because
+// this tree is handed straight to that parser: a branch this calls non-null and
+// the parser calls null emits a shape contradicting its parsed meaning. One
+// asker per representation — isNullBranch for the parsed tree, the normalized
+// node kind for the compiled and metadata trees, this for pre-Parse — so a new
+// asker here belongs in this function, not in a fresh bare-spelling compare.
 func isNullBranchTree(v any) bool {
 	switch v := v.(type) {
 	case string:
@@ -1292,11 +1260,10 @@ type typeAliasResult struct {
 // named type referenced by a field (as opposed to alias= which sets
 // aliases on the field itself).
 //
-// Like the composition walkers (resolveNameScope and friends), this walk
-// reads reserved keys by exact name, matching how the Parse consuming
-// the composed tree binds them: only the exact lowercase spelling is the
-// reserved attribute — a Props case-variant is an ordinary custom
-// property that neither the walk nor Parse routes through — so the walk
+// Like the composition walkers, this reads reserved keys by exact name, as the
+// Parse consuming the tree binds them: only the exact lowercase spelling is
+// reserved, and a Props case-variant is an ordinary custom property — so the
+// walk
 // descends and writes exactly the keys Parse will bind. The one consumer
 // with no Parse counterpart is refName: a per-build bookkeeping key
 // (applied[]), which only needs to be CONSISTENT across occurrences
