@@ -62,6 +62,23 @@ const maxJSONValueNesting = 10000
 //
 // Keeping the literal is what makes both the sign and the cap a property of
 // the INPUT rather than of how far the decode happened to resolve it.
+//
+// # Strings share the input's memory
+//
+// A key or string value carrying no escapes is returned as a SUBSTRING of
+// schema rather than a copy, which is where most of the allocation saving comes
+// from. Nothing can be written through a string, so no aliasing SEMANTICS
+// follow — two [Schema.Root] trees stay mutually independent, and mutating one
+// is still invisible to the other — but the LIFETIME does change: a Go string
+// keeps its whole backing array alive, so any one of these substrings pins the
+// entire schema text.
+//
+// Inside a [Schema] that costs nothing, since the text is already retained
+// verbatim for [Schema.String]. It costs something wherever a piece outlives
+// its schema: a [SchemaNode] kept after its *Schema is dropped, one short string
+// pulled out of [SchemaNode.Props] and held, or a [SchemaCache], which retains
+// the definitions of every schema it parsed. The bound is one copy of the text
+// per schema, not per string.
 func decodeSchemaAny(schema string) (any, int, error) {
 	d := &schemaDecoder{in: schema}
 	d.space()
@@ -149,17 +166,29 @@ func (d *schemaDecoder) literal(tok string, v any) (any, error) {
 
 // value decodes one value at the cursor, which space() has already advanced to
 // a non-space byte. depth counts enclosing containers.
+//
+// The nesting bound is charged on the two CONTAINER arms, not here, because a
+// scalar costs no nesting: it is a leaf, it recurses no further, and a decode
+// into a generic tree pushes state for containers alone. Charging every value
+// spends the last unit of the budget on the innermost leaf, so a shape whose
+// innermost container is NON-EMPTY refuses one level early — [ x10000 holding a
+// number is 10000 containers and must parse, while [ x10000 holding nothing is
+// the same 10000 and always did. The empty-innermost shapes agree either way,
+// which is what makes the difference easy to miss.
 func (d *schemaDecoder) value(depth int) (any, error) {
-	if depth >= maxJSONValueNesting {
-		return nil, d.errorf("exceeded max depth at offset %d", d.at)
-	}
 	if d.at >= len(d.in) {
 		return nil, d.eof("unexpected end of input")
 	}
 	switch d.in[d.at] {
 	case '{':
+		if depth >= maxJSONValueNesting {
+			return nil, d.errorf("exceeded max depth at offset %d", d.at)
+		}
 		return d.object(depth)
 	case '[':
+		if depth >= maxJSONValueNesting {
+			return nil, d.errorf("exceeded max depth at offset %d", d.at)
+		}
 		return d.array(depth)
 	case '"':
 		return d.str()

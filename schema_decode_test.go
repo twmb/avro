@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,13 +25,21 @@ import (
 // ---------------------------------------------------------------------
 
 func oracleDecodeLenient(schema string) (any, error) {
+	v, _, err := oracleDecodeLenientOffset(schema)
+	return v, err
+}
+
+// oracleDecodeLenientOffset also reports where the stdlib decoder stopped, so
+// the consumed count the shared decoder returns has an independent answer to
+// be checked against rather than only being self-consistent.
+func oracleDecodeLenientOffset(schema string) (any, int, error) {
 	dec := json.NewDecoder(strings.NewReader(schema))
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return v, nil
+	return v, int(dec.InputOffset()), nil
 }
 
 func oracleDecodeStrict(schema string) (any, error) {
@@ -83,8 +92,20 @@ func oracleCacheNormalize(schema string) string {
 	return string(normalized)
 }
 
-// oracleTagDefault is the struct-tag default decode with the stdlib decode:
-// a value that is not exactly one JSON value stays a verbatim string.
+// oracleTagDefault is the struct-tag default read, built on the stdlib decode.
+//
+// Unlike the other twins here it is NOT a copy of what the site used to do,
+// because this is the one site whose behavior changed: it used to ask
+// json.Decoder.More whether anything followed, and More answers `c != ']' &&
+// c != '}'`, so it called `42]` a complete value and discarded the bracket.
+// A twin spelling that would asserts the behavior the change removed.
+//
+// So the rule is stated independently on this side instead: decode one value,
+// then require the rest of the text to be whitespace, using the decoder's OWN
+// offset accounting (InputOffset) rather than the consumed count the
+// implementation computes. That keeps the oracle answerable from stdlib alone
+// while also crossing the arithmetic the implementation uses to find the same
+// boundary.
 func oracleTagDefault(raw string) any {
 	dec := json.NewDecoder(strings.NewReader(raw))
 	dec.UseNumber()
@@ -92,8 +113,12 @@ func oracleTagDefault(raw string) any {
 	if err := dec.Decode(&v); err != nil {
 		return raw
 	}
-	if dec.More() {
-		return raw
+	for _, c := range raw[dec.InputOffset():] {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+		default:
+			return raw
+		}
 	}
 	return v
 }
@@ -193,12 +218,32 @@ var decodeCorpus = func() []decodeCell {
 	)
 	// The nesting boundary, which no mutation-driven corpus reaches: the
 	// decoder accepts exactly the depth the stdlib decoder accepted.
+	//
+	// The innermost value is an axis of its own, not a detail. An EMPTY
+	// innermost container agrees with the stdlib decode whatever the bound is
+	// charged per — value or per container — because there is no leaf to spend
+	// the last unit on. Only a NON-EMPTY innermost separates the two, so a
+	// ladder of empty containers can be run at every depth and still measure
+	// nothing about which rule the decoder implements.
 	for _, n := range []int{2, 9999, 10000, 10001, 10002} {
-		cells = append(cells, decodeCell{
-			name:  fmt.Sprintf("nesting-%d", n),
-			class: "depth",
-			in:    strings.Repeat("[", n) + strings.Repeat("]", n),
-		})
+		for _, inner := range []struct{ name, body string }{
+			{"empty", ""},
+			{"number", "1"},
+			{"string", `"x"`},
+			{"object", `{"a":1}`},
+		} {
+			cells = append(cells,
+				decodeCell{
+					name:  fmt.Sprintf("nesting-array-%d-%s", n, inner.name),
+					class: "depth",
+					in:    strings.Repeat("[", n) + inner.body + strings.Repeat("]", n),
+				},
+				decodeCell{
+					name:  fmt.Sprintf("nesting-object-%d-%s", n, inner.name),
+					class: "depth",
+					in:    strings.Repeat(`{"a":`, n) + cmp.Or(inner.body, "{}") + strings.Repeat("}", n),
+				})
+		}
 	}
 	return cells
 }()
@@ -833,10 +878,17 @@ func addDecodeSeeds(f *testing.F) {
 func FuzzSchemaDecodeParity(f *testing.F) {
 	addDecodeSeeds(f)
 	f.Fuzz(func(t *testing.T, in string) {
-		wantLenient, wantErr := oracleDecodeLenient(in)
-		gotLenient, _, gotErr := decodeSchemaAny(in)
+		wantLenient, wantOff, wantErr := oracleDecodeLenientOffset(in)
+		gotLenient, gotOff, gotErr := decodeSchemaAny(in)
 		if (wantErr == nil) != (gotErr == nil) {
 			t.Fatalf("lenient accept/reject differs: stdlib=%v shared=%v", wantErr, gotErr)
+		}
+		// The consumed count is an ANSWER, not bookkeeping: it is the whole
+		// of what every strict caller decides on, so a decoder landing on
+		// the right value at the wrong offset would split the two callers
+		// that share this decode.
+		if wantErr == nil && wantOff != gotOff {
+			t.Fatalf("consumed count differs: stdlib=%d shared=%d for %q", wantOff, gotOff, in)
 		}
 		// Parse echoes a decode error rather than replacing it, so these two
 		// sentinels are part of what a caller can ask about the failure —
@@ -916,7 +968,14 @@ func FuzzSchemaParseEndToEnd(f *testing.F) {
 // FALLBACK path are different answers the other sites never produce.
 func FuzzSchemaTagDefaultParity(f *testing.F) {
 	addDecodeSeeds(f)
-	for _, s := range []string{"note (a", "hello", "42 oops", "", "  ", "true", "[1,2]", "-0"} {
+	for _, s := range []string{
+		"note (a", "hello", "42 oops", "", "  ", "true", "[1,2]", "-0",
+		// A complete value followed by a closing bracket or brace. This is
+		// the shape the old rule called complete and this one calls
+		// trailing, and no other seed here ends that way — a corpus without
+		// it cannot tell the two rules apart.
+		"0}", "0]", "42]", `"s"}`, "[1,2]]", `{"a":1}}`, "true]", "null}",
+	} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, in string) {
