@@ -1526,11 +1526,12 @@ func (b *builder) finalize() error {
 		m.sr.fields[m.idx].fn = b.customWrappedSer(nt.node, nt.node.ser)
 		m.dr.fields[m.idx].fn = b.customWrappedDeser(nt.node, nt.node.deser)
 		if nt.node.serRecord != nil {
-			m.sr.fields[m.idx].avroType = "record"
+			// The encode and decode entries for one field were handed the
+			// SAME *fieldMeta when the field was built, so naming the type
+			// once updates both; the second write was a rewrite of the word
+			// the first had just stored.
 			m.sr.fields[m.idx].meta.avroType = "record"
 			m.sr.fields[m.idx].meta.serRecord = nt.node.serRecord
-			m.dr.fields[m.idx].avroType = "record"
-			m.dr.fields[m.idx].meta.avroType = "record"
 			m.dr.fields[m.idx].meta.deserRecord = nt.node.deserRecord
 		}
 		m.nd.fields[m.idx].node = nt.node
@@ -2989,19 +2990,17 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			*meta = bf.meta
 			fieldIdx := len(sr.fields)
 			sr.fields = append(sr.fields, serRecordField{
-				name:     of.Name,
-				nameVal:  reflect.ValueOf(of.Name),
-				fn:       bf.ser,
-				avroType: meta.avroType,
-				meta:     meta,
+				name:    of.Name,
+				nameVal: reflect.ValueOf(of.Name),
+				fn:      bf.ser,
+				meta:    meta,
 			})
 			drf := deserRecordField{
-				name:     of.Name,
-				nameVal:  reflect.ValueOf(of.Name),
-				fn:       bf.deser,
-				fnIface:  ifaceFnForPrimitive(meta),
-				avroType: meta.avroType,
-				meta:     meta,
+				name:    of.Name,
+				nameVal: reflect.ValueOf(of.Name),
+				fn:      bf.deser,
+				fnIface: ifaceFnForPrimitive(meta),
+				meta:    meta,
 			}
 			fn := fieldNode{
 				name:    of.Name,

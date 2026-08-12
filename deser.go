@@ -499,10 +499,19 @@ type deserRecordField struct {
 	nameVal    reflect.Value // pre-computed reflect.ValueOf(name); avoids alloc per map lookup
 	fn         deserfn
 	fnIface    deserIfaceFn // non-nil iff f.fn handles a primitive that benefits from iface-direct decode
-	avroType   string
 	meta       *fieldMeta
 	defaultVal any
 	hasDefault bool
+}
+
+// avroType names the field's Avro type, or "" when the field carries no
+// metadata to name it with. Decode twin of [serRecordField.avroType]; see
+// that comment for why the type is asked rather than copied.
+func (f *deserRecordField) avroType() string {
+	if f.meta == nil {
+		return ""
+	}
+	return f.meta.avroType
 }
 
 type deserRecord struct {
