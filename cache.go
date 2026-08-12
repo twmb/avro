@@ -37,11 +37,20 @@ import (
 //
 // The zero value is ready to use. A SchemaCache is safe for concurrent use.
 type SchemaCache struct {
-	mu           sync.Mutex
-	named        map[string]*namedType
-	dedup        map[[32]byte]*Schema
-	customParsed map[[32]byte]bool // schemas previously parsed with custom types
-	laxParsed    map[[32]byte]bool // schemas previously parsed with WithLaxNames
+	mu    sync.Mutex
+	named map[string]*namedType
+	dedup map[[32]byte]*Schema
+	// skipDedupParsed holds the schema strings this cache has parsed under
+	// options that skip dedup — custom types or WithLaxNames. It exists to
+	// answer one question, asked in one place: may this string re-DEFINE a
+	// name the cache already holds? A string the cache has compiled before
+	// under any option may; a new string may not.
+	//
+	// Which option it was is not that question, and nothing asks it. Two
+	// maps here would be two sets that no read tells apart, which is a
+	// second thing to keep in step for no answer gained — and the same
+	// string parsed both ways would sit in both.
+	skipDedupParsed map[[32]byte]bool
 	// defs holds each registered named type's self-contained JSON definition,
 	// all attributes included, keyed by fullname. A later Parse referencing an
 	// earlier type splices the definition back in at the first dangling
@@ -80,8 +89,7 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	if c.named == nil {
 		c.named = make(map[string]*namedType)
 		c.dedup = make(map[[32]byte]*Schema)
-		c.customParsed = make(map[[32]byte]bool)
-		c.laxParsed = make(map[[32]byte]bool)
+		c.skipDedupParsed = make(map[[32]byte]bool)
 		c.defs = make(map[string]any)
 	}
 
@@ -132,13 +140,13 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	}
 	// allowReRegister lets a parse re-DEFINE an inherited name instead of
 	// erroring, granted ONLY when the cache has already seen this exact schema
-	// string (dedup for strict, customParsed for custom, laxParsed for lax).
-	// Such a re-parse re-enters the builder and re-registers the names IT
-	// defined — the same string, not a conflict. A NEW string re-defining an
-	// inherited name still errors, custom mode included: a custom parse that
-	// merely REFERENCES a cached name never needs this, and a conflicting
-	// redefinition must error regardless.
-	b.allowReRegister = c.dedup[h] != nil || c.customParsed[h] || c.laxParsed[h]
+	// string — under dedup if it was parsed strictly, under skipDedupParsed if
+	// it was parsed with custom types or lax names. Such a re-parse re-enters
+	// the builder and re-registers the names IT defined — the same string, not
+	// a conflict. A NEW string re-defining an inherited name still errors,
+	// custom mode included: a custom parse that merely REFERENCES a cached name
+	// never needs this, and a conflicting redefinition must error regardless.
+	b.allowReRegister = c.dedup[h] != nil || c.skipDedupParsed[h]
 
 	s, err := parse(schema, b)
 	if err != nil {
@@ -222,12 +230,13 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	// wraps b.ser/b.deser without mutating the node's ser/deser, so
 	// cached named type nodes keep their unwrapped functions.
 	c.named = b.named
-	switch {
-	case hasCustomTypes:
-		c.customParsed[h] = true
-	case hasLaxNames:
-		c.laxParsed[h] = true
-	default:
+	// The same condition that decided whether to CONSULT dedup decides which
+	// side to record on, so the two cannot fall out of step: a schema whose
+	// result the string alone does not identify is remembered as parsed, not
+	// as a result to hand back.
+	if skipDedup {
+		c.skipDedupParsed[h] = true
+	} else {
 		c.dedup[h] = s
 	}
 	return s, nil

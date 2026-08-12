@@ -9808,6 +9808,94 @@ func TestMatrix_ResolvedSingleObjectWriterAcceptance(t *testing.T) {
 
 // ---------- cache_test.go ----------
 
+// TestMatrix_CacheReparsePermissionIsOptionBlind pins that whether a cache
+// lets a schema string re-DEFINE a name it already holds depends on having
+// compiled that exact string before, and not on which options either parse
+// used.
+//
+// The cache remembers a parsed string on one of two sides: a strict parse
+// stores the compiled result to hand back, while a parse whose options change
+// what the string compiles to — custom types, WithLaxNames, or both — stores
+// only that it happened, because the string alone no longer identifies the
+// result. Both sides answer the same question at the next parse, so the axes
+// are the options of the FIRST parse crossed with the options of the SECOND,
+// and the two documented outcomes are crossed over that: the same string
+// re-parses, and a DIFFERENT string redefining the same name is refused.
+//
+// Expectations come from the documented contract rather than from current
+// behavior. [SchemaCache] says parsing the same string again is allowed, that
+// custom types and WithLaxNames skip deduplication and re-parse, and that a
+// conflicting redefinition is a duplicate-type error. Nothing in that
+// contract distinguishes which option did the skipping, which is the property
+// under test.
+func TestMatrix_CacheReparsePermissionIsOptionBlind(t *testing.T) {
+	const def = `{"type":"record","name":"D","fields":[{"name":"a","type":"int"}]}`
+	// Same name, different body: a genuine conflict at every option.
+	const conflicting = `{"type":"record","name":"D","fields":[{"name":"b","type":"string"}]}`
+
+	ct := CustomType{AvroType: "int", Decode: func(v any, _ *SchemaNode) (any, error) { return v, nil }}
+	lax := WithLaxNames(func(string) error { return nil })
+
+	optionSets := []struct {
+		name string
+		opts []SchemaOpt
+		// skips reports whether these options make the parse skip dedup,
+		// which is the only thing the cache is entitled to vary on.
+		skips bool
+	}{
+		{"strict", nil, false},
+		{"custom", []SchemaOpt{ct}, true},
+		{"lax", []SchemaOpt{lax}, true},
+		{"custom+lax", []SchemaOpt{ct, lax}, true},
+	}
+
+	realized := 0
+	for _, first := range optionSets {
+		for _, second := range optionSets {
+			t.Run(first.name+"-then-"+second.name+"/same-string", func(t *testing.T) {
+				var c SchemaCache
+				a, err := c.Parse(def, first.opts...)
+				if err != nil {
+					t.Fatalf("first parse: %v", err)
+				}
+				b, err := c.Parse(def, second.opts...)
+				if err != nil {
+					t.Fatalf("re-parsing the same string must be allowed whatever options either parse used: %v", err)
+				}
+				// Deduplication is the documented reward for a strict pair
+				// and is withheld from every other, so assert which one
+				// happened rather than only that no error came back.
+				sameResult := a == b
+				wantSame := !first.skips && !second.skips
+				if sameResult != wantSame {
+					t.Fatalf("returned the same *Schema = %v, want %v (dedup applies only when neither parse skips it)", sameResult, wantSame)
+				}
+			})
+			realized++
+
+			t.Run(first.name+"-then-"+second.name+"/conflicting-string", func(t *testing.T) {
+				var c SchemaCache
+				if _, err := c.Parse(def, first.opts...); err != nil {
+					t.Fatalf("first parse: %v", err)
+				}
+				_, err := c.Parse(conflicting, second.opts...)
+				if err == nil {
+					t.Fatal("a different string redefining a cached name must be refused")
+				}
+				// A refusal that came from somewhere else would pass a bare
+				// error check while proving nothing about the permission.
+				if !strings.Contains(err.Error(), "duplicate named type") {
+					t.Fatalf("refused, but not as a duplicate definition: %v", err)
+				}
+			})
+			realized++
+		}
+	}
+	if want := len(optionSets) * len(optionSets) * 2; realized != want {
+		t.Fatalf("realized %d cells, want %d", realized, want)
+	}
+}
+
 func TestSchemaCacheBasic(t *testing.T) {
 	cache := &SchemaCache{}
 
