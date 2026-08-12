@@ -5869,6 +5869,10 @@ var presenceOnlyFields = map[string]struct {
 	src             string // a schema whose node carries the attribute written as the zero
 	key             string // the JSON key the rebuild must still carry
 	reachesCollapse bool
+	// at navigates from the parsed root to the node under test. Nil means
+	// the root itself. An attribute whose meaning depends on an enclosing
+	// scope has to be probed inside one.
+	at func(*SchemaNode) *SchemaNode
 }{
 	"Doc": {
 		// doc is recorded only where Apache Avro reads one — the named
@@ -5885,6 +5889,78 @@ var presenceOnlyFields = map[string]struct {
 		key:             "logicalType",
 		reachesCollapse: true,
 	},
+	"Namespace": {
+		// "namespace":"" is the null-namespace escape, and it says
+		// something only INSIDE an enclosing namespace — at the root it
+		// names the scope the root already has, which is why the emitter
+		// drops it there and must not drop it here. A named kind always
+		// carries its name, so the collapse is out of reach.
+		src: `{"type":"record","name":"P","namespace":"ns","fields":[` +
+			`{"name":"inner","type":{"type":"record","name":"I","namespace":"","fields":[]}}]}`,
+		key: "namespace",
+		at:  func(n *SchemaNode) *SchemaNode { return &n.Fields[0].Type },
+	},
+	"Size": {
+		// A zero-size fixed writes its size as the field's own zero. Fixed
+		// is a named kind, so the collapse is out of reach here too.
+		src: `{"type":"fixed","name":"F","size":0}`,
+		key: "size",
+	},
+}
+
+// presenceZeroUnwritable classifies the remaining presence-carrying fields as
+// having no presence-ONLY form at all: writing the attribute as the field's
+// own zero either fails to parse, or leaves the field holding a value the
+// emptiness walk can already see, so presence is never the only signal.
+//
+// A classification is a CLAIM, and the guard below checks it rather than
+// taking it — each entry is the schema that attempts to write the zero, and
+// the attempt must actually come out one of those two ways.
+var presenceZeroUnwritable = map[string]string{
+	// An empty name is not a name; the parse refuses it outright.
+	"Name": `{"type":"record","name":"","fields":[]}`,
+	// An empty JSON array parses to a non-nil empty slice, which is not the
+	// field's zero, so the value-based walk sees it without asking presence.
+	"Aliases": `{"type":"record","name":"R","aliases":[],"fields":[]}`,
+	"Symbols": `{"type":"enum","name":"E","symbols":[]}`,
+	"Fields":  `{"type":"record","name":"R","fields":[]}`,
+}
+
+// TestInvariant_PresenceZeroUnwritableClaimsHold checks the classification
+// above in both directions: every classified field must carry a presence bit
+// (so a row for a field that no longer has one reds), and its schema must
+// come out either unparseable or with the field non-zero (so a field that
+// gains a presence-only form reds instead of sitting unchecked).
+func TestInvariant_PresenceZeroUnwritableClaimsHold(t *testing.T) {
+	rt := reflect.TypeFor[SchemaNode]()
+	for field, src := range presenceZeroUnwritable {
+		if _, ok := presenceBitFor(field); !ok {
+			t.Errorf("field %s is classified as having no presence-only form, but carries no presence bit at all; drop the row", field)
+			continue
+		}
+		if _, ok := presenceOnlyFields[field]; ok {
+			t.Errorf("field %s is both classified and celled; it can only be one", field)
+			continue
+		}
+		idx := -1
+		for i := range rt.NumField() {
+			if rt.Field(i).Name == field {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			t.Errorf("field %s is classified but SchemaNode no longer declares it", field)
+			continue
+		}
+		s, err := Parse(src)
+		if err != nil {
+			continue // unparseable: the claim holds by refusal
+		}
+		n := s.Root()
+		if reflect.ValueOf(n).Elem().Field(idx).IsZero() {
+			t.Errorf("field %s parsed to its ZERO with the attribute written, so it DOES have a presence-only form; give it a cell in presenceOnlyFields instead", field)
+		}
+	}
 }
 
 // TestInvariant_BareEmissionCoversPresenceOnlyFields is the completeness guard's
@@ -5905,16 +5981,32 @@ func TestInvariant_BareEmissionCoversPresenceOnlyFields(t *testing.T) {
 		}
 		spec, ok := presenceOnlyFields[f.Name]
 		if !ok {
-			// Every OTHER field must have no presence state, or it belongs
-			// in the table above with its own cell.
-			var probe SchemaNode
-			if nodePresenceSet(&probe, f.Name) {
-				t.Errorf("field %s answers nodePresenceSet but has no presence-only cell; add one so its zero-valued form is checked", f.Name)
+			// Every OTHER field must either carry no presence state at all,
+			// or be classified as having no presence-only form. Ask whether
+			// the field HAS a presence bit — asking a zero SchemaNode
+			// whether its presence is SET answers no for every field, since
+			// a zero node has recorded nothing, and the guard can never
+			// fire.
+			if _, hasBit := presenceBitFor(f.Name); !hasBit {
+				continue
+			}
+			if _, classified := presenceZeroUnwritable[f.Name]; !classified {
+				t.Errorf("field %s carries a presence bit but has neither a presence-only cell nor a row in presenceZeroUnwritable; add one so its zero-valued form is checked", f.Name)
 			}
 			continue
 		}
 		seen++
-		n := MustParse(spec.src).Root()
+		// The attribute may be written on a node INSIDE the probe schema, so
+		// the rebuild is always of the whole root while the field, presence
+		// and collapse questions are asked of the node carrying it.
+		probe := func(root *SchemaNode) *SchemaNode {
+			if spec.at == nil {
+				return root
+			}
+			return spec.at(root)
+		}
+		root := MustParse(spec.src).Root()
+		n := probe(root)
 		fv := reflect.ValueOf(n).Elem().Field(i)
 		if !fv.IsZero() {
 			t.Errorf("field %s: the probe schema did not leave the field at its zero (%#v), so this cell is testing the ordinary value case", f.Name, fv.Interface())
@@ -5939,7 +6031,7 @@ func TestInvariant_BareEmissionCoversPresenceOnlyFields(t *testing.T) {
 				continue
 			}
 		}
-		s, err := n.Schema()
+		s, err := root.Schema()
 		if err != nil {
 			t.Errorf("field %s: rebuild failed: %v", f.Name, err)
 			continue
@@ -5950,12 +6042,12 @@ func TestInvariant_BareEmissionCoversPresenceOnlyFields(t *testing.T) {
 		}
 		// And it must be a FIXPOINT: the re-parse has to record the presence
 		// again, or the attribute survives one rebuild and dies on the next.
-		back := s.Root()
+		back := probe(s.Root())
 		if !nodePresenceSet(back, f.Name) {
 			t.Errorf("field %s: the re-parse did not record the attribute, so a second rebuild would drop it", f.Name)
 			continue
 		}
-		s2, err := back.Schema()
+		s2, err := s.Root().Schema()
 		if err != nil {
 			t.Errorf("field %s: second rebuild failed: %v", f.Name, err)
 			continue
