@@ -1000,8 +1000,12 @@ type metaFixup struct {
 // recordFieldFixup patches a record field's ser/deser function, avroType,
 // meta, and schemaNode when the field's type was a forward reference.
 type recordFieldFixup struct {
-	sr         *serRecord
-	dr         *deserRecord
+	// nd is the enclosing record's node, and the encode and decode tables
+	// are reached through it: nd.serRecord and nd.deserRecord are the very
+	// sr and dr the record case builds, assigned into the node in the same
+	// literal. Carrying them again would be three names for one record,
+	// which a fixup could then be built holding a node from one record and
+	// tables from another.
 	nd         *schemaNode
 	idx        int
 	name       string
@@ -1036,9 +1040,7 @@ type containerFixup struct {
 // forward-ref name) is handled by recordFieldFixup instead, which also
 // carries the default and resolves the node by name in finalize.
 type defaultFixup struct {
-	sr         *serRecord
-	dr         *deserRecord
-	nd         *schemaNode
+	nd         *schemaNode // enclosing record; its serRecord/deserRecord are the field tables
 	idx        int
 	node       *schemaNode // the field's already-built outer node (children wired by other fixups)
 	defaultVal any         // parsed-but-not-yet-coerced JSON default
@@ -1523,16 +1525,16 @@ func (b *builder) finalize() error {
 		if nt == nil {
 			return fmt.Errorf("unknown type %q", truncForError(m.name))
 		}
-		m.sr.fields[m.idx].fn = b.customWrappedSer(nt.node, nt.node.ser)
-		m.dr.fields[m.idx].fn = b.customWrappedDeser(nt.node, nt.node.deser)
+		m.nd.serRecord.fields[m.idx].fn = b.customWrappedSer(nt.node, nt.node.ser)
+		m.nd.deserRecord.fields[m.idx].fn = b.customWrappedDeser(nt.node, nt.node.deser)
 		if nt.node.serRecord != nil {
 			// The encode and decode entries for one field were handed the
 			// SAME *fieldMeta when the field was built, so naming the type
 			// once updates both; the second write was a rewrite of the word
 			// the first had just stored.
-			m.sr.fields[m.idx].meta.avroType = "record"
-			m.sr.fields[m.idx].meta.serRecord = nt.node.serRecord
-			m.dr.fields[m.idx].meta.deserRecord = nt.node.deserRecord
+			m.nd.serRecord.fields[m.idx].meta.avroType = "record"
+			m.nd.serRecord.fields[m.idx].meta.serRecord = nt.node.serRecord
+			m.nd.deserRecord.fields[m.idx].meta.deserRecord = nt.node.deserRecord
 		}
 		m.nd.fields[m.idx].node = nt.node
 	}
@@ -1587,26 +1589,26 @@ func (b *builder) finalize() error {
 		if node == nil {
 			continue
 		}
-		name := m.sr.fields[m.idx].name
+		name := m.nd.serRecord.fields[m.idx].name
 		converted, err := resolveFieldDefaultValue(
 			coerceDefault(m.defaultVal, node), node, name,
-			&m.dr.fields[m.idx], &m.nd.fields[m.idx],
+			&m.nd.deserRecord.fields[m.idx], &m.nd.fields[m.idx],
 		)
 		if err != nil {
 			return fmt.Errorf("type %q: %w", truncForError(m.name), err)
 		}
-		pending = append(pending, pendingDefault{node, name, converted, &m.sr.fields[m.idx]})
+		pending = append(pending, pendingDefault{node, name, converted, &m.nd.serRecord.fields[m.idx]})
 	}
 	for _, m := range b.defaultFixups {
-		name := m.sr.fields[m.idx].name
+		name := m.nd.serRecord.fields[m.idx].name
 		converted, err := resolveFieldDefaultValue(
 			coerceDefault(m.defaultVal, m.node), m.node, name,
-			&m.dr.fields[m.idx], &m.nd.fields[m.idx],
+			&m.nd.deserRecord.fields[m.idx], &m.nd.fields[m.idx],
 		)
 		if err != nil {
 			return err
 		}
-		pending = append(pending, pendingDefault{m.node, name, converted, &m.sr.fields[m.idx]})
+		pending = append(pending, pendingDefault{m.node, name, converted, &m.nd.serRecord.fields[m.idx]})
 	}
 	// Phase 2b: encode binary default bytes now that every default value
 	// (inline-built and deferred) is recorded on its field node.
@@ -3010,8 +3012,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			}
 			if isFwdRef {
 				fix := recordFieldFixup{
-					sr:         sr,
-					dr:         dr,
 					nd:         nd,
 					idx:        fieldIdx,
 					name:       fwdRefName,
@@ -3042,8 +3042,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 					drf.hasDefault = true
 					fn.hasDefault = true
 					b.defaultFixups = append(b.defaultFixups, defaultFixup{
-						sr:         sr,
-						dr:         dr,
 						nd:         nd,
 						idx:        fieldIdx,
 						node:       bf.node,

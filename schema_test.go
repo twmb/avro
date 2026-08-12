@@ -9069,6 +9069,175 @@ func recvTypeName(e ast.Expr) string {
 	return "?"
 }
 
+// TestMatrix_ForwardRefFixupsLandOnTheirOwnRecord pins that a deferred wiring
+// patches the record it was queued for, when several records are waiting at
+// once.
+//
+// A forward reference leaves a record field unwired until finalize, which
+// walks the queue and patches the encode table, the decode table and the
+// metadata node for one field of one record. Those three are reached through
+// the record's node, so they cannot name different records — but nothing
+// about a QUEUE makes entries land on the right entry, so this crosses the
+// two deferral shapes against several records deferring simultaneously.
+//
+// The shapes are the field whose whole type is a forward reference, and the
+// field whose type resolved but whose descendant did not — an array of a
+// not-yet-defined type — which defers only its default. Both are crossed with
+// a default present, since a default is resolved and pre-encoded against the
+// field it was queued for and would be visibly wrong on another.
+//
+// Each waiting record names a DIFFERENT leaf type, so a fixup landing on a
+// neighbour cannot coincide with the right answer. Expectations are the
+// values the test encodes and the defaults the schema declares; the
+// dependency-ordered spelling of the same schema, which defers nothing,
+// supplies the wire bytes as an independent oracle.
+func TestMatrix_ForwardRefFixupsLandOnTheirOwnRecord(t *testing.T) {
+	// Three records, each referencing a leaf defined AFTER it, each leaf a
+	// different Avro type.
+	leaves := []struct {
+		name  string
+		avro  string
+		value any
+		deflt string
+	}{
+		{"L1", "int", int32(11), `{"v":1}`},
+		{"L2", "long", int64(22), `{"v":2}`},
+		{"L3", "string", "s3", `{"v":"three"}`},
+	}
+
+	var holders, defs []string
+	for _, l := range leaves {
+		holders = append(holders, `{"name":"h`+l.name+`","type":{"type":"record","name":"H`+l.name+`","fields":[`+
+			`{"name":"x","type":"`+l.name+`"},`+
+			`{"name":"d","type":"`+l.name+`","default":`+l.deflt+`},`+
+			`{"name":"arr","type":{"type":"array","items":"`+l.name+`"},"default":[`+l.deflt+`]}`+
+			`]}}`)
+		defs = append(defs, `{"name":"d`+l.name+`","type":{"type":"record","name":"`+l.name+`","fields":[{"name":"v","type":"`+l.avro+`"}]}}`)
+	}
+	// Forward: every holder precedes every definition, so all three records
+	// are waiting on finalize at the same time.
+	forward := `{"type":"record","name":"Outer","fields":[` + strings.Join(append(append([]string{}, holders...), defs...), ",") + `]}`
+	// Dependency-ordered: the definitions come first, so nothing defers. Same
+	// fields in the same order otherwise, so the wire must match.
+	ordered := `{"type":"record","name":"Outer","fields":[` + strings.Join(append(append([]string{}, defs...), holders...), ",") + `]}`
+
+	value := func(l int) map[string]any {
+		return map[string]any{"v": leaves[l].value}
+	}
+	holderValue := func(l int) map[string]any {
+		return map[string]any{"x": value(l), "d": value(l), "arr": []any{value(l)}}
+	}
+	full := map[string]any{}
+	orderedFull := map[string]any{}
+	for i, l := range leaves {
+		full["h"+l.name] = holderValue(i)
+		orderedFull["h"+l.name] = holderValue(i)
+		full["d"+l.name] = value(i)
+		orderedFull["d"+l.name] = value(i)
+	}
+
+	fwd := mustParse(t, forward)
+	ord := mustParse(t, ordered)
+
+	t.Run("wire-matches-dependency-order", func(t *testing.T) {
+		// Field ORDER differs between the two spellings, so compare each
+		// holder's own encoding rather than the whole record's.
+		for i, l := range leaves {
+			sub := `{"type":"record","name":"H` + l.name + `","fields":[` +
+				`{"name":"x","type":{"type":"record","name":"` + l.name + `","fields":[{"name":"v","type":"` + l.avro + `"}]}},` +
+				`{"name":"d","type":"` + l.name + `"},` +
+				`{"name":"arr","type":{"type":"array","items":"` + l.name + `"}}]}`
+			want, err := mustParse(t, sub).AppendEncode(nil, holderValue(i))
+			if err != nil {
+				t.Fatalf("%s: oracle encode: %v", l.name, err)
+			}
+			gotFull, err := fwd.AppendEncode(nil, full)
+			if err != nil {
+				t.Fatalf("%s: forward encode: %v", l.name, err)
+			}
+			if !bytes.Contains(gotFull, want) {
+				t.Fatalf("%s: forward-declared holder did not encode like its dependency-ordered twin", l.name)
+			}
+		}
+	})
+
+	t.Run("round-trip", func(t *testing.T) {
+		for _, s := range []struct {
+			name string
+			s    *Schema
+			v    map[string]any
+		}{{"forward", fwd, full}, {"ordered", ord, orderedFull}} {
+			wire, err := s.s.AppendEncode(nil, s.v)
+			if err != nil {
+				t.Fatalf("%s: encode: %v", s.name, err)
+			}
+			var got map[string]any
+			if _, err := s.s.Decode(wire, &got); err != nil {
+				t.Fatalf("%s: decode: %v", s.name, err)
+			}
+			for i, l := range leaves {
+				h, _ := got["h"+l.name].(map[string]any)
+				if h == nil {
+					t.Fatalf("%s: %s holder missing", s.name, l.name)
+				}
+				if !reflect.DeepEqual(h["x"], value(i)) {
+					t.Fatalf("%s: %s x decoded %#v, want %#v", s.name, l.name, h["x"], value(i))
+				}
+			}
+		}
+	})
+
+	// The defaults are what the deferred wiring pre-encodes, so read them
+	// back through a resolution whose writer omits the defaulted fields.
+	t.Run("defaults-fill-from-their-own-record", func(t *testing.T) {
+		var writerHolders []string
+		for _, l := range leaves {
+			writerHolders = append(writerHolders, `{"name":"h`+l.name+`","type":{"type":"record","name":"H`+l.name+`","fields":[`+
+				`{"name":"x","type":{"type":"record","name":"`+l.name+`","fields":[{"name":"v","type":"`+l.avro+`"}]}}`+
+				`]}}`)
+		}
+		// The leaf-carrying fields exist on the reader with no default, so
+		// the writer must supply them too; only the defaulted fields inside
+		// each holder are withheld.
+		for _, l := range leaves {
+			writerHolders = append(writerHolders, `{"name":"d`+l.name+`","type":"`+l.name+`"}`)
+		}
+		writer := mustParse(t, `{"type":"record","name":"Outer","fields":[`+strings.Join(writerHolders, ",")+`]}`)
+		resolved := mustResolve(t, writer, fwd)
+
+		wv := map[string]any{}
+		for i, l := range leaves {
+			wv["h"+l.name] = map[string]any{"x": value(i)}
+			wv["d"+l.name] = value(i)
+		}
+		wire, err := writer.AppendEncode(nil, wv)
+		if err != nil {
+			t.Fatalf("writer encode: %v", err)
+		}
+		var got map[string]any
+		if _, err := resolved.Decode(wire, &got); err != nil {
+			t.Fatalf("resolved decode: %v", err)
+		}
+		wantDefaults := []any{
+			map[string]any{"v": int32(1)},
+			map[string]any{"v": int64(2)},
+			map[string]any{"v": "three"},
+		}
+		for i, l := range leaves {
+			h, _ := got["h"+l.name].(map[string]any)
+			if h == nil {
+				t.Fatalf("%s holder missing", l.name)
+			}
+			if !reflect.DeepEqual(h["d"], wantDefaults[i]) {
+				t.Fatalf("%s filled d from %#v, want %#v — a default resolved against another record's field", l.name, h["d"], wantDefaults[i])
+			}
+			if !reflect.DeepEqual(h["arr"], []any{wantDefaults[i]}) {
+				t.Fatalf("%s filled arr from %#v, want %#v — a deferred default landed on another record", l.name, h["arr"], []any{wantDefaults[i]})
+			}
+		}
+	})
+}
+
 // wireFieldAssignments names every site that ASSIGNS one of the compiled wire
 // fields — ser, deser, serRecord, deserRecord — outside the composite literal
 // that constructs its struct. Rows are "function: receiver.field".
@@ -9105,11 +9274,13 @@ var wireFieldAssignments = map[string]string{
 	"applyCustomTypes: b.deser":  "builder output; node.deser is deliberately left bare",
 
 	// fieldMeta, not schemaNode: the unsafe fast path's per-field record
-	// tables, wired when a forward reference resolves.
-	"finalize: m.meta.serRecord":                    "fieldMeta",
-	"finalize: m.meta.deserRecord":                  "fieldMeta",
-	"finalize: m.sr.fields[m.idx].meta.serRecord":   "fieldMeta",
-	"finalize: m.dr.fields[m.idx].meta.deserRecord": "fieldMeta",
+	// tables, wired when a forward reference resolves. The field entries are
+	// reached through the enclosing record's node, which is what holds the
+	// encode and decode tables.
+	"finalize: m.meta.serRecord":                                "fieldMeta",
+	"finalize: m.meta.deserRecord":                              "fieldMeta",
+	"finalize: m.nd.serRecord.fields[m.idx].meta.serRecord":     "fieldMeta",
+	"finalize: m.nd.deserRecord.fields[m.idx].meta.deserRecord": "fieldMeta",
 
 	// The only post-construction writes to a schemaNode's wire fields, both
 	// on nodes resolveNode allocated moments earlier and has not published.

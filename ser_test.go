@@ -39,10 +39,10 @@ var avroTypeReads = map[string]string{
 	// The decode accessor's body is spelled identically and collapses into
 	// the row above; both are named here so a reader is not left hunting.
 
-	"ifaceFnForPrimitive: meta.avroType":         "bare *fieldMeta",
-	"tryCompileFieldSer: inner.avroType":         "bare *fieldMeta",
-	"tryCompileFieldDeser: inner.avroType":       "bare *fieldMeta",
-	"finalize: m.sr.fields[m.idx].meta.avroType": "names the resolved type on the fieldMeta the encode and decode entries share",
+	"ifaceFnForPrimitive: meta.avroType":                   "bare *fieldMeta",
+	"tryCompileFieldSer: inner.avroType":                   "bare *fieldMeta",
+	"tryCompileFieldDeser: inner.avroType":                 "bare *fieldMeta",
+	"finalize: m.nd.serRecord.fields[m.idx].meta.avroType": "names the resolved type on the fieldMeta the encode and decode entries share",
 }
 
 // TestAvroTypeReadsAreRowed derives from source every read of a fieldMeta's
