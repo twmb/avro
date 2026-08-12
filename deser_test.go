@@ -2352,6 +2352,106 @@ func TestUnsafeBytesDeserErrors(t *testing.T) {
 	}
 }
 
+// TestMatrix_UnionEmitTagsAreFullLengthAtEveryBranch pins that a union's two
+// emit-tag tables carry an entry for every branch, by decoding through every
+// branch index of every union shape with the tagging options on.
+//
+// maybeWrap picks branchNames or logicalNames by the wire's branch index and
+// indexes it without a length check, so a table that skipped entries — for
+// branches with no logical type, or whose qualified spelling another branch
+// already owns — would panic on exactly the branches it skipped. The axes are
+// the union's shape, the branch actually on the wire, and how the union was
+// compiled: directly by a parse, or by a resolution, which builds these tables
+// at three separate sites of its own.
+//
+// The assertion is answerable from the input: the options say a decoded union
+// value is a one-key envelope, so any branch that comes back bare or panics is
+// wrong whatever the other branches did.
+func TestMatrix_UnionEmitTagsAreFullLengthAtEveryBranch(t *testing.T) {
+	shapes := []struct {
+		name   string
+		union  string
+		values []any    // one per branch, in branch order
+		tags   []string // the tag each branch must emit; "" for the null branch
+	}{
+		{"null-and-int", `["null","int"]`,
+			[]any{nil, int32(1)}, []string{"", "int"}},
+		{"no-logical-anywhere", `["null","int","string","boolean"]`,
+			[]any{nil, int32(1), "s", true}, []string{"", "int", "string", "boolean"}},
+		{"logical-on-some", `["null","int",{"type":"long","logicalType":"timestamp-millis"},"string"]`,
+			[]any{nil, int32(1), int64(1000), "s"},
+			[]string{"", "int", "long.timestamp-millis", "string"}},
+		{"logical-first", `[{"type":"long","logicalType":"timestamp-millis"},"null","int"]`,
+			[]any{int64(1000), nil, int32(1)},
+			[]string{"long.timestamp-millis", "", "int"}},
+		// Two qualified branches: each must keep its OWN qualification, so a
+		// table that shifted by one would swap them rather than go short.
+		{"two-logicals", `["null",{"type":"long","logicalType":"timestamp-millis"},{"type":"int","logicalType":"date"},"string"]`,
+			[]any{nil, int64(1000), int32(5), "s"},
+			[]string{"", "long.timestamp-millis", "int.date", "string"}},
+		{"named-branch", `["null",{"type":"record","name":"N","fields":[{"name":"v","type":"int"}]}]`,
+			[]any{nil, map[string]any{"v": int32(2)}}, []string{"", "N"}},
+	}
+
+	realized := 0
+	for _, sh := range shapes {
+		schema := `{"type":"record","name":"R","fields":[{"name":"u","type":` + sh.union + `}]}`
+		direct := mustParse(t, schema)
+		// A resolution compiles the union again, through its own sites.
+		resolved := mustResolve(t, mustParse(t, schema),
+			mustParse(t, `{"type":"record","name":"R","fields":[{"name":"u","type":`+sh.union+`},{"name":"extra","type":"int","default":9}]}`))
+
+		for branch, v := range sh.values {
+			for _, compiled := range []struct {
+				how string
+				s   *Schema
+			}{{"direct", direct}, {"resolved", resolved}} {
+				t.Run(sh.name+"/branch"+strconv.Itoa(branch)+"/"+compiled.how, func(t *testing.T) {
+					wire, err := direct.AppendEncode(nil, map[string]any{"u": v})
+					if err != nil {
+						t.Fatalf("encode: %v", err)
+					}
+					var got map[string]any
+					if _, err := compiled.s.Decode(wire, &got, TaggedUnions(), TagLogicalTypes()); err != nil {
+						t.Fatalf("decode: %v", err)
+					}
+					if v == nil {
+						// A null decodes to a nil interface, and maybeWrap
+						// returns before the tables on an invalid element —
+						// so the null branch is the one index that does NOT
+						// exercise them, and it must stay bare.
+						if got["u"] != nil {
+							t.Fatalf("null branch decoded %#v, want a bare nil", got["u"])
+						}
+						return
+					}
+					m, ok := got["u"].(map[string]any)
+					if !ok || len(m) != 1 {
+						t.Fatalf("branch %d decoded %#v, want a one-key envelope", branch, got["u"])
+					}
+					// The exact tag, not merely some tag: a table that
+					// shifted or dropped a qualification still produces an
+					// envelope, and the wrong one routes a re-encode to a
+					// different branch.
+					for k := range m {
+						if k != sh.tags[branch] {
+							t.Fatalf("branch %d emitted tag %q, want %q", branch, k, sh.tags[branch])
+						}
+					}
+				})
+				realized++
+			}
+		}
+	}
+	want := 0
+	for _, sh := range shapes {
+		want += len(sh.values) * 2
+	}
+	if realized != want {
+		t.Fatalf("realized %d cells, want %d", realized, want)
+	}
+}
+
 // TestMatrix_FastPathDeclinesOnIncompleteFieldMeta pins that the unsafe field
 // compilers decline — rather than fault — whenever the metadata a shape needs
 // is missing, on both wires.
