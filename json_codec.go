@@ -185,10 +185,8 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 	sl.taggedUnions = cfg.tagged
 	sl.tagLogicalTypes = cfg.tagLogical
 	ctx := &jsonDecoder{
-		scanner:        &jsonScanner{data: src},
-		slab:           sl,
-		wrapUnions:     cfg.tagged,
-		qualifyLogical: cfg.tagLogical,
+		scanner: &jsonScanner{data: src},
+		slab:    sl,
 	}
 	err := ctx.decodeValue(rv.Elem(), s.node)
 	if err == nil {

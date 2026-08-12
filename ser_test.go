@@ -10,6 +10,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"math"
 	"math/big"
 	"os"
@@ -19,6 +20,88 @@ import (
 	"testing"
 	"time"
 )
+
+// avroTypeReads names every expression in the package that reads an
+// avroType out of a fieldMeta, and says what is doing the reading.
+//
+// A record field does not store its Avro type; it asks its fieldMeta through
+// serRecordField.avroType / deserRecordField.avroType, which answer "" when
+// there is no meta to ask. That accessor is the reason the compilers can
+// dispatch before proving meta non-nil, so a site that reaches around it and
+// writes f.meta.avroType would fault exactly where the accessor declines —
+// and the two spellings differ by four characters.
+//
+// Reads off a bare *fieldMeta are a different thing and are rowed as such:
+// the walkers already hold the meta, and there is no field indirection to go
+// around.
+var avroTypeReads = map[string]string{
+	"avroType: f.meta.avroType": "the encode accessor itself",
+	// The decode accessor's body is spelled identically and collapses into
+	// the row above; both are named here so a reader is not left hunting.
+
+	"ifaceFnForPrimitive: meta.avroType":                   "bare *fieldMeta",
+	"tryCompileFieldSer: inner.avroType":                   "bare *fieldMeta",
+	"tryCompileFieldDeser: inner.avroType":                 "bare *fieldMeta",
+	"finalize: m.nd.serRecord.fields[m.idx].meta.avroType": "names the resolved type on the fieldMeta the encode and decode entries share",
+}
+
+// TestAvroTypeReadsAreRowed derives from source every read of a fieldMeta's
+// avroType and requires each to be rowed. It reds in both directions, so a
+// new site that reaches past the accessor fails here, and a row whose site
+// has vanished fails too.
+func TestAvroTypeReadsAreRowed(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	found := map[string]bool{}
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", n, err)
+		}
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			// A CallExpr is visited before its Fun, so recording call
+			// targets on the way down is enough to tell the accessor call
+			// f.avroType() from a field read f.meta.avroType.
+			callTargets := map[ast.Node]bool{}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				if ce, ok := n.(*ast.CallExpr); ok {
+					callTargets[ce.Fun] = true
+					return true
+				}
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "avroType" || callTargets[sel] {
+					return true
+				}
+				found[fd.Name.Name+": "+types.ExprString(sel)] = true
+				return true
+			})
+		}
+	}
+	if len(found) == 0 {
+		t.Fatal("derivation found no avroType read; the walk is broken, not the package")
+	}
+	for site := range found {
+		if _, ok := avroTypeReads[site]; !ok {
+			t.Errorf("%s reads a fieldMeta's avroType; a record field must ask through its avroType() accessor, or row this as a bare-meta read", site)
+		}
+	}
+	for site := range avroTypeReads {
+		if !found[site] {
+			t.Errorf("avroTypeReads rows %s, which the source no longer contains", site)
+		}
+	}
+}
 
 // ---------- ser_test.go ----------
 

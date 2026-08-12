@@ -224,9 +224,18 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 ///////////
 
 type deserUnion struct {
-	fns          []deserfn
-	branchNames  []string // standard names: "null", "string", "com.example.Foo"
-	logicalNames []string // with logical type: "long.timestamp-millis"; empty if same as branchNames
+	fns []deserfn
+	// branchNames and logicalNames are the tags the decoder EMITS, indexed
+	// by branch: the standard name ("null", "string", "com.example.Foo") and
+	// the same name qualified by any logical type ("long.timestamp-millis").
+	//
+	// Both are FULL LENGTH, always. A branch with no logical type repeats
+	// its standard name rather than leaving a hole, and so does one whose
+	// qualified spelling another branch already owns. maybeWrap indexes
+	// whichever the options select without a length check, so a short slice
+	// is a panic rather than a fallback.
+	branchNames  []string
+	logicalNames []string
 	// noWrap disables maybeWrap. Set by resolveWriterUnion when the
 	// reader is non-union — wrapping there would leak the writer's
 	// branch name onto a target that has no union to dispatch through.
@@ -499,10 +508,19 @@ type deserRecordField struct {
 	nameVal    reflect.Value // pre-computed reflect.ValueOf(name); avoids alloc per map lookup
 	fn         deserfn
 	fnIface    deserIfaceFn // non-nil iff f.fn handles a primitive that benefits from iface-direct decode
-	avroType   string
 	meta       *fieldMeta
 	defaultVal any
 	hasDefault bool
+}
+
+// avroType names the field's Avro type, or "" when the field carries no
+// metadata to name it with. Decode twin of [serRecordField.avroType]; see
+// that comment for why the type is asked rather than copied.
+func (f *deserRecordField) avroType() string {
+	if f.meta == nil {
+		return ""
+	}
+	return f.meta.avroType
 }
 
 type deserRecord struct {

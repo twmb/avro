@@ -15,6 +15,106 @@ import (
 
 // ---------- json_codec_test.go ----------
 
+// TestMatrix_JSONDecodeOptionsAgreeAcrossFieldProvenance pins that one
+// DecodeJSON call answers TaggedUnions and TagLogicalTypes the same way for
+// every field, however that field got its value.
+//
+// A field present in the JSON is decoded by the JSON decoder. A field absent
+// from it is filled from its schema default, which routes through the BINARY
+// deser fn and reads the options off the per-call slab. Two readers of one
+// option, and a caller sees both in a single returned map — so the axes are
+// the option combination crossed with the field's provenance, and crossed
+// again with whether the union branch carries a logical type, since that is
+// what the second option renames.
+//
+// Each cell asserts twice. The two provenances must AGREE, which is the
+// cross-path question and the one a second copy of an option can get wrong.
+// Each must also match what the option itself says: wrapped in a {branch:
+// value} envelope exactly when TaggedUnions is on, and the branch named with
+// its logical type exactly when TagLogicalTypes is on. Agreement alone would
+// stay green if both readers were wrong together, which is precisely the case
+// a parity oracle cannot see.
+func TestMatrix_JSONDecodeOptionsAgreeAcrossFieldProvenance(t *testing.T) {
+	const schema = `{"type":"record","name":"R","fields":[
+		{"name":"p","type":["int","string"]},
+		{"name":"f","type":["int","string"],"default":7},
+		{"name":"pl","type":[{"type":"long","logicalType":"timestamp-millis"},"string"]},
+		{"name":"fl","type":[{"type":"long","logicalType":"timestamp-millis"},"string"],"default":0}
+	]}`
+	// p and pl are present; f and fl are absent and fill from their defaults.
+	const doc = `{"p":{"int":5},"pl":{"long":1000}}`
+
+	s := mustParse(t, schema)
+
+	combos := []struct {
+		name    string
+		opts    []Opt
+		tagged  bool
+		logical bool
+	}{
+		{"neither", nil, false, false},
+		{"tagged", []Opt{TaggedUnions()}, true, false},
+		{"taglogical", []Opt{TagLogicalTypes()}, false, true},
+		{"both", []Opt{TaggedUnions(), TagLogicalTypes()}, true, true},
+	}
+
+	// tagOf reports the envelope key a value is wrapped in, or "" when it is
+	// not wrapped at all. A union value is never legitimately a one-key map
+	// in this schema, so the two are distinguishable.
+	tagOf := func(v any) string {
+		m, ok := v.(map[string]any)
+		if !ok || len(m) != 1 {
+			return ""
+		}
+		for k := range m {
+			return k
+		}
+		return ""
+	}
+
+	realized := 0
+	for _, c := range combos {
+		for _, pair := range []struct {
+			kind            string
+			present, filled string
+			wantTag         string
+		}{
+			{"plain", "p", "f", "int"},
+			{"logical", "pl", "fl", "long"},
+		} {
+			t.Run(c.name+"/"+pair.kind, func(t *testing.T) {
+				var got map[string]any
+				if err := s.DecodeJSON([]byte(doc), &got, c.opts...); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				presentTag := tagOf(got[pair.present])
+				filledTag := tagOf(got[pair.filled])
+				if presentTag != filledTag {
+					t.Fatalf("present field %q tagged %q but default-filled field %q tagged %q; one option, two answers",
+						pair.present, presentTag, pair.filled, filledTag)
+				}
+
+				// Answerable from the options alone, so both readers being
+				// wrong together cannot pass.
+				want := ""
+				if c.tagged {
+					want = pair.wantTag
+					if c.logical && pair.kind == "logical" {
+						want += ".timestamp-millis"
+					}
+				}
+				if presentTag != want {
+					t.Fatalf("tagged=%v taglogical=%v produced tag %q, want %q", c.tagged, c.logical, presentTag, want)
+				}
+			})
+			realized++
+		}
+	}
+	if want := len(combos) * 2; realized != want {
+		t.Fatalf("realized %d cells, want %d", realized, want)
+	}
+}
+
 func TestEncodeJSON(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -201,10 +201,15 @@ func (ctx *jsonDecoder) consumeSlabString() (string, error) {
 
 // jsonDecoder is the state for schema-guided JSON decoding.
 type jsonDecoder struct {
-	scanner        *jsonScanner
-	slab           *slab
-	wrapUnions     bool
-	qualifyLogical bool
+	scanner *jsonScanner
+	// slab carries the decode options as well as the string arena. A record
+	// field filled from its schema default routes through the BINARY deser
+	// fn, which reads taggedUnions / tagLogicalTypes off the slab, so the
+	// slab has to hold them whatever this struct does. Holding them twice
+	// would let a present union field and a default-filled one answer the
+	// same option differently — the exact inconsistency the slab assignment
+	// exists to prevent.
+	slab *slab
 	// suppressLogical, when set, makes the next decodeKind hand the RAW
 	// Avro-native value (int32/int64/[]byte) to its leaf decoder instead
 	// of the logical-transformed Go value (time.Time/time.Duration/
@@ -1768,7 +1773,7 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, p byt
 }
 
 func (ctx *jsonDecoder) wrapUnion(v reflect.Value, val any, union, branch *schemaNode) any {
-	if !ctx.wrapUnions || val == nil {
+	if !ctx.slab.taggedUnions || val == nil {
 		return val
 	}
 	// Mirror the binary wrap (deserUnion.maybeWrap): the {branch: value}
@@ -1786,7 +1791,7 @@ func (ctx *jsonDecoder) wrapUnion(v reflect.Value, val any, union, branch *schem
 	// references this mirrors), and a logical qualifier another branch
 	// owns as its exact name degrades to the unqualified name on BOTH
 	// sides rather than only one.
-	return map[string]any{unionEmitTag(union, branch, ctx.qualifyLogical): val}
+	return map[string]any{unionEmitTag(union, branch, ctx.slab.tagLogicalTypes): val}
 }
 
 // jsonTokenMatchesBranch returns true if a JSON token type could

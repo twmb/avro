@@ -2352,44 +2352,212 @@ func TestUnsafeBytesDeserErrors(t *testing.T) {
 	}
 }
 
-// TestTryCompileFieldSerDefensive covers defensive nil-meta guards
-// in tryCompileFieldSer that protect against internal schema builder bugs.
-func TestTryCompileFieldSerDefensive(t *testing.T) {
-	// Null-union with nil meta → return nil.
-	fn := tryCompileFieldSer(&serRecordField{avroType: "nullunion"}, reflect.TypeFor[*int]())
-	if fn != nil {
-		t.Error("expected nil for nullunion with nil meta")
+// TestMatrix_UnionEmitTagsAreFullLengthAtEveryBranch pins that a union's two
+// emit-tag tables carry an entry for every branch, by decoding through every
+// branch index of every union shape with the tagging options on.
+//
+// maybeWrap picks branchNames or logicalNames by the wire's branch index and
+// indexes it without a length check, so a table that skipped entries — for
+// branches with no logical type, or whose qualified spelling another branch
+// already owns — would panic on exactly the branches it skipped. The axes are
+// the union's shape, the branch actually on the wire, and how the union was
+// compiled: directly by a parse, or by a resolution, which builds these tables
+// at three separate sites of its own.
+//
+// The assertion is answerable from the input: the options say a decoded union
+// value is a one-key envelope, so any branch that comes back bare or panics is
+// wrong whatever the other branches did.
+func TestMatrix_UnionEmitTagsAreFullLengthAtEveryBranch(t *testing.T) {
+	shapes := []struct {
+		name   string
+		union  string
+		values []any    // one per branch, in branch order
+		tags   []string // the tag each branch must emit; "" for the null branch
+	}{
+		{"null-and-int", `["null","int"]`,
+			[]any{nil, int32(1)}, []string{"", "int"}},
+		{"no-logical-anywhere", `["null","int","string","boolean"]`,
+			[]any{nil, int32(1), "s", true}, []string{"", "int", "string", "boolean"}},
+		{"logical-on-some", `["null","int",{"type":"long","logicalType":"timestamp-millis"},"string"]`,
+			[]any{nil, int32(1), int64(1000), "s"},
+			[]string{"", "int", "long.timestamp-millis", "string"}},
+		{"logical-first", `[{"type":"long","logicalType":"timestamp-millis"},"null","int"]`,
+			[]any{int64(1000), nil, int32(1)},
+			[]string{"long.timestamp-millis", "", "int"}},
+		// Two qualified branches: each must keep its OWN qualification, so a
+		// table that shifted by one would swap them rather than go short.
+		{"two-logicals", `["null",{"type":"long","logicalType":"timestamp-millis"},{"type":"int","logicalType":"date"},"string"]`,
+			[]any{nil, int64(1000), int32(5), "s"},
+			[]string{"", "long.timestamp-millis", "int.date", "string"}},
+		{"named-branch", `["null",{"type":"record","name":"N","fields":[{"name":"v","type":"int"}]}]`,
+			[]any{nil, map[string]any{"v": int32(2)}}, []string{"", "N"}},
 	}
-	// Null-union with nil inner meta → return nil.
-	fn = tryCompileFieldSer(&serRecordField{avroType: "nullunion", meta: &fieldMeta{avroType: "nullunion"}}, reflect.TypeFor[*int]())
-	if fn != nil {
-		t.Error("expected nil for nullunion with nil inner meta")
+
+	realized := 0
+	for _, sh := range shapes {
+		schema := `{"type":"record","name":"R","fields":[{"name":"u","type":` + sh.union + `}]}`
+		direct := mustParse(t, schema)
+		// A resolution compiles the union again, through its own sites.
+		resolved := mustResolve(t, mustParse(t, schema),
+			mustParse(t, `{"type":"record","name":"R","fields":[{"name":"u","type":`+sh.union+`},{"name":"extra","type":"int","default":9}]}`))
+
+		for branch, v := range sh.values {
+			for _, compiled := range []struct {
+				how string
+				s   *Schema
+			}{{"direct", direct}, {"resolved", resolved}} {
+				t.Run(sh.name+"/branch"+strconv.Itoa(branch)+"/"+compiled.how, func(t *testing.T) {
+					wire, err := direct.AppendEncode(nil, map[string]any{"u": v})
+					if err != nil {
+						t.Fatalf("encode: %v", err)
+					}
+					var got map[string]any
+					if _, err := compiled.s.Decode(wire, &got, TaggedUnions(), TagLogicalTypes()); err != nil {
+						t.Fatalf("decode: %v", err)
+					}
+					if v == nil {
+						// A null decodes to a nil interface, and maybeWrap
+						// returns before the tables on an invalid element —
+						// so the null branch is the one index that does NOT
+						// exercise them, and it must stay bare.
+						if got["u"] != nil {
+							t.Fatalf("null branch decoded %#v, want a bare nil", got["u"])
+						}
+						return
+					}
+					m, ok := got["u"].(map[string]any)
+					if !ok || len(m) != 1 {
+						t.Fatalf("branch %d decoded %#v, want a one-key envelope", branch, got["u"])
+					}
+					// The exact tag, not merely some tag: a table that
+					// shifted or dropped a qualification still produces an
+					// envelope, and the wrong one routes a re-encode to a
+					// different branch.
+					for k := range m {
+						if k != sh.tags[branch] {
+							t.Fatalf("branch %d emitted tag %q, want %q", branch, k, sh.tags[branch])
+						}
+					}
+				})
+				realized++
+			}
+		}
 	}
-	// Array with nil meta → return nil.
-	fn = tryCompileFieldSer(&serRecordField{avroType: "array"}, reflect.SliceOf(reflect.TypeFor[int32]()))
-	if fn != nil {
-		t.Error("expected nil for array with nil meta")
+	want := 0
+	for _, sh := range shapes {
+		want += len(sh.values) * 2
 	}
-	// Array nullunion with non-ptr element → return nil.
-	fn = tryCompileFieldSer(&serRecordField{
-		avroType: "array",
-		meta:     &fieldMeta{avroType: "array", inner: &fieldMeta{avroType: "nullunion", inner: &fieldMeta{avroType: "int"}}},
-	}, reflect.SliceOf(reflect.TypeFor[int32]()))
-	if fn != nil {
-		t.Error("expected nil for array nullunion with non-ptr element")
+	if realized != want {
+		t.Fatalf("realized %d cells, want %d", realized, want)
 	}
-	// Array nullunion with ptr to non-compilable inner (covers catch-all return nil).
-	fn = tryCompileFieldSer(&serRecordField{
-		avroType: "array",
-		meta:     &fieldMeta{avroType: "array", inner: &fieldMeta{avroType: "nullunion", inner: &fieldMeta{avroType: "map"}}},
-	}, reflect.SliceOf(reflect.TypeFor[*map[string]int]()))
-	if fn != nil {
-		t.Error("expected nil for array nullunion with non-compilable inner")
+}
+
+// TestMatrix_FastPathDeclinesOnIncompleteFieldMeta pins that the unsafe field
+// compilers decline — rather than fault — whenever the metadata a shape needs
+// is missing, on both wires.
+//
+// A record field names its Avro type by asking its fieldMeta, so a field
+// carrying NO meta names no type and reaches no shape arm at all; the other
+// cells name a shape but withhold the inner metadata that shape needs. The
+// axes are the wire (encode and decode compile through separate switches over
+// one vocabulary) and the shape whose metadata is withheld.
+//
+// Every cell carries a COMPLETE twin: the same shape and the same Go type with
+// the metadata supplied, which must compile to a non-nil fast path. Without
+// it a cell proves only that something declined, which the kind checks would
+// also do — the twin is what attributes the refusal to the missing metadata.
+func TestMatrix_FastPathDeclinesOnIncompleteFieldMeta(t *testing.T) {
+	// A real record's compiled tables, so the record cells' complete twins
+	// carry something the compiler will actually accept.
+	rec := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"v","type":"int"}]}`)
+	type R struct {
+		V int32 `avro:"v"`
 	}
-	// Record with nil meta → return nil.
-	fn = tryCompileFieldSer(&serRecordField{avroType: "record"}, reflect.TypeFor[struct{}]())
-	if fn != nil {
-		t.Error("expected nil for record with nil meta")
+	recGo := reflect.TypeFor[R]()
+
+	intMeta := func() *fieldMeta { return &fieldMeta{avroType: "int"} }
+
+	cells := []struct {
+		name       string
+		goType     reflect.Type
+		incomplete *fieldMeta // nil means the field carries no meta at all
+		complete   *fieldMeta
+	}{
+		{"no-meta-at-all/ptr", reflect.TypeFor[*int32](), nil,
+			&fieldMeta{avroType: "nullunion", inner: intMeta()}},
+		{"no-meta-at-all/slice", reflect.SliceOf(reflect.TypeFor[int32]()), nil,
+			&fieldMeta{avroType: "array", inner: intMeta()}},
+		{"no-meta-at-all/scalar", reflect.TypeFor[int32](), nil, intMeta()},
+		{"nullunion/no-inner", reflect.TypeFor[*int32](),
+			&fieldMeta{avroType: "nullunion"},
+			&fieldMeta{avroType: "nullunion", inner: intMeta()}},
+		{"array/no-inner", reflect.SliceOf(reflect.TypeFor[int32]()),
+			&fieldMeta{avroType: "array"},
+			&fieldMeta{avroType: "array", inner: intMeta()}},
+	}
+
+	realized := 0
+	for _, c := range cells {
+		for _, wire := range []string{"encode", "decode"} {
+			t.Run(wire+"/"+c.name, func(t *testing.T) {
+				complete := c.complete
+				switch wire {
+				case "encode":
+					if got := tryCompileFieldSer(&serRecordField{meta: c.incomplete}, c.goType); got != nil {
+						t.Fatalf("compiled a fast path from incomplete metadata")
+					}
+					if got := tryCompileFieldSer(&serRecordField{meta: complete}, c.goType); got == nil {
+						t.Fatalf("declined the COMPLETE twin, so the refusal above is not attributable to the missing metadata")
+					}
+				case "decode":
+					if got := tryCompileFieldDeser(&deserRecordField{meta: c.incomplete}, c.goType); got != nil {
+						t.Fatalf("compiled a fast path from incomplete metadata")
+					}
+					if got := tryCompileFieldDeser(&deserRecordField{meta: complete}, c.goType); got == nil {
+						t.Fatalf("declined the COMPLETE twin, so the refusal above is not attributable to the missing metadata")
+					}
+				}
+			})
+			realized++
+		}
+	}
+
+	// The record arm needs a real compiled table on both wires, so it is
+	// crossed separately rather than being forced into the table above.
+	t.Run("encode/record/no-table", func(t *testing.T) {
+		if got := tryCompileFieldSer(&serRecordField{meta: &fieldMeta{avroType: "record"}}, recGo); got != nil {
+			t.Fatalf("compiled a record fast path with no serRecord")
+		}
+		if got := tryCompileFieldSer(&serRecordField{meta: &fieldMeta{avroType: "record", serRecord: rec.node.serRecord}}, recGo); got == nil {
+			t.Fatalf("declined the COMPLETE twin, so the refusal above is not attributable to the missing table")
+		}
+	})
+	realized++
+	t.Run("decode/record/no-table", func(t *testing.T) {
+		if got := tryCompileFieldDeser(&deserRecordField{meta: &fieldMeta{avroType: "record"}}, recGo); got != nil {
+			t.Fatalf("compiled a record fast path with no deserRecord")
+		}
+		if got := tryCompileFieldDeser(&deserRecordField{meta: &fieldMeta{avroType: "record", deserRecord: rec.node.deserRecord}}, recGo); got == nil {
+			t.Fatalf("declined the COMPLETE twin, so the refusal above is not attributable to the missing table")
+		}
+	})
+	realized++
+
+	// Element shapes an array declines for reasons of its own, kept because
+	// they are the arms that walk the inner metadata one level deeper.
+	if fn := tryCompileFieldSer(&serRecordField{
+		meta: &fieldMeta{avroType: "array", inner: &fieldMeta{avroType: "nullunion", inner: intMeta()}},
+	}, reflect.SliceOf(reflect.TypeFor[int32]())); fn != nil {
+		t.Error("compiled an array-of-nullunion fast path for a non-pointer element")
+	}
+	if fn := tryCompileFieldSer(&serRecordField{
+		meta: &fieldMeta{avroType: "array", inner: &fieldMeta{avroType: "nullunion", inner: &fieldMeta{avroType: "map"}}},
+	}, reflect.SliceOf(reflect.TypeFor[*map[string]int]())); fn != nil {
+		t.Error("compiled an array-of-nullunion fast path for a non-compilable inner")
+	}
+
+	if want := len(cells)*2 + 2; realized != want {
+		t.Fatalf("realized %d cells, want %d", realized, want)
 	}
 }
 
@@ -2418,30 +2586,6 @@ func TestUsArraySerErrorPaths(t *testing.T) {
 			t.Errorf("expected fake error, got %v", err)
 		}
 	})
-}
-
-// TestTryCompileFieldDeserDefensive covers defensive nil-meta guards
-// in tryCompileFieldDeser.
-func TestTryCompileFieldDeserDefensive(t *testing.T) {
-	// Null-union with nil meta → return nil.
-	fn := tryCompileFieldDeser(&deserRecordField{avroType: "nullunion"}, reflect.TypeFor[*int]())
-	if fn != nil {
-		t.Error("expected nil for nullunion with nil meta")
-	}
-	fn = tryCompileFieldDeser(&deserRecordField{avroType: "nullunion", meta: &fieldMeta{avroType: "nullunion"}}, reflect.TypeFor[*int]())
-	if fn != nil {
-		t.Error("expected nil for nullunion with nil inner meta")
-	}
-	// Array with nil meta → return nil.
-	fn = tryCompileFieldDeser(&deserRecordField{avroType: "array"}, reflect.SliceOf(reflect.TypeFor[int32]()))
-	if fn != nil {
-		t.Error("expected nil for array with nil meta")
-	}
-	// Record with nil meta → return nil.
-	fn = tryCompileFieldDeser(&deserRecordField{avroType: "record"}, reflect.TypeFor[struct{}]())
-	if fn != nil {
-		t.Error("expected nil for record with nil meta")
-	}
 }
 
 // TestUnsafePtrNilSerialize covers the nil-pointer check in the ptr-wrapping

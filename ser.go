@@ -1122,7 +1122,6 @@ type serRecordField struct {
 	name         string
 	nameVal      reflect.Value // pre-computed reflect.ValueOf(name); avoids alloc per map lookup
 	fn           serfn
-	avroType     string
 	meta         *fieldMeta
 	defaultBytes []byte // pre-encoded Avro binary for the field's default value
 	hasDefault   bool
@@ -1134,6 +1133,23 @@ type serRecordField struct {
 	// records the reason here and every consumer of defaultBytes surfaces it
 	// at the moment the default would actually reach the wire.
 	defaultErr error
+}
+
+// avroType names the field's Avro type, or "" when the field carries no
+// metadata to name it with.
+//
+// The type is asked of the metadata rather than copied beside it: the two
+// were always written from the same expression, and a copy that only ever
+// equals its source is a second thing to keep in step. Every dispatch below
+// switches on this, so a field whose meta is missing — which only a
+// hand-assembled field can be, since the build hands every field a fieldMeta
+// — matches no arm and declines to the reflect path, which is what the
+// per-arm nil checks used to spell out one arm at a time.
+func (f *serRecordField) avroType() string {
+	if f.meta == nil {
+		return ""
+	}
+	return f.meta.avroType
 }
 
 // appendDefault appends the field's pre-encoded default, or returns the
@@ -1170,7 +1186,7 @@ func (f *serRecordField) omitzeroAction() ozAction {
 	switch {
 	case f.hasDefault:
 		return ozDefault
-	case f.avroType == "nullunion":
+	case f.avroType() == "nullunion":
 		return ozNull
 	default:
 		return ozNoop

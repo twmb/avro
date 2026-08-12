@@ -295,16 +295,16 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 	k := goType.Kind()
 
 	// Regular unions need the reflect slow path.
-	if f.avroType == "union" {
+	if f.avroType() == "union" {
 		return nil
 	}
 
 	// Null-union: *T mapped to ["null", T] or [T, "null"].
-	if f.avroType == "nullunion" {
+	if f.avroType() == "nullunion" {
 		if k != reflect.Pointer {
 			return nil
 		}
-		if f.meta == nil || f.meta.inner == nil {
+		if f.meta.inner == nil {
 			return nil
 		}
 		nullByte, valByte := nullUnionBytes(f.meta.nullSecond)
@@ -330,7 +330,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		if inner.serRecord != nil {
 			return usNullUnionRecord(inner.serRecord, innerGoType, nullByte, valByte)
 		}
-		innerFn := tryCompileFieldSer(&serRecordField{avroType: inner.avroType, meta: inner}, innerGoType)
+		innerFn := tryCompileFieldSer(&serRecordField{meta: inner}, innerGoType)
 		if innerFn != nil {
 			return usNullUnionPtr(innerFn, nullByte, valByte)
 		}
@@ -338,11 +338,11 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 	}
 
 	// Array: []T or []*T.
-	if f.avroType == "array" {
+	if f.avroType() == "array" {
 		if k != reflect.Slice {
 			return nil
 		}
-		if f.meta == nil || f.meta.inner == nil {
+		if f.meta.inner == nil {
 			return nil
 		}
 		inner := f.meta.inner
@@ -369,7 +369,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			if inner.inner != nil && inner.inner.serRecord != nil {
 				return usArrayNullUnionRecord(inner.inner.serRecord, elemGoType.Elem(), nullByte, valByte)
 			}
-			innerFn := tryCompileFieldSer(&serRecordField{avroType: inner.inner.avroType, meta: inner.inner}, elemGoType.Elem())
+			innerFn := tryCompileFieldSer(&serRecordField{meta: inner.inner}, elemGoType.Elem())
 			if innerFn != nil {
 				return usArrayNullUnionPtr(innerFn, nullByte, valByte)
 			}
@@ -378,7 +378,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 				return usArrayRecord(inner.serRecord, elemGoType)
 			}
 		default:
-			innerFn := tryCompileFieldSer(&serRecordField{avroType: inner.avroType, meta: inner}, elemGoType)
+			innerFn := tryCompileFieldSer(&serRecordField{meta: inner}, elemGoType)
 			if innerFn != nil {
 				return usArrayDirect(innerFn, elemGoType.Size())
 			}
@@ -387,11 +387,11 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 	}
 
 	// Record: struct T.
-	if f.avroType == "record" {
+	if f.avroType() == "record" {
 		if k != reflect.Struct {
 			return nil
 		}
-		if f.meta == nil || f.meta.serRecord == nil {
+		if f.meta.serRecord == nil {
 			return nil
 		}
 		rec := f.meta.serRecord
@@ -439,10 +439,10 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 
 	// Logical type fast paths for time.Time and time.Duration.
 	if f.meta != nil && f.meta.logical != "" {
-		return tryCompileLogicalSer(f.meta.logical, f.avroType, goType)
+		return tryCompileLogicalSer(f.meta.logical, f.avroType(), goType)
 	}
 
-	switch f.avroType {
+	switch f.avroType() {
 	case "boolean":
 		if k == reflect.Bool {
 			return usBool
@@ -485,16 +485,16 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 	}
 	k := goType.Kind()
 
-	if f.avroType == "union" {
+	if f.avroType() == "union" {
 		return nil
 	}
 
 	// Null-union: *T mapped to ["null", T] or [T, "null"].
-	if f.avroType == "nullunion" {
+	if f.avroType() == "nullunion" {
 		if k != reflect.Pointer {
 			return nil
 		}
-		if f.meta == nil || f.meta.inner == nil {
+		if f.meta.inner == nil {
 			return nil
 		}
 		nullByte, valByte := nullUnionBytes(f.meta.nullSecond)
@@ -524,7 +524,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		if inner.deserRecord != nil {
 			return udNullUnionRecord(inner.deserRecord, innerGoType, valIdx, nullByte, valByte)
 		}
-		innerFn := tryCompileFieldDeser(&deserRecordField{avroType: inner.avroType, meta: inner}, innerGoType)
+		innerFn := tryCompileFieldDeser(&deserRecordField{meta: inner}, innerGoType)
 		if innerFn != nil {
 			return udNullUnionPtr(innerFn, innerGoType, valIdx, nullByte, valByte)
 		}
@@ -532,11 +532,11 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 	}
 
 	// Array: []T or []*T.
-	if f.avroType == "array" {
+	if f.avroType() == "array" {
 		if k != reflect.Slice {
 			return nil
 		}
-		if f.meta == nil || f.meta.inner == nil {
+		if f.meta.inner == nil {
 			return nil
 		}
 		inner := f.meta.inner
@@ -559,7 +559,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 				return udArrayPtrRecord(inner.deserRecord, elemGoType.Elem(), goType, inner.minBytes)
 			}
 		default:
-			innerFn := tryCompileFieldDeser(&deserRecordField{avroType: inner.avroType, meta: inner}, elemGoType)
+			innerFn := tryCompileFieldDeser(&deserRecordField{meta: inner}, elemGoType)
 			if innerFn != nil {
 				return udArrayDirect(innerFn, elemGoType.Size(), goType, inner.minBytes)
 			}
@@ -568,11 +568,11 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 	}
 
 	// Record: struct T.
-	if f.avroType == "record" {
+	if f.avroType() == "record" {
 		if k != reflect.Struct {
 			return nil
 		}
-		if f.meta == nil || f.meta.deserRecord == nil {
+		if f.meta.deserRecord == nil {
 			return nil
 		}
 		rec := f.meta.deserRecord
@@ -588,10 +588,10 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 
 	// Logical type fast paths for time.Time and time.Duration.
 	if f.meta != nil && f.meta.logical != "" {
-		return tryCompileLogicalDeser(f.meta.logical, f.avroType, goType)
+		return tryCompileLogicalDeser(f.meta.logical, f.avroType(), goType)
 	}
 
-	switch f.avroType {
+	switch f.avroType() {
 	case "boolean":
 		if k == reflect.Bool {
 			return udBool

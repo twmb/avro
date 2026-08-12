@@ -14,6 +14,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"hash"
 	"hash/crc32"
 	"hash/crc64"
@@ -5868,6 +5869,10 @@ var presenceOnlyFields = map[string]struct {
 	src             string // a schema whose node carries the attribute written as the zero
 	key             string // the JSON key the rebuild must still carry
 	reachesCollapse bool
+	// at navigates from the parsed root to the node under test. Nil means
+	// the root itself. An attribute whose meaning depends on an enclosing
+	// scope has to be probed inside one.
+	at func(*SchemaNode) *SchemaNode
 }{
 	"Doc": {
 		// doc is recorded only where Apache Avro reads one — the named
@@ -5884,6 +5889,78 @@ var presenceOnlyFields = map[string]struct {
 		key:             "logicalType",
 		reachesCollapse: true,
 	},
+	"Namespace": {
+		// "namespace":"" is the null-namespace escape, and it says
+		// something only INSIDE an enclosing namespace — at the root it
+		// names the scope the root already has, which is why the emitter
+		// drops it there and must not drop it here. A named kind always
+		// carries its name, so the collapse is out of reach.
+		src: `{"type":"record","name":"P","namespace":"ns","fields":[` +
+			`{"name":"inner","type":{"type":"record","name":"I","namespace":"","fields":[]}}]}`,
+		key: "namespace",
+		at:  func(n *SchemaNode) *SchemaNode { return &n.Fields[0].Type },
+	},
+	"Size": {
+		// A zero-size fixed writes its size as the field's own zero. Fixed
+		// is a named kind, so the collapse is out of reach here too.
+		src: `{"type":"fixed","name":"F","size":0}`,
+		key: "size",
+	},
+}
+
+// presenceZeroUnwritable classifies the remaining presence-carrying fields as
+// having no presence-ONLY form at all: writing the attribute as the field's
+// own zero either fails to parse, or leaves the field holding a value the
+// emptiness walk can already see, so presence is never the only signal.
+//
+// A classification is a CLAIM, and the guard below checks it rather than
+// taking it — each entry is the schema that attempts to write the zero, and
+// the attempt must actually come out one of those two ways.
+var presenceZeroUnwritable = map[string]string{
+	// An empty name is not a name; the parse refuses it outright.
+	"Name": `{"type":"record","name":"","fields":[]}`,
+	// An empty JSON array parses to a non-nil empty slice, which is not the
+	// field's zero, so the value-based walk sees it without asking presence.
+	"Aliases": `{"type":"record","name":"R","aliases":[],"fields":[]}`,
+	"Symbols": `{"type":"enum","name":"E","symbols":[]}`,
+	"Fields":  `{"type":"record","name":"R","fields":[]}`,
+}
+
+// TestInvariant_PresenceZeroUnwritableClaimsHold checks the classification
+// above in both directions: every classified field must carry a presence bit
+// (so a row for a field that no longer has one reds), and its schema must
+// come out either unparseable or with the field non-zero (so a field that
+// gains a presence-only form reds instead of sitting unchecked).
+func TestInvariant_PresenceZeroUnwritableClaimsHold(t *testing.T) {
+	rt := reflect.TypeFor[SchemaNode]()
+	for field, src := range presenceZeroUnwritable {
+		if _, ok := presenceBitFor(field); !ok {
+			t.Errorf("field %s is classified as having no presence-only form, but carries no presence bit at all; drop the row", field)
+			continue
+		}
+		if _, ok := presenceOnlyFields[field]; ok {
+			t.Errorf("field %s is both classified and celled; it can only be one", field)
+			continue
+		}
+		idx := -1
+		for i := range rt.NumField() {
+			if rt.Field(i).Name == field {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			t.Errorf("field %s is classified but SchemaNode no longer declares it", field)
+			continue
+		}
+		s, err := Parse(src)
+		if err != nil {
+			continue // unparseable: the claim holds by refusal
+		}
+		n := s.Root()
+		if reflect.ValueOf(n).Elem().Field(idx).IsZero() {
+			t.Errorf("field %s parsed to its ZERO with the attribute written, so it DOES have a presence-only form; give it a cell in presenceOnlyFields instead", field)
+		}
+	}
 }
 
 // TestInvariant_BareEmissionCoversPresenceOnlyFields is the completeness guard's
@@ -5904,16 +5981,32 @@ func TestInvariant_BareEmissionCoversPresenceOnlyFields(t *testing.T) {
 		}
 		spec, ok := presenceOnlyFields[f.Name]
 		if !ok {
-			// Every OTHER field must have no presence state, or it belongs
-			// in the table above with its own cell.
-			var probe SchemaNode
-			if nodePresenceSet(&probe, f.Name) {
-				t.Errorf("field %s answers nodePresenceSet but has no presence-only cell; add one so its zero-valued form is checked", f.Name)
+			// Every OTHER field must either carry no presence state at all,
+			// or be classified as having no presence-only form. Ask whether
+			// the field HAS a presence bit — asking a zero SchemaNode
+			// whether its presence is SET answers no for every field, since
+			// a zero node has recorded nothing, and the guard can never
+			// fire.
+			if _, hasBit := presenceBitFor(f.Name); !hasBit {
+				continue
+			}
+			if _, classified := presenceZeroUnwritable[f.Name]; !classified {
+				t.Errorf("field %s carries a presence bit but has neither a presence-only cell nor a row in presenceZeroUnwritable; add one so its zero-valued form is checked", f.Name)
 			}
 			continue
 		}
 		seen++
-		n := MustParse(spec.src).Root()
+		// The attribute may be written on a node INSIDE the probe schema, so
+		// the rebuild is always of the whole root while the field, presence
+		// and collapse questions are asked of the node carrying it.
+		probe := func(root *SchemaNode) *SchemaNode {
+			if spec.at == nil {
+				return root
+			}
+			return spec.at(root)
+		}
+		root := MustParse(spec.src).Root()
+		n := probe(root)
 		fv := reflect.ValueOf(n).Elem().Field(i)
 		if !fv.IsZero() {
 			t.Errorf("field %s: the probe schema did not leave the field at its zero (%#v), so this cell is testing the ordinary value case", f.Name, fv.Interface())
@@ -5938,7 +6031,7 @@ func TestInvariant_BareEmissionCoversPresenceOnlyFields(t *testing.T) {
 				continue
 			}
 		}
-		s, err := n.Schema()
+		s, err := root.Schema()
 		if err != nil {
 			t.Errorf("field %s: rebuild failed: %v", f.Name, err)
 			continue
@@ -5949,12 +6042,12 @@ func TestInvariant_BareEmissionCoversPresenceOnlyFields(t *testing.T) {
 		}
 		// And it must be a FIXPOINT: the re-parse has to record the presence
 		// again, or the attribute survives one rebuild and dies on the next.
-		back := s.Root()
+		back := probe(s.Root())
 		if !nodePresenceSet(back, f.Name) {
 			t.Errorf("field %s: the re-parse did not record the attribute, so a second rebuild would drop it", f.Name)
 			continue
 		}
-		s2, err := back.Schema()
+		s2, err := s.Root().Schema()
 		if err != nil {
 			t.Errorf("field %s: second rebuild failed: %v", f.Name, err)
 			continue
@@ -9068,6 +9161,429 @@ func recvTypeName(e ast.Expr) string {
 	return "?"
 }
 
+// TestMatrix_ForwardRefFixupsLandOnTheirOwnRecord pins that a deferred wiring
+// patches the record it was queued for, when several records are waiting at
+// once.
+//
+// A forward reference leaves a record field unwired until finalize, which
+// walks the queue and patches the encode table, the decode table and the
+// metadata node for one field of one record. Those three are reached through
+// the record's node, so they cannot name different records — but nothing
+// about a QUEUE makes entries land on the right entry, so this crosses the
+// two deferral shapes against several records deferring simultaneously.
+//
+// The shapes are the field whose whole type is a forward reference, and the
+// field whose type resolved but whose descendant did not — an array of a
+// not-yet-defined type — which defers only its default. Both are crossed with
+// a default present, since a default is resolved and pre-encoded against the
+// field it was queued for and would be visibly wrong on another.
+//
+// Each waiting record names a DIFFERENT leaf type, so a fixup landing on a
+// neighbour cannot coincide with the right answer. Expectations are the
+// values the test encodes and the defaults the schema declares; the
+// dependency-ordered spelling of the same schema, which defers nothing,
+// supplies the wire bytes as an independent oracle.
+func TestMatrix_ForwardRefFixupsLandOnTheirOwnRecord(t *testing.T) {
+	// Three records, each referencing a leaf defined AFTER it, each leaf a
+	// different Avro type.
+	leaves := []struct {
+		name  string
+		avro  string
+		value any
+		deflt string
+	}{
+		{"L1", "int", int32(11), `{"v":1}`},
+		{"L2", "long", int64(22), `{"v":2}`},
+		{"L3", "string", "s3", `{"v":"three"}`},
+	}
+
+	var holders, defs []string
+	for _, l := range leaves {
+		holders = append(holders, `{"name":"h`+l.name+`","type":{"type":"record","name":"H`+l.name+`","fields":[`+
+			`{"name":"x","type":"`+l.name+`"},`+
+			`{"name":"d","type":"`+l.name+`","default":`+l.deflt+`},`+
+			`{"name":"arr","type":{"type":"array","items":"`+l.name+`"},"default":[`+l.deflt+`]}`+
+			`]}}`)
+		defs = append(defs, `{"name":"d`+l.name+`","type":{"type":"record","name":"`+l.name+`","fields":[{"name":"v","type":"`+l.avro+`"}]}}`)
+	}
+	// Forward: every holder precedes every definition, so all three records
+	// are waiting on finalize at the same time.
+	forward := `{"type":"record","name":"Outer","fields":[` + strings.Join(append(append([]string{}, holders...), defs...), ",") + `]}`
+	// Dependency-ordered: the definitions come first, so nothing defers. Same
+	// fields in the same order otherwise, so the wire must match.
+	ordered := `{"type":"record","name":"Outer","fields":[` + strings.Join(append(append([]string{}, defs...), holders...), ",") + `]}`
+
+	value := func(l int) map[string]any {
+		return map[string]any{"v": leaves[l].value}
+	}
+	holderValue := func(l int) map[string]any {
+		return map[string]any{"x": value(l), "d": value(l), "arr": []any{value(l)}}
+	}
+	full := map[string]any{}
+	orderedFull := map[string]any{}
+	for i, l := range leaves {
+		full["h"+l.name] = holderValue(i)
+		orderedFull["h"+l.name] = holderValue(i)
+		full["d"+l.name] = value(i)
+		orderedFull["d"+l.name] = value(i)
+	}
+
+	fwd := mustParse(t, forward)
+	ord := mustParse(t, ordered)
+
+	t.Run("wire-matches-dependency-order", func(t *testing.T) {
+		// Field ORDER differs between the two spellings, so compare each
+		// holder's own encoding rather than the whole record's.
+		for i, l := range leaves {
+			sub := `{"type":"record","name":"H` + l.name + `","fields":[` +
+				`{"name":"x","type":{"type":"record","name":"` + l.name + `","fields":[{"name":"v","type":"` + l.avro + `"}]}},` +
+				`{"name":"d","type":"` + l.name + `"},` +
+				`{"name":"arr","type":{"type":"array","items":"` + l.name + `"}}]}`
+			want, err := mustParse(t, sub).AppendEncode(nil, holderValue(i))
+			if err != nil {
+				t.Fatalf("%s: oracle encode: %v", l.name, err)
+			}
+			gotFull, err := fwd.AppendEncode(nil, full)
+			if err != nil {
+				t.Fatalf("%s: forward encode: %v", l.name, err)
+			}
+			if !bytes.Contains(gotFull, want) {
+				t.Fatalf("%s: forward-declared holder did not encode like its dependency-ordered twin", l.name)
+			}
+		}
+	})
+
+	t.Run("round-trip", func(t *testing.T) {
+		for _, s := range []struct {
+			name string
+			s    *Schema
+			v    map[string]any
+		}{{"forward", fwd, full}, {"ordered", ord, orderedFull}} {
+			wire, err := s.s.AppendEncode(nil, s.v)
+			if err != nil {
+				t.Fatalf("%s: encode: %v", s.name, err)
+			}
+			var got map[string]any
+			if _, err := s.s.Decode(wire, &got); err != nil {
+				t.Fatalf("%s: decode: %v", s.name, err)
+			}
+			for i, l := range leaves {
+				h, _ := got["h"+l.name].(map[string]any)
+				if h == nil {
+					t.Fatalf("%s: %s holder missing", s.name, l.name)
+				}
+				if !reflect.DeepEqual(h["x"], value(i)) {
+					t.Fatalf("%s: %s x decoded %#v, want %#v", s.name, l.name, h["x"], value(i))
+				}
+			}
+		}
+	})
+
+	// The defaults are what the deferred wiring pre-encodes, so read them
+	// back through a resolution whose writer omits the defaulted fields.
+	t.Run("defaults-fill-from-their-own-record", func(t *testing.T) {
+		var writerHolders []string
+		for _, l := range leaves {
+			writerHolders = append(writerHolders, `{"name":"h`+l.name+`","type":{"type":"record","name":"H`+l.name+`","fields":[`+
+				`{"name":"x","type":{"type":"record","name":"`+l.name+`","fields":[{"name":"v","type":"`+l.avro+`"}]}}`+
+				`]}}`)
+		}
+		// The leaf-carrying fields exist on the reader with no default, so
+		// the writer must supply them too; only the defaulted fields inside
+		// each holder are withheld.
+		for _, l := range leaves {
+			writerHolders = append(writerHolders, `{"name":"d`+l.name+`","type":"`+l.name+`"}`)
+		}
+		writer := mustParse(t, `{"type":"record","name":"Outer","fields":[`+strings.Join(writerHolders, ",")+`]}`)
+		resolved := mustResolve(t, writer, fwd)
+
+		wv := map[string]any{}
+		for i, l := range leaves {
+			wv["h"+l.name] = map[string]any{"x": value(i)}
+			wv["d"+l.name] = value(i)
+		}
+		wire, err := writer.AppendEncode(nil, wv)
+		if err != nil {
+			t.Fatalf("writer encode: %v", err)
+		}
+		var got map[string]any
+		if _, err := resolved.Decode(wire, &got); err != nil {
+			t.Fatalf("resolved decode: %v", err)
+		}
+		wantDefaults := []any{
+			map[string]any{"v": int32(1)},
+			map[string]any{"v": int64(2)},
+			map[string]any{"v": "three"},
+		}
+		for i, l := range leaves {
+			h, _ := got["h"+l.name].(map[string]any)
+			if h == nil {
+				t.Fatalf("%s holder missing", l.name)
+			}
+			if !reflect.DeepEqual(h["d"], wantDefaults[i]) {
+				t.Fatalf("%s filled d from %#v, want %#v — a default resolved against another record's field", l.name, h["d"], wantDefaults[i])
+			}
+			if !reflect.DeepEqual(h["arr"], []any{wantDefaults[i]}) {
+				t.Fatalf("%s filled arr from %#v, want %#v — a deferred default landed on another record", l.name, h["arr"], []any{wantDefaults[i]})
+			}
+		}
+	})
+}
+
+// wireFieldAssignments names every site that ASSIGNS one of the compiled wire
+// fields — ser, deser, serRecord, deserRecord — outside the composite literal
+// that constructs its struct. Rows are "function: receiver.field".
+//
+// The set matters because two different structs spell these fields the same
+// way, and only one of them may be written after construction.
+//
+// A schemaNode's wire fields are written ONCE, by the literal that builds the
+// node. That is what lets a named type be registered as its node alone: a
+// reference reads node.ser back out and gets exactly the function the
+// definition compiled, with no second copy that could be re-pointed
+// independently. Every row below whose receiver is a schemaNode is therefore a
+// deliberate exception and says why.
+//
+// The builder's OWN ser and deser share the spelling and are a different
+// thing: they are the current build step's output, rewritten freely as the
+// step narrows. applyCustomTypes is the case that proves the two must not be
+// confused — it re-points b.ser at a wrapped function while deliberately
+// leaving node.ser bare, so a cache-inherited named type hands out the
+// unwrapped form.
+//
+// A new post-construction write to a schemaNode's wire fields would break the
+// registration invariant while looking exactly like a builder write.
+var wireFieldAssignments = map[string]string{
+	"buildPrimitive: b.ser":      "builder output",
+	"buildPrimitive: b.deser":    "builder output",
+	"buildUnion: b.ser":          "builder output",
+	"buildUnion: b.deser":        "builder output",
+	"buildComplex: b.ser":        "builder output",
+	"buildComplex: b.deser":      "builder output",
+	"tryAssignNamedRef: b.ser":   "builder output, read back out of the referenced node",
+	"tryAssignNamedRef: b.deser": "builder output, read back out of the referenced node",
+	"applyCustomTypes: b.ser":    "builder output; node.ser is deliberately left bare",
+	"applyCustomTypes: b.deser":  "builder output; node.deser is deliberately left bare",
+
+	// fieldMeta, not schemaNode: the unsafe fast path's per-field record
+	// tables, wired when a forward reference resolves. The field entries are
+	// reached through the enclosing record's node, which is what holds the
+	// encode and decode tables.
+	"finalize: m.meta.serRecord":                                "fieldMeta",
+	"finalize: m.meta.deserRecord":                              "fieldMeta",
+	"finalize: m.nd.serRecord.fields[m.idx].meta.serRecord":     "fieldMeta",
+	"finalize: m.nd.deserRecord.fields[m.idx].meta.deserRecord": "fieldMeta",
+
+	// The only post-construction writes to a schemaNode's wire fields, both
+	// on nodes resolveNode allocated moments earlier and has not published.
+	"applyCustomToNode: nd.deser": "schemaNode: freshly allocated resolved node, not a registered one",
+	"resolveNode: n.deser":        "schemaNode: cycle placeholder's trampoline, overwritten wholesale on unwind",
+}
+
+// TestMatrix_NamedReferenceCompilesLikeItsDefinition pins that referencing a
+// named type compiles to the same wire behavior as defining it, across every
+// shape the reference can take.
+//
+// A named type is registered as its schemaNode alone, and a reference reads
+// the compiled ser/deser back out of that node. The axes are what could make
+// one reference behave unlike the definition it names: the KIND registered
+// (record, enum, fixed — the three types that register a name), the POSITION
+// the reference occupies (bare field, union branch, array items, map values —
+// the four contexts that resolve a name), the BINDING DIRECTION (backward,
+// resolved during the build; forward, wired in finalize, which is a wholly
+// separate code path), and whether a CustomType is WIRED onto the named type,
+// since a reference that picked up the definition's raw function without its
+// conversion wrap — or the reverse — is the divergence that has actually
+// shipped here before.
+//
+// Every schema carries the named type TWICE: once written out as its
+// definition, once as a reference. Both occurrences are given the same value
+// and the two decoded results must agree. The definition occurrence is a sound
+// oracle for the reference precisely because the mechanism sits only on the
+// reference side — the definition's artifacts are written by the composite
+// literal that builds the node, and reading them back out is what is under
+// test. The CustomType arm transforms the value rather than echoing it, so a
+// callback that never fired cannot be mistaken for one that fired and returned
+// its input.
+func TestMatrix_NamedReferenceCompilesLikeItsDefinition(t *testing.T) {
+	kinds := map[string]struct {
+		def   string
+		value any
+	}{
+		"record": {`{"type":"record","name":"T","fields":[{"name":"v","type":"int"}]}`, map[string]any{"v": int32(1)}},
+		"enum":   {`{"type":"enum","name":"T","symbols":["x","y"]}`, "y"},
+		"fixed":  {`{"type":"fixed","name":"T","size":3}`, []byte{1, 2, 3}},
+	}
+	// wrap places a reference to "T" in one position, and shapes a value for
+	// it; unwrap recovers the payload from what that position decodes to.
+	positions := map[string]struct {
+		refType string
+		wrap    func(any) any
+		unwrap  func(any) any
+	}{
+		"direct": {`"T"`, func(v any) any { return v }, func(v any) any { return v }},
+		"union":  {`["null","T"]`, func(v any) any { return v }, func(v any) any { return v }},
+		"array": {`{"type":"array","items":"T"}`,
+			func(v any) any { return []any{v} },
+			func(v any) any {
+				s, ok := v.([]any)
+				if !ok || len(s) != 1 {
+					return nil
+				}
+				return s[0]
+			}},
+		"map": {`{"type":"map","values":"T"}`,
+			func(v any) any { return map[string]any{"k": v} },
+			func(v any) any {
+				m, ok := v.(map[string]any)
+				if !ok {
+					return nil
+				}
+				return m["k"]
+			}},
+	}
+
+	realized := 0
+	for kindName, kind := range kinds {
+		for posName, pos := range positions {
+			for _, forward := range []bool{false, true} {
+				for _, custom := range []bool{false, true} {
+					dir := "backward"
+					if forward {
+						dir = "forward"
+					}
+					ct := "plain"
+					if custom {
+						ct = "customtyped"
+					}
+					name := kindName + "/" + posName + "/" + dir + "/" + ct
+					t.Run(name, func(t *testing.T) {
+						defField := `{"name":"def","type":` + kind.def + `}`
+						refField := `{"name":"ref","type":` + pos.refType + `}`
+						fields := defField + "," + refField
+						if forward {
+							fields = refField + "," + defField
+						}
+						schema := `{"type":"record","name":"Outer","fields":[` + fields + `]}`
+
+						var opts []SchemaOpt
+						if custom {
+							// Transforms rather than echoes, so a callback
+							// that never ran cannot look like one that did.
+							opts = append(opts, CustomType{
+								AvroType: kindName,
+								Decode: func(v any, n *SchemaNode) (any, error) {
+									// The record arm would otherwise also
+									// match the enclosing record, whose
+									// decode is the thing doing the asking.
+									if n == nil || n.Name != "T" {
+										return nil, ErrSkipCustomType
+									}
+									return "seen:" + fmt.Sprint(v), nil
+								},
+							})
+						}
+						s, err := Parse(schema, opts...)
+						if err != nil {
+							t.Fatalf("parse: %v", err)
+						}
+
+						in := map[string]any{"def": kind.value, "ref": pos.wrap(kind.value)}
+						wire, err := s.AppendEncode(nil, in)
+						if err != nil {
+							t.Fatalf("encode: %v", err)
+						}
+						var got map[string]any
+						if _, err := s.Decode(wire, &got); err != nil {
+							t.Fatalf("decode: %v", err)
+						}
+
+						gotDef := got["def"]
+						gotRef := pos.unwrap(got["ref"])
+						if !reflect.DeepEqual(gotDef, gotRef) {
+							t.Fatalf("reference decoded %#v, definition decoded %#v; a reference must compile to what its definition compiled", gotRef, gotDef)
+						}
+						if custom {
+							// Without this the arm proves only that the two
+							// sides agree, which they also do when neither
+							// runs the callback.
+							str, ok := gotDef.(string)
+							if !ok || !strings.HasPrefix(str, "seen:") {
+								t.Fatalf("CustomType decoder did not fire on the definition: %#v", gotDef)
+							}
+						}
+					})
+					realized++
+				}
+			}
+		}
+	}
+	// An axis collapsed by the setup would leave cells unbuilt while the
+	// loops still looked crossed.
+	if want := len(kinds) * len(positions) * 2 * 2; realized != want {
+		t.Fatalf("realized %d cells, want %d", realized, want)
+	}
+}
+
+// TestWireFieldAssignmentsAreRowed derives from source every assignment to a
+// compiled wire field and requires each to be rowed above. It reds in both
+// directions: an unrowed assignment fails, and a row whose site has vanished
+// fails, so the set cannot drift without someone deciding it should.
+func TestWireFieldAssignmentsAreRowed(t *testing.T) {
+	wireFields := map[string]bool{"ser": true, "deser": true, "serRecord": true, "deserRecord": true}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	found := map[string]bool{}
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", n, err)
+		}
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			fn := fd.Name.Name
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				as, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for _, lhs := range as.Lhs {
+					sel, ok := lhs.(*ast.SelectorExpr)
+					if !ok || !wireFields[sel.Sel.Name] {
+						continue
+					}
+					found[fn+": "+types.ExprString(sel)] = true
+				}
+				return true
+			})
+		}
+	}
+	if len(found) == 0 {
+		t.Fatal("derivation found no wire-field assignment; the walk is broken, not the package")
+	}
+	for site := range found {
+		if _, ok := wireFieldAssignments[site]; !ok {
+			t.Errorf("%s assigns a compiled wire field but is not rowed; if the receiver is a schemaNode, say why a node may be written after construction", site)
+		}
+	}
+	for site := range wireFieldAssignments {
+		if !found[site] {
+			t.Errorf("wireFieldAssignments rows %s, which the source no longer contains", site)
+		}
+	}
+}
+
 // ---------- soe_test.go ----------
 
 func TestSingleObjectRoundTrip(t *testing.T) {
@@ -9554,6 +10070,94 @@ func TestMatrix_ResolvedSingleObjectWriterAcceptance(t *testing.T) {
 }
 
 // ---------- cache_test.go ----------
+
+// TestMatrix_CacheReparsePermissionIsOptionBlind pins that whether a cache
+// lets a schema string re-DEFINE a name it already holds depends on having
+// compiled that exact string before, and not on which options either parse
+// used.
+//
+// The cache remembers a parsed string on one of two sides: a strict parse
+// stores the compiled result to hand back, while a parse whose options change
+// what the string compiles to — custom types, WithLaxNames, or both — stores
+// only that it happened, because the string alone no longer identifies the
+// result. Both sides answer the same question at the next parse, so the axes
+// are the options of the FIRST parse crossed with the options of the SECOND,
+// and the two documented outcomes are crossed over that: the same string
+// re-parses, and a DIFFERENT string redefining the same name is refused.
+//
+// Expectations come from the documented contract rather than from current
+// behavior. [SchemaCache] says parsing the same string again is allowed, that
+// custom types and WithLaxNames skip deduplication and re-parse, and that a
+// conflicting redefinition is a duplicate-type error. Nothing in that
+// contract distinguishes which option did the skipping, which is the property
+// under test.
+func TestMatrix_CacheReparsePermissionIsOptionBlind(t *testing.T) {
+	const def = `{"type":"record","name":"D","fields":[{"name":"a","type":"int"}]}`
+	// Same name, different body: a genuine conflict at every option.
+	const conflicting = `{"type":"record","name":"D","fields":[{"name":"b","type":"string"}]}`
+
+	ct := CustomType{AvroType: "int", Decode: func(v any, _ *SchemaNode) (any, error) { return v, nil }}
+	lax := WithLaxNames(func(string) error { return nil })
+
+	optionSets := []struct {
+		name string
+		opts []SchemaOpt
+		// skips reports whether these options make the parse skip dedup,
+		// which is the only thing the cache is entitled to vary on.
+		skips bool
+	}{
+		{"strict", nil, false},
+		{"custom", []SchemaOpt{ct}, true},
+		{"lax", []SchemaOpt{lax}, true},
+		{"custom+lax", []SchemaOpt{ct, lax}, true},
+	}
+
+	realized := 0
+	for _, first := range optionSets {
+		for _, second := range optionSets {
+			t.Run(first.name+"-then-"+second.name+"/same-string", func(t *testing.T) {
+				var c SchemaCache
+				a, err := c.Parse(def, first.opts...)
+				if err != nil {
+					t.Fatalf("first parse: %v", err)
+				}
+				b, err := c.Parse(def, second.opts...)
+				if err != nil {
+					t.Fatalf("re-parsing the same string must be allowed whatever options either parse used: %v", err)
+				}
+				// Deduplication is the documented reward for a strict pair
+				// and is withheld from every other, so assert which one
+				// happened rather than only that no error came back.
+				sameResult := a == b
+				wantSame := !first.skips && !second.skips
+				if sameResult != wantSame {
+					t.Fatalf("returned the same *Schema = %v, want %v (dedup applies only when neither parse skips it)", sameResult, wantSame)
+				}
+			})
+			realized++
+
+			t.Run(first.name+"-then-"+second.name+"/conflicting-string", func(t *testing.T) {
+				var c SchemaCache
+				if _, err := c.Parse(def, first.opts...); err != nil {
+					t.Fatalf("first parse: %v", err)
+				}
+				_, err := c.Parse(conflicting, second.opts...)
+				if err == nil {
+					t.Fatal("a different string redefining a cached name must be refused")
+				}
+				// A refusal that came from somewhere else would pass a bare
+				// error check while proving nothing about the permission.
+				if !strings.Contains(err.Error(), "duplicate named type") {
+					t.Fatalf("refused, but not as a duplicate definition: %v", err)
+				}
+			})
+			realized++
+		}
+	}
+	if want := len(optionSets) * len(optionSets) * 2; realized != want {
+		t.Fatalf("realized %d cells, want %d", realized, want)
+	}
+}
 
 func TestSchemaCacheBasic(t *testing.T) {
 	cache := &SchemaCache{}
