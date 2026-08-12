@@ -1063,11 +1063,20 @@ func captureFwdRef(err error, ctxLabel string) (isFwdRef bool, fwdName string, w
 // namedType holds the compiled artifacts for a named Avro type (record,
 // enum, fixed) so they can be looked up by name during schema building.
 type namedType struct {
-	ser   serfn
-	deser deserfn
-	sr    *serRecord   // non-nil for records only
-	dr    *deserRecord // non-nil for records only
-	node  *schemaNode
+	// node carries the type's compiled artifacts as well as its metadata:
+	// node.ser / node.deser are the wire functions, and node.serRecord /
+	// node.deserRecord are the record tables (nil for enum and fixed). They
+	// are read through here rather than copied beside it because a copy taken
+	// at registration and a node read later are two answers to one question,
+	// and only one of them can be re-pointed.
+	//
+	// The copy was safe — registration happens in the same statement that
+	// builds the node, from the same expressions — but safe is not the bar: a
+	// custom-typed reference wraps b.ser while deliberately leaving node.ser
+	// bare (applyCustomTypes), so the two spellings ALREADY mean different
+	// things elsewhere in this file, and a reader cannot tell from the name
+	// which one a copy froze.
+	node *schemaNode
 	// hadCustomType is true when this named type was DEFINED by a parse
 	// that wired at least one CustomType anywhere (deliberately coarse —
 	// every definition of a custom-wired parse counts; stamped at
@@ -1459,10 +1468,10 @@ func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (boo
 	if setCanon {
 		b.canon = aschema{primitive: resolved}
 	}
-	b.ser = nt.ser
-	b.deser = nt.deser
-	if nt.sr != nil {
-		b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
+	b.ser = nt.node.ser
+	b.deser = nt.node.deser
+	if nt.node.serRecord != nil {
+		b.meta = fieldMeta{avroType: "record", serRecord: nt.node.serRecord, deserRecord: nt.node.deserRecord}
 	}
 	b.node = nt.node
 	return true, nil
@@ -1475,8 +1484,8 @@ func (b *builder) finalize() error {
 			if nt == nil {
 				return fmt.Errorf("unknown type %q", truncForError(name))
 			}
-			m.ser.fns[idx] = b.customWrappedSer(nt.node, nt.ser)
-			m.deser.fns[idx] = b.customWrappedDeser(nt.node, nt.deser)
+			m.ser.fns[idx] = b.customWrappedSer(nt.node, nt.node.ser)
+			m.deser.fns[idx] = b.customWrappedDeser(nt.node, nt.node.deser)
 			// The builder left branches[idx] nil for this forward-ref
 			// branch (the named type wasn't built yet). The binary path
 			// dispatches through the ser/deser fn tables (patched above),
@@ -1502,8 +1511,8 @@ func (b *builder) finalize() error {
 		if nt == nil {
 			return fmt.Errorf("unknown type %q", truncForError(m.name))
 		}
-		m.meta.serRecord = nt.sr
-		m.meta.deserRecord = nt.dr
+		m.meta.serRecord = nt.node.serRecord
+		m.meta.deserRecord = nt.node.deserRecord
 	}
 	// Phase 1: wire every forward-referenced record-field node. Default
 	// ENCODING is deferred to phase 2 below so it runs only after every
@@ -1514,15 +1523,15 @@ func (b *builder) finalize() error {
 		if nt == nil {
 			return fmt.Errorf("unknown type %q", truncForError(m.name))
 		}
-		m.sr.fields[m.idx].fn = b.customWrappedSer(nt.node, nt.ser)
-		m.dr.fields[m.idx].fn = b.customWrappedDeser(nt.node, nt.deser)
-		if nt.sr != nil {
+		m.sr.fields[m.idx].fn = b.customWrappedSer(nt.node, nt.node.ser)
+		m.dr.fields[m.idx].fn = b.customWrappedDeser(nt.node, nt.node.deser)
+		if nt.node.serRecord != nil {
 			m.sr.fields[m.idx].avroType = "record"
 			m.sr.fields[m.idx].meta.avroType = "record"
-			m.sr.fields[m.idx].meta.serRecord = nt.sr
+			m.sr.fields[m.idx].meta.serRecord = nt.node.serRecord
 			m.dr.fields[m.idx].avroType = "record"
 			m.dr.fields[m.idx].meta.avroType = "record"
-			m.dr.fields[m.idx].meta.deserRecord = nt.dr
+			m.dr.fields[m.idx].meta.deserRecord = nt.node.deserRecord
 		}
 		m.nd.fields[m.idx].node = nt.node
 	}
@@ -1543,8 +1552,8 @@ func (b *builder) finalize() error {
 		if nt == nil {
 			return fmt.Errorf("%s references unknown named type %q", m.ctxLabel, truncForError(m.name))
 		}
-		*m.serItem = b.customWrappedSer(nt.node, nt.ser)
-		*m.deserItem = b.customWrappedDeser(nt.node, nt.deser)
+		*m.serItem = b.customWrappedSer(nt.node, nt.node.ser)
+		*m.deserItem = b.customWrappedDeser(nt.node, nt.node.deser)
 		m.setMinBytes(mbw.minBytesOf(nt.node))
 		*m.nodeChild = nt.node
 	}
@@ -2913,7 +2922,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			serRecord:   sr,
 			deserRecord: dr,
 		}
-		b.registerNamed(o.Name, &namedType{ser: b.ser, deser: b.deser, sr: sr, dr: dr, node: nd})
+		b.registerNamed(o.Name, &namedType{node: nd})
 		b.node = nd
 
 		// Mark this record as under construction. A field default whose type
@@ -3160,7 +3169,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			nd.enumDef = defStr
 			nd.hasEnumDef = true
 		}
-		b.registerNamed(o.Name, &namedType{ser: b.ser, deser: b.deser, node: nd})
+		b.registerNamed(o.Name, &namedType{node: nd})
 		b.node = nd
 
 	case "array":
@@ -3439,7 +3448,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			}
 		}
 		b.node = nd
-		b.registerNamed(o.Name, &namedType{ser: b.ser, deser: b.deser, node: nd})
+		b.registerNamed(o.Name, &namedType{node: nd})
 	}
 	return nil
 }

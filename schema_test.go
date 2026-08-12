@@ -14,6 +14,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"hash"
 	"hash/crc32"
 	"hash/crc64"
@@ -9066,6 +9067,258 @@ func recvTypeName(e ast.Expr) string {
 		return id.Name
 	}
 	return "?"
+}
+
+// wireFieldAssignments names every site that ASSIGNS one of the compiled wire
+// fields — ser, deser, serRecord, deserRecord — outside the composite literal
+// that constructs its struct. Rows are "function: receiver.field".
+//
+// The set matters because two different structs spell these fields the same
+// way, and only one of them may be written after construction.
+//
+// A schemaNode's wire fields are written ONCE, by the literal that builds the
+// node. That is what lets a named type be registered as its node alone: a
+// reference reads node.ser back out and gets exactly the function the
+// definition compiled, with no second copy that could be re-pointed
+// independently. Every row below whose receiver is a schemaNode is therefore a
+// deliberate exception and says why.
+//
+// The builder's OWN ser and deser share the spelling and are a different
+// thing: they are the current build step's output, rewritten freely as the
+// step narrows. applyCustomTypes is the case that proves the two must not be
+// confused — it re-points b.ser at a wrapped function while deliberately
+// leaving node.ser bare, so a cache-inherited named type hands out the
+// unwrapped form.
+//
+// A new post-construction write to a schemaNode's wire fields would break the
+// registration invariant while looking exactly like a builder write.
+var wireFieldAssignments = map[string]string{
+	"buildPrimitive: b.ser":      "builder output",
+	"buildPrimitive: b.deser":    "builder output",
+	"buildUnion: b.ser":          "builder output",
+	"buildUnion: b.deser":        "builder output",
+	"buildComplex: b.ser":        "builder output",
+	"buildComplex: b.deser":      "builder output",
+	"tryAssignNamedRef: b.ser":   "builder output, read back out of the referenced node",
+	"tryAssignNamedRef: b.deser": "builder output, read back out of the referenced node",
+	"applyCustomTypes: b.ser":    "builder output; node.ser is deliberately left bare",
+	"applyCustomTypes: b.deser":  "builder output; node.deser is deliberately left bare",
+
+	// fieldMeta, not schemaNode: the unsafe fast path's per-field record
+	// tables, wired when a forward reference resolves.
+	"finalize: m.meta.serRecord":                    "fieldMeta",
+	"finalize: m.meta.deserRecord":                  "fieldMeta",
+	"finalize: m.sr.fields[m.idx].meta.serRecord":   "fieldMeta",
+	"finalize: m.dr.fields[m.idx].meta.deserRecord": "fieldMeta",
+
+	// The only post-construction writes to a schemaNode's wire fields, both
+	// on nodes resolveNode allocated moments earlier and has not published.
+	"applyCustomToNode: nd.deser": "schemaNode: freshly allocated resolved node, not a registered one",
+	"resolveNode: n.deser":        "schemaNode: cycle placeholder's trampoline, overwritten wholesale on unwind",
+}
+
+// TestMatrix_NamedReferenceCompilesLikeItsDefinition pins that referencing a
+// named type compiles to the same wire behavior as defining it, across every
+// shape the reference can take.
+//
+// A named type is registered as its schemaNode alone, and a reference reads
+// the compiled ser/deser back out of that node. The axes are what could make
+// one reference behave unlike the definition it names: the KIND registered
+// (record, enum, fixed — the three types that register a name), the POSITION
+// the reference occupies (bare field, union branch, array items, map values —
+// the four contexts that resolve a name), the BINDING DIRECTION (backward,
+// resolved during the build; forward, wired in finalize, which is a wholly
+// separate code path), and whether a CustomType is WIRED onto the named type,
+// since a reference that picked up the definition's raw function without its
+// conversion wrap — or the reverse — is the divergence that has actually
+// shipped here before.
+//
+// Every schema carries the named type TWICE: once written out as its
+// definition, once as a reference. Both occurrences are given the same value
+// and the two decoded results must agree. The definition occurrence is a sound
+// oracle for the reference precisely because the mechanism sits only on the
+// reference side — the definition's artifacts are written by the composite
+// literal that builds the node, and reading them back out is what is under
+// test. The CustomType arm transforms the value rather than echoing it, so a
+// callback that never fired cannot be mistaken for one that fired and returned
+// its input.
+func TestMatrix_NamedReferenceCompilesLikeItsDefinition(t *testing.T) {
+	kinds := map[string]struct {
+		def   string
+		value any
+	}{
+		"record": {`{"type":"record","name":"T","fields":[{"name":"v","type":"int"}]}`, map[string]any{"v": int32(1)}},
+		"enum":   {`{"type":"enum","name":"T","symbols":["x","y"]}`, "y"},
+		"fixed":  {`{"type":"fixed","name":"T","size":3}`, []byte{1, 2, 3}},
+	}
+	// wrap places a reference to "T" in one position, and shapes a value for
+	// it; unwrap recovers the payload from what that position decodes to.
+	positions := map[string]struct {
+		refType string
+		wrap    func(any) any
+		unwrap  func(any) any
+	}{
+		"direct": {`"T"`, func(v any) any { return v }, func(v any) any { return v }},
+		"union":  {`["null","T"]`, func(v any) any { return v }, func(v any) any { return v }},
+		"array": {`{"type":"array","items":"T"}`,
+			func(v any) any { return []any{v} },
+			func(v any) any {
+				s, ok := v.([]any)
+				if !ok || len(s) != 1 {
+					return nil
+				}
+				return s[0]
+			}},
+		"map": {`{"type":"map","values":"T"}`,
+			func(v any) any { return map[string]any{"k": v} },
+			func(v any) any {
+				m, ok := v.(map[string]any)
+				if !ok {
+					return nil
+				}
+				return m["k"]
+			}},
+	}
+
+	realized := 0
+	for kindName, kind := range kinds {
+		for posName, pos := range positions {
+			for _, forward := range []bool{false, true} {
+				for _, custom := range []bool{false, true} {
+					dir := "backward"
+					if forward {
+						dir = "forward"
+					}
+					ct := "plain"
+					if custom {
+						ct = "customtyped"
+					}
+					name := kindName + "/" + posName + "/" + dir + "/" + ct
+					t.Run(name, func(t *testing.T) {
+						defField := `{"name":"def","type":` + kind.def + `}`
+						refField := `{"name":"ref","type":` + pos.refType + `}`
+						fields := defField + "," + refField
+						if forward {
+							fields = refField + "," + defField
+						}
+						schema := `{"type":"record","name":"Outer","fields":[` + fields + `]}`
+
+						var opts []SchemaOpt
+						if custom {
+							// Transforms rather than echoes, so a callback
+							// that never ran cannot look like one that did.
+							opts = append(opts, CustomType{
+								AvroType: kindName,
+								Decode: func(v any, n *SchemaNode) (any, error) {
+									// The record arm would otherwise also
+									// match the enclosing record, whose
+									// decode is the thing doing the asking.
+									if n == nil || n.Name != "T" {
+										return nil, ErrSkipCustomType
+									}
+									return "seen:" + fmt.Sprint(v), nil
+								},
+							})
+						}
+						s, err := Parse(schema, opts...)
+						if err != nil {
+							t.Fatalf("parse: %v", err)
+						}
+
+						in := map[string]any{"def": kind.value, "ref": pos.wrap(kind.value)}
+						wire, err := s.AppendEncode(nil, in)
+						if err != nil {
+							t.Fatalf("encode: %v", err)
+						}
+						var got map[string]any
+						if _, err := s.Decode(wire, &got); err != nil {
+							t.Fatalf("decode: %v", err)
+						}
+
+						gotDef := got["def"]
+						gotRef := pos.unwrap(got["ref"])
+						if !reflect.DeepEqual(gotDef, gotRef) {
+							t.Fatalf("reference decoded %#v, definition decoded %#v; a reference must compile to what its definition compiled", gotRef, gotDef)
+						}
+						if custom {
+							// Without this the arm proves only that the two
+							// sides agree, which they also do when neither
+							// runs the callback.
+							str, ok := gotDef.(string)
+							if !ok || !strings.HasPrefix(str, "seen:") {
+								t.Fatalf("CustomType decoder did not fire on the definition: %#v", gotDef)
+							}
+						}
+					})
+					realized++
+				}
+			}
+		}
+	}
+	// An axis collapsed by the setup would leave cells unbuilt while the
+	// loops still looked crossed.
+	if want := len(kinds) * len(positions) * 2 * 2; realized != want {
+		t.Fatalf("realized %d cells, want %d", realized, want)
+	}
+}
+
+// TestWireFieldAssignmentsAreRowed derives from source every assignment to a
+// compiled wire field and requires each to be rowed above. It reds in both
+// directions: an unrowed assignment fails, and a row whose site has vanished
+// fails, so the set cannot drift without someone deciding it should.
+func TestWireFieldAssignmentsAreRowed(t *testing.T) {
+	wireFields := map[string]bool{"ser": true, "deser": true, "serRecord": true, "deserRecord": true}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	found := map[string]bool{}
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", n, err)
+		}
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			fn := fd.Name.Name
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				as, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for _, lhs := range as.Lhs {
+					sel, ok := lhs.(*ast.SelectorExpr)
+					if !ok || !wireFields[sel.Sel.Name] {
+						continue
+					}
+					found[fn+": "+types.ExprString(sel)] = true
+				}
+				return true
+			})
+		}
+	}
+	if len(found) == 0 {
+		t.Fatal("derivation found no wire-field assignment; the walk is broken, not the package")
+	}
+	for site := range found {
+		if _, ok := wireFieldAssignments[site]; !ok {
+			t.Errorf("%s assigns a compiled wire field but is not rowed; if the receiver is a schemaNode, say why a node may be written after construction", site)
+		}
+	}
+	for site := range wireFieldAssignments {
+		if !found[site] {
+			t.Errorf("wireFieldAssignments rows %s, which the source no longer contains", site)
+		}
+	}
 }
 
 // ---------- soe_test.go ----------
