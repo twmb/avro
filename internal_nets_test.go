@@ -150,6 +150,17 @@ var censusRegistry = []censusQuestion{
 				"json_scan.go": 1,
 				"ocf/ocf.go":   1,
 			}},
+			{pattern: `literal("null"`, counts: map[string]int{
+				// Not an answerer of this question, and registered so the site
+				// stays visible rather than invisible: schema_decode.go
+				// consumes the four bytes of the JSON literal `null` while
+				// tokenizing schema TEXT, exactly as json_scan.go does for a
+				// value stream. It decides what a BYTE SEQUENCE is, not what a
+				// schema type is, so no union branch is being classified — but
+				// a site spelling the word is worth a row, because the next one
+				// to appear here might be classifying rather than tokenizing.
+				"schema_decode.go": 1,
+			}},
 		},
 	},
 	{

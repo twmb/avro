@@ -4416,21 +4416,9 @@ func buildFromAschema(schema string, orig *aschema) (*Schema, error) {
 		return nil, err
 	}
 	s := &Schema{ser: b.ser, deser: b.deser, c: b.canon, node: b.node, full: schema, custom: b.custom}
-	s.soe[0], s.soe[1] = 0xC3, 0x01
-	h := NewRabin()
-	h.Write(s.Canonical())
-	for i, x := range uint64ToLE(h.Sum64()) {
-		s.soe[2+i] = x
-	}
+	// No SOE header here, matching parse(): the header is hashed on first
+	// use from c, which is already set.
 	return s, nil
-}
-
-func uint64ToLE(v uint64) [8]byte {
-	var b [8]byte
-	for i := 0; i < 8; i++ {
-		b[i] = byte(v >> (8 * i))
-	}
-	return b
 }
 
 // TestDiff_ParseFrontEndEquivalence proves the new O(n) parseSchemaTree
@@ -9149,9 +9137,9 @@ func TestSingleObjectFingerprint(t *testing.T) {
 		t.Fatalf("SingleObjectFingerprint: %v", err)
 	}
 
-	// Verify fingerprint matches the schema's precomputed one.
+	// Verify fingerprint matches the schema's own one.
 	var want [8]byte
-	copy(want[:], s.soe[2:10])
+	copy(want[:], s.soeHeader()[2:10])
 	if fp != want {
 		t.Fatalf("fingerprint mismatch: got %x, want %x", fp, want)
 	}
@@ -9227,10 +9215,147 @@ func TestSingleObjectFingerprintMatchesSpec(t *testing.T) {
 	binary.LittleEndian.PutUint64(want[:], sum)
 
 	var got [8]byte
-	copy(got[:], s.soe[2:10])
+	copy(got[:], s.soeHeader()[2:10])
 
 	if got != want {
 		t.Fatalf("SOE fingerprint does not match LE CRC-64-AVRO: got %x, want %x", got, want)
+	}
+}
+
+// TestSOEHeaderIsHashedOnFirstUseOnly is the non-vacuity half of the
+// single-object matrix: that matrix proves the lazily hashed header is
+// CORRECT, and would still pass if parse() went back to hashing eagerly.
+// This one proves the hash is actually deferred — every surface that is not a
+// single-object entry point must leave the header unhashed, including the two
+// failure paths of DecodeSingleObject, which reject before they can need it.
+func TestSOEHeaderIsHashedOnFirstUseOnly(t *testing.T) {
+	unhashed := func(t *testing.T, s *Schema, after string) {
+		t.Helper()
+		if s.soe != ([10]byte{}) {
+			t.Fatalf("%s hashed the single-object header (%x); it must wait for an SOE call", after, s.soe)
+		}
+	}
+	schema := `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`
+	val := map[string]any{"a": int32(1), "b": "s"}
+
+	s := mustParse(t, schema)
+	unhashed(t, s, "Parse")
+
+	// Every non-SOE surface of a Schema.
+	_ = s.Canonical()
+	_ = s.Fingerprint(NewRabin())
+	_ = s.String()
+	_ = s.Root()
+	wire := mustAppendEncode(t, s, nil, val)
+	var out map[string]any
+	mustDecode(t, s, wire, &out)
+	mustAppendEncodeJSON(t, s, nil, val)
+	mustDecodeJSON(t, s, []byte(`{"a":1,"b":"s"}`), &out)
+	unhashed(t, s, "the non-SOE API")
+
+	// DecodeSingleObject rejects a short buffer and a bad magic before it
+	// has any use for the header, so neither may hash it: that ordering is
+	// what keeps the errors identical to the eager version.
+	for _, bad := range [][]byte{nil, make([]byte, 9), append([]byte{0x00, 0x01}, make([]byte, 12)...)} {
+		if _, err := s.DecodeSingleObject(bad, &out); err == nil {
+			t.Fatalf("DecodeSingleObject(%x) accepted", bad)
+		}
+	}
+	unhashed(t, s, "a rejected SOE header")
+
+	// A fingerprint MISMATCH does need the header, so this one must hash.
+	alien := mustParse(t, `"int"`)
+	alienWire := mustAppendSingleObject(t, alien, nil, int32(1))
+	if _, err := s.DecodeSingleObject(alienWire, &out); err == nil {
+		t.Fatal("DecodeSingleObject accepted an alien fingerprint")
+	}
+	if s.soe == ([10]byte{}) {
+		t.Fatal("a fingerprint comparison did not hash the header")
+	}
+
+	// Resolve copies neither header: the reader's is re-derived from the
+	// canonical form it hands over, and the writer's is reached through the
+	// writer schema itself.
+	w := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":"long"}]}`)
+	r := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	res := mustResolve(t, w, r)
+	unhashed(t, w, "Resolve (writer)")
+	unhashed(t, r, "Resolve (reader)")
+	unhashed(t, res, "Resolve (resolved)")
+	if res.resolveWriter != w {
+		t.Fatalf("resolved schema does not point at its writer")
+	}
+
+	// SchemaCache's splice replaces the canonical form after parse; the
+	// header must follow it without being copied at the splice.
+	var c SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"Leaf","namespace":"n","fields":[{"name":"l","type":"int"}]}`); err != nil {
+		t.Fatalf("cache parse leaf: %v", err)
+	}
+	parent, err := c.Parse(`{"type":"record","name":"Parent","namespace":"n","fields":[{"name":"p","type":"n.Leaf"}]}`)
+	if err != nil {
+		t.Fatalf("cache parse parent: %v", err)
+	}
+	unhashed(t, parent, "SchemaCache.Parse")
+	if got, want := *parent.soeHeader(), *mustParse(t, parent.String()).soeHeader(); got != want {
+		t.Fatalf("spliced header %x, want standalone %x", got, want)
+	}
+}
+
+// soeFieldReaders names the only functions allowed to touch the raw soe
+// field. Every other read must go through soeHeader, which is what makes the
+// first use race-free on a type documented safe for concurrent use.
+var soeFieldReaders = map[string]bool{"Schema.soeHeader": true, "Schema.hashSOEHeader": true}
+
+// TestSOEFieldIsReadOnlyThroughAccessor derives the set of functions that
+// mention the soe field from source, so a new bare read cannot be added
+// without either failing here or being rowed above deliberately. Fails in
+// both directions.
+func TestSOEFieldIsReadOnlyThroughAccessor(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	found := map[string]bool{}
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", n, err)
+		}
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			name := fd.Name.Name
+			if fd.Recv != nil && len(fd.Recv.List) > 0 {
+				name = recvTypeName(fd.Recv.List[0].Type) + "." + name
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "soe" {
+					found[name] = true
+				}
+				return true
+			})
+		}
+	}
+	if len(found) == 0 {
+		t.Fatal("derivation found no soe field access; the walk is broken, not the package")
+	}
+	for name := range found {
+		if !soeFieldReaders[name] {
+			t.Errorf("%s reads the soe field directly; go through soeHeader or row it in soeFieldReaders", name)
+		}
+	}
+	for name := range soeFieldReaders {
+		if !found[name] {
+			t.Errorf("soeFieldReaders names %s, which no longer touches the soe field", name)
+		}
 	}
 }
 
@@ -9253,7 +9378,7 @@ func TestRegression_ResolvedDecodeSingleObjectAcceptsWriterFingerprint(t *testin
 		t.Fatal(err)
 	}
 
-	// Writer produces SOE wire bearing writer.soe.
+	// Writer produces SOE wire bearing the writer's own header.
 	wire, err := writer.AppendSingleObject(nil, map[string]any{
 		"a": int32(7),
 		"b": "hello",
@@ -9261,8 +9386,8 @@ func TestRegression_ResolvedDecodeSingleObjectAcceptsWriterFingerprint(t *testin
 	if err != nil {
 		t.Fatalf("writer.AppendSingleObject: %v", err)
 	}
-	if [10]byte(wire[:10]) != writer.soe {
-		t.Fatalf("wire header is not writer.soe")
+	if [10]byte(wire[:10]) != *writer.soeHeader() {
+		t.Fatalf("wire header is not the writer's SOE header")
 	}
 
 	resolved, err := Resolve(writer, reader)
@@ -9299,8 +9424,8 @@ func TestRegression_ResolvedDecodeSingleObjectAcceptsWriterFingerprint(t *testin
 
 // TestRegression_NonResolvedDecodeSingleObjectRejectsForeignFingerprint
 // pins that a non-resolved schema continues to reject SOE wire whose
-// fingerprint doesn't match its own — the zero-valued writerSoe must
-// never silently accept arbitrary input.
+// fingerprint doesn't match its own — the nil writer schema must never
+// silently accept arbitrary input.
 func TestRegression_NonResolvedDecodeSingleObjectRejectsForeignFingerprint(t *testing.T) {
 	a := MustParse(`{"type":"record","name":"A","fields":[{"name":"f","type":"int"}]}`)
 	b := MustParse(`{"type":"record","name":"B","fields":[{"name":"f","type":"int"}]}`)
@@ -9311,6 +9436,120 @@ func TestRegression_NonResolvedDecodeSingleObjectRejectsForeignFingerprint(t *te
 	var got map[string]any
 	if _, err := b.DecodeSingleObject(wire, &got); err == nil {
 		t.Fatalf("b.DecodeSingleObject(a-wire) accepted; want fingerprint mismatch")
+	}
+}
+
+// TestMatrix_ResolvedSingleObjectWriterAcceptance pins WHICH single-object
+// fingerprints a resolved schema accepts, and that the answer is a function of
+// the writer it was resolved from.
+//
+// A resolution stores its writer once, and two callers ask that one field:
+// DecodeJSON, to resolve writer-shaped JSON, and DecodeSingleObject, to accept
+// wire bearing the writer's fingerprint. Nothing structurally ties the second
+// caller to the field, so this is what does: several distinct writers are each
+// resolved against ONE reader, and every resolution is offered every writer's
+// fingerprint plus the reader's and an unrelated schema's. Acceptance must be
+// exactly {its own writer, the reader} — so dropping the field, or pointing it
+// at the reader, or at another writer, or accepting unconditionally, each
+// changes a verdict here.
+//
+// The expected set is computed from the schemas themselves rather than written
+// down, so no cell can agree with a hardcoded byte string that has rotted.
+//
+// One repoint it cannot see, stated rather than implied: the custom-free writer
+// view is a re-parse of the writer's own text, so it has the same canonical
+// form and the same fingerprint. Asking it instead would decide every cell
+// here identically — which is also why that repoint would change no behavior.
+func TestMatrix_ResolvedSingleObjectWriterAcceptance(t *testing.T) {
+	const readerJSON = `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`
+	writerJSON := map[string]string{
+		"one-extra-field":   `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`,
+		"two-extra-fields":  `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":"long"}]}`,
+		"different-extra":   `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"z","type":"double"}]}`,
+		"extra-before-kept": `{"type":"record","name":"R","fields":[{"name":"q","type":"boolean"},{"name":"a","type":"int"}]}`,
+	}
+	values := map[string]map[string]any{
+		"one-extra-field":   {"a": int32(1), "b": "x"},
+		"two-extra-fields":  {"a": int32(2), "b": "y", "c": int64(3)},
+		"different-extra":   {"a": int32(4), "z": 1.5},
+		"extra-before-kept": {"q": true, "a": int32(5)},
+	}
+
+	reader := mustParse(t, readerJSON)
+	unrelated := mustParse(t, `{"type":"record","name":"U","fields":[{"name":"u","type":"int"}]}`)
+
+	names := make([]string, 0, len(writerJSON))
+	for name := range writerJSON {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	writers := map[string]*Schema{}
+	for _, name := range names {
+		writers[name] = mustParse(t, writerJSON[name])
+	}
+
+	// The axis measures nothing unless the fingerprints actually differ, so
+	// require that before reading any verdict off them.
+	seen := map[[10]byte]string{}
+	for _, name := range append(append([]string{}, names...), "reader", "unrelated") {
+		s := writers[name]
+		switch name {
+		case "reader":
+			s = reader
+		case "unrelated":
+			s = unrelated
+		}
+		h := *s.soeHeader()
+		if prev, ok := seen[h]; ok {
+			t.Fatalf("%s and %s fingerprint identically, so no cell here can tell them apart", prev, name)
+		}
+		seen[h] = name
+	}
+
+	for _, name := range names {
+		writer := writers[name]
+		resolved := mustResolve(t, writer, reader)
+		// The payload after the header must be WRITER-shaped whichever
+		// accepted fingerprint precedes it, since the resolving decoder
+		// consumes writer bytes.
+		body, err := writer.AppendEncode(nil, values[name])
+		if err != nil {
+			t.Fatalf("%s: encode: %v", name, err)
+		}
+
+		for _, presented := range append(append([]string{}, names...), "reader", "unrelated") {
+			t.Run(name+"/presents-"+presented, func(t *testing.T) {
+				src := writers[presented]
+				switch presented {
+				case "reader":
+					src = reader
+				case "unrelated":
+					src = unrelated
+				}
+				wantAccept := presented == name || presented == "reader"
+
+				wire := append(append([]byte{}, src.soeHeader()[:]...), body...)
+				var got map[string]any
+				_, err := resolved.DecodeSingleObject(wire, &got)
+				switch {
+				case wantAccept && err != nil:
+					t.Fatalf("resolved-from-%s refused the %s fingerprint: %v", name, presented, err)
+				case !wantAccept && err == nil:
+					t.Fatalf("resolved-from-%s accepted the %s fingerprint; acceptance must follow the writer it resolved from", name, presented)
+				case !wantAccept && !strings.Contains(err.Error(), "fingerprint mismatch"):
+					// A refusal that comes from the decode rather than the
+					// header check would pass a bare error assertion while
+					// proving nothing about the guard.
+					t.Fatalf("resolved-from-%s refused the %s fingerprint, but not at the header: %v", name, presented, err)
+				}
+				if wantAccept {
+					if got["a"] != values[name]["a"] {
+						t.Fatalf("decoded a=%v, want %v", got["a"], values[name]["a"])
+					}
+				}
+			})
+		}
 	}
 }
 

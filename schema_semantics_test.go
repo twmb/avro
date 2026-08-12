@@ -11845,6 +11845,18 @@ func capRows() []capRow {
 				"so a tree this package renders cannot exceed what it will re-read",
 		},
 		{
+			konst:         "maxJSONValueNesting",
+			applicability: capWireValue,
+			reason: "bounds how deep the schema-text decoder descends, charged per CONTAINER so the boundary is the one a decode " +
+				"into a generic tree has always drawn. On the two callers that decode a whole schema it is the looser of two " +
+				"bounds and never the one that fires: Parse runs the far tighter bracket pre-scan first, and SchemaCache.Parse " +
+				"normalizes before parse() but then hands the same text to it, so a schema too deep for the pre-scan is refused " +
+				"either way. It binds ALONE on the two callers the pre-scan never covers. One of them, a preserved field default, " +
+				"is text an earlier parse already accepted. The other, a struct-tag default, is arbitrary text an author typed and " +
+				"is the one place this bound decides a user's input by itself — there is no producer counterpart there, because " +
+				"nothing in this package emits that text",
+		},
+		{
 			konst:         "maxParseFloatLen",
 			applicability: capWireValue,
 			reason: "bounds float TEXT at parse; the producer counterpart is strconv formatting, whose output is bounded by the " +

@@ -2,7 +2,6 @@ package avro
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +12,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // Schema is a compiled Avro schema. Create one with [Parse] or [MustParse],
@@ -23,18 +24,23 @@ type Schema struct {
 	deser deserfn
 
 	c    aschema     // canonical form, used for fingerprinting and schema comparison
-	soe  [10]byte    // Single Object Encoding header: 2-byte magic (0xC3, 0x01) + 8-byte LE CRC64-Avro fingerprint
 	node *schemaNode // full metadata tree (aliases, defaults, etc.) for schema introspection and evolution
 	full string      // original schema JSON, returned by String()
 
-	// writerSoe is the writer schema's SOE header — populated only by
-	// Resolve(writer, reader) and consulted by DecodeSingleObject so a
-	// resolved schema can decode wire bytes bearing the writer's
-	// fingerprint (the wire fingerprint identifies the schema that
-	// produced the bytes, which is the writer when a resolution is
-	// involved). Zero value (writerSoe[0] == 0x00) means "not a resolved
-	// schema; accept only s.soe."
-	writerSoe [10]byte
+	// soe is the Single Object Encoding header: 2-byte magic (0xC3, 0x01)
+	// + 8-byte LE CRC64-Avro fingerprint of the canonical form. Computed on
+	// first use by soeHeader (soe.go), never at parse: hashing the canonical
+	// form was 11-31% of Parse depending on schema shape, and only the three
+	// SOE entry points ever read it. Read it ONLY through soeHeader — a bare
+	// field read races with a concurrent first use, and Schema is documented
+	// safe for concurrent use.
+	//
+	// The header is a pure function of c, so the two sites that adopt
+	// another schema's canonical form (Resolve, SchemaCache's self-contained
+	// splice) adopt its header by assigning c and leaving soe alone.
+	soeHashed atomic.Bool
+	soeOnce   sync.Once
+	soe       [10]byte
 
 	// resolveWriter is the writer schema, populated only by
 	// Resolve(writer, reader) when the writer and reader differ (an identity
@@ -45,6 +51,15 @@ type Schema struct {
 	// JSON resolution composes the writer's JSON decode + binary re-encode with
 	// that same resolving s.deser. nil ⇒ not resolved; DecodeJSON decodes
 	// directly against s.node.
+	//
+	// DecodeSingleObject reads it too, to accept wire bearing the WRITER's
+	// fingerprint (see acceptsWriterSOE). That is a second question asked of
+	// one field rather than a second copy of it: two fields that must always
+	// hold the same schema can drift with nothing to notice, while one field
+	// two callers ask cannot. The hazard the duplicate was guarding — a change
+	// that repoints this at the raw view, or drops it, silently taking
+	// single-object writer acceptance along — is caught instead by the net
+	// asserting that acceptance follows the writer schema.
 	resolveWriter *Schema
 
 	// resolveWriterRaw is a custom-free view of the writer, used solely by
@@ -319,11 +334,6 @@ func parse(schema string, b *builder) (*Schema, error) {
 		customBaked: len(b.custom) > 0 || b.sawInheritedCustom,
 	}
 	s.slabFree = slabFreeKinds[b.node.kind] && !s.customBaked
-	s.soe[0] = 0xC3
-	s.soe[1] = 0x01
-	h := NewRabin()
-	h.Write(s.Canonical())
-	binary.LittleEndian.PutUint64(s.soe[2:], h.Sum64())
 	return s, nil
 }
 
@@ -3680,17 +3690,15 @@ var (
 func logicalSer(logical string) serfn     { return logicalSers[logical] }
 func logicalDeser(logical string) deserfn { return logicalDesers[logical] }
 
-// unmarshalDefault parses a field's raw JSON default. Uses
-// json.Decoder.UseNumber() so that numeric literals are preserved as
-// json.Number rather than rounded through float64 — int64 / long
-// defaults > 2^53 would otherwise silently lose precision (e.g. 9007199254740993
-// → 9007199254740992).
+// unmarshalDefault parses a field's raw JSON default. Numeric literals stay
+// json.Number rather than rounding through float64 — long defaults above 2^53
+// would otherwise silently lose precision (9007199254740993 → …92) — which is
+// what the shared decoder returns for every number anyway.
 func unmarshalDefault(raw json.RawMessage) any {
-	var dv any
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
 	// Cannot fail: raw is preserved from the initial parse and is valid JSON.
-	_ = dec.Decode(&dv)
+	// Lenient rather than strict for the same reason — whatever the parse
+	// accepted into these bytes is what comes back out.
+	dv, _, _ := decodeSchemaAny(string(raw))
 	return dv
 }
 
@@ -3834,11 +3842,9 @@ func applyResolvedDefault(defaultVal any, node *schemaNode, fieldName string,
 // SchemaNode.Props, and Root()'s re-parse — where a bare Unmarshal silently
 // rounds JSON ints above 2^53. unmarshalDefault already gives the encode/decode
 // path the same guarantee.
-func unmarshalAnyPreservePrecision(raw []byte) (any, error) {
-	var v any
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	if err := dec.Decode(&v); err != nil {
+func unmarshalAnyPreservePrecision(raw string) (any, error) {
+	v, err := decodeSchemaAnyStrict(raw)
+	if err != nil {
 		return nil, err
 	}
 	return normalizeJSONValue(v), nil

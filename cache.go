@@ -3,8 +3,6 @@ package avro
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
-	"io"
 	"maps"
 	"strings"
 	"sync"
@@ -52,6 +50,27 @@ type SchemaCache struct {
 	defs map[string]any
 }
 
+// cacheNormalizeSchema re-marshals a schema string so two spellings of one
+// schema — different whitespace, different key order — share a dedup key.
+//
+// Only a schema that is EXACTLY one JSON value normalizes. A decode that stops
+// at the first value would silently drop whatever followed, turning a schema
+// bare [Parse] rejects into one the cache truncates and accepts, so anything
+// with trailing content is handed back untouched for parse() to refuse on its
+// own terms. Same strict rule parseSchemaTree applies, asked of the same
+// decoder rather than spelled again here.
+func cacheNormalizeSchema(schema string) string {
+	v, err := decodeSchemaAnyStrict(schema)
+	if err != nil {
+		return schema
+	}
+	normalized, err := json.Marshal(v)
+	if err != nil {
+		return schema
+	}
+	return string(normalized)
+}
+
 // Parse parses a schema string, registering any named types (records, enums,
 // fixed) in the cache. Named types from previous Parse calls are available
 // for reference resolution. On failure, the cache is not modified.
@@ -66,25 +85,7 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 		c.defs = make(map[string]any)
 	}
 
-	dec := json.NewDecoder(strings.NewReader(schema))
-	dec.UseNumber()
-	var v any
-	if err := dec.Decode(&v); err == nil {
-		// json.Decoder.Decode stops after the first JSON value, silently
-		// ignoring trailing bytes. Parse (json.Unmarshal) rejects trailing
-		// non-whitespace, so only normalize when the input is a single
-		// value: a second Decode returning io.EOF means the value was the
-		// whole input (trailing whitespace is consumed). Anything else
-		// (a syntax error on garbage, or a second value) means trailing
-		// content — leave schema unchanged so parse() rejects it exactly
-		// as bare Parse would, instead of silently truncating-and-accepting.
-		var tail json.RawMessage
-		if err2 := dec.Decode(&tail); errors.Is(err2, io.EOF) {
-			if normalized, err := json.Marshal(v); err == nil {
-				schema = string(normalized)
-			}
-		}
-	}
+	schema = cacheNormalizeSchema(schema)
 	// Clone the cache's map so a failed parse doesn't corrupt the cache.
 	cloned := maps.Clone(c.named)
 	b := &builder{
@@ -165,7 +166,7 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	// splices nothing and keeps its String().
 	selfContained := s.full
 	if len(cloned) > 0 {
-		if tree, terr := unmarshalAnyPreservePrecision([]byte(s.full)); terr == nil {
+		if tree, terr := unmarshalAnyPreservePrecision(s.full); terr == nil {
 			inlined := make(map[string]bool)
 			tree = inlineTreeDefs(tree, "", c.defs, make(map[string]bool), inlined)
 			if len(inlined) > 0 {
@@ -191,9 +192,12 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 					}
 					if rerr == nil {
 						selfContained = s2.full
+						// Adopting s2's canonical form adopts its SOE header
+						// too: the header is a pure function of c, hashed on
+						// first use, and nothing has reached that first use on
+						// this still-unpublished schema.
 						s.c = s2.c
 						s.full = s2.full
-						s.soe = s2.soe
 					}
 				}
 			}
@@ -203,7 +207,7 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	// Record this parse's named-type definitions (from the self-contained form,
 	// so each captured definition has its own transitive references spliced in)
 	// for future cross-parse references.
-	if tree, terr := unmarshalAnyPreservePrecision([]byte(selfContained)); terr == nil {
+	if tree, terr := unmarshalAnyPreservePrecision(selfContained); terr == nil {
 		collectTreeDefs(tree, "", func(fn string, def any) {
 			if _, ok := c.defs[fn]; !ok {
 				// Store with the namespace made explicit so the definition
