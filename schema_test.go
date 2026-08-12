@@ -9282,7 +9282,7 @@ func TestSOEHeaderIsHashedOnFirstUseOnly(t *testing.T) {
 	unhashed(t, w, "Resolve (writer)")
 	unhashed(t, r, "Resolve (reader)")
 	unhashed(t, res, "Resolve (resolved)")
-	if res.soeWriter != w {
+	if res.resolveWriter != w {
 		t.Fatalf("resolved schema does not point at its writer")
 	}
 
@@ -9424,7 +9424,7 @@ func TestRegression_ResolvedDecodeSingleObjectAcceptsWriterFingerprint(t *testin
 
 // TestRegression_NonResolvedDecodeSingleObjectRejectsForeignFingerprint
 // pins that a non-resolved schema continues to reject SOE wire whose
-// fingerprint doesn't match its own — the nil soeWriter must never
+// fingerprint doesn't match its own — the nil writer schema must never
 // silently accept arbitrary input.
 func TestRegression_NonResolvedDecodeSingleObjectRejectsForeignFingerprint(t *testing.T) {
 	a := MustParse(`{"type":"record","name":"A","fields":[{"name":"f","type":"int"}]}`)
@@ -9436,6 +9436,120 @@ func TestRegression_NonResolvedDecodeSingleObjectRejectsForeignFingerprint(t *te
 	var got map[string]any
 	if _, err := b.DecodeSingleObject(wire, &got); err == nil {
 		t.Fatalf("b.DecodeSingleObject(a-wire) accepted; want fingerprint mismatch")
+	}
+}
+
+// TestMatrix_ResolvedSingleObjectWriterAcceptance pins WHICH single-object
+// fingerprints a resolved schema accepts, and that the answer is a function of
+// the writer it was resolved from.
+//
+// A resolution stores its writer once, and two callers ask that one field:
+// DecodeJSON, to resolve writer-shaped JSON, and DecodeSingleObject, to accept
+// wire bearing the writer's fingerprint. Nothing structurally ties the second
+// caller to the field, so this is what does: several distinct writers are each
+// resolved against ONE reader, and every resolution is offered every writer's
+// fingerprint plus the reader's and an unrelated schema's. Acceptance must be
+// exactly {its own writer, the reader} — so dropping the field, or pointing it
+// at the reader, or at another writer, or accepting unconditionally, each
+// changes a verdict here.
+//
+// The expected set is computed from the schemas themselves rather than written
+// down, so no cell can agree with a hardcoded byte string that has rotted.
+//
+// One repoint it cannot see, stated rather than implied: the custom-free writer
+// view is a re-parse of the writer's own text, so it has the same canonical
+// form and the same fingerprint. Asking it instead would decide every cell
+// here identically — which is also why that repoint would change no behavior.
+func TestMatrix_ResolvedSingleObjectWriterAcceptance(t *testing.T) {
+	const readerJSON = `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`
+	writerJSON := map[string]string{
+		"one-extra-field":   `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`,
+		"two-extra-fields":  `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":"long"}]}`,
+		"different-extra":   `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"z","type":"double"}]}`,
+		"extra-before-kept": `{"type":"record","name":"R","fields":[{"name":"q","type":"boolean"},{"name":"a","type":"int"}]}`,
+	}
+	values := map[string]map[string]any{
+		"one-extra-field":   {"a": int32(1), "b": "x"},
+		"two-extra-fields":  {"a": int32(2), "b": "y", "c": int64(3)},
+		"different-extra":   {"a": int32(4), "z": 1.5},
+		"extra-before-kept": {"q": true, "a": int32(5)},
+	}
+
+	reader := mustParse(t, readerJSON)
+	unrelated := mustParse(t, `{"type":"record","name":"U","fields":[{"name":"u","type":"int"}]}`)
+
+	names := make([]string, 0, len(writerJSON))
+	for name := range writerJSON {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	writers := map[string]*Schema{}
+	for _, name := range names {
+		writers[name] = mustParse(t, writerJSON[name])
+	}
+
+	// The axis measures nothing unless the fingerprints actually differ, so
+	// require that before reading any verdict off them.
+	seen := map[[10]byte]string{}
+	for _, name := range append(append([]string{}, names...), "reader", "unrelated") {
+		s := writers[name]
+		switch name {
+		case "reader":
+			s = reader
+		case "unrelated":
+			s = unrelated
+		}
+		h := *s.soeHeader()
+		if prev, ok := seen[h]; ok {
+			t.Fatalf("%s and %s fingerprint identically, so no cell here can tell them apart", prev, name)
+		}
+		seen[h] = name
+	}
+
+	for _, name := range names {
+		writer := writers[name]
+		resolved := mustResolve(t, writer, reader)
+		// The payload after the header must be WRITER-shaped whichever
+		// accepted fingerprint precedes it, since the resolving decoder
+		// consumes writer bytes.
+		body, err := writer.AppendEncode(nil, values[name])
+		if err != nil {
+			t.Fatalf("%s: encode: %v", name, err)
+		}
+
+		for _, presented := range append(append([]string{}, names...), "reader", "unrelated") {
+			t.Run(name+"/presents-"+presented, func(t *testing.T) {
+				src := writers[presented]
+				switch presented {
+				case "reader":
+					src = reader
+				case "unrelated":
+					src = unrelated
+				}
+				wantAccept := presented == name || presented == "reader"
+
+				wire := append(append([]byte{}, src.soeHeader()[:]...), body...)
+				var got map[string]any
+				_, err := resolved.DecodeSingleObject(wire, &got)
+				switch {
+				case wantAccept && err != nil:
+					t.Fatalf("resolved-from-%s refused the %s fingerprint: %v", name, presented, err)
+				case !wantAccept && err == nil:
+					t.Fatalf("resolved-from-%s accepted the %s fingerprint; acceptance must follow the writer it resolved from", name, presented)
+				case !wantAccept && !strings.Contains(err.Error(), "fingerprint mismatch"):
+					// A refusal that comes from the decode rather than the
+					// header check would pass a bare error assertion while
+					// proving nothing about the guard.
+					t.Fatalf("resolved-from-%s refused the %s fingerprint, but not at the header: %v", name, presented, err)
+				}
+				if wantAccept {
+					if got["a"] != values[name]["a"] {
+						t.Fatalf("decoded a=%v, want %v", got["a"], values[name]["a"])
+					}
+				}
+			})
+		}
 	}
 }
 

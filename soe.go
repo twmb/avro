@@ -74,10 +74,23 @@ func (s *Schema) DecodeSingleObject(data []byte, v any, opts ...Opt) ([]byte, er
 }
 
 // acceptsWriterSOE reports whether header is the fingerprint of the writer
-// this schema resolves from. Always false for a schema that is not a
-// resolution, which has no writer to accept.
+// this schema resolves from.
+//
+// A single-object message carries the fingerprint of the schema that PRODUCED
+// the bytes, which is the writer whenever a resolution is involved, so a
+// resolved schema is the one place those bytes can be decoded. Java reaches the
+// same outcome through a fingerprint registry (BinaryMessageDecoder); the
+// single-schema model bakes it into the resolved schema's own check.
+//
+// The writer is reached through the writer SCHEMA rather than a copied header,
+// which keeps its fingerprint lazy: a resolved schema that never decodes
+// single-object bytes hashes neither canonical form. It asks resolveWriter —
+// the one field holding that schema — so writer acceptance cannot drift from
+// the resolution it belongs to. Always false for a schema that is not a
+// resolution, which has no writer to accept; resolveWriter is nil for exactly
+// that set, since an identity resolution returns the reader itself.
 func (s *Schema) acceptsWriterSOE(header [10]byte) bool {
-	return s.soeWriter != nil && header == *s.soeWriter.soeHeader()
+	return s.resolveWriter != nil && header == *s.resolveWriter.soeHeader()
 }
 
 // SingleObjectFingerprint extracts the 8-byte CRC-64-AVRO fingerprint and

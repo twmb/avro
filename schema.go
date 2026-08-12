@@ -42,23 +42,6 @@ type Schema struct {
 	soeOnce   sync.Once
 	soe       [10]byte
 
-	// soeWriter is the writer schema of a resolution, consulted by
-	// DecodeSingleObject so a resolved schema can decode wire bytes bearing
-	// the WRITER's fingerprint (the wire fingerprint identifies the schema
-	// that produced the bytes, which is the writer when a resolution is
-	// involved). Populated only by Resolve(writer, reader) when the writer
-	// and reader differ; nil means "not a resolved schema; accept only this
-	// schema's own header". Held as the schema rather than a copied header
-	// so the writer's fingerprint stays lazy too — a resolved schema that
-	// never decodes SOE never hashes either canonical form.
-	//
-	// Always the same schema resolveWriter below holds, kept as its own
-	// field because the two answer different questions: resolveWriter exists
-	// for DecodeJSON and has a diverging sibling (resolveWriterRaw), so a
-	// future change deciding DecodeJSON needs only the raw view would
-	// silently take SOE's writer acceptance with it.
-	soeWriter *Schema
-
 	// resolveWriter is the writer schema, populated only by
 	// Resolve(writer, reader) when the writer and reader differ (an identity
 	// resolution returns the reader schema directly, leaving this nil). It
@@ -68,6 +51,15 @@ type Schema struct {
 	// JSON resolution composes the writer's JSON decode + binary re-encode with
 	// that same resolving s.deser. nil ⇒ not resolved; DecodeJSON decodes
 	// directly against s.node.
+	//
+	// DecodeSingleObject reads it too, to accept wire bearing the WRITER's
+	// fingerprint (see acceptsWriterSOE). That is a second question asked of
+	// one field rather than a second copy of it: two fields that must always
+	// hold the same schema can drift with nothing to notice, while one field
+	// two callers ask cannot. The hazard the duplicate was guarding — a change
+	// that repoints this at the raw view, or drops it, silently taking
+	// single-object writer acceptance along — is caught instead by the net
+	// asserting that acceptance follows the writer schema.
 	resolveWriter *Schema
 
 	// resolveWriterRaw is a custom-free view of the writer, used solely by
