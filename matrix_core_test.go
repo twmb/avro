@@ -9024,72 +9024,85 @@ func TestMatrix_HostileThroughResolution(t *testing.T) {
 // hostile input back; the trunc-helper contract).
 // ---------------------------------------------------------------------------
 
+// "No superlinear work before the type check" is a claim about the hostile
+// value's SIZE, so every arm builds its value from a caller-chosen size and
+// asserts the ratio between two of them. The ceiling this replaced could not
+// make the claim — a superlinear reject of a smaller value clears the same
+// 250ms — and the size it drove was fixed at 1 MiB, so the axis the cell is
+// named for was the one thing it never varied.
 func TestMatrix_HostileSizeRejects(t *testing.T) {
-	bigStr := strings.Repeat("x", 1<<20)
-	bigBytes := []byte(bigStr)
-	bigNum := json.Number(strings.Repeat("9", 1<<20))
-	bigKeyMap := map[string]any{bigStr: int32(1)}
-
 	cases := []struct {
 		label  string
 		schema string
-		bad    any
+		bad    func(n int) any
 	}{
-		{"string-into-int", `"int"`, bigStr},
-		{"bytes-into-long", `"long"`, bigBytes},
-		{"string-into-boolean", `"boolean"`, bigStr},
-		{"hugenum-into-int", `"int"`, bigNum},
-		{"hugenum-into-long", `"long"`, bigNum},
-		{"hugenum-into-float", `"float"`, bigNum},
-		{"hugenum-into-timestamp", `{"type":"long","logicalType":"timestamp-millis"}`, bigNum},
-		{"string-into-fixed16", `{"type":"fixed","name":"HF","size":16}`, bigStr},
-		{"bytes-into-fixed16", `{"type":"fixed","name":"HF","size":16}`, bigBytes},
-		{"symbol-into-enum", `{"type":"enum","name":"HE","symbols":["A","B"]}`, bigStr},
-		{"hugenum-into-decimal", `{"type":"bytes","logicalType":"decimal","precision":6,"scale":2}`, bigNum},
-		{"string-into-array", `{"type":"array","items":"int"}`, bigStr},
-		{"hugekey-into-record", `{"type":"record","name":"HR","fields":[{"name":"a","type":"int"}]}`, bigKeyMap},
-		{"string-into-nullunion", `["null","int"]`, bigStr},
-		{"string-into-uuid-fixed", `{"type":"fixed","name":"HU","size":16,"logicalType":"uuid"}`, bigStr},
+		{"string-into-int", `"int"`, hostileBigString},
+		{"bytes-into-long", `"long"`, hostileBigBytes},
+		{"string-into-boolean", `"boolean"`, hostileBigString},
+		{"hugenum-into-int", `"int"`, hostileBigNumber},
+		{"hugenum-into-long", `"long"`, hostileBigNumber},
+		{"hugenum-into-float", `"float"`, hostileBigNumber},
+		{"hugenum-into-timestamp", `{"type":"long","logicalType":"timestamp-millis"}`, hostileBigNumber},
+		{"string-into-fixed16", `{"type":"fixed","name":"HF","size":16}`, hostileBigString},
+		{"bytes-into-fixed16", `{"type":"fixed","name":"HF","size":16}`, hostileBigBytes},
+		{"symbol-into-enum", `{"type":"enum","name":"HE","symbols":["A","B"]}`, hostileBigString},
+		{"hugenum-into-decimal", `{"type":"bytes","logicalType":"decimal","precision":6,"scale":2}`, hostileBigNumber},
+		{"string-into-array", `{"type":"array","items":"int"}`, hostileBigString},
+		{"hugekey-into-record", `{"type":"record","name":"HR","fields":[{"name":"a","type":"int"}]}`, hostileBigKeyMap},
+		{"string-into-nullunion", `["null","int"]`, hostileBigString},
+		{"string-into-uuid-fixed", `{"type":"fixed","name":"HU","size":16,"logicalType":"uuid"}`, hostileBigString},
 	}
-	// The reject is locally ~µs; 250ms is generous CI headroom. Under -race,
-	// instrumentation inflates the bounded reject past 250ms, so relax to a
-	// ~3s ceiling there — a superlinear blowup before the type check is
-	// multi-second and still trips it (see raceRelaxed).
-	maxDur := raceRelaxed(250 * time.Millisecond)
+	// Both sizes sit ABOVE every length cap these arms can reach, which is what
+	// makes one scale serve all fifteen. Straddling a cap does not measure a
+	// complexity class, it measures the cap: at 128 KiB the decimal arm is under
+	// boundedRatFromString's limit and pays a 29ms conversion, at 1 MiB it is
+	// over and rejects in a microsecond, and the "ratio" between those is 0.00.
+	// Above every cap the arms divide cleanly — flat where the type check
+	// precedes any look at the value, near 8 where something scans it, and 64 if
+	// superlinear work were reintroduced before the check.
+	sc := costScale(1<<20, 1<<23, 25, 500*time.Microsecond)
 	const maxErrLen = 2 << 10
+	// bounded pairs the message-length claim with the cost one, so both are
+	// made at both sizes rather than one at one.
+	bounded := func(t *testing.T, arm string, fn func() error) func() error {
+		return func() error {
+			err := fn()
+			if err != nil {
+				if n := len(err.Error()); n > maxErrLen {
+					t.Errorf("%s reject error echoes hostile input: %d bytes", arm, n)
+				}
+			}
+			return err
+		}
+	}
 
 	for _, c := range cases {
 		t.Run(c.label, func(t *testing.T) {
 			s := avro.MustParse(c.schema)
-
-			start := time.Now()
-			_, err := s.AppendEncode(nil, c.bad)
-			d := time.Since(start)
-			if err == nil {
-				t.Fatalf("hostile value unexpectedly accepted (binary)")
-			}
-			if d > maxDur {
-				t.Errorf("binary reject took %v (> %v): superlinear work before the type check", d, maxDur)
-			}
-			if n := len(err.Error()); n > maxErrLen {
-				t.Errorf("binary reject error echoes hostile input: %d bytes", n)
-			}
-
-			start = time.Now()
-			_, jerr := s.AppendEncodeJSON(nil, c.bad)
-			d = time.Since(start)
-			if jerr == nil {
-				t.Fatalf("hostile value unexpectedly accepted (JSON)")
-			}
-			if d > maxDur {
-				t.Errorf("JSON reject took %v (> %v)", d, maxDur)
-			}
-			if n := len(jerr.Error()); n > maxErrLen {
-				t.Errorf("JSON reject error echoes hostile input: %d bytes", n)
-			}
+			wantRejectScales(t, "AppendEncode/hostile-size-"+c.label, sc, func(n int) func() error {
+				bad := c.bad(n)
+				return bounded(t, "binary", func() error {
+					_, err := s.AppendEncode(nil, bad)
+					return err
+				})
+			})
+			wantRejectScales(t, "AppendEncodeJSON/hostile-size-"+c.label, sc, func(n int) func() error {
+				bad := c.bad(n)
+				return bounded(t, "JSON", func() error {
+					_, err := s.AppendEncodeJSON(nil, bad)
+					return err
+				})
+			})
 		})
 	}
 }
+
+// The four hostile value shapes, each built at a caller-chosen size so the
+// rejection axis can be driven rather than pinned.
+func hostileBigString(n int) any { return strings.Repeat("x", n) }
+func hostileBigBytes(n int) any  { return []byte(strings.Repeat("x", n)) }
+func hostileBigNumber(n int) any { return json.Number(strings.Repeat("9", n)) }
+func hostileBigKeyMap(n int) any { return map[string]any{strings.Repeat("x", n): int32(1)} }
 
 // Hostile-size DECODE-target rejects: a valid small wire decoded into a
 // mismatched target must reject with a bounded message too (the wire side
@@ -9097,23 +9110,25 @@ func TestMatrix_HostileSizeRejects(t *testing.T) {
 // promptness are interesting).
 func TestMatrix_HostileSizeDecodeMessages(t *testing.T) {
 	s := avro.MustParse(`"string"`)
-	big := strings.Repeat("y", 1<<20)
-	wire := mustAppendEncode(t, s, nil, big)
-	// Decoding a 1 MiB string wire into an int target: the rejection must
-	// not echo the megabyte of wire content.
-	var i int32
-	start := time.Now()
-	_, derr := s.Decode(wire, &i)
-	d := time.Since(start)
-	if derr == nil {
-		t.Fatal("string wire into int target unexpectedly accepted")
-	}
-	if bound := raceRelaxed(250 * time.Millisecond); d > bound {
-		t.Errorf("decode reject took %v (>%v)", d, bound)
-	}
-	if n := len(derr.Error()); n > 2<<10 {
-		t.Errorf("decode reject error echoes wire content: %d bytes", n)
-	}
+	// Decoding a large string wire into an int target: the rejection must not
+	// echo the wire content, and must not cost the wire either. Both are claims
+	// about the wire's SIZE and both are made at two of them — the message
+	// bound was already size-independent by construction, and the cost bound
+	// says so now instead of pinning one size under a ceiling.
+	wantRejectScales(t, "Decode/hostile-size-string-into-int", costScale(1<<20, 1<<23, 25, 500*time.Microsecond),
+		func(n int) func() error {
+			wire := mustAppendEncode(t, s, nil, strings.Repeat("y", n))
+			return func() error {
+				var i int32
+				_, derr := s.Decode(wire, &i)
+				if derr != nil {
+					if l := len(derr.Error()); l > 2<<10 {
+						t.Errorf("decode reject error echoes wire content: %d bytes", l)
+					}
+				}
+				return derr
+			}
+		})
 }
 
 // ---------- matrix_json_strictness_parity_test.go ----------

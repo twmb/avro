@@ -9276,59 +9276,71 @@ type T1 struct {
 //     room for the improvement rather than forbidding it: adding a memo to
 //     collectFieldsRaw makes later calls cheaper, which passes.
 //
-// The depth pair is measured and LOGGED rather than bounded, so the 2^depth
-// shape is visible in the output instead of only in a comment, and the absolute
-// ceiling still catches a regression worse than exponential in the depth.
+// All three are RATIOS, and the depth pair had to become one. Its row has
+// always declared a scaleTol — the growth the depth factor is allowed — and
+// nothing enforced it: the cell logged the measured ratio and then asserted an
+// absolute two-second ceiling, which the depth is nowhere near and which
+// measures the host. The number was already written down; now it is asked.
 func TestInvariant_EmbedDiamondCostFactors(t *testing.T) {
-	depths := costFactorValues(t, "TestInvariant_EmbedDiamondCostFactors")
-	if len(depths) < 2 {
-		t.Fatalf("need two depths, row gives %v", depths)
-	}
+	sc := costScaleFor(t, "TestInvariant_EmbedDiamondCostFactors")
 	// The row's two values are the DEPTHS the two concrete types carry; the
 	// types cannot be indexed by a variable, so the mapping is stated here and
 	// asserted rather than assumed.
-	const shallowDepth, deepDepth = 8, 12
-	if depths[0] != shallowDepth || depths[1] != deepDepth {
-		t.Fatalf("row drives %v but the declared types carry depths %d and %d — the row and the types disagree",
-			depths, shallowDepth, deepDepth)
+	const shallowDepth, deepDepth = 4, 12
+	if sc.lo != shallowDepth || sc.hi != deepDepth {
+		t.Fatalf("row drives %d and %d but the declared types carry depths %d and %d — the row and the types disagree",
+			sc.lo, sc.hi, shallowDepth, deepDepth)
 	}
 
-	ceiling := raceRelaxed(2 * time.Second)
 	timeCall := func(fn func()) time.Duration {
 		start := time.Now()
 		fn()
 		return time.Since(start)
 	}
 
-	// Factor 1: PATHS. T5 is depth 8, T1 is depth 12 — 16x the paths.
-	shallow := timeCall(func() {
-		if _, err := SchemaFor[T5](); err != nil {
-			t.Errorf("SchemaFor at depth %d: %v", shallowDepth, err)
-		}
-	})
-	deep := timeCall(func() {
-		if _, err := SchemaFor[T1](); err != nil {
-			t.Errorf("SchemaFor at depth %d: %v", deepDepth, err)
-		}
-	})
-	t.Logf("SchemaFor: depth %d %v, depth %d %v (%.1fx for 16x the paths)",
-		shallowDepth, shallow, deepDepth, deep, float64(deep)/float64(shallow))
-	if deep > ceiling {
-		t.Errorf("SchemaFor at depth %d took %v (> %v) — the per-path descent got worse than the exponential it is known to be", deepDepth, deep, ceiling)
+	// Factor 1: PATHS. T9 is depth 4, T1 is depth 12 — 256x the paths. The walk
+	// is un-memoized by design, so repeating it measures the same work every
+	// time and the minimum of several samples is the honest cost.
+	deep, errDeep, n := measureCost(func() error { _, err := SchemaFor[T1](); return err })
+	shallow, errShallow, _ := measureCostN(func() error { _, err := SchemaFor[T9](); return err }, n)
+	if errShallow != nil {
+		t.Errorf("SchemaFor at depth %d: %v", shallowDepth, errShallow)
 	}
+	if errDeep != nil {
+		t.Errorf("SchemaFor at depth %d: %v", deepDepth, errDeep)
+	}
+	// The claim is NOT that this is flat — it is exponential in the depth by
+	// design, and a cell claiming otherwise would assert a property the package
+	// does not have. It is that the exponential does not get WORSE, and that
+	// needs a wide depth span to say anything. At depths 8 and 12 the honest
+	// ratio wandered between 9.7 and 25 against a nominal 16, because a walk
+	// this allocation-heavy is judged partly by the garbage collector; a
+	// tolerance with room for that band has no room left below a 3^depth
+	// degradation, which the same span puts at only 5x further out. At depths 4
+	// and 12 the nominal is 256, the degradation is 6561, and the honest
+	// measurement's own spread is small against the gap between them.
+	wantCostScales(t, "SchemaFor/embed-diamond-depth", sc, shallow, deep)
 
 	// Factor 2: CALLS, on the SchemaFor collector. Each call re-pays the walk
 	// (no memo), which is the documented cost; what must hold is that no call
-	// costs MORE than the first, so nothing accumulates.
+	// costs MORE than the first, so nothing accumulates. The magnitude here is
+	// the call ORDINAL and the work per call is identical, so a collector that
+	// does not accumulate is FLAT in it — expected ratio 1, not 3. That is why
+	// the tolerance is small where the depth factor's is 32: this one is not
+	// paying for any growth at all.
+	callScale := costScale{lo: 1, hi: 3, tol: 4, floor: 2 * time.Millisecond}
+	var firstWalk time.Duration
 	for i := range 3 {
 		d := timeCall(func() {
 			if _, err := SchemaFor[T1](); err != nil {
 				t.Errorf("SchemaFor call %d: %v", i, err)
 			}
 		})
-		if d > ceiling {
-			t.Errorf("SchemaFor call %d took %v (> %v) — cost is accumulating across calls", i, d, ceiling)
+		if i == 0 {
+			firstWalk = d
+			continue
 		}
+		wantCostScales(t, fmt.Sprintf("SchemaFor/embed-diamond-call-%d", i+1), callScale, firstWalk, d)
 	}
 
 	// Factor 2 again, on the DECODE collector, where the memo makes it free.
@@ -9345,15 +9357,16 @@ func TestInvariant_EmbedDiamondCostFactors(t *testing.T) {
 			t.Errorf("second decode: %v", err)
 		}
 	})
-	t.Logf("Decode into the depth-%d type: first %v, second %v", deepDepth, first, second)
 	// The measured gap is enormous (microseconds against milliseconds at this
 	// depth, and 3us against 952ms at depth 18); a tenth is a bound nothing but
-	// a lost cache can cross, and it does not depend on the host.
-	if second > first/10 && second > raceRelaxed(time.Millisecond) {
-		t.Errorf("second decode took %v against the first's %v — the embed walk is running again.\n"+
-			"Two caches in series prevent that (deserRecord.fast, then typeFieldMapping's own map); losing either one is invisible here, so this failure means both stopped answering.",
-			second, first)
-	}
+	// a lost cache can cross, and it does not depend on the host. This one was
+	// already a ratio and keeps being one; it goes through the shared harness
+	// so its floor is the same kind of number as everyone else's — a cost too
+	// small for a ratio to mean anything, inflated proportionally under -race
+	// rather than given a three-second absolute minimum that would swallow the
+	// comparison whole.
+	amortScale := costScale{lo: 1, hi: 2, tol: 0.1, floor: time.Millisecond}
+	wantCostScales(t, "Decode/embed-diamond-amortized", amortScale, first, second)
 }
 
 // ---------- repeated_embed_test.go ----------

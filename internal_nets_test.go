@@ -1983,18 +1983,33 @@ func TestCensus_Q9_EscapedLenScanIsBoundedByTheLimit(t *testing.T) {
 		}
 		prev = got
 	}
-	// And the cost of the whole walk over a value far larger than the budget
-	// stays small, since the scan abandons it.
-	huge := strings.Repeat("\x01", 32<<20) // 32 MiB of 6x-escaping content
-	start := time.Now()
-	b := newWalkBudget()
-	if r := valueWalkLimit(reflect.ValueOf(huge), maxSchemaJSONDepth, &b); r != valueWalkTooLarge {
-		t.Fatalf("a 32 MiB control-byte string must bust the byte budget, got code %d", r)
-	}
-	if el := time.Since(start); el > 2*time.Second {
-		t.Fatalf("rejecting an over-budget string took %v; the scan is not bounded by the budget", el)
-	}
+	// And the COST of the whole walk over a value far larger than the budget
+	// stays small, since the scan abandons it. "Bounded by the budget rather
+	// than by the input" is a claim about the input's size, and the answer it
+	// predicts is flat: past the budget the walk abandons at the same byte
+	// whatever it was handed, so eight times the input costs the same and a
+	// scan without the early exit costs eight times as much. The cell drove one
+	// 32 MiB string under a 2s ceiling, which a scan proportional to a 4 MiB
+	// input passes just as easily. Both sizes have to BUST the budget for the
+	// comparison to be of one operation: the content escapes 6x, so the budget
+	// is reached at about 10.7 MiB of input and the low end sits above that.
+	wantRejectScales(t, "valueWalkLimit/over-budget-escaping-string",
+		costScale{lo: 16 << 20, hi: 128 << 20, tol: 4, floor: 2 * time.Millisecond},
+		func(n int) func() error {
+			huge := strings.Repeat("\x01", n) // 6x-escaping content
+			return func() error {
+				b := newWalkBudget()
+				if r := valueWalkLimit(reflect.ValueOf(huge), maxSchemaJSONDepth, &b); r != valueWalkTooLarge {
+					return nil // reported by wantRejectScales as an acceptance
+				}
+				return errValueWalkOverBudget
+			}
+		})
 }
+
+// errValueWalkOverBudget is the sentinel the Q9 growth cell reports so the
+// reject harness can read a walk-limit CODE as a rejection.
+var errValueWalkOverBudget = errors.New("valueWalkLimit: over budget")
 
 // htmlJSONMarshaler emits JSON whose string content is the HTML trio, which
 // the compactor expands one byte into six.
@@ -4692,7 +4707,15 @@ type costScale struct {
 
 // String renders the claim for a failure message.
 func (c costScale) String() string {
-	return fmt.Sprintf("%d->%d (%.0fx size), tol %.1fx", c.lo, c.hi, float64(c.hi)/float64(c.lo), c.tol)
+	return fmt.Sprintf("%d->%d (%s size), tol %s", c.lo, c.hi, costFactorString(float64(c.hi)/float64(c.lo)), costFactorString(c.tol))
+}
+
+// costFactorString renders a growth or size factor. Three significant digits
+// and no exponent: these span 0.0003 (a cache making the second call free)
+// to 4096 (an allocation following a fixed size), and %.2f flattens the first
+// to "0.00" while %.0f turns a 1.5x depth span into "2x".
+func costFactorString(f float64) string {
+	return strconv.FormatFloat(f, 'g', 3, 64) + "x"
 }
 
 // The reported cost of a size is the SMALLEST of several samples, which is the
@@ -4716,15 +4739,37 @@ const (
 	costSampleBudget = 20 * time.Millisecond
 )
 
-// measureCost samples fn as described above and returns the smallest elapsed
-// time together with the last error it saw, so the caller can assert the verdict
-// as well as the cost.
-func measureCost(fn func() error) (time.Duration, error) {
+// The two sides of a ratio are sampled the SAME number of times, and the count
+// comes from the expensive one. A minimum converges on the true cost from above
+// as samples accumulate, so a side sampled twenty-five times has converged
+// further than one sampled four — and if that side is the denominator, the ratio
+// is inflated by the difference rather than by anything the code did. The
+// SchemaFor depth cell showed it: 25 samples on the cheap side against 5 on the
+// dear one moved its measured ratio between 14 and 20 run to run, for a cost
+// that had not changed. Taking the count from the hi side also errs the safe
+// way when it is small, since a less-converged denominator makes the ratio
+// smaller, never larger.
+
+// measureCost samples fn adaptively and returns the smallest elapsed time, the
+// last error it saw, and how many samples it took, so a caller comparing two
+// costs can sample the second one the same number of times.
+func measureCost(fn func() error) (time.Duration, error, int) {
+	return measureCostN(fn, 0)
+}
+
+// measureCostN is measureCost with the sample count fixed; want <= 0 means
+// adaptive.
+func measureCostN(fn func() error, want int) (time.Duration, error, int) {
 	best := time.Duration(1) << 62
 	var total time.Duration
 	var err error
-	for n := 0; n < costMaxSamples; n++ {
-		if n >= costMinSamples && total >= costSampleBudget {
+	n := 0
+	for ; n < costMaxSamples; n++ {
+		if want > 0 {
+			if n >= want {
+				break
+			}
+		} else if n >= costMinSamples && total >= costSampleBudget {
 			break
 		}
 		start := time.Now()
@@ -4738,7 +4783,7 @@ func measureCost(fn func() error) (time.Duration, error) {
 			err = e
 		}
 	}
-	return best, err
+	return best, err, n
 }
 
 // wantCostScales is the assertion the accept and reject forms share: cost at
@@ -4751,20 +4796,20 @@ func wantCostScales(t *testing.T, name string, sc costScale, tLo, tHi time.Durat
 	// resolution at that size — an O(1) surface the magnitude does not reach —
 	// so the ratio is undefined rather than infinite. The floor decides such a
 	// cell, and it admits it: nothing that fast is the quadratic being hunted.
-	ratio := float64(tHi) / float64(tLo)
-	shape := fmt.Sprintf("%.2fx", ratio)
+	shape := costFactorString(float64(tHi) / float64(tLo))
 	if tLo == 0 {
 		shape = "undefined (lo-side cost below the clock's resolution)"
 	}
+	span := costFactorString(float64(sc.hi) / float64(sc.lo))
 	lim := max(time.Duration(sc.tol*float64(tLo)), raceInflated(sc.floor))
-	t.Logf("%s: %v at %d, %v at %d — ratio %s for a %.0fx size increase (limit %v)",
-		name, tLo, sc.lo, tHi, sc.hi, shape, float64(sc.hi)/float64(sc.lo), lim)
+	t.Logf("%s: %v at %d, %v at %d — ratio %s for a %s size increase (limit %v)",
+		name, tLo, sc.lo, tHi, sc.hi, shape, span, lim)
 	if tHi > lim {
-		t.Errorf("%s: cost grew %s for a %.0fx size increase — %v at %d vs %v at %d (limit %v; claim: %s).\n"+
+		t.Errorf("%s: cost grew %s for a %s size increase — %v at %d vs %v at %d (limit %v; claim: %s).\n"+
 			"The bound claims to cap this magnitude, so growth past the magnitude's own is the bound missing.\n"+
 			"This is a RATIO between two sizes measured on the same machine moments apart: host load inflates\n"+
 			"both and divides out, so a busy machine is not an explanation for it.",
-			name, shape, float64(sc.hi)/float64(sc.lo), tLo, sc.lo, tHi, sc.hi, lim, sc)
+			name, shape, span, tLo, sc.lo, tHi, sc.hi, lim, sc)
 	}
 }
 
@@ -4777,8 +4822,8 @@ func wantCostScales(t *testing.T, name string, sc costScale, tLo, tHi time.Durat
 // error; it is how a cell ends up timing a parse instead of the walk it names.
 func wantAcceptScales(t *testing.T, name string, sc costScale, build func(n int) func() error) {
 	t.Helper()
-	tLo, errLo := measureCost(build(sc.lo))
-	tHi, errHi := measureCost(build(sc.hi))
+	tHi, errHi, n := measureCost(build(sc.hi))
+	tLo, errLo, _ := measureCostN(build(sc.lo), n)
 	if errLo != nil {
 		t.Errorf("%s (n=%d): %v", name, sc.lo, errLo)
 		return
@@ -4797,8 +4842,8 @@ func wantAcceptScales(t *testing.T, name string, sc costScale, build func(n int)
 // reaches the check is what the bound caps, and one size cannot see it.
 func wantRejectScales(t *testing.T, name string, sc costScale, build func(n int) func() error) {
 	t.Helper()
-	tLo, errLo := measureCost(build(sc.lo))
-	tHi, errHi := measureCost(build(sc.hi))
+	tHi, errHi, n := measureCost(build(sc.hi))
+	tLo, errLo, _ := measureCostN(build(sc.lo), n)
 	if errLo == nil {
 		t.Errorf("%s (n=%d): hostile input was accepted (want a fast rejection)", name, sc.lo)
 		return

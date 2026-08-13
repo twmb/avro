@@ -15165,7 +15165,13 @@ var costCells = []costCell{
 		// already measured, but the second factor.
 		factor:  "sibling-embed DAG depth (the paths factor, 2^depth) crossed with CALL COUNT (the amortization factor, where the two collectors diverge)",
 		carrier: "a Go TYPE — the depth is carried by which declared embed-diamond type the cell instantiates, so no schema-text generator appears and the derivation cannot discover this cell. Rowed by hand; the depths the row names are asserted against the types inside the cell",
-		values:  []int{8, 12}, scaleTol: 32, floor: 2 * time.Second},
+		// The values were 8 and 12 and the floor 2s, which is what an absolute
+		// ceiling needs and a ratio cannot use: nothing enforced scaleTol at
+		// all, and once it was enforced a 1.5x depth span could not hold a
+		// tolerance between the honest 2^depth and a degraded 3^depth. Four to
+		// twelve puts those at 256 and 6561. The floor has to sit UNDER the
+		// tolerance's own limit or it decides the cell by itself.
+		values: []int{4, 12}, scaleTol: 1000, floor: 2 * time.Millisecond},
 
 	{fn: "TestDoSBattery_C9_CustomTypeParseCost",
 		// The values were 3000 and 6000 while the cell asserted a per-length

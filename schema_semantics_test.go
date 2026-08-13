@@ -8855,6 +8855,16 @@ func TestMatrix_InfiniteRecursiveDefaultRejected(t *testing.T) {
 			{"name":"b","type":{"type":"record","name":"B","fields":[
 				{"name":"a","type":"A","default":{}}]},"default":{}}]}`},
 	}
+	// This cell keeps an ABSOLUTE bound where the suite's cost cells took growth
+	// ratios, and the reason is that it has no magnitude to drive. Its four
+	// schemas are fixed text and the recursion in each is INFINITE by
+	// construction — there is no bigger version of "does not terminate" to
+	// measure a second time, and the bound under test is production's own
+	// maxDepth rather than anything this input carries. The clock here is a
+	// liveness detector: it asks whether Parse RETURNED, which is the whole
+	// property, and where the deadline sits does not matter because the two
+	// outcomes it separates are milliseconds and a dead process. Compare
+	// dosBudget, which is absolute for exactly the same reason.
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			// Must complete (the bound stops the recursion) and must reject.

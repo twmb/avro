@@ -6261,7 +6261,92 @@ func TestRegression_OCFZstdTinyCapFloorsAtMinWindow(t *testing.T) {
 // Same rule as the core battery: cells are never "closed". A later OCF DoS find
 // extends this matrix; it does not retire it.
 
+// ocfDosBudget stays ABSOLUTE where the cost cells took growth ratios (see
+// costScale in the core package's dos_battery section): what a watchdog asks is
+// whether fn RETURNED, and a hang leaves no second measurement to divide by.
 const ocfDosBudget = 4 * time.Second
+
+// costScale is the growth claim a cost cell makes: cost measured at two problem
+// sizes, and the largest ratio between them that leaves the claim standing. Why
+// a complexity claim is a RATIO and not an absolute wall-clock ceiling is
+// written out once, beside the core package's copy of this harness in its
+// dos_battery section; the short form is that a ceiling measures the machine as
+// much as the code, and `go test ./...` runs this package concurrently with
+// that one.
+//
+// It is a copy and not a bridge for the same reason dosRun above is: the core
+// package's version lives in its own _test.go files, so it is compiled into the
+// avro test binary and not into this one. There is no import that reaches it.
+type costScale struct {
+	lo, hi int
+	tol    float64
+	floor  time.Duration
+}
+
+const (
+	ocfCostMinSamples   = 3
+	ocfCostMaxSamples   = 25
+	ocfCostSampleBudget = 20 * time.Millisecond
+)
+
+// measureOCFCost samples fn and returns the smallest elapsed time, the last
+// error, and the sample count. Both sides of a ratio take the same count, from
+// the expensive one, so a better-converged minimum on one side cannot show up
+// as growth on the other.
+func measureOCFCost(fn func() error, want int) (time.Duration, error, int) {
+	best := time.Duration(1) << 62
+	var total time.Duration
+	var err error
+	n := 0
+	for ; n < ocfCostMaxSamples; n++ {
+		if want > 0 {
+			if n >= want {
+				break
+			}
+		} else if n >= ocfCostMinSamples && total >= ocfCostSampleBudget {
+			break
+		}
+		start := time.Now()
+		e := fn()
+		d := time.Since(start)
+		total += d
+		if d < best {
+			best = d
+		}
+		if e != nil {
+			err = e
+		}
+	}
+	return best, err, n
+}
+
+// wantAcceptScales asserts fn accepts at both of sc's sizes and that its cost
+// grows no faster than sc permits. build takes the magnitude and returns the
+// thunk to TIME, so everything the magnitude needs but the bound does not own
+// stays outside the measurement.
+func wantAcceptScales(t *testing.T, name string, sc costScale, build func(n int) func() error) {
+	t.Helper()
+	tHi, errHi, n := measureOCFCost(build(sc.hi), 0)
+	tLo, errLo, _ := measureOCFCost(build(sc.lo), n)
+	if errLo != nil {
+		t.Errorf("%s (n=%d): %v", name, sc.lo, errLo)
+		return
+	}
+	if errHi != nil {
+		t.Errorf("%s (n=%d): %v", name, sc.hi, errHi)
+		return
+	}
+	ratio := float64(tHi) / float64(tLo)
+	lim := max(time.Duration(sc.tol*float64(tLo)), sc.floor)
+	t.Logf("%s: %v at %d, %v at %d — ratio %.3gx for a %.3gx size increase (limit %v)",
+		name, tLo, sc.lo, tHi, sc.hi, ratio, float64(sc.hi)/float64(sc.lo), lim)
+	if tHi > lim {
+		t.Errorf("%s: cost grew %.3gx for a %.3gx size increase — %v at %d vs %v at %d (limit %v).\n"+
+			"The bound claims to cap this magnitude, so growth past the magnitude's own is the bound missing.\n"+
+			"This is a RATIO between two sizes measured moments apart: host load inflates both and divides out.",
+			name, ratio, float64(sc.hi)/float64(sc.lo), tLo, sc.lo, tHi, sc.hi, lim)
+	}
+}
 
 // dosRun runs fn under a watchdog: a hang past the budget (missing bound on a
 // non-allocating loop) or a panic (hostile input must error, not panic) fails
@@ -7179,24 +7264,39 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 	// An all-empty-blocks file terminates in bounded time: one Decode call
 	// walks every block (18 bytes each) and returns io.EOF — cost linear in
 	// the input, no records, no hang.
+	//
+	// "Linear in the input" is a claim about the BLOCK COUNT, so the cell drives
+	// two counts and asserts the ratio. It pinned 10,000 blocks under a 10s
+	// ceiling, which is a hang detector wearing a cost assertion's clothes: a
+	// reader that failed to advance past a count-0 block never returns at all,
+	// and that is caught by the test binary's own timeout, while a reader that
+	// merely rescanned from the file's start per block — the quadratic near
+	// miss — walks 10,000 blocks in well under 10s and passed. Eight times the
+	// blocks is eight times a linear walk and sixty-four times a rescanning one.
 	t.Run("ten-thousand-empty-blocks", func(t *testing.T) {
 		s := avro.MustParse(`"string"`)
-		var buf bytes.Buffer
-		w := mustNewWriter(t, &buf, s, WithSyncMarker(foreignSync))
-		mustClose(t, w)
-		for range 10_000 {
-			appendRawBlock(&buf, 0, nil, foreignSync)
+		build := func(blocks int) []byte {
+			var buf bytes.Buffer
+			w := mustNewWriter(t, &buf, s, WithSyncMarker(foreignSync))
+			mustClose(t, w)
+			for range blocks {
+				appendRawBlock(&buf, 0, nil, foreignSync)
+			}
+			return buf.Bytes()
 		}
-		start := time.Now()
-		got := readAllStrings(t, buf.Bytes())
-		if len(got) != 0 {
-			t.Fatalf("read %v from an all-empty file", got)
-		}
-		if d := time.Since(start); d > 10*time.Second {
-			t.Fatalf("all-empty file took %v to reach io.EOF", d)
-		}
+		wantAcceptScales(t, "Reader/all-empty-blocks", costScale{lo: 1_250, hi: 10_000, tol: 25, floor: 500 * time.Microsecond},
+			func(blocks int) func() error {
+				file := build(blocks)
+				return func() error {
+					if got := readAllStrings(t, file); len(got) != 0 {
+						return fmt.Errorf("read %v from an all-empty file", got)
+					}
+					return nil
+				}
+			})
 		if fa != nil && faSupported["null"] {
-			faGot, faErr := fa(buf.Bytes())
+			file := build(10_000)
+			faGot, faErr := fa(file)
 			if faErr != "" || len(faGot) != 0 {
 				t.Errorf("fastavro on all-empty file: values=%v err=%s", faGot, faErr)
 			}
