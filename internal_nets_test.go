@@ -4672,6 +4672,31 @@ func TestDoSBattery_C8_DirectByteAPIs(t *testing.T) {
 //
 // Each such cell says so at its own site. Everything else that times work states
 // its claim through the helpers below.
+//
+// WHAT A RATIO IS AND IS NOT IMMUNE TO, measured rather than assumed. It is
+// immune to CPU contention, which is the case this exists for: with the machine
+// six times oversubscribed and GOMAXPROCS pinned to 2, every cell in the
+// converted battery holds, and the whole suite holds through repeated
+// package-parallel runs at GOMAXPROCS=2 — the shape of a two-core CI runner
+// executing `go test ./...`.
+//
+// It is NOT immune to memory-bandwidth starvation, and the reason is structural
+// rather than fixable by sampling. The two sides of a growth cell hold working
+// sets that differ by the magnitude itself, and cache is not shared
+// proportionally: under an antagonist that streams 64 MiB buffers on every core
+// continuously, the hi side's misses grow faster than the lo side's and the
+// measured ratio inflates by about 3x — 9.6-12 becomes 22-38 in the breadth
+// column. Widening the span does not escape it, because the inflation is a
+// factor and not an offset (at a 16x span the same antagonist turns 19-23 into
+// 67-74). Under that antagonist a handful of cells can red.
+//
+// Two things keep that from being a reason to go back. The ceilings it replaced
+// fail HARDER under the same antagonist — five to seven cells against two to
+// six, on the same code — and they fail as a bare "took 1.5s", where a growth
+// cell prints both measurements and the size they were taken at, which is
+// diagnosable in one line. And the antagonist is well past what the failures on
+// record describe: a file copy competing for bandwidth, not a sustained
+// cache-eviction benchmark.
 
 // costScale is the growth claim a column of cells makes: cost measured at two
 // problem sizes, and the largest ratio between them that leaves the claim
