@@ -4045,33 +4045,62 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 	// it re-enters the recursive schema decode, and two decodes per level compound
 	// to O(2^depth), a sub-KB stray schema that hangs Parse. The bracket-depth arms
 	// use the BINDING form, which never routes a stray, so they cannot see this.
-	// Depth 1000 stays under the bracket pre-scan for all three keys, and the bound
-	// sits far above the linear cost and far below the quadratic and exponential
-	// ones it exists to catch.
-	const strayDepth = 1000
+	//
+	// The claim is that the per-level decode happens ONCE, which is a claim about
+	// how cost responds to the DEPTH and so is asserted as the ratio between two
+	// depths. A single depth under a ceiling cannot make it: the ceiling has to
+	// clear the honest linear cost, and anything that clears it at depth 1000
+	// clears a quadratic cost at some shallower one. Eight times the depth costs
+	// 8x for one decode per level, 64x for the quadratic re-validation, and
+	// arbitrarily much for the O(2^depth) double decode.
+	//
+	// Eight and not four, which is what these cells measured at first. Their calls
+	// run in hundreds of microseconds, and at that scale a linear cost does not
+	// land on its nominal ratio: allocation and GC grow with the tree and put the
+	// honest number between 1.0x and 1.7x above it, reproducibly, on a quiet
+	// machine. At a 4x separation that band ran to 6.9 against a nominal 4, which
+	// leaves nowhere to put a tolerance between it and the quadratic's 16. At 8x
+	// the same band is 7.8 to 12.1 against a nominal 8 and the quadratic is 64, so
+	// 25 has a factor of two on each side. Both depths stay under the bracket
+	// pre-scan for all three keys, "fields" included at three brackets a level.
+	strayScale := costScale{lo: 125, hi: 1000, tol: 25, floor: 10 * time.Millisecond}
 	for _, key := range []string{"items", "values", "fields"} {
-		open, closeStr := `{"type":"int","`+key+`":`, `}`
-		if key == "fields" {
-			open, closeStr = `{"type":"int","fields":[{"name":"f","type":`, `}]}`
+		stray := func(depth int) string {
+			open, closeStr := `{"type":"int","`+key+`":`, `}`
+			if key == "fields" {
+				open, closeStr = `{"type":"int","fields":[{"name":"f","type":`, `}]}`
+			}
+			return strings.Repeat(open, depth) + `"int"` + strings.Repeat(closeStr, depth)
 		}
-		straySchema := strings.Repeat(open, strayDepth) + `"int"` + strings.Repeat(closeStr, strayDepth)
-		wantAcceptUnder(t, "Parse/nested-stray-"+key, 300*time.Millisecond, func() error {
-			_, err := Parse(straySchema)
-			return err
-		})
-		wantAcceptUnder(t, "SchemaCache.Parse/nested-stray-"+key, 300*time.Millisecond, func() error {
-			var c SchemaCache
-			_, err := c.Parse(straySchema)
-			return err
-		})
-		wantAcceptUnder(t, "Root().Schema()/nested-stray-"+key, 300*time.Millisecond, func() error {
-			ss, err := Parse(straySchema)
-			if err != nil {
+		wantAcceptScales(t, "Parse/nested-stray-"+key, strayScale, func(depth int) func() error {
+			straySchema := stray(depth)
+			return func() error {
+				_, err := Parse(straySchema)
 				return err
 			}
-			root := ss.Root()
-			_, err = root.Schema()
-			return err
+		})
+		wantAcceptScales(t, "SchemaCache.Parse/nested-stray-"+key, strayScale, func(depth int) func() error {
+			straySchema := stray(depth)
+			return func() error {
+				var c SchemaCache
+				_, err := c.Parse(straySchema)
+				return err
+			}
+		})
+		// The parse is fixture here, not the subject: this cell names the
+		// metadata rebuild, and the Parse cell above already drives the parse
+		// at both depths. Timing them together would put two costs of the same
+		// shape in one number, and the rebuild's is the smaller of the two.
+		wantAcceptScales(t, "Root().Schema()/nested-stray-"+key, strayScale, func(depth int) func() error {
+			ss, err := Parse(stray(depth))
+			if err != nil {
+				t.Fatalf("nested-stray-%s depth %d: %v", key, depth, err)
+			}
+			return func() error {
+				root := ss.Root()
+				_, err := root.Schema()
+				return err
+			}
 		})
 	}
 }
@@ -4666,25 +4695,43 @@ func (c costScale) String() string {
 	return fmt.Sprintf("%d->%d (%.0fx size), tol %.1fx", c.lo, c.hi, float64(c.hi)/float64(c.lo), c.tol)
 }
 
-// costSamples is how many times each size is measured. The reported cost is the
-// SMALLEST sample, which is the closest thing to an uncontended measurement a
-// loaded host can produce: contention, GC and scheduler steals can only inflate
-// a sample, never deflate one, so the minimum converges on the real cost from
-// above while the mean chases the load. Three is enough for that — the samples
-// are drawn seconds apart at most, so a fourth buys little — and it keeps the
-// battery's added wall-clock to roughly its own measurement.
-const costSamples = 3
+// The reported cost of a size is the SMALLEST of several samples, which is the
+// closest thing to an uncontended measurement a loaded host can produce:
+// contention, GC and scheduler steals can only inflate a sample, never deflate
+// one, so the minimum converges on the real cost from above while a mean chases
+// the load.
+//
+// How many samples that takes depends on how expensive the call is, so it is not
+// a constant. A cell whose call runs tens of microseconds needs many, because at
+// that scale one steal moves the number by more than the growth being measured —
+// the stray-key cells drifted between 3.5x and 6.3x on three samples for a cost
+// that is 4x. A cell whose call runs tens of milliseconds needs few, because its
+// own size averages the noise out, and more samples would only spend wall clock.
+// So: at least costMinSamples, then keep sampling while the size has cost less
+// than costSampleBudget in total, up to costMaxSamples. Both ends are bounded,
+// so the added wall clock per cell is bounded too.
+const (
+	costMinSamples   = 3
+	costMaxSamples   = 25
+	costSampleBudget = 20 * time.Millisecond
+)
 
-// measureCost runs fn costSamples times and returns the smallest elapsed time
-// together with the last error it saw, so the caller can assert the verdict as
-// well as the cost.
+// measureCost samples fn as described above and returns the smallest elapsed
+// time together with the last error it saw, so the caller can assert the verdict
+// as well as the cost.
 func measureCost(fn func() error) (time.Duration, error) {
 	best := time.Duration(1) << 62
+	var total time.Duration
 	var err error
-	for range costSamples {
+	for n := 0; n < costMaxSamples; n++ {
+		if n >= costMinSamples && total >= costSampleBudget {
+			break
+		}
 		start := time.Now()
 		e := fn()
-		if d := time.Since(start); d < best {
+		d := time.Since(start)
+		total += d
+		if d < best {
 			best = d
 		}
 		if e != nil {
@@ -4789,66 +4836,87 @@ func TestDoSBattery_C9_CustomTypeParseCost(t *testing.T) {
 	noMatch := CustomType{LogicalType: "no-such-logical", AvroType: "string"}
 	match := CustomType{AvroType: "long"} // matches every chain leaf
 
-	// The chain LENGTH is the factor, driven at two values read from the registry.
-	// One value cannot tell the memo from its absence: the cost this bound caps is
-	// quadratic without the memo, so a single length only asks whether that length
-	// finishes, and a bound generous enough for the linear cost at 3000 is
-	// generous enough for the QUADRATIC cost at some smaller length. Doubling
-	// separates them — linear doubles, quadratic quadruples — and the per-length
-	// ceiling scales with the length. Measured linear at both, on both arms: 28ms
-	// and 25ms at 3000, 55ms and 58ms at 6000.
-	for _, n := range costFactorValues(t, "TestDoSBattery_C9_CustomTypeParseCost") {
-		chain := dosChainSchema(n) // ~60n bytes of well-formed schema text
-		bound := time.Duration(n/3000) * 200 * time.Millisecond
+	// The chain LENGTH is the factor, and the assertion is the RATIO between its
+	// two values, read from the registry. One value cannot tell the memo from its
+	// absence: the cost this bound caps is quadratic without the memo, so a single
+	// length only asks whether that length finishes, and a ceiling generous enough
+	// for the linear cost at 6000 is generous enough for the QUADRATIC cost at some
+	// smaller length. Quadrupling separates them — linear costs 4x, quadratic 16x —
+	// which is the comparison this cell's comment always described and only now
+	// makes. Measured linear on both arms: ~13ms at 1500 and ~55ms at 6000, against
+	// a quadratic that is ~500ms at 3000 and grows 4x per doubling.
+	chainScale := costScaleFor(t, "TestDoSBattery_C9_CustomTypeParseCost")
 
-		// Parse × non-matching CustomType: every stamp walk completes clean,
-		// the worst case for a memo (nothing to short-circuit on). Healthy
-		// cost is the plain-parse neighborhood (tens of ms); quadratic is
-		// ~500ms+ at 3000 and grows 4x per doubling.
-		wantAcceptUnder(t, fmt.Sprintf("Parse/chain-noMatch-custom/n=%d", n), bound, func() error {
+	// Parse × non-matching CustomType: every stamp walk completes clean,
+	// the worst case for a memo (nothing to short-circuit on).
+	wantAcceptScales(t, "Parse/chain-noMatch-custom", chainScale, func(n int) func() error {
+		chain := dosChainSchema(n) // ~60n bytes of well-formed schema text
+		return func() error {
 			_, err := Parse(chain, noMatch)
 			return err
-		})
+		}
+	})
 
-		// Parse × MATCHING CustomType: walks short-circuit at the chain's
-		// leaf, which without a memo is still O(n) per walk = O(n^2) total.
-		// The memo must bound the match case too, not only the clean case.
-		wantAcceptUnder(t, fmt.Sprintf("Parse/chain-matching-custom/n=%d", n), bound, func() error {
+	// Parse × MATCHING CustomType: walks short-circuit at the chain's
+	// leaf, which without a memo is still O(n) per walk = O(n^2) total.
+	// The memo must bound the match case too, not only the clean case.
+	wantAcceptScales(t, "Parse/chain-matching-custom", chainScale, func(n int) func() error {
+		chain := dosChainSchema(n)
+		return func() error {
 			_, err := Parse(chain, match)
 			return err
-		})
-	}
+		}
+	})
 
 	// SchemaCache × many references to a large inherited type: the boundary
 	// guard and the overlay completion each walk the inherited subtree per
-	// reference — without per-parse sharing that is O(refs × nodes) (seconds
-	// at 1000 × 5000); with it, one walk total.
-	var big strings.Builder
-	big.WriteString(`{"type":"record","name":"Big","fields":[`)
-	for i := range 5000 {
-		if i > 0 {
-			big.WriteString(",")
+	// reference — without per-parse sharing that is O(refs × nodes); with it,
+	// one walk total.
+	//
+	// This arm's magnitude drives BOTH axes at once, and it has to. Holding the
+	// referenced type's size fixed and growing only the reference count makes
+	// the shared and unshared costs O(refs) and O(refs × nodes) — both LINEAR
+	// in the driven magnitude, so their ratio is identical and the comparison
+	// measures nothing. Holding the count fixed and growing the size has the
+	// same problem the other way round. Growing them TOGETHER is what separates
+	// the classes: sharing makes the total linear in the magnitude, its absence
+	// makes it quadratic, which is the same 4-versus-16 the chain arms read.
+	// That is a crossed factor and not the single one the registry row lists,
+	// so the scale is stated here beside the reason.
+	refsScale := costScale{lo: 1250, hi: 5000, tol: 8, floor: 100 * time.Millisecond}
+	wantAcceptScales(t, "SchemaCache.Parse/many-refs-custom", refsScale, func(n int) func() error {
+		var big strings.Builder
+		big.WriteString(`{"type":"record","name":"Big","fields":[`)
+		for i := range n {
+			if i > 0 {
+				big.WriteString(",")
+			}
+			fmt.Fprintf(&big, `{"name":"f%d","type":"long"}`, i)
 		}
-		fmt.Fprintf(&big, `{"name":"f%d","type":"long"}`, i)
-	}
-	big.WriteString(`]}`)
-	var wide strings.Builder
-	wide.WriteString(`{"type":"record","name":"Wide","fields":[`)
-	for i := range 1000 {
-		if i > 0 {
-			wide.WriteString(",")
+		big.WriteString(`]}`)
+		var wide strings.Builder
+		wide.WriteString(`{"type":"record","name":"Wide","fields":[`)
+		for i := range n / 5 {
+			if i > 0 {
+				wide.WriteString(",")
+			}
+			fmt.Fprintf(&wide, `{"name":"r%d","type":"Big"}`, i)
 		}
-		fmt.Fprintf(&wide, `{"name":"r%d","type":"Big"}`, i)
-	}
-	wide.WriteString(`]}`)
+		wide.WriteString(`]}`)
 
-	c := new(SchemaCache)
-	if _, err := c.Parse(big.String(), noMatch); err != nil {
-		t.Fatalf("cache parse of the inherited type: %v", err)
-	}
-	wantAcceptUnder(t, "SchemaCache.Parse/many-refs-custom", 400*time.Millisecond, func() error {
-		_, err := c.Parse(wide.String(), noMatch)
-		return err
+		// The inherited type is cached OUTSIDE the timed closure: what this
+		// bound owns is the per-reference walk of an already-cached subtree,
+		// not the parse that put it there. A fresh cache per size, so the
+		// two measurements are of the same operation.
+		c := new(SchemaCache)
+		if _, err := c.Parse(big.String(), noMatch); err != nil {
+			t.Fatalf("cache parse of the inherited type (n=%d): %v", n, err)
+		}
+		text := wide.String()
+		return func() error {
+			_, err := c.Parse(text, noMatch)
+			return err
+		}
 	})
 }
 

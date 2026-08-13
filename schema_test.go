@@ -15168,8 +15168,19 @@ var costCells = []costCell{
 		values:  []int{8, 12}, scaleTol: 32, floor: 2 * time.Second},
 
 	{fn: "TestDoSBattery_C9_CustomTypeParseCost",
+		// The values were 3000 and 6000 while the cell asserted a per-length
+		// ABSOLUTE ceiling, where the separation only had to make the two
+		// ceilings differ. Now that the cell asserts the ratio between them the
+		// separation is the whole instrument, and 2x is the worst usable one:
+		// linear lands at 2 and quadratic at 4, so every tolerance is within
+		// 1.4x of being wrong. At 4x they land at 4 and 16 and the tolerance
+		// below has a factor of two on each side.
+		//
+		// The cell's third arm crosses reference COUNT with the referenced
+		// type's SIZE, which is one magnitude driving two axes at once and has
+		// no place in a single values list; it builds its own scale and says so.
 		factor: "backward-reference chain LENGTH — the per-parse custom-match memo's factor. Without it every stamp walk from Ri reaches R0..R(i-1), so the total is quadratic in this count while the schema text is linear in it",
-		values: []int{3000, 6000}, scaleTol: 4, floor: 200 * time.Millisecond},
+		values: []int{1500, 6000}, scaleTol: 8, floor: 100 * time.Millisecond},
 
 	{fn: "TestDoSBattery_OCF_C1_Header",
 		// In package ocf, which cannot import this registry. Its magnitudes are
@@ -15232,6 +15243,28 @@ func costFactorValues(t *testing.T, fn string) []int {
 	}
 	t.Fatalf("%s is not rowed in costCells — a cost cell must declare the factor it drives", fn)
 	return nil
+}
+
+// costScaleFor returns the named cell's row as a growth claim, so a cell that
+// asserts its own ratio states the same magnitudes and the same tolerance as
+// one handing the whole measurement to wantCostDoesNotScale. Only for a row
+// whose values ARE the two ends of one factor; a row listing the magnitudes of
+// two crossed factors has no single lo/hi and its cell builds its own scale
+// beside the row that records it.
+func costScaleFor(t *testing.T, fn string) costScale {
+	t.Helper()
+	var row costCell
+	for _, c := range costCells {
+		if c.fn == fn {
+			row = c
+		}
+	}
+	vals := costFactorValues(t, fn)
+	lo, hi := vals[0], vals[0]
+	for _, v := range vals {
+		lo, hi = min(lo, v), max(hi, v)
+	}
+	return costScale{lo: lo, hi: hi, tol: float64(row.scaleTol), floor: row.floor}
 }
 
 // wantCostDoesNotScale asserts that the named cell's operation costs about the
@@ -15459,7 +15492,7 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 		// directory while being just as unable to reach this registry as ocf is.
 		if pkg := filePackage(src[bodyFile[fn]]); pkg == "avro" {
 			if !strings.Contains(raw, `"`+fn+`"`) {
-				t.Errorf("%s does not name itself to costFactorValues/wantCostDoesNotScale — its magnitudes are not read from its row, so the row and the cell can disagree.", fn)
+				t.Errorf("%s does not name itself to costFactorValues/costScaleFor/wantCostDoesNotScale — its magnitudes are not read from its row, so the row and the cell can disagree.", fn)
 			}
 		} else {
 			// The magnitudes are checked against the whole FILE, not the test
