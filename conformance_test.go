@@ -19312,11 +19312,18 @@ func TestJSONNumberMapKeyContentValidated(t *testing.T) {
 	// rejected on its FIRST byte, so the cost is flat in the key's length
 	// (1.0 to 1.04 across runs) and not merely linear in it. A tolerance of
 	// 25 would have admitted an implementation that walked the whole megabyte
-	// before deciding, which is the regression this cell is about; 6 admits
-	// the measured spread and nothing else.
+	// before deciding, which is the regression this cell is about.
+	//
+	// 4 and not 6, and the difference was found by re-running the neuter
+	// rather than by argument. Making isJSONNumber walk the key measures 7.9,
+	// and at 6 that left one round's worth of margin: the reported ratio is
+	// the smallest of several rounds, so a single round whose lo side caught a
+	// GC pause was enough to bring the neutered cell in under the limit. At 4
+	// the honest 1.0 still has nearly four times the room it needs and the
+	// neutered 7.9 has to halve before it escapes.
 	t.Run("hostile_key_rejected_fast", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"map","values":"long"}`)
-		wantRejectScales(t, "AppendEncode/hostile-json-number-key", costScale(1<<17, 1<<20, 6, 500*time.Microsecond),
+		wantRejectScales(t, "AppendEncode/hostile-json-number-key", costScale(1<<17, 1<<20, 4, 500*time.Microsecond),
 			func(n int) func() error {
 				in := map[json.Number]int64{json.Number(strings.Repeat("x", n)): 1}
 				return func() error {

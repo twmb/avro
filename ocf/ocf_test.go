@@ -6286,38 +6286,43 @@ type costScale struct {
 const (
 	ocfCostMinSamples   = 3
 	ocfCostMaxSamples   = 25
-	ocfCostSampleBudget = 20 * time.Millisecond
+	ocfCostSampleBudget = 30 * time.Millisecond
 )
 
-// measureOCFCost samples fn and returns the smallest elapsed time, the last
-// error, and the sample count. Both sides of a ratio take the same count, from
-// the expensive one, so a better-converged minimum on one side cannot show up
-// as growth on the other.
-func measureOCFCost(fn func() error, want int) (time.Duration, error, int) {
-	best := time.Duration(1) << 62
+// measureOCFCostPair samples the two sides of a ratio in alternating ROUNDS and
+// returns the pair from the round whose ratio was smallest. The reasoning is
+// written out once beside the core package's copy: a quiet window on a loaded
+// host is a stretch of TIME, so phase-separated sampling lets it lower one
+// side alone, and two independently-taken minima pair a lucky low with an
+// unlucky high that never coexisted. One round is two measurements made
+// microseconds apart under one machine state.
+func measureOCFCostPair(loFn, hiFn func() error) (tLo, tHi time.Duration, errLo, errHi error) {
 	var total time.Duration
-	var err error
-	n := 0
-	for ; n < ocfCostMaxSamples; n++ {
-		if want > 0 {
-			if n >= want {
-				break
-			}
-		} else if n >= ocfCostMinSamples && total >= ocfCostSampleBudget {
+	bestRatio := math.Inf(1)
+	for n := 0; n < ocfCostMaxSamples; n++ {
+		if n >= ocfCostMinSamples && total >= ocfCostSampleBudget {
 			break
 		}
-		start := time.Now()
-		e := fn()
-		d := time.Since(start)
-		total += d
-		if d < best {
-			best = d
+		hiStart := time.Now()
+		if e := hiFn(); e != nil {
+			errHi = e
 		}
-		if e != nil {
-			err = e
+		dHi := time.Since(hiStart)
+		loStart := time.Now()
+		if e := loFn(); e != nil {
+			errLo = e
+		}
+		dLo := time.Since(loStart)
+		total += dHi + dLo
+		r := math.Inf(1)
+		if dLo > 0 {
+			r = float64(dHi) / float64(dLo)
+		}
+		if n == 0 || r < bestRatio {
+			bestRatio, tLo, tHi = r, dLo, dHi
 		}
 	}
-	return best, err, n
+	return tLo, tHi, errLo, errHi
 }
 
 // wantAcceptScales asserts fn accepts at both of sc's sizes and that its cost
@@ -6326,8 +6331,7 @@ func measureOCFCost(fn func() error, want int) (time.Duration, error, int) {
 // stays outside the measurement.
 func wantAcceptScales(t *testing.T, name string, sc costScale, build func(n int) func() error) {
 	t.Helper()
-	tHi, errHi, n := measureOCFCost(build(sc.hi), 0)
-	tLo, errLo, _ := measureOCFCost(build(sc.lo), n)
+	tLo, tHi, errLo, errHi := measureOCFCostPair(build(sc.lo), build(sc.hi))
 	if errLo != nil {
 		t.Errorf("%s (n=%d): %v", name, sc.lo, errLo)
 		return

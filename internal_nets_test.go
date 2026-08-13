@@ -3810,8 +3810,8 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 		pan any
 	}
 	ch := make(chan result, 1)
-	// Under -race the bound gets the same wider ceiling wantAcceptUnder already
-	// takes (see its rationale): instrumentation multiplies a HEALTHY bounded
+	// Under -race the watchdog gets a wider ceiling: instrumentation
+	// multiplies a HEALTHY bounded
 	// walk's wall-clock several-fold — the widest metadata cell runs ~0.5s
 	// unraced and ~4-5s raced with zero data races and normal completion — so
 	// the tight bound false-trips it. The separation these cells rely on is
@@ -4625,28 +4625,21 @@ func TestDoSBattery_C8_DirectByteAPIs(t *testing.T) {
 	})
 }
 
-// wantAcceptUnder asserts fn ACCEPTS (nil error) within bound. The C9 cells pin
-// a complexity CLASS on the accept path, so unlike the reject cells they carry
-// per-cell absolute bounds: generous multiples of the healthy cost yet far below
-// the quadratic the bound exists to catch, the two sitting an order of magnitude
-// apart. Under -race the bound gets the same ~3s ceiling every other wall-clock
-// cell takes (see avro_test's raceRelaxed): instrumentation puts the healthy
-// linear cost past the tight bound — ~350ms observed for the 200ms chain cells —
-// while the quadratic classes are multi-second under -race.
-func wantAcceptUnder(t *testing.T, name string, bound time.Duration, fn func() error) {
-	t.Helper()
-	bound = raceRelaxed(bound)
-	start := time.Now()
-	err := fn()
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Errorf("%s: %v", name, err)
-		return
-	}
-	if elapsed > bound {
-		t.Errorf("%s: took %v (> %v) — the pass lost its complexity bound at this size", name, elapsed, bound)
-	}
-}
+// wantAcceptUnder — "fn ACCEPTS within an absolute wall-clock bound" — is GONE,
+// and its absence is the shape of this change rather than a tidy-up. Every one
+// of its thirty-eight callers was a cell pinning a complexity CLASS on the
+// accept path, which is the one thing an absolute ceiling cannot express; all
+// thirty-eight now state their claim as a growth ratio through
+// wantAcceptScales. The absolutes that remain are not this shape — they are
+// watchdogs asking whether work RETURNS (dosRun, hangDeadline, the
+// hostile-extras probe) and one cell with no magnitude to drive — so nothing is
+// left for an accept-under-a-ceiling helper to do.
+//
+// The NAME stays in the two source-derived vocabularies that classify timing
+// cells (batteryCellLabel and TestInvariant_EveryCostCellDrivesItsFactor's
+// harness list). A helper that reappeared under that name would be an absolute
+// ceiling again, and the guards should recognise it as a timing cell the moment
+// it does, rather than the round after someone notices.
 
 // ---- growth ratios: the form a complexity claim takes -----------------------
 
@@ -4730,46 +4723,94 @@ func costFactorString(f float64) string {
 // the stray-key cells drifted between 3.5x and 6.3x on three samples for a cost
 // that is 4x. A cell whose call runs tens of milliseconds needs few, because its
 // own size averages the noise out, and more samples would only spend wall clock.
-// So: at least costMinSamples, then keep sampling while the size has cost less
-// than costSampleBudget in total, up to costMaxSamples. Both ends are bounded,
-// so the added wall clock per cell is bounded too.
+// So: at least costMinSamples, then keep sampling while the PAIR has cost less
+// than costSampleBudget in total, up to costMaxSamples each. Both ends are
+// bounded, so the added wall clock per cell is bounded too.
 const (
 	costMinSamples   = 3
 	costMaxSamples   = 25
-	costSampleBudget = 20 * time.Millisecond
+	costSampleBudget = 30 * time.Millisecond
 )
 
-// The two sides of a ratio are sampled the SAME number of times, and the count
-// comes from the expensive one. A minimum converges on the true cost from above
-// as samples accumulate, so a side sampled twenty-five times has converged
-// further than one sampled four — and if that side is the denominator, the ratio
-// is inflated by the difference rather than by anything the code did. The
-// SchemaFor depth cell showed it: 25 samples on the cheap side against 5 on the
-// dear one moved its measured ratio between 14 and 20 run to run, for a cost
-// that had not changed. Taking the count from the hi side also errs the safe
-// way when it is small, since a less-converged denominator makes the ratio
-// smaller, never larger.
-
-// measureCost samples fn adaptively and returns the smallest elapsed time, the
-// last error it saw, and how many samples it took, so a caller comparing two
-// costs can sample the second one the same number of times.
-func measureCost(fn func() error) (time.Duration, error, int) {
-	return measureCostN(fn, 0)
+// measureCostPair samples the two sides of a ratio in alternating ROUNDS — hi
+// then lo, hi then lo — and returns the pair from the round whose ratio was
+// smallest.
+//
+// Both halves of that matter, and both were arrived at by measuring under a
+// deliberately oversubscribed host rather than by reasoning.
+//
+// Interleaving first. A quiet window on a contended machine is a stretch of
+// TIME, so measuring one side to completion before starting the other lets a
+// quiet stretch fall entirely inside one side's phase and lower that side's
+// minimum alone. With the sides measured in phases, twenty-four spinning
+// workers at GOMAXPROCS=2 put a 4x linear cost ratio at 24. Alternating offers
+// every window to both sides.
+//
+// Then the pair, rather than two independent minima. Interleaving is not enough
+// on its own, because the two sides do not suffer contention equally: a working
+// set that grows with the magnitude does not share a cache proportionally, so
+// under memory-bandwidth pressure the hi side's minimum inflates more than the
+// lo side's, and combining the two sides' best-ever samples pairs a lucky lo
+// with an unlucky hi that never coexisted. Taking the smallest ratio from a
+// single round compares two measurements made microseconds apart under one
+// machine state, which is the comparison the assertion claims to be making.
+//
+// It biases the reported ratio DOWNWARD, and that is the safe direction and not
+// a loophole: the growth being hunted is a property of the code, so it is
+// present in every round. A quadratic pass is 16x in the quiet rounds too — the
+// neuters measure 16x to 3478x, and the least-contended round reports the same
+// thing the others do.
+//
+// Both sides take the same number of samples, which independent per-side
+// sampling did not guarantee. A minimum converges from above as samples
+// accumulate, so a side sampled twenty-five times has converged further than one
+// sampled four, and if that side is the denominator the ratio is inflated by the
+// difference rather than by anything the code did. The SchemaFor depth cell
+// showed that one: 25 against 5 moved its ratio between 14 and 20 for a cost
+// that had not changed.
+func measureCostPair(loFn, hiFn func() error) (tLo, tHi time.Duration, errLo, errHi error) {
+	var total time.Duration
+	bestRatio := math.Inf(1)
+	for n := 0; n < costMaxSamples; n++ {
+		if n >= costMinSamples && total >= costSampleBudget {
+			break
+		}
+		hiStart := time.Now()
+		if e := hiFn(); e != nil {
+			errHi = e
+		}
+		dHi := time.Since(hiStart)
+		loStart := time.Now()
+		if e := loFn(); e != nil {
+			errLo = e
+		}
+		dLo := time.Since(loStart)
+		total += dHi + dLo
+		// A zero lo-side sample is below the clock's resolution, so this round
+		// has no ratio to offer; keep the pair only if nothing better has been
+		// seen, so the caller still gets real durations to report.
+		r := math.Inf(1)
+		if dLo > 0 {
+			r = float64(dHi) / float64(dLo)
+		}
+		if n == 0 || r < bestRatio {
+			bestRatio, tLo, tHi = r, dLo, dHi
+		}
+	}
+	return tLo, tHi, errLo, errHi
 }
 
-// measureCostN is measureCost with the sample count fixed; want <= 0 means
-// adaptive.
-func measureCostN(fn func() error, want int) (time.Duration, error, int) {
+// measureCost samples fn adaptively and returns the smallest elapsed time and
+// the last error it saw. For a cell whose two costs are not two calls of one
+// closure — the embed-diamond depths are carried by distinct Go TYPES — the
+// caller pairs two of these itself and accepts that they are not interleaved.
+func measureCost(fn func() error) (time.Duration, error, int) {
 	best := time.Duration(1) << 62
 	var total time.Duration
 	var err error
 	n := 0
 	for ; n < costMaxSamples; n++ {
-		if want > 0 {
-			if n >= want {
-				break
-			}
-		} else if n >= costMinSamples && total >= costSampleBudget {
+		if n >= costMinSamples && total >= costSampleBudget {
 			break
 		}
 		start := time.Now()
@@ -4784,6 +4825,23 @@ func measureCostN(fn func() error, want int) (time.Duration, error, int) {
 		}
 	}
 	return best, err, n
+}
+
+// measureCostN is measureCost with the sample count fixed.
+func measureCostN(fn func() error, want int) (time.Duration, error, int) {
+	best := time.Duration(1) << 62
+	var err error
+	for n := 0; n < want; n++ {
+		start := time.Now()
+		e := fn()
+		if d := time.Since(start); d < best {
+			best = d
+		}
+		if e != nil {
+			err = e
+		}
+	}
+	return best, err, want
 }
 
 // wantCostScales is the assertion the accept and reject forms share: cost at
@@ -4822,8 +4880,7 @@ func wantCostScales(t *testing.T, name string, sc costScale, tLo, tHi time.Durat
 // error; it is how a cell ends up timing a parse instead of the walk it names.
 func wantAcceptScales(t *testing.T, name string, sc costScale, build func(n int) func() error) {
 	t.Helper()
-	tHi, errHi, n := measureCost(build(sc.hi))
-	tLo, errLo, _ := measureCostN(build(sc.lo), n)
+	tLo, tHi, errLo, errHi := measureCostPair(build(sc.lo), build(sc.hi))
 	if errLo != nil {
 		t.Errorf("%s (n=%d): %v", name, sc.lo, errLo)
 		return
@@ -4842,8 +4899,7 @@ func wantAcceptScales(t *testing.T, name string, sc costScale, build func(n int)
 // reaches the check is what the bound caps, and one size cannot see it.
 func wantRejectScales(t *testing.T, name string, sc costScale, build func(n int) func() error) {
 	t.Helper()
-	tHi, errHi, n := measureCost(build(sc.hi))
-	tLo, errLo, _ := measureCostN(build(sc.lo), n)
+	tLo, tHi, errLo, errHi := measureCostPair(build(sc.lo), build(sc.hi))
 	if errLo == nil {
 		t.Errorf("%s (n=%d): hostile input was accepted (want a fast rejection)", name, sc.lo)
 		return
