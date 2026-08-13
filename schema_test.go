@@ -12073,33 +12073,40 @@ func TestRegression_NonUnionBranchesInertInRebuild(t *testing.T) {
 // because a pass that scans the sibling list once per sibling turns an O(n)
 // input into O(n^2) work.
 //
-// The bounds are absolute wall-clock, not ratios: a ratio between two sizes is
-// noise-sensitive on a loaded host, while the two complexity classes these
-// separate are orders of magnitude apart at the sizes driven.
+// Every cell here therefore asserts a RATIO between two sibling counts, not an
+// absolute wall-clock ceiling. The claim is "linear in the sibling count", which
+// is a statement about how cost RESPONDS to that count; a single size cannot
+// make it, because a ceiling generous enough for the linear cost at 20000 is
+// generous enough for the quadratic cost at some smaller count. It is also the
+// only form that survives the machine: this column shared a run with ocf's
+// package, and TestDoSBattery_C10b_FieldLookupBreadth reported 882ms against a
+// 500ms ceiling on code that was correct. See costScale in dos_battery_test.go.
 
-// breadthN is the sibling count every cell drives. It is chosen so that a
-// quadratic pass takes seconds while a linear one takes tens of milliseconds,
-// leaving room for a loaded host and for the race detector's instrumentation
-// without either class being mistaken for the other.
-const breadthN = 20000
+// breadthN is the sibling count every cell drives at the top of its range, and
+// breadthLoN is the bottom. 20000 is chosen so a quadratic pass takes seconds
+// while a linear one takes tens of milliseconds; the 4x separation between them
+// puts a linear pass at 4 and a quadratic one at 16, far enough apart that the
+// tolerance between has a factor of two on each side.
+const (
+	breadthN   = 20000
+	breadthLoN = breadthN / 4
+)
 
-// breadthBound is the per-cell ceiling. wantAcceptUnder raises it under -race.
-const breadthBound = 500 * time.Millisecond
-
-// breadthParseBound is the ceiling for the two cells that parse the schema TEXT
-// rather than walking an already-parsed tree.
+// breadthScale is the growth claim every cell in this column makes. The
+// tolerance is the geometric mean of the linear ratio (4) and the quadratic one
+// (16); the floor is the cost below which the measurement is noise rather than
+// work, and it is far under the quadratic this column exists to catch, which
+// measured 1.9s to 32s at breadthN.
 //
-// A bound only separates linear from quadratic if it sits far above the linear
-// cost, and those two do not qualify at breadthBound: a 20000-branch union is
-// close to a megabyte of JSON, and parsing it is ~140ms (Parse) and ~300ms
-// (SchemaCache.Parse) of measured-linear work, doubling with the branch count.
-// At 500ms those cells sat within 1.7x of their own linear cost, so a merely
-// BUSY host crossed the line and reported a complexity change that had not
-// happened. The quadratic this column exists to catch measured 1.9s to 32s at
-// this size, so the ceiling still separates the two classes by more than 2x on
-// each side. Every other cell walks a parsed tree in tens of milliseconds and
-// keeps the tighter bound.
-const breadthParseBound = 1500 * time.Millisecond
+// One scale serves the whole column, including the two cells that parse the
+// schema TEXT rather than walking a parsed tree. Those two used to need a
+// ceiling of their own: a 20000-branch union is close to a megabyte of JSON and
+// parsing it is ~140ms (Parse) and ~300ms (SchemaCache.Parse) of measured-linear
+// work, so at a 500ms ceiling they sat within 1.7x of their own healthy cost and
+// a merely BUSY host crossed the line. Growth does not have that problem —
+// their linear cost lands at 4 whatever the machine is doing — so the second
+// constant is gone rather than retuned.
+var breadthScale = costScale{lo: breadthLoN, hi: breadthN, tol: 8, floor: 50 * time.Millisecond}
 
 //////////////////////////////////////////////////////////////////////////////
 // The entry-point axis, derived from the battery's other columns
@@ -12111,7 +12118,7 @@ const breadthParseBound = 1500 * time.Millisecond
 // than being covered by whoever remembers to add it. batteryCellLabel matches a
 // battery cell's name argument; every cell is named "<entry point>/<case>", which
 // is what makes the entry-point axis recoverable from source.
-var batteryCellLabel = regexp.MustCompile(`want(?:Reject|RejectIs|Terminate|BoundedErr|AcceptUnder)\(t, "([^"/]+)`)
+var batteryCellLabel = regexp.MustCompile(`want(?:RejectIs|RejectScales|Reject|Terminate|BoundedErr|AcceptUnder|AcceptScales)\(t, "([^"/]+)`)
 
 // breadthEntryAlias folds the spellings the battery uses for one entry point
 // onto a single name. A cell label names the call the cell makes, so the same
@@ -12351,27 +12358,39 @@ func TestRegression_UnionTagTierShapesReachTheirTier(t *testing.T) {
 // parse time is the observable.
 func TestDoSBattery_C10a_UnionTagBreadth(t *testing.T) {
 	for _, s := range breadthTierShapes {
-		union := s.build(breadthN)
-		schema := `{"type":"record","name":"Top","fields":[{"name":"f","type":` + union + `}]}`
-
-		wantAcceptUnder(t, "Parse/wide-union-"+s.tier, breadthParseBound, func() error {
-			_, err := Parse(schema)
-			return err
-		})
-		wantAcceptUnder(t, "SchemaCache.Parse/wide-union-"+s.tier, breadthParseBound, func() error {
-			var c SchemaCache
-			_, err := c.Parse(schema)
-			return err
-		})
+		schema := func(n int) string {
+			return `{"type":"record","name":"Top","fields":[{"name":"f","type":` + s.build(n) + `}]}`
+		}
 		// A forward-referenced branch leaves buildUnion with an unbound node,
 		// so finalizeUnionNames rebuilds the tables over the resolved nodes —
 		// a SECOND full build of the same tables, through the same tiers.
-		fwd := `{"type":"record","name":"Top","fields":[` +
-			`{"name":"a","type":"a.Fwd"},` +
-			`{"name":"f","type":` + union[:len(union)-1] + `,{"type":"record","name":"a.Fwd","fields":[]}]}]}`
-		wantAcceptUnder(t, "Parse/wide-union-forward-ref-"+s.tier, breadthParseBound, func() error {
-			_, err := Parse(fwd)
-			return err
+		fwd := func(n int) string {
+			union := s.build(n)
+			return `{"type":"record","name":"Top","fields":[` +
+				`{"name":"a","type":"a.Fwd"},` +
+				`{"name":"f","type":` + union[:len(union)-1] + `,{"type":"record","name":"a.Fwd","fields":[]}]}]}`
+		}
+		wantAcceptScales(t, "Parse/wide-union-"+s.tier, breadthScale, func(n int) func() error {
+			text := schema(n)
+			return func() error {
+				_, err := Parse(text)
+				return err
+			}
+		})
+		wantAcceptScales(t, "SchemaCache.Parse/wide-union-"+s.tier, breadthScale, func(n int) func() error {
+			text := schema(n)
+			return func() error {
+				var c SchemaCache
+				_, err := c.Parse(text)
+				return err
+			}
+		})
+		wantAcceptScales(t, "Parse/wide-union-forward-ref-"+s.tier, breadthScale, func(n int) func() error {
+			text := fwd(n)
+			return func() error {
+				_, err := Parse(text)
+				return err
+			}
 		})
 	}
 }
@@ -12602,24 +12621,37 @@ func TestRegression_BreadthFieldShapesReachTheResolvedPath(t *testing.T) {
 // every entry point that reaches the lookup.
 func TestDoSBattery_C10b_FieldLookupBreadth(t *testing.T) {
 	for _, s := range breadthFieldShapes {
-		w, err := Parse(s.writer(breadthN))
-		if err != nil {
-			t.Fatalf("%s writer: %v", s.name, err)
+		// The two schemas are parsed per size and OUTSIDE the timed closure:
+		// the parse is linear in a text that grows with the field count, so
+		// timing it here would put a second linear cost beside the lookup this
+		// cell exists to bound and dilute the growth signal it is reading.
+		pair := func(n int) (w, r *Schema) {
+			w, err := Parse(s.writer(n))
+			if err != nil {
+				t.Fatalf("%s writer: %v", s.name, err)
+			}
+			r, err = Parse(s.reader(n))
+			if err != nil {
+				t.Fatalf("%s reader: %v", s.name, err)
+			}
+			return w, r
 		}
-		r, err := Parse(s.reader(breadthN))
-		if err != nil {
-			t.Fatalf("%s reader: %v", s.name, err)
-		}
-		wantAcceptUnder(t, "Resolve/wide-record-"+s.name, breadthBound, func() error {
-			_, err := Resolve(w, r)
-			return err
+		wantAcceptScales(t, "Resolve/wide-record-"+s.name, breadthScale, func(n int) func() error {
+			w, r := pair(n)
+			return func() error {
+				_, err := Resolve(w, r)
+				return err
+			}
 		})
-		wantAcceptUnder(t, "CheckCompatibility/wide-record-"+s.name, breadthBound, func() error {
-			// A reader field the writer lacks needs a default, so the miss
-			// shape is legitimately incompatible; the cost is the question
-			// here, not the verdict.
-			CheckCompatibility(w, r)
-			return nil
+		wantAcceptScales(t, "CheckCompatibility/wide-record-"+s.name, breadthScale, func(n int) func() error {
+			w, r := pair(n)
+			return func() error {
+				// A reader field the writer lacks needs a default, so the miss
+				// shape is legitimately incompatible; the cost is the question
+				// here, not the verdict.
+				CheckCompatibility(w, r)
+				return nil
+			}
 		})
 	}
 }
@@ -12635,71 +12667,138 @@ func TestDoSBattery_C10b_FieldLookupBreadth(t *testing.T) {
 // the schema, so each of these passes over the field list once per call and
 // must stay linear in it.
 func TestDoSBattery_C10c_WideRecordSurfaces(t *testing.T) {
-	text := breadthLongFields("f", nil, false)(breadthN)
-	s := mustParse(t, text)
-	val := make(map[string]any, breadthN)
-	for i := range breadthN {
-		val[fmt.Sprintf("f%d", i)] = int64(i)
-	}
-	wire := mustEncode(t, s, val)
-	jsonWire := mustEncodeJSON(t, s, val)
-	soe := mustAppendSingleObject(t, s, nil, val)
+	// One fixture per size, built once and shared by every cell below: the
+	// parse, the datum and the three wire forms are what the magnitude needs,
+	// not what any of these bounds owns, so they are built outside the timed
+	// closures. Memoized because eleven cells x two sizes would otherwise
+	// rebuild the same two fixtures twenty-two times.
+	at := breadthWideRecordFixtures(t)
 
-	wantAcceptUnder(t, "Encode/wide-record", breadthBound, func() error {
-		_, err := s.Encode(val)
-		return err
-	})
-	wantAcceptUnder(t, "Decode/wide-record", breadthBound, func() error {
-		var out map[string]any
-		_, err := s.Decode(wire, &out)
-		return err
-	})
-	wantAcceptUnder(t, "EncodeJSON/wide-record", breadthBound, func() error {
-		_, err := s.EncodeJSON(val)
-		return err
-	})
-	wantAcceptUnder(t, "DecodeJSON/wide-record", breadthBound, func() error {
-		var out map[string]any
-		return s.DecodeJSON(jsonWire, &out)
-	})
-	wantAcceptUnder(t, "AppendSingleObject/wide-record", breadthBound, func() error {
-		_, err := s.AppendSingleObject(nil, val)
-		return err
-	})
-	wantAcceptUnder(t, "DecodeSingleObject/wide-record", breadthBound, func() error {
-		var out map[string]any
-		_, err := s.DecodeSingleObject(soe, &out)
-		return err
-	})
-	wantAcceptUnder(t, "Canonical/wide-record", breadthBound, func() error {
-		if len(s.Canonical()) == 0 {
-			return fmt.Errorf("empty canonical form")
+	wantAcceptScales(t, "Encode/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			_, err := f.s.Encode(f.val)
+			return err
 		}
-		return nil
 	})
-	wantAcceptUnder(t, "Fingerprint/wide-record", breadthBound, func() error {
-		if len(s.Fingerprint(crypto.SHA256.New())) == 0 {
-			return fmt.Errorf("empty fingerprint")
+	wantAcceptScales(t, "Decode/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			var out map[string]any
+			_, err := f.s.Decode(f.wire, &out)
+			return err
 		}
-		return nil
 	})
-	wantAcceptUnder(t, "String/wide-record", breadthBound, func() error {
-		if len(s.String()) == 0 {
-			return fmt.Errorf("empty string form")
+	wantAcceptScales(t, "EncodeJSON/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			_, err := f.s.EncodeJSON(f.val)
+			return err
 		}
-		return nil
 	})
-	wantAcceptUnder(t, "Root/wide-record", breadthBound, func() error {
-		if len(s.Root().Fields) != breadthN {
-			return fmt.Errorf("Root surfaced %d fields, want %d", len(s.Root().Fields), breadthN)
+	wantAcceptScales(t, "DecodeJSON/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			var out map[string]any
+			return f.s.DecodeJSON(f.jsonWire, &out)
 		}
-		return nil
 	})
-	root := s.Root()
-	wantAcceptUnder(t, "SchemaNode.Schema/wide-record", breadthBound, func() error {
-		_, err := root.Schema()
-		return err
+	wantAcceptScales(t, "AppendSingleObject/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			_, err := f.s.AppendSingleObject(nil, f.val)
+			return err
+		}
 	})
+	wantAcceptScales(t, "DecodeSingleObject/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			var out map[string]any
+			_, err := f.s.DecodeSingleObject(f.soe, &out)
+			return err
+		}
+	})
+	wantAcceptScales(t, "Canonical/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			if len(f.s.Canonical()) == 0 {
+				return fmt.Errorf("empty canonical form")
+			}
+			return nil
+		}
+	})
+	wantAcceptScales(t, "Fingerprint/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			if len(f.s.Fingerprint(crypto.SHA256.New())) == 0 {
+				return fmt.Errorf("empty fingerprint")
+			}
+			return nil
+		}
+	})
+	wantAcceptScales(t, "String/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			if len(f.s.String()) == 0 {
+				return fmt.Errorf("empty string form")
+			}
+			return nil
+		}
+	})
+	wantAcceptScales(t, "Root/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			if len(f.s.Root().Fields) != n {
+				return fmt.Errorf("Root surfaced %d fields, want %d", len(f.s.Root().Fields), n)
+			}
+			return nil
+		}
+	})
+	wantAcceptScales(t, "SchemaNode.Schema/wide-record", breadthScale, func(n int) func() error {
+		f := at(n)
+		return func() error {
+			_, err := f.root.Schema()
+			return err
+		}
+	})
+}
+
+// breadthWideRecord is one size's worth of the wide-record fixture: the parsed
+// schema, a datum with one entry per field, and that datum's three wire forms.
+type breadthWideRecord struct {
+	s        *Schema
+	root     *SchemaNode
+	val      map[string]any
+	wire     []byte
+	jsonWire []byte
+	soe      []byte
+}
+
+// breadthWideRecordFixtures returns a memoizing accessor for the fixture at a
+// given field count.
+func breadthWideRecordFixtures(t *testing.T) func(n int) *breadthWideRecord {
+	t.Helper()
+	built := map[int]*breadthWideRecord{}
+	return func(n int) *breadthWideRecord {
+		if f, ok := built[n]; ok {
+			return f
+		}
+		s := mustParse(t, breadthLongFields("f", nil, false)(n))
+		val := make(map[string]any, n)
+		for i := range n {
+			val[fmt.Sprintf("f%d", i)] = int64(i)
+		}
+		f := &breadthWideRecord{
+			s:        s,
+			root:     s.Root(),
+			val:      val,
+			wire:     mustEncode(t, s, val),
+			jsonWire: mustEncodeJSON(t, s, val),
+			soe:      mustAppendSingleObject(t, s, nil, val),
+		}
+		built[n] = f
+		return f
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -12960,114 +13059,199 @@ func TestInvariant_EveryBreadthSiblingKindIsCelled(t *testing.T) {
 func TestDoSBattery_C10d_SiblingKindSurfaces(t *testing.T) {
 	for _, kind := range breadthSiblingKinds {
 		t.Run(kind.field, func(t *testing.T) {
-			text := kind.schema(breadthN)
-			s, err := Parse(text)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
-			twinText := kind.twin(breadthN)
-			twin, err := Parse(twinText)
-			if err != nil {
-				t.Fatalf("parse twin: %v", err)
-			}
-			// A twin canonically equal to the schema takes Resolve's equality
-			// short-circuit, and the resolve cells would time that instead of
-			// the sibling matching they exist to bound.
-			if string(s.Canonical()) == string(twin.Canonical()) {
-				t.Fatal("the twin is canonically equal to the schema, so the resolve cells would time the equality short-circuit rather than the match")
-			}
-			val := kind.value(breadthN)
-			wire, err := s.Encode(val)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			jsonWire, err := s.EncodeJSON(val)
-			if err != nil {
-				t.Fatalf("encode json: %v", err)
-			}
-			soe, err := s.AppendSingleObject(nil, val)
-			if err != nil {
-				t.Fatalf("single object: %v", err)
-			}
-
+			at := breadthSiblingFixtures(t, kind)
 			label := func(entry string) string { return entry + "/wide-" + kind.field }
-			wantAcceptUnder(t, label("Parse"), breadthParseBound, func() error {
-				_, err := Parse(text)
-				return err
+
+			wantAcceptScales(t, label("Parse"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					_, err := Parse(f.text)
+					return err
+				}
 			})
-			wantAcceptUnder(t, label("SchemaCache.Parse"), breadthParseBound, func() error {
-				var c SchemaCache
-				_, err := c.Parse(text)
-				return err
+			wantAcceptScales(t, label("SchemaCache.Parse"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					var c SchemaCache
+					_, err := c.Parse(f.text)
+					return err
+				}
 			})
-			wantAcceptUnder(t, label("Resolve"), breadthBound, func() error {
-				_, err := Resolve(twin, s)
-				return err
+			wantAcceptScales(t, label("Resolve"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					_, err := Resolve(f.twin, f.s)
+					return err
+				}
 			})
-			wantAcceptUnder(t, label("CheckCompatibility"), breadthBound, func() error {
-				return CheckCompatibility(twin, s)
+			wantAcceptScales(t, label("CheckCompatibility"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error { return CheckCompatibility(f.twin, f.s) }
 			})
-			wantAcceptUnder(t, label("Encode"), breadthBound, func() error {
-				_, err := s.Encode(val)
-				return err
+			wantAcceptScales(t, label("Encode"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					_, err := f.s.Encode(f.val)
+					return err
+				}
 			})
-			wantAcceptUnder(t, label("Decode"), breadthBound, func() error {
-				var out any
-				_, err := s.Decode(wire, &out)
-				return err
+			wantAcceptScales(t, label("Decode"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					var out any
+					_, err := f.s.Decode(f.wire, &out)
+					return err
+				}
 			})
-			wantAcceptUnder(t, label("EncodeJSON"), breadthBound, func() error {
-				_, err := s.EncodeJSON(val)
-				return err
+			wantAcceptScales(t, label("EncodeJSON"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					_, err := f.s.EncodeJSON(f.val)
+					return err
+				}
 			})
-			wantAcceptUnder(t, label("DecodeJSON"), breadthBound, func() error {
-				var out any
-				return s.DecodeJSON(jsonWire, &out)
+			wantAcceptScales(t, label("DecodeJSON"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					var out any
+					return f.s.DecodeJSON(f.jsonWire, &out)
+				}
 			})
 			// The tagged form routes every value through the union tag table
 			// rather than through try-each, which is the consumer the bare
 			// form never reaches.
-			wantAcceptUnder(t, label("DecodeJSON+TaggedUnions"), breadthBound, func() error {
-				var out any
-				return s.DecodeJSON(jsonWire, &out, TaggedUnions())
-			})
-			wantAcceptUnder(t, label("AppendSingleObject"), breadthBound, func() error {
-				_, err := s.AppendSingleObject(nil, val)
-				return err
-			})
-			wantAcceptUnder(t, label("DecodeSingleObject"), breadthBound, func() error {
-				var out any
-				_, err := s.DecodeSingleObject(soe, &out)
-				return err
-			})
-			wantAcceptUnder(t, label("Canonical"), breadthBound, func() error {
-				if len(s.Canonical()) == 0 {
-					return fmt.Errorf("empty canonical form")
+			wantAcceptScales(t, label("DecodeJSON+TaggedUnions"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					var out any
+					return f.s.DecodeJSON(f.jsonWire, &out, TaggedUnions())
 				}
-				return nil
 			})
-			wantAcceptUnder(t, label("Fingerprint"), breadthBound, func() error {
-				if len(s.Fingerprint(crypto.SHA256.New())) == 0 {
-					return fmt.Errorf("empty fingerprint")
+			wantAcceptScales(t, label("AppendSingleObject"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					_, err := f.s.AppendSingleObject(nil, f.val)
+					return err
 				}
-				return nil
 			})
-			wantAcceptUnder(t, label("String"), breadthBound, func() error {
-				if len(s.String()) == 0 {
-					return fmt.Errorf("empty string form")
+			wantAcceptScales(t, label("DecodeSingleObject"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					var out any
+					_, err := f.s.DecodeSingleObject(f.soe, &out)
+					return err
 				}
-				return nil
 			})
-			var root SchemaNode
-			wantAcceptUnder(t, label("Root"), breadthBound, func() error {
-				root = *s.Root()
-				return nil
+			wantAcceptScales(t, label("Canonical"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					if len(f.s.Canonical()) == 0 {
+						return fmt.Errorf("empty canonical form")
+					}
+					return nil
+				}
 			})
-			wantAcceptUnder(t, label("SchemaNode.Schema"), breadthBound, func() error {
-				_, err := root.Schema()
-				return err
+			wantAcceptScales(t, label("Fingerprint"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					if len(f.s.Fingerprint(crypto.SHA256.New())) == 0 {
+						return fmt.Errorf("empty fingerprint")
+					}
+					return nil
+				}
+			})
+			wantAcceptScales(t, label("String"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					if len(f.s.String()) == 0 {
+						return fmt.Errorf("empty string form")
+					}
+					return nil
+				}
+			})
+			// Root and SchemaNode.Schema are two cells, not one: Root builds
+			// the metadata tree and Schema re-emits it, so each has to grow
+			// with the sibling count on its own. Schema's input is the tree
+			// Root produced, which is fixture setup for that cell and is built
+			// here rather than inside its timed closure.
+			wantAcceptScales(t, label("Root"), breadthScale, func(n int) func() error {
+				f := at(n)
+				return func() error {
+					if f.s.Root() == nil {
+						return fmt.Errorf("nil root")
+					}
+					return nil
+				}
+			})
+			wantAcceptScales(t, label("SchemaNode.Schema"), breadthScale, func(n int) func() error {
+				root := *at(n).s.Root()
+				return func() error {
+					_, err := root.Schema()
+					return err
+				}
 			})
 		})
+	}
+}
+
+// breadthSiblingFixture is one size's worth of a sibling kind: its schema text
+// and parsed form, the twin the resolve cells match against, a datum, and that
+// datum's three wire forms.
+type breadthSiblingFixture struct {
+	text     string
+	s        *Schema
+	twin     *Schema
+	val      any
+	wire     []byte
+	jsonWire []byte
+	soe      []byte
+}
+
+// breadthSiblingFixtures returns a memoizing accessor for one kind's fixture at
+// a given sibling count. Everything it builds is what the magnitude needs and
+// not what any cell's bound owns, so building it here keeps it out of the timed
+// closures; memoizing keeps seventeen cells from rebuilding the same two.
+func breadthSiblingFixtures(t *testing.T, kind breadthSiblingKind) func(n int) *breadthSiblingFixture {
+	t.Helper()
+	built := map[int]*breadthSiblingFixture{}
+	return func(n int) *breadthSiblingFixture {
+		if f, ok := built[n]; ok {
+			return f
+		}
+		text := kind.schema(n)
+		s, err := Parse(text)
+		if err != nil {
+			t.Fatalf("parse (n=%d): %v", n, err)
+		}
+		twin, err := Parse(kind.twin(n))
+		if err != nil {
+			t.Fatalf("parse twin (n=%d): %v", n, err)
+		}
+		// A twin canonically equal to the schema takes Resolve's equality
+		// short-circuit, and the resolve cells would time that instead of
+		// the sibling matching they exist to bound. Checked at every size:
+		// a twin that diverges only at the larger one leaves the smaller
+		// cell timing the short-circuit, which is the denominator of every
+		// ratio this kind reports.
+		if string(s.Canonical()) == string(twin.Canonical()) {
+			t.Fatalf("the twin is canonically equal to the schema at n=%d, so the resolve cells would time the equality short-circuit rather than the match", n)
+		}
+		val := kind.value(n)
+		wire, err := s.Encode(val)
+		if err != nil {
+			t.Fatalf("encode (n=%d): %v", n, err)
+		}
+		jsonWire, err := s.EncodeJSON(val)
+		if err != nil {
+			t.Fatalf("encode json (n=%d): %v", n, err)
+		}
+		soe, err := s.AppendSingleObject(nil, val)
+		if err != nil {
+			t.Fatalf("single object (n=%d): %v", n, err)
+		}
+		f := &breadthSiblingFixture{text: text, s: s, twin: twin, val: val, wire: wire, jsonWire: jsonWire, soe: soe}
+		built[n] = f
+		return f
 	}
 }
 
@@ -15224,7 +15408,10 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 	// absolute ceiling stayed invisible. time.Since( is in the set because a cell
 	// may time inline rather than through a named helper, and a timing cell that
 	// does so is still one — leaving it out would let an exemption sit on it.
-	harnesses := []string{"wantTerminate(", "dosRun(", "wantCostDoesNotScale(", "wantAcceptUnder(", "time.Since("}
+	// The two Scales forms are the growth harness a complexity claim takes; they
+	// are timing cells like any other, and an exemption must not be able to sit
+	// on one by preferring the ratio form over the ceiling form.
+	harnesses := []string{"wantTerminate(", "dosRun(", "wantCostDoesNotScale(", "wantAcceptUnder(", "wantAcceptScales(", "wantRejectScales(", "time.Since("}
 	takesHarness := func(code string) bool {
 		for _, h := range harnesses {
 			if strings.Contains(code, h) {
