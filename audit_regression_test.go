@@ -2443,28 +2443,42 @@ func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
 // deeply-nested schema took ~22s to parse-then-reject. A linear pre-scan now
 // rejects past maxSchemaJSONDepth first; its limit clears the provable ceiling
 // of a build-acceptable schema by a full maxDepth, so a valid deep schema is
-// never falsely rejected. The timing assertion runs only without -race.
+// never falsely rejected.
+//
+// O(input) against O(N^2) is a claim about the DEPTH, so the cell drives two
+// depths past the limit and asserts the ratio. It pinned depth 50000 against a
+// 2s ceiling, which the quadratic unmarshal of a shallower over-limit schema
+// also passes — and the ceiling was skipped under -race besides, so in that
+// mode nothing measured the cost at all.
+//
+// The answer the pre-scan gives is stronger than linear and worth stating: it
+// stops at bracket 4001, so BOTH depths cost the same and the ratio is 1
+// (measured 0.88). Depth stops mattering once it is past the limit, which is
+// exactly the property, and it is invisible to a cell driving one depth. The
+// quadratic unmarshal, which ran over the whole input before the guard fired,
+// would be 64 across this range.
 func TestRegression_DeepSchemaNestingRejectedInBoundedTime(t *testing.T) {
 	arrayNest := func(d int) string {
 		return strings.Repeat(`{"type":"array","items":`, d) + `"int"` + strings.Repeat(`}`, d)
 	}
 
-	// A schema nested far past the limit must be REJECTED, and (without -race)
-	// quickly — pre-fix this 1.25 MB input ran the O(n^2) unmarshal for many
-	// seconds; the pre-scan rejects it in O(input).
-	huge := arrayNest(50000)
-	start := time.Now()
-	_, err := avro.Parse(huge)
-	elapsed := time.Since(start)
-	if err == nil {
+	// A schema nested far past the limit must be REJECTED, with a nesting-depth
+	// error, and the rejection must cost the input rather than its square —
+	// pre-fix the 1.25 MB input at the top of this range ran the O(n^2)
+	// unmarshal for many seconds before the depth guard ever fired.
+	if _, err := avro.Parse(arrayNest(50000)); err == nil {
 		t.Fatal("a 50000-deep schema must be rejected, not parsed")
-	}
-	if !strings.Contains(err.Error(), "deep") {
+	} else if !strings.Contains(err.Error(), "deep") {
 		t.Errorf("expected a nesting-depth error, got: %v", err)
 	}
-	if !isRaceEnabled() && elapsed > 2*time.Second {
-		t.Errorf("deep-schema reject took %s — exceeds 2s budget (quadratic unmarshal not short-circuited?)", elapsed)
-	}
+	wantRejectScales(t, "Parse/over-limit-nesting", costScale(6250, 50000, 25, 2*time.Millisecond),
+		func(d int) func() error {
+			text := arrayNest(d)
+			return func() error {
+				_, err := avro.Parse(text)
+				return err
+			}
+		})
 
 	// Just past the limit is rejected; comfortably within it still parses.
 	// maxSchemaJSONDepth is 4*maxDepth (4000) brackets.
@@ -2765,25 +2779,45 @@ func TestRegression_CompatibilityErrorRenderingBounded(t *testing.T) {
 // parse-time allocation. The probe is now bounded to maxFixedLogicalLen+1. This
 // pins the end-to-end parse path; the probe-level answer is pinned by
 // TestMatrix_JSONDecodeAppliesLogicalMatchesDecode.
+//
+// "Not proportional to that size" is a claim about the SIZE, and the cell drove
+// exactly one — the top of the int64 range — under a wall-clock ceiling. Two
+// sizes make the claim directly, and here the expected answer is the strongest
+// a growth cell can report: the probe is capped at maxFixedLogicalLen+1
+// regardless of what the schema declares, so the cost is FLAT and the ratio is
+// 1. An allocation proportional to the size would be 4096x across this range,
+// which is the whole point of choosing two sizes twelve doublings apart rather
+// than the usual eight.
 func TestRegression_FixedLogicalProbeSizeBounded(t *testing.T) {
 	ct := avro.CustomType{AvroType: "fixed", LogicalType: "duration"}
-	const schema = `{"type":"fixed","size":9223372036854775807,"logicalType":"duration","name":"f"}`
+	schemaOf := func(size uint64) string {
+		return fmt.Sprintf(`{"type":"fixed","size":%d,"logicalType":"duration","name":"f"}`, size)
+	}
+	const maxFixed = 9223372036854775807
 
+	// The panic probe stays as it was and stays absolute: make([]byte, 9e18)
+	// either returns or takes the process down, and neither outcome has a
+	// second measurement to divide by.
 	done := make(chan struct{})
 	var panicVal any
-	t0 := time.Now()
 	go func() {
 		defer func() { panicVal = recover(); close(done) }()
-		_, _ = avro.Parse(schema, avro.WithCustomType(ct))
+		_, _ = avro.Parse(schemaOf(maxFixed), avro.WithCustomType(ct))
 	}()
 	<-done
-	elapsed := time.Since(t0)
 	if panicVal != nil {
 		t.Fatalf("Parse panicked on a large fixed size (parse-time make([]byte, size) DoS): %v", panicVal)
 	}
-	if bound := raceRelaxed(100 * time.Millisecond); elapsed > bound {
-		t.Fatalf("Parse of a large-fixed-size schema took %v (>%v): allocation proportional to size", elapsed, bound)
-	}
+	// A size of 2^50 is still absurd — a petabyte — while leaving 4096x of room
+	// for what an uncapped probe would do across this range.
+	wantAcceptScales(t, "Parse/large-fixed-logical-size", costScale(1<<50, 1<<62, 4, 500*time.Microsecond),
+		func(size int) func() error {
+			text := schemaOf(uint64(size))
+			return func() error {
+				_, err := avro.Parse(text, avro.WithCustomType(ct))
+				return err
+			}
+		})
 
 	// Answer-preservation at the in-range sizes: a no-callback CustomType on a
 	// uuid fixed (size 16) suppresses the logical, so DecodeJSON into any yields
@@ -2856,31 +2890,26 @@ func TestRegression_BareUnionJSONNoExponentialBacktrack(t *testing.T) {
 				return []byte(b.String())
 			}
 
-			// Depth 20 pre-fix backtracks ~2^20 full subtree re-decodes (seconds);
-			// post-fix it commits to the first container branch and rejects in
-			// microseconds. The 500ms bound sits well under the pre-fix cost and
-			// far over the post-fix cost.
-			var out any
-			t0 := time.Now()
-			if err := s.DecodeJSON(build(20), &out); err == nil {
-				t.Fatal("expected a decode error (innermost value matches no branch)")
-			}
-			if d := time.Since(t0); d > 500*time.Millisecond {
-				t.Fatalf("depth-20 union mismatch took %v; want <500ms (exponential-backtrack regression)", d)
-			}
-
-			// Scaling guard: a far deeper input must still reject in bounded
-			// (linear) time. Pre-fix this is 2^200 (unreachable) — the depth-20
-			// Fatalf above stops a pre-fix run before reaching here. Depth 200
-			// stays within maxDepth, so the rejection is the bottom mismatch,
-			// exercising the commit-to-first path itself.
-			t1 := time.Now()
-			if err := s.DecodeJSON(build(200), &out); err == nil {
-				t.Fatal("expected a decode error at depth 200")
-			}
-			if d := time.Since(t1); d > 500*time.Millisecond {
-				t.Fatalf("depth-200 union mismatch took %v; want <500ms (super-linear regression)", d)
-			}
+			// This cell already drove two depths and then compared each of them
+			// to the SAME absolute ceiling, never to each other — which is two
+			// point budgets, not a scaling guard, whatever the second one was
+			// called. Depth 20 pre-fix backtracks ~2^20 full subtree re-decodes
+			// (seconds) while post-fix it commits to the first container branch
+			// and rejects in microseconds; depth 200 is 2^200 pre-fix, which is
+			// unreachable, so a pre-fix run never returns from the high side at
+			// all and the ratio is bounded only by the watchdog.
+			//
+			// Both depths stay within maxDepth, so each rejection is the bottom
+			// mismatch and not a depth guard, which is what keeps the cell on
+			// the commit-to-first path it exists to pin.
+			wantRejectScales(t, "DecodeJSON/bare-union-mismatch", costScale(25, 200, 25, 500*time.Microsecond),
+				func(depth int) func() error {
+					wire := build(depth)
+					return func() error {
+						var out any
+						return s.DecodeJSON(wire, &out)
+					}
+				})
 		})
 	}
 }

@@ -5131,7 +5131,13 @@ type raceRelaxation struct {
 
 // The set is DERIVED from source below, not from this list; this list is what the
 // derivation is checked against, so a consult in no row fails and a row naming a
-// file that no longer consults fails. Rows are per FILE, and the test-file
+// file that no longer consults fails.
+//
+// The list is SHORTER than it was, and that is the point rather than an
+// accident: three cells used to skip a wall-clock budget under -race because a
+// fixed budget is not deterministic there. Each is now a growth RATIO, which
+// is stable in both modes, so the decision those three consults were making no
+// longer has to be made. Rows go away when the last consult in a file does. Rows are per FILE, and the test-file
 // consolidation made some files hold several of these sections — the
 // `// ---------- x ----------` banner still names which original file a consult
 // sits in, so a row covering more than one says so and splits its count.
@@ -5141,9 +5147,6 @@ var raceRelaxations = []raceRelaxation{
 
 	{file: "conformance_test.go", sites: 1, kind: "authority",
 		why: "isRaceEnabled forwards the bridged value, and nothing in this file asks it any more. Two cells used to SKIP their cost budgets under -race, each saying a fixed budget is not deterministic there — which is true of a budget and is the reason both are now growth RATIOS instead. A ratio holds in both modes (measured 8.20 raced against 7.66-8.85 unraced on the same cell), so those two cells run their cost assertion everywhere rather than only where a wall-clock number happened to behave. Every remaining wall-clock ceiling in this file asks raceRelaxed"},
-
-	{file: "audit_regression_test.go", sites: 1, kind: "skip",
-		why: "SKIPS its 2s deep-schema-reject budget under -race rather than relaxing it. A skip is a different decision from a ceiling and is kept as one: the quadratic it guards is seconds in the untraced run, which always executes"},
 
 	{file: "schema_semantics_test.go", sites: 1, kind: "skip",
 		why: "the error_bound section SKIPS a growth-RATIO check (linear lands near 2, quadratic near 4). Instrumentation distorts the ratio itself, not just the magnitude, so no multiplier can correct it; the absolute ceilings in the same test still run under -race"},
