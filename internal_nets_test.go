@@ -3774,6 +3774,13 @@ func TestCensus_Q22_MagnitudeConsumersAgreeOnTheCeiling(t *testing.T) {
 // deliberately generous so a loaded host never false-fails a real bound, while
 // still catching any unbounded path — the gap between the two is orders of
 // magnitude, so the exact value is not the point.
+//
+// This one stays ABSOLUTE where the complexity cells took growth ratios (see
+// costScale). The question it asks is whether fn RETURNS, not how its cost
+// responds to a magnitude: the failure it exists to catch is a hang, and a
+// hang produces no second measurement to take a ratio against. Nothing about
+// it is sensitive to where the ceiling sits, since the two outcomes it
+// separates are milliseconds and never.
 const dosBudget = 4 * time.Second
 
 // dosRun executes fn on hostile input under a watchdog. It fails the test if fn
@@ -4597,6 +4604,165 @@ func wantAcceptUnder(t *testing.T, name string, bound time.Duration, fn func() e
 	}
 }
 
+// ---- growth ratios: the form a complexity claim takes -----------------------
+
+// A cell that claims a COMPLEXITY CLASS — linear, flat, anything but the
+// quadratic or exponential its bound exists to catch — must not assert that
+// claim as an absolute wall-clock ceiling. A ceiling measures two things at once,
+// the cost and the machine, and cannot tell them apart. `go test ./...` runs
+// packages concurrently up to GOMAXPROCS, so this package's timed cells compete
+// with ocf's work, and a two-core CI runner is exactly that case; it has been
+// lucky, not immune. Three cells have reported red on correct code that way —
+// 614ms against a 400ms bound, 882ms against 500ms, and 675ms from a memo that
+// was working while unrelated processes took the machine's memory — and every
+// one cost the time to prove it false.
+//
+// A RATIO between two problem sizes is immune to it, because contention inflates
+// both measurements together and divides out. The claim being made is about how
+// cost RESPONDS to the magnitude, which is what a ratio measures and what a
+// single point cannot: a ceiling generous enough for the linear cost at n is
+// generous enough for the QUADRATIC cost at some smaller n, so one point asks
+// only whether that one size finishes.
+//
+// What stays absolute, and why:
+//
+//   - dosBudget (dosRun) and hangDeadline. These ask "does this RETURN", not
+//     "how does it grow" — a missing bound there is a hang, and a hang has no
+//     second measurement to take a ratio against.
+//   - a cell with no magnitude to drive. An infinitely recursive schema default
+//     cannot be made bigger; the bound under test is production's own depth
+//     limit, and the clock only proves the recursion stopped.
+//
+// Each such cell says so at its own site. Everything else that times work states
+// its claim through the helpers below.
+
+// costScale is the growth claim a column of cells makes: cost measured at two
+// problem sizes, and the largest ratio between them that leaves the claim
+// standing.
+type costScale struct {
+	// lo and hi are the two magnitudes. Their SEPARATION is what buys the
+	// margin: at hi = 4*lo a linear pass lands at 4 and a quadratic one at 16,
+	// so a tol between them is two-sided by a factor of two — where at hi = 2*lo
+	// the same two classes are 2 and 4 and every choice of tol is within 1.4x of
+	// being wrong.
+	lo, hi int
+	// tol is the largest cost(hi)/cost(lo) the claim permits. Set it between the
+	// growth the bound ALLOWS and the growth it exists to catch, at their
+	// geometric mean where nothing argues for either side.
+	tol float64
+	// floor is the smallest hi-side cost the ratio is believed at. Below it the
+	// numbers are timer noise rather than work — a 90us measurement against a
+	// 30us one is a 3x "growth" that means nothing — so the limit is
+	// max(tol*cost(lo), floor), exactly as wantCostDoesNotScale computes it.
+	// The floor only ever ADMITS a cell; it can never fail one, so it is not a
+	// wall-clock ceiling wearing a different name. It is scaled by raceInflated
+	// and not raceRelaxed for the reason raceInflated states: an absolute 3s
+	// minimum would swallow the comparison whole.
+	floor time.Duration
+}
+
+// String renders the claim for a failure message.
+func (c costScale) String() string {
+	return fmt.Sprintf("%d->%d (%.0fx size), tol %.1fx", c.lo, c.hi, float64(c.hi)/float64(c.lo), c.tol)
+}
+
+// costSamples is how many times each size is measured. The reported cost is the
+// SMALLEST sample, which is the closest thing to an uncontended measurement a
+// loaded host can produce: contention, GC and scheduler steals can only inflate
+// a sample, never deflate one, so the minimum converges on the real cost from
+// above while the mean chases the load. Three is enough for that — the samples
+// are drawn seconds apart at most, so a fourth buys little — and it keeps the
+// battery's added wall-clock to roughly its own measurement.
+const costSamples = 3
+
+// measureCost runs fn costSamples times and returns the smallest elapsed time
+// together with the last error it saw, so the caller can assert the verdict as
+// well as the cost.
+func measureCost(fn func() error) (time.Duration, error) {
+	best := time.Duration(1) << 62
+	var err error
+	for range costSamples {
+		start := time.Now()
+		e := fn()
+		if d := time.Since(start); d < best {
+			best = d
+		}
+		if e != nil {
+			err = e
+		}
+	}
+	return best, err
+}
+
+// wantCostScales is the assertion the accept and reject forms share: cost at
+// sc.hi may exceed cost at sc.lo by no more than sc.tol, or by the floor,
+// whichever is larger. It logs the measured ratio unconditionally so the shape
+// is visible in `go test -v` output rather than only in a comment.
+func wantCostScales(t *testing.T, name string, sc costScale, tLo, tHi time.Duration) {
+	t.Helper()
+	// A zero lo-side sample means the entry point is below the clock's
+	// resolution at that size — an O(1) surface the magnitude does not reach —
+	// so the ratio is undefined rather than infinite. The floor decides such a
+	// cell, and it admits it: nothing that fast is the quadratic being hunted.
+	ratio := float64(tHi) / float64(tLo)
+	shape := fmt.Sprintf("%.2fx", ratio)
+	if tLo == 0 {
+		shape = "undefined (lo-side cost below the clock's resolution)"
+	}
+	lim := max(time.Duration(sc.tol*float64(tLo)), raceInflated(sc.floor))
+	t.Logf("%s: %v at %d, %v at %d — ratio %s for a %.0fx size increase (limit %v)",
+		name, tLo, sc.lo, tHi, sc.hi, shape, float64(sc.hi)/float64(sc.lo), lim)
+	if tHi > lim {
+		t.Errorf("%s: cost grew %s for a %.0fx size increase — %v at %d vs %v at %d (limit %v; claim: %s).\n"+
+			"The bound claims to cap this magnitude, so growth past the magnitude's own is the bound missing.\n"+
+			"This is a RATIO between two sizes measured on the same machine moments apart: host load inflates\n"+
+			"both and divides out, so a busy machine is not an explanation for it.",
+			name, shape, float64(sc.hi)/float64(sc.lo), tLo, sc.lo, tHi, sc.hi, lim, sc)
+	}
+}
+
+// wantAcceptScales asserts fn ACCEPTS (nil error) at both of sc's sizes and that
+// its cost grows no faster than sc permits. build takes the magnitude and
+// returns the thunk to TIME: everything the magnitude needs but the bound does
+// not own — generating schema text linear in the factor, parsing it when the
+// bound under test is downstream of the parse, encoding the datum — belongs in
+// build, outside the returned closure. Putting it inside is not a rounding
+// error; it is how a cell ends up timing a parse instead of the walk it names.
+func wantAcceptScales(t *testing.T, name string, sc costScale, build func(n int) func() error) {
+	t.Helper()
+	tLo, errLo := measureCost(build(sc.lo))
+	tHi, errHi := measureCost(build(sc.hi))
+	if errLo != nil {
+		t.Errorf("%s (n=%d): %v", name, sc.lo, errLo)
+		return
+	}
+	if errHi != nil {
+		t.Errorf("%s (n=%d): %v", name, sc.hi, errHi)
+		return
+	}
+	wantCostScales(t, name, sc, tLo, tHi)
+}
+
+// wantRejectScales is wantAcceptScales for the hostile-input cells: the input
+// must be REJECTED at both sizes, and the cost of rejecting it must not grow
+// with the size faster than sc permits. A reject cell needs the growth form for
+// the same reason an accept cell does — the work a rejection does before it
+// reaches the check is what the bound caps, and one size cannot see it.
+func wantRejectScales(t *testing.T, name string, sc costScale, build func(n int) func() error) {
+	t.Helper()
+	tLo, errLo := measureCost(build(sc.lo))
+	tHi, errHi := measureCost(build(sc.hi))
+	if errLo == nil {
+		t.Errorf("%s (n=%d): hostile input was accepted (want a fast rejection)", name, sc.lo)
+		return
+	}
+	if errHi == nil {
+		t.Errorf("%s (n=%d): hostile input was accepted (want a fast rejection)", name, sc.hi)
+		return
+	}
+	wantCostScales(t, name, sc, tLo, tHi)
+}
+
 // dosChainSchema builds a backward-reference chain: Top's field i defines
 // record Ri whose single field references R(i-1). Every custom-match subtree
 // walk from Ri reaches all of R0..R(i-1), so without a shared per-parse memo
@@ -4868,7 +5034,9 @@ func raceInflated(allowance time.Duration) time.Duration {
 // to turn a HANG into a failure. It is a liveness detector, never a performance
 // assertion: the property under test is that an over-budget walk REJECTS, and
 // the goroutine plus deadline exist only so a regression that stopped bounding
-// the walk surfaces as a failure instead of wedging the suite. Those batteries
+// the walk surfaces as a failure instead of wedging the suite. That is why it
+// stays absolute where the complexity cells took growth ratios (see costScale):
+// a detector for "never returns" has no second measurement to divide by. Those batteries
 // are the one place whose work is at the budget by construction — a cell must
 // EXCEED maxSchemaJSONNodes — so they are the slowest thing here and the
 // detector multiplies that: two run 21s and 33s in isolation under -race, higher
@@ -5236,6 +5404,34 @@ func RaceRelaxedForTest(normal time.Duration) time.Duration { return raceRelaxed
 // RaceEnabledForTest bridges the build-tagged predicate itself, so there is one
 // mechanism for the whole module rather than one per test package.
 const RaceEnabledForTest = raceEnabled
+
+// CostScale is the growth-claim type (dos_battery_test.go), aliased so package
+// avro_test names the same thing rather than declaring a second one. Its fields
+// stay unexported and CostScaleForTest is the way to build one, so a claim made
+// from either package goes through the same constructor.
+type CostScale = costScale
+
+// CostScaleForTest states a growth claim: cost measured at lo and at hi, growing
+// by no more than tol, judged against floor when the hi-side cost is too small
+// for a ratio to mean anything. See costScale for what each argument buys.
+func CostScaleForTest(lo, hi int, tol float64, floor time.Duration) CostScale {
+	return costScale{lo: lo, hi: hi, tol: tol, floor: floor}
+}
+
+// WantAcceptScalesForTest and WantRejectScalesForTest bridge the growth
+// assertions for the same reason RaceRelaxedForTest bridges the ceiling rule:
+// the two packages cannot share an unexported helper, and a rule stated twice
+// agrees only until one copy is edited. Package avro_test wraps these under the
+// unprefixed names its cells read.
+func WantAcceptScalesForTest(t *testing.T, name string, sc CostScale, build func(n int) func() error) {
+	t.Helper()
+	wantAcceptScales(t, name, sc, build)
+}
+
+func WantRejectScalesForTest(t *testing.T, name string, sc CostScale, build func(n int) func() error) {
+	t.Helper()
+	wantRejectScales(t, name, sc, build)
+}
 
 // SlabFreeForTest reports the internal slab-free classification: whether
 // Decode bypasses the slab pool and runs this schema's deser on a nil slab.

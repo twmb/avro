@@ -17762,6 +17762,29 @@ func raceRelaxed(normal time.Duration) time.Duration {
 	return avro.RaceRelaxedForTest(normal)
 }
 
+// costScale states a growth claim — cost at two problem sizes and the largest
+// ratio between them that leaves the claim standing. The type, the rule and the
+// reason a complexity claim is a RATIO and not an absolute wall-clock ceiling
+// all live in dos_battery_test.go; these three are the bridge, not a second
+// statement of any of it.
+func costScale(lo, hi int, tol float64, floor time.Duration) avro.CostScale {
+	return avro.CostScaleForTest(lo, hi, tol, floor)
+}
+
+// wantAcceptScales asserts fn accepts at both of sc's sizes and that its cost
+// grows no faster than sc permits.
+func wantAcceptScales(t *testing.T, name string, sc avro.CostScale, build func(n int) func() error) {
+	t.Helper()
+	avro.WantAcceptScalesForTest(t, name, sc, build)
+}
+
+// wantRejectScales is the same for hostile input: rejected at both sizes, and
+// the cost of rejecting does not grow with the size.
+func wantRejectScales(t *testing.T, name string, sc avro.CostScale, build func(n int) func() error) {
+	t.Helper()
+	avro.WantRejectScalesForTest(t, name, sc, build)
+}
+
 // TestRegression_OCFWriterPreservesLogicalTypeInHeader pins that the OCF writer
 // writes the full schema JSON to the avro.schema header, matching Java's
 // DataFileWriter and fastavro. writeHeader must use Schema.String(), not
