@@ -13582,3 +13582,133 @@ for the round's OWN ledger line"). Originals compressed in the second pass:
 The (e1)–(e6) Instance narratives were compressed in the same pass; their full
 text is in archive #1 above, under "§Audit conventions — rule 1 preamble, (e),
 (e1)-(e6), the label prohibition, (f) (verbatim)".
+
+## Distillation archive (2026-08-13) — three superseded ledger lines, verbatim
+
+Archived by the wall-clock-ratio round's distillation pass. AUDIT_CORE.md stood
+at 54,620 bytes against a 55,000 bound — under by 380, which this round's own
+ledger line would have crossed on the spot, the case §Feedback loop names when
+it says a distillation "must leave room for the round's OWN ledger line". All
+three are superseded by the 2026-08-06 anchor below them and compress to one
+line each in the live file; the text they compress from is here.
+
+- 2026-07-01..2026-08-02 · ea9a2ce→b655d12 · PRE-CONVERGENCE ERAS + the
+  convergence anchor — ten ledger lines. #53-#77; P19-P31; G1-G3; the PREDICATE
+  CENSUS; the reserved-attribute ENUMERATION (→ **#74**, **PLACEMENT AUTHORITY**,
+  **2a**, **7a**); convention 1(e) then **(f)**; `budgeted_walk_census_test.go`;
+  `-race` MANDATORY at `max(3s, 10x)`; B32c. Lesson: MEASUREMENT NEVER HAPPENED —
+  a net that reds is not one that MEASURES. **Ended CONVERGED.** Archive (#66,
+  #69, #70).
+- 2026-08-03..2026-08-04 · 38b0c95→41aabfa · the CODEC-OWNERSHIP era, two
+  FIX-then-FULL rounds (5172647, 41aabfa). Both halves of ocf codec ownership:
+  the ADOPTED codec released on no error return (fixed via `Fingerprint`'s
+  `h.Reset()`-on-ENTRY shape), then the DECLINED offer across all three
+  constructors — `resolveCodec` returns the adopted INDEX, release by DISTINCT
+  codec (map when comparable, by TYPE when not), never by index; 21 cells, 13
+  neuters. Plus 2 production findings, one class: `ocf.WithCodec`'s nil SPELLING
+  (P20). One BEHAVIORAL maintainer-ruled NOT A BUG (#52 stands): time-of-day
+  wire outside [0,24h) into `time.Time` re-encodes changed. Two inverse-density
+  instruments minted: STATEMENT COVERAGE, and AUDITOR ATTENTION (262/763 funcs
+  in no audit doc, 128 in no test) which picked compat.go — CLEAN on 2809
+  `CheckCompatibility`/`Resolve` pairs. Archive (2026-08-06 #1).
+- 2026-08-04 · 41aabfa (START head — 41aabfa..HEAD quarantines this round's fix)
+  · FIX · **one option, two nil spellings, three constructors that did
+  not agree.** One `isNilCodec` (reflect Kind+`IsNil`) answers all THREE consults
+  — the third, `NewWriter`'s adoption, neither reported nor optional: fixing only
+  the two reported would leave `WithCodec(nil)` ignored by NewReader and fatal to
+  NewWriter, the split moved. Net: spelling × ctor (DERIVED) × layout ×
+  reader adoption; oracle `WithCodec`'s "as if not written" +
+  `Close`-exactly-once, the real codec's count the CONTROL. The nil-SAFE-Close
+  row stops it measuring "does it crash" — it COUNTS the wrong Close, severity
+  being caller-dependent. FIVE neuters, five distinct reds, no panic (cells
+  recover); the release pre-marking neuters GREEN — a measured immunity carrying
+  the combination that moves it (B32b). Census **Q24**; the guard derives sites
+  by RANGE-or-INDEX over `[]Codec`, index because NewWriter's is an index loop
+  and a range-only walk would report full coverage of the class. Attacked both
+  ways. 7a83530. Base + fastavro (1118) GREEN. **-race RED then GREEN**: root hit
+  the DEFAULT 600s timeout, then passed at 586.4s — not this round's cost (matrix
+  1.6s raced, census 3.1s, same suite 360.5s earlier). OPEN gap.
+
+Compressed to, in AUDIT_CORE.md §Round ledger:
+
+- `2026-07-01..2026-08-06 · ea9a2ce→8f08bdf · PRE-CONVERGENCE ERAS, the
+  convergence anchor, the CODEC-OWNERSHIP era and its FIX round.` — with the
+  2026-08-06 DISTILLATION line kept verbatim, since it is the newest entry and
+  the quarantine boundary the next round reads.
+
+### The wall-clock-ratio round — full narrative
+
+**What was wrong.** 72 assertions across 25 cells bound a cost with an absolute
+wall-clock ceiling. A ceiling measures two things at once, the cost and the
+machine, and cannot tell them apart; `go test ./...` runs packages concurrently
+up to GOMAXPROCS, so the root package's timed cells share the host with ocf's
+work, and the two-core CI runner is exactly that case. Three cells had already
+reported red on correct code that way (614ms against a 400ms bound, 882ms
+against 500ms, 675ms out of a working memo), each costing the time to prove it
+false.
+
+**Why a ratio.** The claim every one of these cells makes is about how cost
+RESPONDS to a magnitude, which is what a ratio between two problem sizes
+measures and what a single point cannot: a ceiling generous enough for the
+linear cost at n is generous enough for the QUADRATIC cost at some smaller n.
+C9's own comment had been reasoning about exactly this ratio — "linear doubles,
+quadratic quadruples" — while asserting a ceiling.
+
+**The demonstration.** At GOMAXPROCS=2 under a deliberate whole-machine load
+(mixed CPU and memory-bandwidth workers, 3x oversubscription), the base
+commit's ceilings fail ten cells across four tests on correct code: C9
+chain-noMatch 218ms/200ms and chain-matching 429ms/400ms; C10b
+Resolve/wide-record-alias-hit 631ms/500ms; C10c SchemaNode.Schema 762ms/500ms;
+C10d Resolve/wide-fields 535ms, Root/wide-fields 743ms, SchemaNode.Schema
+947ms, SchemaCache.Parse/wide-branches 2.23s/1.5s, Resolve/wide-branches 1.72s,
+SchemaNode.Schema/wide-branches 899ms. The converted branch is green under the
+same load, with every breadth-column ratio at or under 9.7 against tolerances
+of 8 to 25 and the floor absorbing the one cell that drifted past its
+tolerance.
+
+**Three harness defects, all found by measuring under load rather than by
+reasoning about it.** (1) Sampling the two sides in PHASES lets a quiet stretch
+of a contended machine fall entirely inside one side's phase and lower that
+side's minimum alone — it put a 4x linear cost ratio at 24. (2) Two
+independently-taken minima pair a lucky low with an unlucky high that never
+coexisted; the two sides do not suffer contention equally, because a working
+set that grows with the magnitude does not share a cache proportionally. (3)
+Unequal sample counts inflate the ratio by convergence alone — 25 samples
+against 5 moved the SchemaFor depth cell between 14 and 20 for a cost that had
+not changed. All three are answered by alternating ROUNDS and reporting the
+round whose ratio was smallest: two measurements made microseconds apart under
+one machine state. The downward bias is the safe direction and not a loophole,
+since the growth being hunted is a property of the code and is present in every
+round.
+
+**Tolerances are measured, not guessed.** Each is the geometric mean of a
+measured healthy ratio and a measured broken one, the broken number obtained by
+restoring the regression the cell commemorates. finiteScale's BitLen
+short-circuit measures 251-298 across its range and the divide-by-5 loop it
+replaced measures 3478. truncRatForError's guard measures 4.8 and RatString
+measures 25 — and that comparison also showed the message-length assertion
+alone could not catch it, since the amplification is in CPU and allocation
+while the message stays bounded either way. toJSONWalk's collision-only
+snapshot measures 4.2-4.9 and the eager one 21.7. Two cells turned out to have
+limits their own regression could not reach and were retuned on the evidence.
+
+**What stayed absolute, and why.** dosBudget and hangDeadline, the
+infinitely-recursive-default cell, and the hostile-extras hang probe. Each asks
+whether work RETURNS rather than how it grows; a hang produces no second
+measurement to divide by, and the recursive-default cell has no magnitude to
+drive at all — its schemas are fixed text, the recursion is infinite by
+construction, and the bound under test is production's own maxDepth.
+
+**A ratio holds under -race** (8.20 raced against 7.66-8.85 unraced on the same
+cell), which retired three skips: cells that had skipped their cost budget
+under the detector on the stated grounds that a fixed budget is not
+deterministic there now assert cost in every mode. raceRelaxations rows 4 → 2.
+
+**Answers the ceilings had been hiding.** Several cells turned out to be
+stronger than their comments claimed, visible only once a second size was
+driven: the deep-nesting reject is FLAT rather than linear, because the
+pre-scan stops at bracket 4001 and depth stops mattering past the limit; the
+escaped-length walk is flat past its budget; the fixed-logical probe is flat
+across a thousandfold size range; a hostile map key is rejected on its first
+byte rather than scanned. Each of those tolerances was tightened to the
+measured answer, which is what makes them able to fail.
