@@ -19304,13 +19304,19 @@ func TestJSONNumberMapKeyContentValidated(t *testing.T) {
 	})
 
 	// Per-key validation cost is O(n) byte-scan via isJSONNumber; no
-	// arbitrary-precision helper. O(n) is a claim about the key's LENGTH, so
-	// the cell drives two lengths and asserts the ratio between them: a byte
-	// scan responds to eight times the key with about eight times the work,
-	// where an arbitrary-precision parse of the same key does not.
+	// arbitrary-precision helper. That is a claim about the key's LENGTH, so
+	// the cell drives two lengths and asserts the ratio between them.
+	//
+	// The measured answer is stronger than the comment promises and the
+	// tolerance is set to it rather than to the promise: a hostile key is
+	// rejected on its FIRST byte, so the cost is flat in the key's length
+	// (1.0 to 1.04 across runs) and not merely linear in it. A tolerance of
+	// 25 would have admitted an implementation that walked the whole megabyte
+	// before deciding, which is the regression this cell is about; 6 admits
+	// the measured spread and nothing else.
 	t.Run("hostile_key_rejected_fast", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"map","values":"long"}`)
-		wantRejectScales(t, "AppendEncode/hostile-json-number-key", costScale(1<<17, 1<<20, 25, 500*time.Microsecond),
+		wantRejectScales(t, "AppendEncode/hostile-json-number-key", costScale(1<<17, 1<<20, 6, 500*time.Microsecond),
 			func(n int) func() error {
 				in := map[json.Number]int64{json.Number(strings.Repeat("x", n)): 1}
 				return func() error {

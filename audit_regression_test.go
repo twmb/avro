@@ -2785,15 +2785,34 @@ func TestRegression_CompatibilityErrorRenderingBounded(t *testing.T) {
 // sizes make the claim directly, and here the expected answer is the strongest
 // a growth cell can report: the probe is capped at maxFixedLogicalLen+1
 // regardless of what the schema declares, so the cost is FLAT and the ratio is
-// 1. An allocation proportional to the size would be 4096x across this range,
-// which is the whole point of choosing two sizes twelve doublings apart rather
-// than the usual eight.
+// 1 across a thousandfold range, where a probe following the size would be a
+// thousandfold cost.
 func TestRegression_FixedLogicalProbeSizeBounded(t *testing.T) {
 	ct := avro.CustomType{AvroType: "fixed", LogicalType: "duration"}
 	schemaOf := func(size uint64) string {
 		return fmt.Sprintf(`{"type":"fixed","size":%d,"logicalType":"duration","name":"f"}`, size)
 	}
 	const maxFixed = 9223372036854775807
+
+	// The growth cell drives sizes an uncapped probe could actually ALLOCATE,
+	// 64 KiB to 64 MiB, rather than the extreme the panic probe below drives.
+	// The two split the claim between them because the failure mode splits: a
+	// probe that follows the declared size is a real 1024x cost across this
+	// range and a clamped one is flat, while at 2^63 the same probe does not
+	// run slowly at all — it panics, which no clock can measure. This half runs
+	// FIRST so that a build with the clamp removed reports the cost it can
+	// still measure before the other half reports the panic. The floor is 50us
+	// against a healthy 4.7us: a floor sized like the battery's heavier cells
+	// would sit above the unclamped probe's own cost here and leave the panic
+	// as the only thing that could fail.
+	wantAcceptScales(t, "Parse/large-fixed-logical-size", costScale(1<<16, 1<<26, 4, 50*time.Microsecond),
+		func(size int) func() error {
+			text := schemaOf(uint64(size))
+			return func() error {
+				_, err := avro.Parse(text, avro.WithCustomType(ct))
+				return err
+			}
+		})
 
 	// The panic probe stays as it was and stays absolute: make([]byte, 9e18)
 	// either returns or takes the process down, and neither outcome has a
@@ -2808,16 +2827,6 @@ func TestRegression_FixedLogicalProbeSizeBounded(t *testing.T) {
 	if panicVal != nil {
 		t.Fatalf("Parse panicked on a large fixed size (parse-time make([]byte, size) DoS): %v", panicVal)
 	}
-	// A size of 2^50 is still absurd — a petabyte — while leaving 4096x of room
-	// for what an uncapped probe would do across this range.
-	wantAcceptScales(t, "Parse/large-fixed-logical-size", costScale(1<<50, 1<<62, 4, 500*time.Microsecond),
-		func(size int) func() error {
-			text := schemaOf(uint64(size))
-			return func() error {
-				_, err := avro.Parse(text, avro.WithCustomType(ct))
-				return err
-			}
-		})
 
 	// Answer-preservation at the in-range sizes: a no-callback CustomType on a
 	// uuid fixed (size 16) suppresses the logical, so DecodeJSON into any yields
