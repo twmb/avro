@@ -12084,17 +12084,24 @@ func TestRegression_NonUnionBranchesInertInRebuild(t *testing.T) {
 
 // breadthN is the sibling count every cell drives at the top of its range, and
 // breadthLoN is the bottom. 20000 is chosen so a quadratic pass takes seconds
-// while a linear one takes tens of milliseconds; the 4x separation between them
-// puts a linear pass at 4 and a quadratic one at 16, far enough apart that the
-// tolerance between has a factor of two on each side.
+// while a linear one takes tens of milliseconds; the 8x separation between them
+// puts a linear pass at 8 and a quadratic one at 64.
+//
+// Eight and not four, for two reasons that happen to agree. It is the better
+// instrument — at 4x the two classes are 4 and 16 and a tolerance between them
+// has only a factor of two on each side, where at 8x it has nearly three — and
+// it is the cheaper one, since the lo call is an eighth of the hi rather than a
+// quarter. The second reason is not a nicety: `go test -race ./...` gets Go's
+// default 600s per-package timeout, CI passes no -timeout, and this column is
+// the largest single consumer of that budget.
 const (
 	breadthN   = 20000
-	breadthLoN = breadthN / 4
+	breadthLoN = breadthN / 8
 )
 
 // breadthScale is the growth claim every cell in this column makes. The
-// tolerance is the geometric mean of the linear ratio (4) and the quadratic one
-// (16); the floor is the cost below which the measurement is noise rather than
+// tolerance is the geometric mean of the linear ratio (8) and the quadratic one
+// (64); the floor is the cost below which the measurement is noise rather than
 // work, and it is far under the quadratic this column exists to catch, which
 // measured 1.9s to 32s at breadthN.
 //
@@ -12106,7 +12113,7 @@ const (
 // a merely BUSY host crossed the line. Growth does not have that problem —
 // their linear cost lands at 4 whatever the machine is doing — so the second
 // constant is gone rather than retuned.
-var breadthScale = costScale{lo: breadthLoN, hi: breadthN, tol: 8, floor: 50 * time.Millisecond}
+var breadthScale = costScale{lo: breadthLoN, hi: breadthN, tol: 22, floor: 50 * time.Millisecond}
 
 //////////////////////////////////////////////////////////////////////////////
 // The entry-point axis, derived from the battery's other columns

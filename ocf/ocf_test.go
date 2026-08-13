@@ -6284,7 +6284,7 @@ type costScale struct {
 }
 
 const (
-	ocfCostMinSamples   = 3
+	ocfCostMinSamples   = 2
 	ocfCostMaxSamples   = 25
 	ocfCostSampleBudget = 30 * time.Millisecond
 )

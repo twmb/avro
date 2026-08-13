@@ -9060,7 +9060,7 @@ func TestMatrix_HostileSizeRejects(t *testing.T) {
 	// Above every cap the arms divide cleanly — flat where the type check
 	// precedes any look at the value, near 8 where something scans it, and 64 if
 	// superlinear work were reintroduced before the check.
-	sc := costScale(1<<20, 1<<23, 25, 500*time.Microsecond)
+	sc := costScale(1<<19, 1<<22, 25, 500*time.Microsecond)
 	const maxErrLen = 2 << 10
 	// bounded pairs the message-length claim with the cost one, so both are
 	// made at both sizes rather than one at one.
@@ -9115,7 +9115,7 @@ func TestMatrix_HostileSizeDecodeMessages(t *testing.T) {
 	// about the wire's SIZE and both are made at two of them — the message
 	// bound was already size-independent by construction, and the cost bound
 	// says so now instead of pinning one size under a ceiling.
-	wantRejectScales(t, "Decode/hostile-size-string-into-int", costScale(1<<20, 1<<23, 25, 500*time.Microsecond),
+	wantRejectScales(t, "Decode/hostile-size-string-into-int", costScale(1<<19, 1<<22, 25, 500*time.Microsecond),
 		func(n int) func() error {
 			wire := mustAppendEncode(t, s, nil, strings.Repeat("y", n))
 			return func() error {

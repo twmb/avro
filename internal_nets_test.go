@@ -4726,8 +4726,18 @@ func costFactorString(f float64) string {
 // So: at least costMinSamples, then keep sampling while the PAIR has cost less
 // than costSampleBudget in total, up to costMaxSamples each. Both ends are
 // bounded, so the added wall clock per cell is bounded too.
+//
+// The minimum is TWO and not three, and the reason is a budget the whole suite
+// shares. `go test -race ./...` gets Go's default 600s per-package timeout and
+// no more — CI passes no -timeout — and the root package already runs 522s
+// there before this harness exists, which its own ledger records as an open
+// gap. A third round buys very little (two adjacent rounds already give the
+// minimum-of-rounds its meaning) and costs a third of every growth cell's raced
+// wall clock, which is the difference between a suite that fits in the default
+// timeout and one that does not. Cheap cells still get up to twenty-five rounds
+// from the budget, which is where extra rounds actually change the number.
 const (
-	costMinSamples   = 3
+	costMinSamples   = 2
 	costMaxSamples   = 25
 	costSampleBudget = 30 * time.Millisecond
 )
