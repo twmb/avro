@@ -12367,23 +12367,49 @@ func TestRegression_DeepSchemaErrorBounded(t *testing.T) {
 // full subtree (O(n^2)); a 999-deep array took ~0.4s, and Parse also fed
 // Canonical() whose nested MarshalJSON re-copied each subtree (a second
 // O(n^2)). Both are now single-pass.
+//
+// Linear is a claim about how cost responds to the depth, so it is asserted as
+// the ratio between two depths and not as a ceiling on one. The cell held depth
+// 900 against 200ms, which one quadratic parse of a shallower schema would also
+// have passed; eight times the depth costs 8x if the pass is single and 64x if
+// it re-scans, and the tolerance sits between them.
 func TestRegression_DeepValidSchemaParsesLinear(t *testing.T) {
-	deep := strings.Repeat(`{"type":"array","items":`, 900) + `"int"` + strings.Repeat(`}`, 900)
-	t0 := time.Now()
-	s, err := avro.Parse(deep)
-	if err != nil {
-		t.Fatalf("parse valid deep schema: %v", err)
+	deep := func(d int) string {
+		return strings.Repeat(`{"type":"array","items":`, d) + `"int"` + strings.Repeat(`}`, d)
 	}
-	if d, bound := time.Since(t0), raceRelaxed(200*time.Millisecond); d > bound {
-		t.Errorf("valid 900-deep schema parsed in %v; want <%v (O(n^2) regression?)", d, bound)
-	}
+	// Both depths stay under the build's maxDepth, which is what makes the
+	// schema VALID and so keeps the cell on the accept path it is about.
+	//
+	// The floor is small on purpose. These two calls are cheap — 125us and 9.5us
+	// at the shallow depth — so a floor sized for the battery's heavier cells
+	// would sit above 25x the lo-side cost and decide the cell by itself,
+	// leaving a wall-clock ceiling wearing the floor's name. At 200us the ratio
+	// decides both, with the healthy cost 2.8x under its limit.
+	sc := costScale(100, 800, 25, 200*time.Microsecond)
+	wantAcceptScales(t, "Parse/deep-valid-array", sc, func(d int) func() error {
+		text := deep(d)
+		return func() error {
+			_, err := avro.Parse(text)
+			return err
+		}
+	})
 	// Canonical()/Fingerprint must also be linear (it is on the hot Parse
-	// path for the SOE fingerprint).
-	t1 := time.Now()
-	_ = s.Canonical()
-	if d, bound := time.Since(t1), raceRelaxed(200*time.Millisecond); d > bound {
-		t.Errorf("Canonical() of 900-deep schema took %v; want <%v", d, bound)
-	}
+	// path for the SOE fingerprint). The parse that produces the schema is
+	// what the magnitude needs and not what this bound owns, so it happens
+	// once per depth outside the timed call — and the cell above already
+	// drives the parse at both depths.
+	wantAcceptScales(t, "Canonical/deep-valid-array", sc, func(d int) func() error {
+		s, err := avro.Parse(deep(d))
+		if err != nil {
+			t.Fatalf("parse valid %d-deep schema: %v", d, err)
+		}
+		return func() error {
+			if len(s.Canonical()) == 0 {
+				return fmt.Errorf("empty canonical form")
+			}
+			return nil
+		}
+	})
 }
 
 // Canonical() must emit valid JSON (and a sound fingerprint) for a name
@@ -12420,26 +12446,44 @@ func jsonEscapeForTest(s string) string {
 // snapshot map is only ever read on a duplicate fullname. Parse() and Canonical()
 // of the same schema are already linear, and this pins the metadata emitter to
 // match: a 900-deep, ~318KB record chain that parses in ~12ms regressed to >1.3s.
+//
+// The claim is about the DEPTH, so the assertion is the ratio across two depths
+// rather than a ceiling on one. Both numbers below are MEASURED, by restoring
+// the snapshot: a single-pass emitter costs 1.9ms at depth 100 and 8.3ms at 800,
+// a ratio of 4.2 to 4.9 across runs — sublinear, because the leaf's fixed 256 KiB
+// doc is a large constant in it. An emitter that snapshots every named type's
+// body costs 53ms and 1.14s, a ratio of 21.7, because each enclosing record
+// re-marshals the doc and everything under it. The tolerance is the geometric
+// mean of the two, so each is about a factor of two away.
 func TestRegression_RootSchemaEmitterLinearOnDeepNesting(t *testing.T) {
-	const depth = 900
-	var sb strings.Builder
-	for i := 0; i < depth; i++ {
-		fmt.Fprintf(&sb, `{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i)
+	chain := func(depth int) string {
+		var sb strings.Builder
+		for i := 0; i < depth; i++ {
+			fmt.Fprintf(&sb, `{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i)
+		}
+		sb.WriteString(`{"type":"record","name":"Leaf","doc":"` + strings.Repeat("x", 256*1024) + `","fields":[{"name":"v","type":"int"}]}`)
+		for i := 0; i < depth; i++ {
+			sb.WriteString(`}]}`)
+		}
+		return sb.String()
 	}
-	sb.WriteString(`{"type":"record","name":"Leaf","doc":"` + strings.Repeat("x", 256*1024) + `","fields":[{"name":"v","type":"int"}]}`)
-	for i := 0; i < depth; i++ {
-		sb.WriteString(`}]}`)
-	}
-	s, err := avro.Parse(sb.String())
-	if err != nil {
-		t.Fatalf("parse deep record chain: %v", err)
-	}
-	root := s.Root()
-	t0 := time.Now()
-	mustNodeSchema(t, root)
-	if d, bound := time.Since(t0), raceRelaxed(500*time.Millisecond); d > bound {
-		t.Errorf("Root().Schema() of a %d-deep record chain took %v; want <%v (O(depth*subtree) regression in toJSONWalk)", depth, d, bound)
-	}
+	// The parse and the Root() walk are what the magnitude needs and not what
+	// this bound owns — toJSONWalk is — so both stay outside the timed call.
+	// The floor sits below the healthy limit (11 x 1.9ms) rather than above it,
+	// so the ratio is what decides this cell and not a wall-clock number
+	// wearing the floor's name.
+	wantAcceptScales(t, "SchemaNode.Schema/deep-record-chain", costScale(100, 800, 11, 5*time.Millisecond),
+		func(depth int) func() error {
+			s, err := avro.Parse(chain(depth))
+			if err != nil {
+				t.Fatalf("parse %d-deep record chain: %v", depth, err)
+			}
+			root := s.Root()
+			return func() error {
+				_, err := root.Schema()
+				return err
+			}
+		})
 }
 
 // A schema field name has no length cap at parse — validName is pure grammar and
