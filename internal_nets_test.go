@@ -5139,8 +5139,8 @@ var raceRelaxations = []raceRelaxation{
 	{file: "internal_nets_test.go", sites: 4, kind: "authority",
 		why: "two authority sections in one file. race_bounds (3): raceRelaxed and raceInflated — the two forms of the rule and the only place either number appears — plus the invariant that asserts neither ever tightens. export (1): the bridge READS the predicate to hand it to package avro_test, so the two packages share one build-tagged mechanism instead of declaring one each"},
 
-	{file: "conformance_test.go", sites: 3, kind: "authority+skip",
-		why: "isRaceEnabled forwards the bridged value (1); the two remaining consults SKIP their budgets rather than relax them, each for a reason recorded at the site. Every wall-clock CEILING in this file asks raceRelaxed — three of them used to compute their own, with three different multipliers"},
+	{file: "conformance_test.go", sites: 1, kind: "authority",
+		why: "isRaceEnabled forwards the bridged value, and nothing in this file asks it any more. Two cells used to SKIP their cost budgets under -race, each saying a fixed budget is not deterministic there — which is true of a budget and is the reason both are now growth RATIOS instead. A ratio holds in both modes (measured 8.20 raced against 7.66-8.85 unraced on the same cell), so those two cells run their cost assertion everywhere rather than only where a wall-clock number happened to behave. Every remaining wall-clock ceiling in this file asks raceRelaxed"},
 
 	{file: "audit_regression_test.go", sites: 1, kind: "skip",
 		why: "SKIPS its 2s deep-schema-reject budget under -race rather than relaxing it. A skip is a different decision from a ceiling and is kept as one: the quadratic it guards is seconds in the untraced run, which always executes"},
