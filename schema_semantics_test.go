@@ -12519,6 +12519,19 @@ func nestStrayContainer(key string, d int) string {
 	return sb.String()
 }
 
+// wantAccept asserts fn ACCEPTS (nil error). It is the avro_test twin of the
+// helper in package avro — same rule, restated rather than reached, because
+// this package cannot see the internal one. Its existence is what lets an
+// external cost cell be rowed with the magnitudes it drives instead of being
+// waved through as an exemption: the registry's cross-check requires a cell
+// rowed with values to take a harness, and this is the harness.
+func wantAccept(t *testing.T, name string, fn func() error) {
+	t.Helper()
+	if err := fn(); err != nil {
+		t.Errorf("%s: %v", name, err)
+	}
+}
+
 // A reserved structural/naming key on a kind that does not bind it is decoded
 // once by the parser's arm to decide whether it surfaces as-written or rides in
 // Props. That decode must not be repeated: the props-routing loop and the Root()
@@ -12544,30 +12557,25 @@ func TestMatrix_NestedStrayContainerKeyLinearCost(t *testing.T) {
 		}
 		entryPoints := []struct {
 			name string
-			run  func()
+			run  func() error
 		}{
-			{"Parse", func() {
-				if _, err := avro.Parse(schema); err != nil {
-					t.Errorf("Parse(%s): %v", key, err)
-				}
+			{"Parse", func() error {
+				_, err := avro.Parse(schema)
+				return err
 			}},
-			{"MustParse", func() { _ = avro.MustParse(schema) }},
-			{"SchemaCache.Parse", func() {
+			{"MustParse", func() error { _ = avro.MustParse(schema); return nil }},
+			{"SchemaCache.Parse", func() error {
 				var c avro.SchemaCache
-				if _, err := c.Parse(schema); err != nil {
-					t.Errorf("SchemaCache.Parse(%s): %v", key, err)
-				}
+				_, err := c.Parse(schema)
+				return err
 			}},
-			{"Root().Schema()", func() {
-				s := avro.MustParse(schema)
-				root := s.Root()
-				if _, err := root.Schema(); err != nil {
-					t.Errorf("Root().Schema()(%s): %v", key, err)
-				}
+			{"Root().Schema()", func() error {
+				_, err := avro.MustParse(schema).Root().Schema()
+				return err
 			}},
 		}
 		for _, ep := range entryPoints {
-			ep.run()
+			wantAccept(t, fmt.Sprintf("%s/%s/depth=%d", ep.name, key, shallowDepth), ep.run)
 		}
 	}
 
@@ -12577,12 +12585,13 @@ func TestMatrix_NestedStrayContainerKeyLinearCost(t *testing.T) {
 	// to time and nothing to compare — the cell simply does not finish.
 	for _, depth := range []int{400, 800} {
 		deep := nestStrayContainer("items", depth)
-		if _, err := avro.Parse(deep); err != nil {
-			t.Errorf("Parse of a %d-deep stray chain: %v", depth, err)
-		}
-		sc := avro.MustParse(deep)
-		if _, err := sc.Root().Schema(); err != nil {
-			t.Errorf("Root().Schema() of a %d-deep stray chain: %v", depth, err)
-		}
+		wantAccept(t, fmt.Sprintf("Parse/items/depth=%d", depth), func() error {
+			_, err := avro.Parse(deep)
+			return err
+		})
+		wantAccept(t, fmt.Sprintf("Root().Schema()/items/depth=%d", depth), func() error {
+			_, err := avro.MustParse(deep).Root().Schema()
+			return err
+		})
 	}
 }

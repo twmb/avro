@@ -14947,7 +14947,8 @@ var costCells = []costCell{
 		values: []int{26, 30, 8000, 16000, 220, 440}},
 
 	{fn: "TestMatrix_NestedStrayContainerKeyLinearCost",
-		exempt: "accept oracle, and it lives in package avro_test where none of the harness helpers are reachable. A stray structural key on a kind that does not bind it is legal inert metadata, so what the cell asserts is that all four entry points ACCEPT the chain — at depth 20 on a sub-KB input, and again at 400 and 800, depths a doubled per-level decode could not return from at all. Accept/reject, not cost"},
+		factor: "nestStrayContainer DEPTH — the per-level decode factor. A second decode per level is 2^depth, so what separates a working single decode from a doubled one is reaching a depth the exponential cannot: 20 is sub-KB and survivable either way, 400 and 800 are not. It is in package avro_test, so the tie between row and cell is the literal check, not a read",
+		values: []int{20, 400, 800}},
 
 	// Value oracles. Named explicitly rather than left to a reader to re-derive:
 	// each varies shapes to check an ANSWER and asserts equality, so a second
