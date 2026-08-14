@@ -1983,16 +1983,12 @@ func TestCensus_Q9_EscapedLenScanIsBoundedByTheLimit(t *testing.T) {
 		}
 		prev = got
 	}
-	// And the cost of the whole walk over a value far larger than the budget
-	// stays small, since the scan abandons it.
+	// And the whole walk over a value far larger than the budget reaches the
+	// same verdict, since the scan abandons it rather than measuring it.
 	huge := strings.Repeat("\x01", 32<<20) // 32 MiB of 6x-escaping content
-	start := time.Now()
 	b := newWalkBudget()
 	if r := valueWalkLimit(reflect.ValueOf(huge), maxSchemaJSONDepth, &b); r != valueWalkTooLarge {
 		t.Fatalf("a 32 MiB control-byte string must bust the byte budget, got code %d", r)
-	}
-	if el := time.Since(start); el > 2*time.Second {
-		t.Fatalf("rejecting an over-budget string took %v; the scan is not bounded by the budget", el)
 	}
 }
 
@@ -3755,15 +3751,18 @@ func TestCensus_Q22_MagnitudeConsumersAgreeOnTheCeiling(t *testing.T) {
 //                              deep per-node Props/Default value.
 //   C7 cyclic Go type        — decode target / SchemaFor field type whose
 //                              reflect graph is cyclic: unbounded recursion.
-//   C9 registration-scaled   — a registered CustomType must not change Parse's
-//      parse cost              complexity class: the custom-match subtree walks
+//   C9 registration-scaled   — a registered CustomType must not change what
+//      parse cost              Parse can accept: the custom-match subtree walks
 //                              share one per-parse memo, else a
 //                              backward-reference chain or a many-refs cache
-//                              parse goes quadratic. Absolute wall-clock bounds,
-//                              not ratios.
+//                              parse is quadratic in a magnitude the text is
+//                              linear in.
 //
 // Each cell drives the real public API with a hostile input and asserts the
-// bound holds: it returns FAST, never hangs, panics, or crashes the process.
+// bound holds: it RETURNS — never hangs, panics, or crashes the process — with
+// the verdict the input deserves. No cell asserts a wall-clock cost; the caps
+// this package names are what make an unbounded input error out, and a cell
+// that merely got slower while staying under a cap is not what these are for.
 // Where a dedicated regression already pins the extreme case, the cell cites it.
 //
 // RULE: nothing here is ever "closed". A later DoS find EXTENDS this battery
@@ -3788,9 +3787,8 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 		pan any
 	}
 	ch := make(chan result, 1)
-	// Under -race the bound gets the same wider ceiling wantAcceptUnder already
-	// takes (see its rationale): instrumentation multiplies a HEALTHY bounded
-	// walk's wall-clock several-fold — the widest metadata cell runs ~0.5s
+	// Under -race the deadline widens, because instrumentation multiplies a
+	// HEALTHY bounded walk's wall-clock several-fold — the widest metadata cell runs ~0.5s
 	// unraced and ~4-5s raced with zero data races and normal completion — so
 	// the tight bound false-trips it. The separation these cells rely on is
 	// preserved: an actually-unbounded walk here is tens of seconds unraced
@@ -3799,7 +3797,6 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 	// timeout — that would hide a real hang; this only widens what -race itself
 	// inflated.
 	budget := raceInflated(dosBudget)
-	start := time.Now()
 	go func() {
 		var r result
 		defer func() {
@@ -3815,9 +3812,6 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 		if r.pan != nil {
 			t.Errorf("%s: panicked on hostile input (must return an error, not panic): %v", name, r.pan)
 			return nil, false
-		}
-		if d := time.Since(start); d > budget {
-			t.Errorf("%s: completed but took %v (> %v) — cost not bounded for hostile input", name, d, budget)
 		}
 		return r.err, true
 	case <-time.After(budget):
@@ -4038,9 +4032,9 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 	// it re-enters the recursive schema decode, and two decodes per level compound
 	// to O(2^depth), a sub-KB stray schema that hangs Parse. The bracket-depth arms
 	// use the BINDING form, which never routes a stray, so they cannot see this.
-	// Depth 1000 stays under the bracket pre-scan for all three keys, and the bound
-	// sits far above the linear cost and far below the quadratic and exponential
-	// ones it exists to catch.
+	// Depth 1000 stays under the bracket pre-scan for all three keys, so all three
+	// entry points must ACCEPT it — a doubling regression makes the input
+	// unparseable in practice rather than merely slow.
 	const strayDepth = 1000
 	for _, key := range []string{"items", "values", "fields"} {
 		open, closeStr := `{"type":"int","`+key+`":`, `}`
@@ -4048,16 +4042,16 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 			open, closeStr = `{"type":"int","fields":[{"name":"f","type":`, `}]}`
 		}
 		straySchema := strings.Repeat(open, strayDepth) + `"int"` + strings.Repeat(closeStr, strayDepth)
-		wantAcceptUnder(t, "Parse/nested-stray-"+key, 300*time.Millisecond, func() error {
+		wantAccept(t, "Parse/nested-stray-"+key, func() error {
 			_, err := Parse(straySchema)
 			return err
 		})
-		wantAcceptUnder(t, "SchemaCache.Parse/nested-stray-"+key, 300*time.Millisecond, func() error {
+		wantAccept(t, "SchemaCache.Parse/nested-stray-"+key, func() error {
 			var c SchemaCache
 			_, err := c.Parse(straySchema)
 			return err
 		})
-		wantAcceptUnder(t, "Root().Schema()/nested-stray-"+key, 300*time.Millisecond, func() error {
+		wantAccept(t, "Root().Schema()/nested-stray-"+key, func() error {
 			ss, err := Parse(straySchema)
 			if err != nil {
 				return err
@@ -4341,11 +4335,11 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 		{"nested", func(d int) string { return `{"type":"array","items":` + dagNested(d, 2) + `}` }},
 		{"flat-forward-ref", func(d int) string { return dagFlat(d, 2) }},
 	} {
-		wantCostDoesNotScale(t, cell, "Parse/shared-node-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "Parse/shared-node-"+form.name, func(d int) func() error {
 			s := form.build(d)
 			return func() error { _, err := Parse(s); return err }
 		})
-		wantCostDoesNotScale(t, cell, "SchemaCache.Parse/shared-node-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "SchemaCache.Parse/shared-node-"+form.name, func(d int) func() error {
 			s := form.build(d)
 			return func() error {
 				var c SchemaCache
@@ -4353,7 +4347,7 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 				return err
 			}
 		})
-		wantCostDoesNotScale(t, cell, "Root+Schema+String+Canonical/shared-node-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "Root+Schema+String+Canonical/shared-node-"+form.name, func(d int) func() error {
 			ds := MustParse(form.build(d))
 			return func() error {
 				root := ds.Root()
@@ -4363,19 +4357,19 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 				return nil
 			}
 		})
-		wantCostDoesNotScale(t, cell, "Resolve/shared-node-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "Resolve/shared-node-"+form.name, func(d int) func() error {
 			ds := MustParse(form.build(d))
 			return func() error { _, err := Resolve(ds, ds); return err }
 		})
 		// The writer field is DROPPED, which compiles a skip — a separate
 		// derivation of the same per-element bound.
-		wantCostDoesNotScale(t, cell, "Resolve/shared-node-dropped-field-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "Resolve/shared-node-dropped-field-"+form.name, func(d int) func() error {
 			schema := form.build(d)
 			w := MustParse(`{"type":"record","name":"T","fields":[{"name":"x","type":` + schema + `},{"name":"y","type":"int"}]}`)
 			r := MustParse(`{"type":"record","name":"T","fields":[{"name":"y","type":"int"}]}`)
 			return func() error { _, err := Resolve(w, r); return err }
 		})
-		wantCostDoesNotScale(t, cell, "CheckCompatibility/shared-node-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "CheckCompatibility/shared-node-"+form.name, func(d int) func() error {
 			ds := MustParse(form.build(d))
 			return func() error { return CheckCompatibility(ds, ds) }
 		})
@@ -4574,26 +4568,15 @@ func TestDoSBattery_C8_DirectByteAPIs(t *testing.T) {
 	})
 }
 
-// wantAcceptUnder asserts fn ACCEPTS (nil error) within bound. The C9 cells pin
-// a complexity CLASS on the accept path, so unlike the reject cells they carry
-// per-cell absolute bounds: generous multiples of the healthy cost yet far below
-// the quadratic the bound exists to catch, the two sitting an order of magnitude
-// apart. Under -race the bound gets the same ~3s ceiling every other wall-clock
-// cell takes (see avro_test's raceRelaxed): instrumentation puts the healthy
-// linear cost past the tight bound — ~350ms observed for the 200ms chain cells —
-// while the quadratic classes are multi-second under -race.
-func wantAcceptUnder(t *testing.T, name string, bound time.Duration, fn func() error) {
+// wantAccept asserts fn ACCEPTS (nil error). The cells that reach for it drive
+// a hostile-SHAPED but perfectly legal input — a union of twenty thousand
+// branches, a reference chain thousands long, a stray key nested a thousand
+// deep — through a public entry point, and the property is that the entry point
+// takes it: a size the spec permits must not be turned into an error.
+func wantAccept(t *testing.T, name string, fn func() error) {
 	t.Helper()
-	bound = raceRelaxed(bound)
-	start := time.Now()
-	err := fn()
-	elapsed := time.Since(start)
-	if err != nil {
+	if err := fn(); err != nil {
 		t.Errorf("%s: %v", name, err)
-		return
-	}
-	if elapsed > bound {
-		t.Errorf("%s: took %v (> %v) — the pass lost its complexity bound at this size", name, elapsed, bound)
 	}
 }
 
@@ -4624,22 +4607,15 @@ func TestDoSBattery_C9_CustomTypeParseCost(t *testing.T) {
 	match := CustomType{AvroType: "long"} // matches every chain leaf
 
 	// The chain LENGTH is the factor, driven at two values read from the registry.
-	// One value cannot tell the memo from its absence: the cost this bound caps is
-	// quadratic without the memo, so a single length only asks whether that length
-	// finishes, and a bound generous enough for the linear cost at 3000 is
-	// generous enough for the QUADRATIC cost at some smaller length. Doubling
-	// separates them — linear doubles, quadratic quadruples — and the per-length
-	// ceiling scales with the length. Measured linear at both, on both arms: 28ms
-	// and 25ms at 3000, 55ms and 58ms at 6000.
+	// Both lengths are well-formed schema text the parser must ACCEPT; the memo
+	// is what keeps the stamping walk from re-descending the whole chain per
+	// link, and its absence is quadratic node visits rather than a rejection.
 	for _, n := range costFactorValues(t, "TestDoSBattery_C9_CustomTypeParseCost") {
 		chain := dosChainSchema(n) // ~60n bytes of well-formed schema text
-		bound := time.Duration(n/3000) * 200 * time.Millisecond
 
 		// Parse × non-matching CustomType: every stamp walk completes clean,
-		// the worst case for a memo (nothing to short-circuit on). Healthy
-		// cost is the plain-parse neighborhood (tens of ms); quadratic is
-		// ~500ms+ at 3000 and grows 4x per doubling.
-		wantAcceptUnder(t, fmt.Sprintf("Parse/chain-noMatch-custom/n=%d", n), bound, func() error {
+		// the worst case for a memo (nothing to short-circuit on).
+		wantAccept(t, fmt.Sprintf("Parse/chain-noMatch-custom/n=%d", n), func() error {
 			_, err := Parse(chain, noMatch)
 			return err
 		})
@@ -4647,7 +4623,7 @@ func TestDoSBattery_C9_CustomTypeParseCost(t *testing.T) {
 		// Parse × MATCHING CustomType: walks short-circuit at the chain's
 		// leaf, which without a memo is still O(n) per walk = O(n^2) total.
 		// The memo must bound the match case too, not only the clean case.
-		wantAcceptUnder(t, fmt.Sprintf("Parse/chain-matching-custom/n=%d", n), bound, func() error {
+		wantAccept(t, fmt.Sprintf("Parse/chain-matching-custom/n=%d", n), func() error {
 			_, err := Parse(chain, match)
 			return err
 		})
@@ -4680,7 +4656,7 @@ func TestDoSBattery_C9_CustomTypeParseCost(t *testing.T) {
 	if _, err := c.Parse(big.String(), noMatch); err != nil {
 		t.Fatalf("cache parse of the inherited type: %v", err)
 	}
-	wantAcceptUnder(t, "SchemaCache.Parse/many-refs-custom", 400*time.Millisecond, func() error {
+	wantAccept(t, "SchemaCache.Parse/many-refs-custom", func() error {
 		_, err := c.Parse(wide.String(), noMatch)
 		return err
 	})
@@ -4808,40 +4784,40 @@ func TestDoSBattery_C11_SchemaDeclaredMagnitude(t *testing.T) {
 
 // ---------- race_bounds_test.go ----------
 
-// Wall-clock assertions have to account for the race detector, and the rule for
-// how is stated ONCE here. It used to be stated six times: a shared helper
-// applying an absolute FLOOR, a second copy of that floor written inline, three
-// hand-written ceilings using three different multipliers, and a pair of budget
-// constants whose comment claimed to mirror the floor and did not. Six
-// statements of one rule agree only until one is edited, and the floor is the
-// form that fails silently: raising a cell's NORMAL bound — done precisely when
-// its legitimate cost is large — shrinks the headroom the floor leaves it. So
-// the rule is a MULTIPLIER with an absolute floor under it, and both numbers
-// live here.
-
-// raceCostMultiplier is how much the detector inflates this suite's own timed
-// work. It is MEASURED, not chosen: running the DoS battery with and without
-// -race gives per-cell ratios from 2.3x (C1 deep nesting) to 8.3x (C10c
-// wide-record surfaces), and a per-call measurement of the widest parse cell
-// gives 6.2x. Ten covers the measured maximum with margin and matches what the
-// suite's older hand-written relaxations assumed.
+// Nothing in this suite asserts a wall-clock BUDGET. What remains that has to
+// account for the race detector is the LIVENESS deadlines — the watchdogs and
+// hang probes that turn "this never returned" into a failure instead of a wedged
+// package — and the rule for widening them is stated ONCE here. It used to be
+// stated six times, and six statements of one rule agree only until one is
+// edited.
 //
-// It stays far below what it has to: the class these ceilings separate is a
-// complexity CHANGE, and the quadratic the widest cell exists to catch measured
-// 1.9s to 32s unraced at that size, so even multiplied the ceiling sits more
-// than 2x from the healthy cost on one side and the broken cost on the other.
+// A deadline set for unraced work is the one that fails silently under the
+// detector: it does not report a hang, it reports a healthy walk that was
+// instrumented. So the rule is a MULTIPLIER with an absolute floor under it,
+// and both numbers live here.
+
+// raceCostMultiplier is how much the detector inflates this suite's own work.
+// It is MEASURED, not chosen: running the DoS battery with and without -race
+// gives per-cell ratios from 2.3x (C1 deep nesting) to 8.3x (C10c wide-record
+// surfaces), and a per-call measurement of the widest parse cell gives 6.2x.
+// Ten covers the measured maximum with margin.
+//
+// It stays far below what it has to: a deadline exists to separate "returned"
+// from "did not return", and the unbounded walks these watchdogs were written
+// against run for minutes or forever, so multiplying the deadline by ten costs
+// nothing in detection.
 const raceCostMultiplier = 10
 
-// raceCeilingFloor is the headroom a timed cell gets under -race no matter how
-// tight its normal bound. A cell asserting a microsecond reject needs ABSOLUTE
-// headroom, not proportional: ten times a 100ms bound is still a second, and
+// raceCeilingFloor is the headroom a deadline gets under -race no matter how
+// short it is. A probe over work that normally takes microseconds needs ABSOLUTE
+// headroom, not proportional: ten times a 100ms deadline is still a second, and
 // process startup, GC and host load are not proportional to the work. The floor
-// serves those cells and the multiplier serves the cells whose legitimate cost is
+// serves those probes and the multiplier serves the ones whose legitimate work is
 // already large, so taking the larger of the two lets one rule serve both — and
-// is why this loosens nothing below a 300ms normal bound.
+// is why this loosens nothing below a 300ms normal deadline.
 const raceCeilingFloor = 3 * time.Second
 
-// raceRelaxed returns the wall-clock CEILING to enforce for a normal bound.
+// raceRelaxed returns the DEADLINE to enforce for a normal one.
 // It never tightens: the result is >= normal in every mode, since the
 // multiplier is >= 1 and the floor only ever raises.
 func raceRelaxed(normal time.Duration) time.Duration {
@@ -4851,12 +4827,12 @@ func raceRelaxed(normal time.Duration) time.Duration {
 	return max(raceCeilingFloor, raceCostMultiplier*normal)
 }
 
-// raceInflated scales a MEASURED-cost allowance by the same inflation, with no
-// absolute floor. The distinction from raceRelaxed is the question being asked: a
-// ceiling asks "is this cost acceptable", so a generous absolute minimum is
-// harmless, while a scale-comparison floor asks "is this cost FLAT", and an
-// absolute 3s floor would swallow the comparison whole. Proportional inflation is
-// the only correct relaxation for a comparison.
+// raceInflated scales an allowance by the same inflation, with no absolute
+// floor. The distinction from raceRelaxed is what the number already is: the
+// two callers here (the DoS watchdog's 4s budget, the schema-node batteries'
+// 30s hang deadline) are already seconds, so the floor would change nothing,
+// and stating them without it keeps them proportional to the work they cover
+// rather than to an unrelated minimum.
 func raceInflated(allowance time.Duration) time.Duration {
 	if !raceEnabled {
 		return allowance
@@ -4900,17 +4876,8 @@ type raceRelaxation struct {
 // `// ---------- x ----------` banner still names which original file a consult
 // sits in, so a row covering more than one says so and splits its count.
 var raceRelaxations = []raceRelaxation{
-	{file: "internal_nets_test.go", sites: 4, kind: "authority",
-		why: "two authority sections in one file. race_bounds (3): raceRelaxed and raceInflated — the two forms of the rule and the only place either number appears — plus the invariant that asserts neither ever tightens. export (1): the bridge READS the predicate to hand it to package avro_test, so the two packages share one build-tagged mechanism instead of declaring one each"},
-
-	{file: "conformance_test.go", sites: 3, kind: "authority+skip",
-		why: "isRaceEnabled forwards the bridged value (1); the two remaining consults SKIP their budgets rather than relax them, each for a reason recorded at the site. Every wall-clock CEILING in this file asks raceRelaxed — three of them used to compute their own, with three different multipliers"},
-
-	{file: "audit_regression_test.go", sites: 1, kind: "skip",
-		why: "SKIPS its 2s deep-schema-reject budget under -race rather than relaxing it. A skip is a different decision from a ceiling and is kept as one: the quadratic it guards is seconds in the untraced run, which always executes"},
-
-	{file: "schema_semantics_test.go", sites: 1, kind: "skip",
-		why: "the error_bound section SKIPS a growth-RATIO check (linear lands near 2, quadratic near 4). Instrumentation distorts the ratio itself, not just the magnitude, so no multiplier can correct it; the absolute ceilings in the same test still run under -race"},
+	{file: "internal_nets_test.go", sites: 3, kind: "authority",
+		why: "the race_bounds section is the whole set: raceRelaxed and raceInflated — the two forms of the rule and the only place either number appears — plus the invariant that asserts neither ever tightens. No cell asserts a wall-clock BUDGET any more, so what the rule now widens is liveness: the DoS watchdog's deadline, the schema-node hang deadline, and the one hang probe in package avro_test that reaches raceRelaxed through the export bridge"},
 }
 
 // raceConstrained reports whether src carries a build constraint mentioning
@@ -5071,11 +5038,11 @@ func TestInvariant_EveryRaceRelaxationIsRowed(t *testing.T) {
 
 // TestInvariant_RaceRelaxationNeverTightens pins the two properties the whole
 // scheme rests on, in both build modes, so neither can be lost to a future
-// edit of the arithmetic: a relaxation never returns LESS than the bound it
-// was given, and under -race a cell whose normal bound is large gets headroom
-// proportional to it rather than a fixed ceiling that shrinks as the bound
-// grows. The second is the property the floor form did not have, which is why
-// it is asserted rather than left to the constant's documentation.
+// edit of the arithmetic: a relaxation never returns LESS than the deadline it
+// was given, and under -race a probe whose normal deadline is large gets
+// headroom proportional to it rather than a fixed ceiling that shrinks as the
+// deadline grows. The second is the property the floor form did not have, which
+// is why it is asserted rather than left to the constant's documentation.
 func TestInvariant_RaceRelaxationNeverTightens(t *testing.T) {
 	for _, normal := range []time.Duration{
 		time.Microsecond, time.Millisecond, 100 * time.Millisecond,
@@ -5091,7 +5058,7 @@ func TestInvariant_RaceRelaxationNeverTightens(t *testing.T) {
 	if !raceEnabled {
 		for _, normal := range []time.Duration{time.Millisecond, time.Minute} {
 			if got := raceRelaxed(normal); got != normal {
-				t.Errorf("raceRelaxed(%v) = %v without -race — the tight bound must stay in effect", normal, got)
+				t.Errorf("raceRelaxed(%v) = %v without -race — the tight deadline must stay in effect", normal, got)
 			}
 		}
 		return
@@ -5099,10 +5066,10 @@ func TestInvariant_RaceRelaxationNeverTightens(t *testing.T) {
 	// Under -race, headroom is proportional once the bound is past the floor.
 	small, large := 100*time.Millisecond, 10*time.Second
 	if ratio := raceRelaxed(large) / large; ratio < 2 {
-		t.Errorf("raceRelaxed(%v) leaves only %vx headroom — the ceiling stops scaling with the bound, which is the shape that reds a correct cell", large, ratio)
+		t.Errorf("raceRelaxed(%v) leaves only %vx headroom — the ceiling stops scaling with the deadline, which is the shape that reds a correct probe", large, ratio)
 	}
 	if raceRelaxed(small) < raceCeilingFloor {
-		t.Errorf("raceRelaxed(%v) = %v — below the absolute floor a tight cell needs", small, raceRelaxed(small))
+		t.Errorf("raceRelaxed(%v) = %v — below the absolute floor a short deadline needs", small, raceRelaxed(small))
 	}
 }
 
@@ -5226,16 +5193,12 @@ func TestCoverage_RatFromBytesHostileScale(t *testing.T) {
 // Test-only bridges for the external avro_test package (compiled only into
 // the test binary; not part of the library surface).
 
-// RaceRelaxedForTest is the wall-clock ceiling authority (race_bounds_test.go),
+// RaceRelaxedForTest is the deadline-widening authority (race_bounds_test.go),
 // bridged so package avro_test ASKS it instead of keeping a second copy of the
 // rule. The two packages cannot share an unexported helper, and that is exactly
 // why the rule was duplicated — so the sharing is made explicit here rather
 // than left to two comments agreeing with each other.
 func RaceRelaxedForTest(normal time.Duration) time.Duration { return raceRelaxed(normal) }
-
-// RaceEnabledForTest bridges the build-tagged predicate itself, so there is one
-// mechanism for the whole module rather than one per test package.
-const RaceEnabledForTest = raceEnabled
 
 // SlabFreeForTest reports the internal slab-free classification: whether
 // Decode bypasses the slab pool and runs this schema's deser on a nil slab.

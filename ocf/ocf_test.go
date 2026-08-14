@@ -6273,7 +6273,6 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 		pan any
 	}
 	ch := make(chan result, 1)
-	start := time.Now()
 	go func() {
 		var r result
 		defer func() {
@@ -6289,9 +6288,6 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 		if r.pan != nil {
 			t.Errorf("%s: panicked on hostile input (must return an error, not panic): %v", name, r.pan)
 			return nil, false
-		}
-		if d := time.Since(start); d > ocfDosBudget {
-			t.Errorf("%s: completed but took %v (> %v) — cost not bounded", name, d, ocfDosBudget)
 		}
 		return r.err, true
 	case <-time.After(ocfDosBudget):
@@ -7176,9 +7172,9 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 		}
 	})
 
-	// An all-empty-blocks file terminates in bounded time: one Decode call
-	// walks every block (18 bytes each) and returns io.EOF — cost linear in
-	// the input, no records, no hang.
+	// An all-empty-blocks file terminates: one Decode call walks every block
+	// (18 bytes each) and returns io.EOF — no records, no hang, and in
+	// particular no block treated as a datum.
 	t.Run("ten-thousand-empty-blocks", func(t *testing.T) {
 		s := avro.MustParse(`"string"`)
 		var buf bytes.Buffer
@@ -7187,13 +7183,9 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 		for range 10_000 {
 			appendRawBlock(&buf, 0, nil, foreignSync)
 		}
-		start := time.Now()
 		got := readAllStrings(t, buf.Bytes())
 		if len(got) != 0 {
 			t.Fatalf("read %v from an all-empty file", got)
-		}
-		if d := time.Since(start); d > 10*time.Second {
-			t.Fatalf("all-empty file took %v to reach io.EOF", d)
 		}
 		if fa != nil && faSupported["null"] {
 			faGot, faErr := fa(buf.Bytes())

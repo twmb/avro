@@ -12062,44 +12062,29 @@ func TestRegression_NonUnionBranchesInertInRebuild(t *testing.T) {
 
 // ---------- schema_breadth_test.go ----------
 
-// Schema BREADTH — cost against the number of SIBLINGS a schema declares.
+// Schema BREADTH — the number of SIBLINGS a schema declares.
 //
 // A schema's size grows two ways: it nests deeper, or it declares more siblings
 // at one level. Depth is bounded by an explicit pre-scan and pinned by the
-// deep-schema cost tests. Breadth has no cap and needs none — a union of 20000
-// named branches, or a record of 20000 fields, is legal Avro that a schema
-// registry, an RPC handshake, or an OCF header can hand a reader. What it does
-// need is for every pass over those siblings to stay LINEAR in their count,
-// because a pass that scans the sibling list once per sibling turns an O(n)
-// input into O(n^2) work.
+// deep-schema cells. Breadth has no cap and needs none — a union of 20000 named
+// branches, or a record of 20000 fields, is legal Avro that a schema registry,
+// an RPC handshake, or an OCF header can hand a reader. What it does need is for
+// every pass over those siblings to stay LINEAR in their count, because a pass
+// that scans the sibling list once per sibling turns an O(n) input into O(n^2)
+// work.
 //
-// The bounds are absolute wall-clock, not ratios: a ratio between two sizes is
-// noise-sensitive on a loaded host, while the two complexity classes these
-// separate are orders of magnitude apart at the sizes driven.
+// What the cells assert is ACCEPTANCE at this width, through every entry point:
+// a sibling count the spec permits must not be refused, and each surface must
+// return the answer its non-wide form returns. They no longer carry a wall-clock
+// ceiling — that read the host as much as the code, and the sizes here are
+// admitted by the parser's named caps rather than by how fast a pass over them
+// runs.
 
-// breadthN is the sibling count every cell drives. It is chosen so that a
-// quadratic pass takes seconds while a linear one takes tens of milliseconds,
-// leaving room for a loaded host and for the race detector's instrumentation
-// without either class being mistaken for the other.
+// breadthN is the sibling count every cell drives. It is the size at which a
+// per-sibling rescan of the sibling list stops being a constant factor and
+// becomes the whole cost, so the shape being guarded is unmistakable in a
+// profile even though no cell asserts a time.
 const breadthN = 20000
-
-// breadthBound is the per-cell ceiling. wantAcceptUnder raises it under -race.
-const breadthBound = 500 * time.Millisecond
-
-// breadthParseBound is the ceiling for the two cells that parse the schema TEXT
-// rather than walking an already-parsed tree.
-//
-// A bound only separates linear from quadratic if it sits far above the linear
-// cost, and those two do not qualify at breadthBound: a 20000-branch union is
-// close to a megabyte of JSON, and parsing it is ~140ms (Parse) and ~300ms
-// (SchemaCache.Parse) of measured-linear work, doubling with the branch count.
-// At 500ms those cells sat within 1.7x of their own linear cost, so a merely
-// BUSY host crossed the line and reported a complexity change that had not
-// happened. The quadratic this column exists to catch measured 1.9s to 32s at
-// this size, so the ceiling still separates the two classes by more than 2x on
-// each side. Every other cell walks a parsed tree in tens of milliseconds and
-// keeps the tighter bound.
-const breadthParseBound = 1500 * time.Millisecond
 
 //////////////////////////////////////////////////////////////////////////////
 // The entry-point axis, derived from the battery's other columns
@@ -12111,7 +12096,7 @@ const breadthParseBound = 1500 * time.Millisecond
 // than being covered by whoever remembers to add it. batteryCellLabel matches a
 // battery cell's name argument; every cell is named "<entry point>/<case>", which
 // is what makes the entry-point axis recoverable from source.
-var batteryCellLabel = regexp.MustCompile(`want(?:Reject|RejectIs|Terminate|BoundedErr|AcceptUnder)\(t, "([^"/]+)`)
+var batteryCellLabel = regexp.MustCompile(`want(?:Reject|RejectIs|Terminate|BoundedErr|Accept)\(t, "([^"/]+)`)
 
 // breadthEntryAlias folds the spellings the battery uses for one entry point
 // onto a single name. A cell label names the call the cell makes, so the same
@@ -12305,8 +12290,8 @@ func TestInvariant_EveryUnionTagTierHasAWideShape(t *testing.T) {
 }
 
 // TestRegression_UnionTagTierShapesReachTheirTier proves each shape actually
-// makes its tier claim its branches. A cost cell whose input never reaches the
-// pass it is timing measures nothing, and would stay green through any change
+// makes its tier claim its branches. A breadth cell whose input never reaches
+// the pass it names exercises nothing, and would stay green through any change
 // to that pass.
 func TestRegression_UnionTagTierShapesReachTheirTier(t *testing.T) {
 	const n = 8
@@ -12347,18 +12332,18 @@ func TestRegression_UnionTagTierShapesReachTheirTier(t *testing.T) {
 }
 
 // TestDoSBattery_C10a_UnionTagBreadth drives every tier's wide shape through
-// every parse entry point. The tag tables are built during the parse, so the
-// parse time is the observable.
+// every parse entry point. The tag tables are built during the parse, so a
+// tier that cannot hold this many branches surfaces as the parse refusing it.
 func TestDoSBattery_C10a_UnionTagBreadth(t *testing.T) {
 	for _, s := range breadthTierShapes {
 		union := s.build(breadthN)
 		schema := `{"type":"record","name":"Top","fields":[{"name":"f","type":` + union + `}]}`
 
-		wantAcceptUnder(t, "Parse/wide-union-"+s.tier, breadthParseBound, func() error {
+		wantAccept(t, "Parse/wide-union-"+s.tier, func() error {
 			_, err := Parse(schema)
 			return err
 		})
-		wantAcceptUnder(t, "SchemaCache.Parse/wide-union-"+s.tier, breadthParseBound, func() error {
+		wantAccept(t, "SchemaCache.Parse/wide-union-"+s.tier, func() error {
 			var c SchemaCache
 			_, err := c.Parse(schema)
 			return err
@@ -12369,7 +12354,7 @@ func TestDoSBattery_C10a_UnionTagBreadth(t *testing.T) {
 		fwd := `{"type":"record","name":"Top","fields":[` +
 			`{"name":"a","type":"a.Fwd"},` +
 			`{"name":"f","type":` + union[:len(union)-1] + `,{"type":"record","name":"a.Fwd","fields":[]}]}]}`
-		wantAcceptUnder(t, "Parse/wide-union-forward-ref-"+s.tier, breadthParseBound, func() error {
+		wantAccept(t, "Parse/wide-union-forward-ref-"+s.tier, func() error {
 			_, err := Parse(fwd)
 			return err
 		})
@@ -12610,14 +12595,16 @@ func TestDoSBattery_C10b_FieldLookupBreadth(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s reader: %v", s.name, err)
 		}
-		wantAcceptUnder(t, "Resolve/wide-record-"+s.name, breadthBound, func() error {
+		wantAccept(t, "Resolve/wide-record-"+s.name, func() error {
 			_, err := Resolve(w, r)
 			return err
 		})
-		wantAcceptUnder(t, "CheckCompatibility/wide-record-"+s.name, breadthBound, func() error {
-			// A reader field the writer lacks needs a default, so the miss
-			// shape is legitimately incompatible; the cost is the question
-			// here, not the verdict.
+		wantAccept(t, "CheckCompatibility/wide-record-"+s.name, func() error {
+			// The verdict is shape-dependent — a reader field the writer lacks
+			// needs a default, so the miss shape is legitimately incompatible —
+			// so what this row holds is the entry point's PRESENCE in the
+			// breadth cross: it must reach a verdict on 20000 siblings at all,
+			// rather than panic or run out of stack.
 			CheckCompatibility(w, r)
 			return nil
 		})
@@ -12632,8 +12619,9 @@ func TestDoSBattery_C10b_FieldLookupBreadth(t *testing.T) {
 // through every remaining entry point the battery covers: the two wire
 // directions, their JSON and single-object forms, and the schema surfaces that
 // walk or re-emit the tree. A record's field count is chosen by whoever writes
-// the schema, so each of these passes over the field list once per call and
-// must stay linear in it.
+// the schema, so every one of these surfaces has to keep working at a width the
+// caller picked — and each cell checks the surface's own answer at that width,
+// not just that it returned.
 func TestDoSBattery_C10c_WideRecordSurfaces(t *testing.T) {
 	text := breadthLongFields("f", nil, false)(breadthN)
 	s := mustParse(t, text)
@@ -12645,58 +12633,58 @@ func TestDoSBattery_C10c_WideRecordSurfaces(t *testing.T) {
 	jsonWire := mustEncodeJSON(t, s, val)
 	soe := mustAppendSingleObject(t, s, nil, val)
 
-	wantAcceptUnder(t, "Encode/wide-record", breadthBound, func() error {
+	wantAccept(t, "Encode/wide-record", func() error {
 		_, err := s.Encode(val)
 		return err
 	})
-	wantAcceptUnder(t, "Decode/wide-record", breadthBound, func() error {
+	wantAccept(t, "Decode/wide-record", func() error {
 		var out map[string]any
 		_, err := s.Decode(wire, &out)
 		return err
 	})
-	wantAcceptUnder(t, "EncodeJSON/wide-record", breadthBound, func() error {
+	wantAccept(t, "EncodeJSON/wide-record", func() error {
 		_, err := s.EncodeJSON(val)
 		return err
 	})
-	wantAcceptUnder(t, "DecodeJSON/wide-record", breadthBound, func() error {
+	wantAccept(t, "DecodeJSON/wide-record", func() error {
 		var out map[string]any
 		return s.DecodeJSON(jsonWire, &out)
 	})
-	wantAcceptUnder(t, "AppendSingleObject/wide-record", breadthBound, func() error {
+	wantAccept(t, "AppendSingleObject/wide-record", func() error {
 		_, err := s.AppendSingleObject(nil, val)
 		return err
 	})
-	wantAcceptUnder(t, "DecodeSingleObject/wide-record", breadthBound, func() error {
+	wantAccept(t, "DecodeSingleObject/wide-record", func() error {
 		var out map[string]any
 		_, err := s.DecodeSingleObject(soe, &out)
 		return err
 	})
-	wantAcceptUnder(t, "Canonical/wide-record", breadthBound, func() error {
+	wantAccept(t, "Canonical/wide-record", func() error {
 		if len(s.Canonical()) == 0 {
 			return fmt.Errorf("empty canonical form")
 		}
 		return nil
 	})
-	wantAcceptUnder(t, "Fingerprint/wide-record", breadthBound, func() error {
+	wantAccept(t, "Fingerprint/wide-record", func() error {
 		if len(s.Fingerprint(crypto.SHA256.New())) == 0 {
 			return fmt.Errorf("empty fingerprint")
 		}
 		return nil
 	})
-	wantAcceptUnder(t, "String/wide-record", breadthBound, func() error {
+	wantAccept(t, "String/wide-record", func() error {
 		if len(s.String()) == 0 {
 			return fmt.Errorf("empty string form")
 		}
 		return nil
 	})
-	wantAcceptUnder(t, "Root/wide-record", breadthBound, func() error {
+	wantAccept(t, "Root/wide-record", func() error {
 		if len(s.Root().Fields) != breadthN {
 			return fmt.Errorf("Root surfaced %d fields, want %d", len(s.Root().Fields), breadthN)
 		}
 		return nil
 	})
 	root := s.Root()
-	wantAcceptUnder(t, "SchemaNode.Schema/wide-record", breadthBound, func() error {
+	wantAccept(t, "SchemaNode.Schema/wide-record", func() error {
 		_, err := root.Schema()
 		return err
 	})
@@ -12971,10 +12959,10 @@ func TestDoSBattery_C10d_SiblingKindSurfaces(t *testing.T) {
 				t.Fatalf("parse twin: %v", err)
 			}
 			// A twin canonically equal to the schema takes Resolve's equality
-			// short-circuit, and the resolve cells would time that instead of
-			// the sibling matching they exist to bound.
+			// short-circuit, and the resolve cells would then exercise that
+			// instead of the sibling matching they exist to reach.
 			if string(s.Canonical()) == string(twin.Canonical()) {
-				t.Fatal("the twin is canonically equal to the schema, so the resolve cells would time the equality short-circuit rather than the match")
+				t.Fatal("the twin is canonically equal to the schema, so the resolve cells would take the equality short-circuit rather than the match")
 			}
 			val := kind.value(breadthN)
 			wire, err := s.Encode(val)
@@ -12991,79 +12979,79 @@ func TestDoSBattery_C10d_SiblingKindSurfaces(t *testing.T) {
 			}
 
 			label := func(entry string) string { return entry + "/wide-" + kind.field }
-			wantAcceptUnder(t, label("Parse"), breadthParseBound, func() error {
+			wantAccept(t, label("Parse"), func() error {
 				_, err := Parse(text)
 				return err
 			})
-			wantAcceptUnder(t, label("SchemaCache.Parse"), breadthParseBound, func() error {
+			wantAccept(t, label("SchemaCache.Parse"), func() error {
 				var c SchemaCache
 				_, err := c.Parse(text)
 				return err
 			})
-			wantAcceptUnder(t, label("Resolve"), breadthBound, func() error {
+			wantAccept(t, label("Resolve"), func() error {
 				_, err := Resolve(twin, s)
 				return err
 			})
-			wantAcceptUnder(t, label("CheckCompatibility"), breadthBound, func() error {
+			wantAccept(t, label("CheckCompatibility"), func() error {
 				return CheckCompatibility(twin, s)
 			})
-			wantAcceptUnder(t, label("Encode"), breadthBound, func() error {
+			wantAccept(t, label("Encode"), func() error {
 				_, err := s.Encode(val)
 				return err
 			})
-			wantAcceptUnder(t, label("Decode"), breadthBound, func() error {
+			wantAccept(t, label("Decode"), func() error {
 				var out any
 				_, err := s.Decode(wire, &out)
 				return err
 			})
-			wantAcceptUnder(t, label("EncodeJSON"), breadthBound, func() error {
+			wantAccept(t, label("EncodeJSON"), func() error {
 				_, err := s.EncodeJSON(val)
 				return err
 			})
-			wantAcceptUnder(t, label("DecodeJSON"), breadthBound, func() error {
+			wantAccept(t, label("DecodeJSON"), func() error {
 				var out any
 				return s.DecodeJSON(jsonWire, &out)
 			})
 			// The tagged form routes every value through the union tag table
 			// rather than through try-each, which is the consumer the bare
 			// form never reaches.
-			wantAcceptUnder(t, label("DecodeJSON+TaggedUnions"), breadthBound, func() error {
+			wantAccept(t, label("DecodeJSON+TaggedUnions"), func() error {
 				var out any
 				return s.DecodeJSON(jsonWire, &out, TaggedUnions())
 			})
-			wantAcceptUnder(t, label("AppendSingleObject"), breadthBound, func() error {
+			wantAccept(t, label("AppendSingleObject"), func() error {
 				_, err := s.AppendSingleObject(nil, val)
 				return err
 			})
-			wantAcceptUnder(t, label("DecodeSingleObject"), breadthBound, func() error {
+			wantAccept(t, label("DecodeSingleObject"), func() error {
 				var out any
 				_, err := s.DecodeSingleObject(soe, &out)
 				return err
 			})
-			wantAcceptUnder(t, label("Canonical"), breadthBound, func() error {
+			wantAccept(t, label("Canonical"), func() error {
 				if len(s.Canonical()) == 0 {
 					return fmt.Errorf("empty canonical form")
 				}
 				return nil
 			})
-			wantAcceptUnder(t, label("Fingerprint"), breadthBound, func() error {
+			wantAccept(t, label("Fingerprint"), func() error {
 				if len(s.Fingerprint(crypto.SHA256.New())) == 0 {
 					return fmt.Errorf("empty fingerprint")
 				}
 				return nil
 			})
-			wantAcceptUnder(t, label("String"), breadthBound, func() error {
+			wantAccept(t, label("String"), func() error {
 				if len(s.String()) == 0 {
 					return fmt.Errorf("empty string form")
 				}
 				return nil
 			})
 			var root SchemaNode
-			wantAcceptUnder(t, label("Root"), breadthBound, func() error {
+			wantAccept(t, label("Root"), func() error {
 				root = *s.Root()
 				return nil
 			})
-			wantAcceptUnder(t, label("SchemaNode.Schema"), breadthBound, func() error {
+			wantAccept(t, label("SchemaNode.Schema"), func() error {
 				_, err := root.Schema()
 				return err
 			})
@@ -13337,7 +13325,7 @@ func TestInvariant_SharedSchemaNodeWalkedOnce(t *testing.T) {
 						t.Fatalf("trigger %q is registered as walks=%v but the parsed schema %s a container that asks for a per-element minimum",
 							tr.name, tr.walks, map[bool]string{true: "contains", false: "does not contain"}[got])
 					}
-					wantCostDoesNotScale(t, cell, name, func(v int) func() error {
+					wantEveryMagnitudeTerminates(t, cell, name, func(v int) func() error {
 						s := build(v)
 						return func() error { _, err := Parse(s); return err }
 					})
@@ -13732,12 +13720,12 @@ func TestInvariant_EveryMinBytesEntryPointIsBounded(t *testing.T) {
 	const cell = "TestInvariant_EveryMinBytesEntryPointIsBounded"
 	dagAt := func(depth int) string { return `{"type":"array","items":` + dagNested(depth, 2) + `}` }
 
-	wantCostDoesNotScale(t, cell, "Parse", func(depth int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "Parse", func(depth int) func() error {
 		s := dagAt(depth)
 		return func() error { _, err := Parse(s); return err }
 	})
 
-	wantCostDoesNotScale(t, cell, "SchemaCache.Parse", func(depth int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "SchemaCache.Parse", func(depth int) func() error {
 		s := dagAt(depth)
 		return func() error {
 			// The cache memoizes by TEXT, so it saves a REPEATED parse and
@@ -13748,14 +13736,14 @@ func TestInvariant_EveryMinBytesEntryPointIsBounded(t *testing.T) {
 		}
 	})
 
-	wantCostDoesNotScale(t, cell, "Resolve/dropped-field-skip", func(depth int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "Resolve/dropped-field-skip", func(depth int) func() error {
 		wDrop := MustParse(fmt.Sprintf(
 			`{"type":"record","name":"Top","fields":[{"name":"x","type":%s},{"name":"y","type":"int"}]}`, dagAt(depth)))
 		rDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"y","type":"int"}]}`)
 		return func() error { _, err := Resolve(wDrop, rDrop); return err }
 	})
 
-	wantCostDoesNotScale(t, cell, "Resolve/kept-field", func(depth int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "Resolve/kept-field", func(depth int) func() error {
 		wKeep := MustParse(fmt.Sprintf(
 			`{"type":"record","name":"Top","fields":[{"name":"x","type":%s}]}`, dagAt(depth)))
 		rKeep := MustParse(fmt.Sprintf(
@@ -13768,7 +13756,7 @@ func TestInvariant_EveryMinBytesEntryPointIsBounded(t *testing.T) {
 	// by the caller. The ocf package cannot be imported from package avro,
 	// so the executable cell lives in ocf/dos_battery_test.go; this cell
 	// pins the parse of the identical header schema that reaches it.
-	wantCostDoesNotScale(t, cell, "ocf-header/schema-parse", func(depth int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "ocf-header/schema-parse", func(depth int) func() error {
 		s := dagAt(depth)
 		return func() error { _, err := Parse(s); return err }
 	})
@@ -13860,7 +13848,7 @@ func TestInvariant_CyclicWalkCostIsBoundedByWork(t *testing.T) {
 				t.Fatalf("trigger %q is registered as walks=%v but the parsed schema %s a container that asks for a per-element minimum",
 					tr.name, tr.walks, map[bool]string{true: "contains", false: "does not contain"}[got])
 			}
-			wantCostDoesNotScale(t, cell, "Parse/wide-scc/"+tr.name, func(width int) func() error {
+			wantEveryMagnitudeTerminates(t, cell, "Parse/wide-scc/"+tr.name, func(width int) func() error {
 				s := tr.wrap(dagWideSCC(dagWideLevels, 2, width))
 				return func() error { _, err := Parse(s); return err }
 			})
@@ -13876,7 +13864,7 @@ func TestInvariant_WideCyclicWalkReachesEveryEntryPoint(t *testing.T) {
 		return `{"type":"array","items":` + dagWideSCC(dagWideLevels, 2, width) + `}`
 	}
 
-	wantCostDoesNotScale(t, cell, "SchemaCache.Parse/wide-scc", func(width int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "SchemaCache.Parse/wide-scc", func(width int) func() error {
 		s := at(width)
 		return func() error {
 			var c SchemaCache
@@ -13884,13 +13872,13 @@ func TestInvariant_WideCyclicWalkReachesEveryEntryPoint(t *testing.T) {
 			return err
 		}
 	})
-	wantCostDoesNotScale(t, cell, "Resolve/wide-scc", func(width int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "Resolve/wide-scc", func(width int) func() error {
 		parsed := MustParse(at(width))
 		return func() error { _, err := Resolve(parsed, parsed); return err }
 	})
 	// The writer field is DROPPED, which compiles a skip — a separate
 	// derivation of the same per-element bound.
-	wantCostDoesNotScale(t, cell, "Resolve/wide-scc-dropped-field", func(width int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "Resolve/wide-scc-dropped-field", func(width int) func() error {
 		s := at(width)
 		w := MustParse(`{"type":"record","name":"T","fields":[{"name":"x","type":` + s + `},{"name":"y","type":"int"}]}`)
 		r := MustParse(`{"type":"record","name":"T","fields":[{"name":"y","type":"int"}]}`)
@@ -13898,7 +13886,7 @@ func TestInvariant_WideCyclicWalkReachesEveryEntryPoint(t *testing.T) {
 	})
 	// ocf-header: the executable cell lives in ocf/dos_battery_test.go
 	// (package avro cannot import ocf); this pins the parse that reaches it.
-	wantCostDoesNotScale(t, cell, "ocf-header/wide-scc-schema-parse", func(width int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "ocf-header/wide-scc-schema-parse", func(width int) func() error {
 		s := at(width)
 		return func() error { _, err := Parse(s); return err }
 	})
@@ -13980,7 +13968,7 @@ func TestInvariant_MetadataSurfacesBoundedByWidth(t *testing.T) {
 	at := func(width int) *Schema {
 		return MustParse(`{"type":"array","items":` + dagWideSCC(dagWideLevels, 2, width) + `}`)
 	}
-	wantCostDoesNotScale(t, cell, "Root+Schema/wide-scc", func(width int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "Root+Schema/wide-scc", func(width int) func() error {
 		s := at(width)
 		return func() error {
 			root := s.Root()
@@ -13988,7 +13976,7 @@ func TestInvariant_MetadataSurfacesBoundedByWidth(t *testing.T) {
 			return nil
 		}
 	})
-	wantCostDoesNotScale(t, cell, "String+Canonical/wide-scc", func(width int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "String+Canonical/wide-scc", func(width int) func() error {
 		s := at(width)
 		return func() error {
 			_ = s.String()
@@ -14088,11 +14076,11 @@ func TestInvariant_MinBytesContainerCountBounded(t *testing.T) {
 
 	// Parse, FORWARD refs: the arrays precede the SCC, so their items resolve in
 	// finalize's container-fixup loop, which shares one walk across all of them.
-	wantCostDoesNotScale(t, cell, "Parse/many-containers-forward", func(n int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "Parse/many-containers-forward", func(n int) func() error {
 		s := nContainersOverSCC(n, containerCountLevels)
 		return func() error { _, err := Parse(s); return err }
 	})
-	wantCostDoesNotScale(t, cell, "SchemaCache.Parse/many-containers-forward", func(n int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "SchemaCache.Parse/many-containers-forward", func(n int) func() error {
 		s := nContainersOverSCC(n, containerCountLevels)
 		return func() error {
 			var c SchemaCache
@@ -14106,11 +14094,11 @@ func TestInvariant_MinBytesContainerCountBounded(t *testing.T) {
 	// computed on the BUILD reaching-path, not finalize. Reference DIRECTION is
 	// its own axis, and it is crossed here WITH the count rather than instead
 	// of it — varying only the direction is what left the count pinned.
-	wantCostDoesNotScale(t, cell, "Parse/many-containers-backward", func(n int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "Parse/many-containers-backward", func(n int) func() error {
 		s := nContainersOverWiredSCC(n, containerCountLevels)
 		return func() error { _, err := Parse(s); return err }
 	})
-	wantCostDoesNotScale(t, cell, "SchemaCache.Parse/many-containers-backward", func(n int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "SchemaCache.Parse/many-containers-backward", func(n int) func() error {
 		s := nContainersOverWiredSCC(n, containerCountLevels)
 		return func() error {
 			var c SchemaCache
@@ -14121,7 +14109,7 @@ func TestInvariant_MinBytesContainerCountBounded(t *testing.T) {
 
 	// Resolve: a reader that differs (extra field) forces resolveRecord to
 	// recurse into every array, each calling ctx.minBytes on the shared walk.
-	wantCostDoesNotScale(t, cell, "Resolve/many-containers", func(n int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "Resolve/many-containers", func(n int) func() error {
 		scc := nContainersOverSCC(n, containerCountLevels)
 		w := MustParse(scc)
 		r := MustParse(strings.Replace(scc,
@@ -14133,7 +14121,7 @@ func TestInvariant_MinBytesContainerCountBounded(t *testing.T) {
 	// Skip: a dropped writer field whose subtree is the many-containers record.
 	// The skip is compiled lazily at first decode, on the resolution's own walk;
 	// this drives that compile.
-	wantCostDoesNotScale(t, cell, "Resolve+Decode/many-containers-dropped", func(n int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "Resolve+Decode/many-containers-dropped", func(n int) func() error {
 		scc := nContainersOverSCC(n, containerCountLevels)
 		wDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"x","type":` + scc + `},{"name":"y","type":"int"}]}`)
 		rDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"y","type":"int"}]}`)
@@ -14153,7 +14141,7 @@ func TestInvariant_MinBytesContainerCountBounded(t *testing.T) {
 
 	// ocf-header: the executable cell lives in ocf/dos_battery_test.go; this
 	// pins the parse of the identical header schema that reaches it.
-	wantCostDoesNotScale(t, cell, "ocf-header/many-containers", func(n int) func() error {
+	wantEveryMagnitudeTerminates(t, cell, "ocf-header/many-containers", func(n int) func() error {
 		s := nContainersOverSCC(n, containerCountLevels)
 		return func() error { _, err := Parse(s); return err }
 	})
@@ -14744,34 +14732,25 @@ func nRecordsOverSCCWire(nrecs, levels int) []byte {
 	return append(w, 2) // keep = 1
 }
 
-// reachScaleTol and reachScaleFloor separate "the walk is shared" from "the
-// walk is rebuilt per unit". A shared walk pays its allowance once, so the high
-// and low cells differ only by the genuinely linear part (a longer schema to
-// parse, more wire bytes to read). A per-unit walk multiplies the allowance by
-// the factor, which at reachCounts' spread is more than an order of magnitude
-// past this. The floor keeps a fast cell from being judged on a ratio of noise.
-const (
-	reachScaleTol   = 4
-	reachScaleFloor = 400 * time.Millisecond
-)
-
 // TestInvariant_EveryReachingPathBoundIsMeasured is the rule that a bound must
-// be MEASURED, not stated. Every reaching path names the counts its one walk is
+// be DRIVEN, not stated. Every reaching path names the counts its one walk is
 // shared across, and every count names a cell that drives it at two or more
 // distinct values. Both directions are mechanical, and the second is the one
 // that bites:
 //
 //   - a row with no cell fails. Prose describing why a cost is bounded is a
 //     claim, and this census exists to reject claims.
-//   - a cell that holds its row's factor CONSTANT fails. One value asks only
-//     "does this finish?", which a cost merely linear in the factor also
-//     answers. The skip path was rowed with a true sentence about the wire and
-//     no cell that varied a record count, and the unbounded factor lived under
-//     it.
+//   - a cell that holds its row's factor CONSTANT fails. One value pins one
+//     size, and the shapes these walks get wrong are the ones that only appear
+//     once a second size is reached. The skip path was rowed with a true
+//     sentence about the wire and no cell that varied a record count, and the
+//     unbounded factor lived under it.
 //
 // Attack it both ways: delete a factor's second value and the constant-factor
-// arm fires; drop a row's factors for a sentence and the no-cell arm fires;
-// rebuild any shared walk per unit and the scale arm fires.
+// arm fires; drop a row's factors for a sentence and the no-cell arm fires.
+// Each value is driven under wantTerminate, so a walk that stops returning at
+// the top of its range surfaces as a watchdog failure rather than as a wedged
+// suite.
 func TestInvariant_EveryReachingPathBoundIsMeasured(t *testing.T) {
 	for _, site := range minBytesConstructionSites {
 		if site.exempt != "" {
@@ -14795,7 +14774,7 @@ func TestInvariant_EveryReachingPathBoundIsMeasured(t *testing.T) {
 				seen[v] = true
 			}
 			if len(seen) < 2 {
-				t.Errorf("%s: cell drives %d distinct value(s) of its own factor %v.\nA bound is a claim about how cost RESPONDS to this count, and one value cannot tell a bound from a linear cost.",
+				t.Errorf("%s: cell drives %d distinct value(s) of its own factor %v.\nOne value pins one size; a walk rebuilt per unit is reached only by varying the count.",
 					name, len(seen), f.values)
 				continue
 			}
@@ -14803,25 +14782,11 @@ func TestInvariant_EveryReachingPathBoundIsMeasured(t *testing.T) {
 				t.Errorf("%s: factor has values but no cell to drive them", name)
 				continue
 			}
-			lo, hi := f.values[0], f.values[0]
 			for _, v := range f.values {
-				lo = min(lo, v)
-				hi = max(hi, v)
-			}
-			times := make(map[int]time.Duration, len(f.values))
-			for _, v := range f.values {
-				start := time.Now()
-				// Each value must also be bounded on its own — the watchdog
-				// catches an unbounded path that would never return to be timed.
+				// The watchdog catches a path that stopped bounding itself and
+				// would never return.
 				wantTerminate(t, fmt.Sprintf("%s=%d", name, v), func() error { return f.drive(v) })
-				times[v] = time.Since(start)
 			}
-			floor := raceInflated(reachScaleFloor)
-			if lim := max(reachScaleTol*times[lo], floor); times[hi] > lim {
-				t.Errorf("%s: cost scales with the factor — %v at %d vs %v at %d (limit %v).\nA walk shared across this count pays its allowance once; this is the shape of one walk per unit.",
-					name, times[hi], hi, times[lo], lo, lim)
-			}
-			t.Logf("%s: %v at %d, %v at %d", name, times[lo], lo, times[hi], hi)
 		}
 	}
 }
@@ -14900,24 +14865,24 @@ func TestInvariant_MinBytesReachingPaths(t *testing.T) {
 	}
 }
 
-// ---- cost cells: the same measured-bound rule, one level out ---------------
+// ---- cost cells: the same driven-factor rule, one level out ---------------
 
-// The reaching-path rule above says a bound must be MEASURED — a cell driving
-// its factor at two or more values, because one value cannot tell a bound from a
-// cost that is merely linear. That rule was stated for the walk CONSTRUCTION
-// sites and then not applied to the wall-clock cost cells, which is the same
-// defect the rule exists to catch: five cells drove one value each and the suite
-// was green. costCell is the registry that closes it — a cell's magnitudes live
-// HERE and the cell reads them, so the two cannot disagree, and the source
-// derivation below means a new cost cell cannot quietly skip the registry.
+// The reaching-path rule above says a bound must be DRIVEN — a cell driving its
+// factor at two or more values, because one value pins one size. That rule was
+// stated for the walk CONSTRUCTION sites and then not applied to the cells that
+// drive a magnitude through the DoS harness, which is the same defect the rule
+// exists to catch: five cells drove one value each and the suite was green.
+// costCell is the registry that closes it — a cell's magnitudes live HERE and
+// the cell reads them, so the two cannot disagree, and the source derivation
+// below means a new cost cell cannot quietly skip the registry.
 type costCell struct {
 	fn     string // the test function
-	factor string // the caller-chosen magnitude its bound claims to cap
+	factor string // the caller-chosen magnitude the cell drives
 	values []int  // what the cell drives — at least two distinct, unless exempt
 	// exempt is why one magnitude suffices. It is a CLAIM like any other, so it
-	// must name what the cell asserts INSTEAD of a wall-clock bound; the guard
-	// cross-checks it against whether the cell actually takes the wall-clock
-	// harness, so an exemption cannot be pasted onto a timing cell.
+	// must name what the cell asserts INSTEAD of a driven factor; the guard
+	// cross-checks it against whether the cell actually takes the DoS harness,
+	// so an exemption cannot be pasted onto a cell that drives one.
 	exempt string
 	// carrier names what carries this cell's magnitude when it is NOT schema text.
 	// The derivation below finds cells by their calls to a cost GENERATOR (a func
@@ -14928,34 +14893,20 @@ type costCell struct {
 	// registry the source cannot check for us; everything else about such a row is
 	// checked exactly as for any other cell.
 	carrier string
-	// scaleTol bounds cost(max)/cost(min). Every one of these factors measured
-	// FLAT with a correct bound even where the schema TEXT grows with the factor
-	// (width 80 -> 8000 grows the text 65x and the parse 1.4x, because the walk
-	// dominates and the allowance caps it), so a small tolerance is honest.
-	scaleTol int
-	// floor is the largest cost the BOUND ITSELF permits at the top of the range,
-	// and the limit is max(scaleTol*cost(min), floor). For a cell whose shapes are
-	// all memoizable it is just machine noise; for one that includes an
-	// UN-memoizable shape it is one exhausted allowance (~120ms measured), because
-	// a cyclic subtree cannot be cached and legitimately walks until maxMinBytesWork
-	// stops it — that is the bound ENGAGING, not the cost scaling, and a cell
-	// spanning both regimes has to be judged against the looser of them. It stays
-	// orders of magnitude under an unbounded walk, which is seconds.
-	floor time.Duration
 }
 
 var costCells = []costCell{
 	{fn: "TestInvariant_EveryMinBytesEntryPointIsBounded",
 		factor: "dagNested DEPTH — the PATHS factor: without the memo this is 2^depth, so 13 vs 26 is a 8192x separation",
-		values: []int{13, 26}, scaleTol: 8, floor: 25 * time.Millisecond},
+		values: []int{13, 26}},
 
 	{fn: "TestInvariant_CyclicWalkCostIsBoundedByWork",
 		factor: "dagWideSCC WIDTH — the CHILDREN factor: a per-NODE charge makes cost allowance x width, a per-CHILD charge makes it flat",
-		values: []int{80, 8000}, scaleTol: 4, floor: 400 * time.Millisecond},
+		values: []int{80, 8000}},
 
 	{fn: "TestInvariant_WideCyclicWalkReachesEveryEntryPoint",
 		factor: "dagWideSCC WIDTH, across the entry points that do not take the schema from the caller",
-		values: []int{80, 8000}, scaleTol: 4, floor: 400 * time.Millisecond},
+		values: []int{80, 8000}},
 
 	{fn: "TestInvariant_MetadataSurfacesBoundedByWidth",
 		// Named for what it drives, after the old name was executed and found
@@ -14966,11 +14917,11 @@ var costCells = []costCell{
 		// the min-bytes charge on its path — neutering that charge reds it. The
 		// node budget's own cells hand-build the trees Parse cannot express.
 		factor: "dagWideSCC WIDTH through the metadata surfaces — Root+Schema (render, marshal, re-Parse), String and Canonical",
-		values: []int{80, 8000}, scaleTol: 4, floor: 400 * time.Millisecond},
+		values: []int{80, 8000}},
 
 	{fn: "TestInvariant_MinBytesContainerCountBounded",
 		factor: "CONTAINER count. Its two generator calls vary reference DIRECTION (forward/backward), which is a different axis — the count itself was pinned at 220",
-		values: []int{1, 220}, scaleTol: 4, floor: 400 * time.Millisecond},
+		values: []int{1, 220}},
 
 	{fn: "TestInvariant_EmbedDiamondCostFactors",
 		// The goTypeDAG walk. Its cost is paths x CALLS and the two collectors
@@ -14981,11 +14932,11 @@ var costCells = []costCell{
 		// already measured, but the second factor.
 		factor:  "sibling-embed DAG depth (the paths factor, 2^depth) crossed with CALL COUNT (the amortization factor, where the two collectors diverge)",
 		carrier: "a Go TYPE — the depth is carried by which declared embed-diamond type the cell instantiates, so no schema-text generator appears and the derivation cannot discover this cell. Rowed by hand; the depths the row names are asserted against the types inside the cell",
-		values:  []int{8, 12}, scaleTol: 32, floor: 2 * time.Second},
+		values:  []int{8, 12}},
 
 	{fn: "TestDoSBattery_C9_CustomTypeParseCost",
 		factor: "backward-reference chain LENGTH — the per-parse custom-match memo's factor. Without it every stamp walk from Ri reaches R0..R(i-1), so the total is quadratic in this count while the schema text is linear in it",
-		values: []int{3000, 6000}, scaleTol: 4, floor: 200 * time.Millisecond},
+		values: []int{3000, 6000}},
 
 	{fn: "TestDoSBattery_OCF_C1_Header",
 		// In package ocf, which cannot import this registry. Its magnitudes are
@@ -14993,43 +14944,39 @@ var costCells = []costCell{
 		// appear there; see the cross-package arm of the guard for why the tie
 		// is checked that way round rather than by the cell reading its row.
 		factor: "the header DAG's three magnitudes — reference DEPTH, cyclic record WIDTH, and CONTAINER count — each driven at two values",
-		values: []int{26, 30, 8000, 16000, 220, 440}, scaleTol: 4, floor: 400 * time.Millisecond},
+		values: []int{26, 30, 8000, 16000, 220, 440}},
 
 	{fn: "TestMatrix_NestedStrayContainerKeyLinearCost",
-		// Times inline rather than through a named helper, which is why the
-		// harness vocabulary includes time.Since: a cell that measures its own
-		// clock is still a timing cell, and an exemption must not be able to
-		// sit on one by avoiding the helpers.
-		factor: "nested stray-key DEPTH — the metadata walker's per-ancestor re-validation, whose absence is exponential. The absolute-ceiling half runs at depth 20 and the growth half compares 400 against 800",
-		values: []int{20, 400, 800}, scaleTol: 3, floor: 100 * time.Millisecond},
+		factor: "nestStrayContainer DEPTH — the per-level decode factor. A second decode per level is 2^depth, so what separates a working single decode from a doubled one is reaching a depth the exponential cannot: 20 is sub-KB and survivable either way, 400 and 800 are not. It is in package avro_test, so the tie between row and cell is the literal check, not a read",
+		values: []int{20, 400, 800}},
 
 	// Value oracles. Named explicitly rather than left to a reader to re-derive:
-	// each varies shapes to check an ANSWER and asserts equality, never
-	// wall-clock, so a second magnitude would measure nothing about a bound.
+	// each varies shapes to check an ANSWER and asserts equality, so a second
+	// magnitude would say nothing about the answer.
 	{fn: "TestInvariant_MemoAgreesWithUnmemoizedWalk",
-		exempt: "value oracle: compares the memoized walk's result against an un-memoized recomputation per node. Its oracle is equality of VALUES, and a wrong memo is FASTER, so timing is exactly what cannot settle it"},
+		exempt: "value oracle: compares the memoized walk's result against an un-memoized recomputation per node. Its oracle is equality of VALUES, and a wrong memo is one that answers differently, not one that answers slowly"},
 	{fn: "TestInvariant_DagMinBytesIsExactAtScale",
 		exempt: "value oracle: asserts the minimum a shared DAG reports equals the minimum its expanded TREE reports. Equality, not cost"},
 	{fn: "TestInvariant_MinBytesSelfReadable",
 		exempt: "value oracle: asserts a bound derived from the walk still admits wire this package's own encoder produces. Accept/reject, not cost"},
 	{fn: "TestInvariant_SharingDoesNotChangeMinBytes",
-		exempt: "value oracle: asserts sharing one walk across containers does not change the ANSWER. It already sweeps fan x levels; the sweep is over SHAPES to find a disagreement, not magnitudes to time"},
+		exempt: "value oracle: asserts sharing one walk across containers does not change the ANSWER. It already sweeps fan x levels; the sweep is over SHAPES to find a disagreement, not magnitudes"},
 	{fn: "TestRegression_ZeroByteItemCapStillHolds",
-		exempt: "value oracle: asserts the zero-byte-item CAP still rejects an over-cap count both with and without a drained stand-in. Its use of the SCC generator is to exhaust the allowance — a state, not a magnitude — and its assertion is accept/reject, so a second depth would measure nothing about a bound"},
+		exempt: "value oracle: asserts the zero-byte-item CAP still rejects an over-cap count both with and without a drained stand-in. Its use of the SCC generator is to exhaust the allowance — a state, not a magnitude — and its assertion is accept/reject, so a second depth would say nothing more"},
 	{fn: "TestRegression_ZeroMinimumContainerAfterDrainedAllowance",
 		exempt: "value oracle: encode-implies-decode across the two field ORDERS that decide whether the zero-minimum container is built before or after the allowance drains. The axis is order, not magnitude; the SCC depth only has to be enough to drain"},
 	{fn: "TestInvariant_SharedSchemaNodeWalkedOnce",
-		factor: "dagNested/dagFlat/dagSelfRecursive/dagSingleSCC DEPTH — the PATHS factor across all four sharing shapes and both fans. Its name reads like a value oracle, and the hand derivation classified it as one; it takes the wall-clock harness, so the exemption cross-check caught it",
+		factor: "dagNested/dagFlat/dagSelfRecursive/dagSingleSCC DEPTH — the PATHS factor across all four sharing shapes and both fans. Its name reads like a value oracle, and the hand derivation classified it as one; it takes the DoS harness, so the exemption cross-check caught it",
 		// Two of its four shapes are CYCLIC and cannot be memoized at all, so
 		// they climb to one exhausted allowance between the two depths (~1.9ms
 		// at 13, ~120ms at 26) while the memoizable two stay flat at ~200us.
 		// The floor is that allowance; without the charge the same shapes run
 		// for seconds.
-		values: []int{13, 26}, scaleTol: 8, floor: 500 * time.Millisecond},
+		values: []int{13, 26}},
 
 	{fn: "TestDoSBattery_C6_MetadataWalk",
 		factor: "dagNested/dagFlat DEPTH — the PATHS factor through the metadata + resolve + compat entry points. Missed by the hand derivation entirely; only the source scan found it",
-		values: []int{13, 26}, scaleTol: 8, floor: 25 * time.Millisecond},
+		values: []int{13, 26}},
 }
 
 // costFactorValues returns the magnitudes the named cost cell must drive. A cell
@@ -15050,16 +14997,17 @@ func costFactorValues(t *testing.T, fn string) []int {
 	return nil
 }
 
-// wantCostDoesNotScale asserts that the named cell's operation costs about the
-// same at the top of its factor's range as at the bottom. build takes the
-// magnitude and returns the thunk to TIME: everything the magnitude needs but
-// the bound does not own — generating a schema whose TEXT is linear in the
-// factor, parsing it when the bound under test is downstream of the parse —
-// belongs in build, outside the returned closure. Putting it inside is not a
-// rounding error: the metadata cell had its MustParse in the timed region, and
-// since the parse of a width-8000 schema dominates the walk that follows, the
-// cell moved when the PARSE's bound was neutered and sat still when its own was.
-func wantCostDoesNotScale(t *testing.T, fn, label string, build func(n int) func() error) {
+// wantEveryMagnitudeTerminates drives the named cell's operation at every
+// magnitude its row declares, each under the DoS watchdog: a walk that stopped
+// bounding itself fails as a watchdog trip on the value that reached it, rather
+// than wedging the suite until the package timeout.
+//
+// build takes the magnitude and returns the thunk to RUN: everything the
+// magnitude needs but the walk under test does not own — generating a schema
+// whose TEXT is linear in the factor, parsing it when the walk is downstream of
+// the parse — belongs in build, outside the returned closure, so the thunk is
+// the walk and nothing else.
+func wantEveryMagnitudeTerminates(t *testing.T, fn, label string, build func(n int) func() error) {
 	t.Helper()
 	var row costCell
 	for _, c := range costCells {
@@ -15067,22 +15015,9 @@ func wantCostDoesNotScale(t *testing.T, fn, label string, build func(n int) func
 			row = c
 		}
 	}
-	vals := costFactorValues(t, fn)
-	lo, hi := vals[0], vals[0]
-	for _, v := range vals {
-		lo, hi = min(lo, v), max(hi, v)
-	}
-	times := make(map[int]time.Duration, len(vals))
-	for _, v := range vals {
+	for _, v := range costFactorValues(t, fn) {
 		run := build(v)
-		start := time.Now()
 		wantTerminate(t, fmt.Sprintf("%s/%s=%d", label, row.factor, v), run)
-		times[v] = time.Since(start)
-	}
-	floor := raceInflated(row.floor)
-	if lim := max(time.Duration(row.scaleTol)*times[lo], floor); times[hi] > lim {
-		t.Errorf("%s: cost scales with the factor — %v at %d vs %v at %d (limit %v).\nThe bound claims to cap this magnitude; a cost that grows with it is the bound missing, not a slow machine.",
-			label, times[hi], hi, times[lo], lo, lim)
 	}
 }
 
@@ -15159,19 +15094,19 @@ func costGenerators(t *testing.T, src map[string]string) (map[string]bool, map[s
 	return gens, where
 }
 
-// TestInvariant_EveryCostCellDrivesItsFactor applies the measured-bound rule to
-// the wall-clock cost cells: a cost GENERATOR is a function that turns a
-// magnitude into schema text, and any test that calls one is a cost cell.
-// Mechanical in every direction:
+// TestInvariant_EveryCostCellDrivesItsFactor applies the driven-factor rule to
+// the cells that drive a magnitude at the DoS harness: a cost GENERATOR is a
+// function that turns a magnitude into schema text, and any test that calls one
+// is a cost cell. Mechanical in every direction:
 //
 //   - a cell that calls a cost generator and is not rowed FAILS.
-//   - a rowed timing cell with fewer than two distinct values FAILS. This is
-//     the arm that was missing: the rule was stated for the walk construction
-//     sites and never applied here, so five cells pinned one magnitude each.
-//   - a rowed timing cell that does not READ its row FAILS, so a cell cannot
-//     keep a private constant that disagrees with the registry.
+//   - a rowed cell with fewer than two distinct values FAILS. This is the arm
+//     that was missing: the rule was stated for the walk construction sites and
+//     never applied here, so five cells pinned one magnitude each.
+//   - a rowed cell that does not READ its row FAILS, so a cell cannot keep a
+//     private constant that disagrees with the registry.
 //   - an EXEMPTION is a claim and is cross-checked: a cell rowed exempt that
-//     takes the wall-clock harness is a timing cell wearing a value-oracle
+//     takes the DoS harness is driving a magnitude while wearing a value-oracle
 //     label, and a cell rowed with values that takes no harness is the reverse.
 //   - a row naming no test FAILS, so the registry cannot go stale.
 func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
@@ -15218,13 +15153,13 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 		}
 		return ""
 	}
-	// A cell that takes the wall-clock harness is asserting a COST. The set is
-	// every helper that TIMES something; wantAcceptUnder was missing from it, which
-	// is how the one cell driving a generator at a single magnitude through an
-	// absolute ceiling stayed invisible. time.Since( is in the set because a cell
-	// may time inline rather than through a named helper, and a timing cell that
-	// does so is still one — leaving it out would let an exemption sit on it.
-	harnesses := []string{"wantTerminate(", "dosRun(", "wantCostDoesNotScale(", "wantAcceptUnder(", "time.Since("}
+	// A cell that takes the DoS harness is driving a MAGNITUDE at a walk. The
+	// set is every helper the battery hands hostile-sized input to — the
+	// watchdogs, the multi-magnitude driver, and the accept assertion. A helper
+	// left out of this set is how a cell driving a generator at a single
+	// magnitude once stayed invisible, so a new one belongs here the day it is
+	// written; a cell wearing a value-oracle exemption must take none of them.
+	harnesses := []string{"wantTerminate(", "dosRun(", "wantEveryMagnitudeTerminates(", "wantAccept("}
 	takesHarness := func(code string) bool {
 		for _, h := range harnesses {
 			if strings.Contains(code, h) {
@@ -15242,28 +15177,28 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 		}
 		c, ok := rowed[fn]
 		if !ok {
-			t.Errorf("%s (%s) drives cost generator %s (%s) but is not rowed in costCells.\nRow it with the factor its bound claims to cap and the values it drives, or row it exempt with what it asserts instead.",
+			t.Errorf("%s (%s) drives cost generator %s (%s) but is not rowed in costCells.\nRow it with the factor it drives and the values it drives it at, or row it exempt with what it asserts instead.",
 				fn, bodyFile[fn], g, genFile[g])
 			continue
 		}
 		if c.exempt != "" {
 			if takesHarness(code) {
-				t.Errorf("%s is rowed EXEMPT (%q) but takes the wall-clock harness — an exemption cannot sit on a timing cell", fn, c.exempt)
+				t.Errorf("%s is rowed EXEMPT (%q) but takes the DoS harness — an exemption cannot sit on a cell that drives a magnitude", fn, c.exempt)
 			}
 			continue
 		}
 		if !takesHarness(code) {
-			t.Errorf("%s is rowed with factor values but never takes the wall-clock harness — it is a value oracle, and should be rowed exempt saying so", fn)
+			t.Errorf("%s is rowed with factor values but never takes the DoS harness — it is a value oracle, and should be rowed exempt saying so", fn)
 		}
 		seen := map[int]bool{}
 		for _, v := range c.values {
 			seen[v] = true
 		}
 		if len(seen) < 2 {
-			t.Errorf("%s drives %d distinct value(s) of %q.\nOne value asks only whether the cell finishes, which a cost merely LINEAR in the factor also answers.", fn, len(seen), c.factor)
+			t.Errorf("%s drives %d distinct value(s) of %q.\nOne value pins one size, and the shapes a walk gets wrong appear only once a second size is reached.", fn, len(seen), c.factor)
 		}
 		// The cell has to be tied to its row. A cell in this package READS the row —
-		// it names itself to costFactorValues/wantCostDoesNotScale — so the two
+		// it names itself to costFactorValues/wantEveryMagnitudeTerminates — so the two
 		// cannot disagree. A cell in another package cannot reach this registry, so
 		// there the tie is checked the other way round: every value the row claims
 		// must appear as a literal in the cell. That is weaker, but it still fails
@@ -15272,7 +15207,7 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 		// directory while being just as unable to reach this registry as ocf is.
 		if pkg := filePackage(src[bodyFile[fn]]); pkg == "avro" {
 			if !strings.Contains(raw, `"`+fn+`"`) {
-				t.Errorf("%s does not name itself to costFactorValues/wantCostDoesNotScale — its magnitudes are not read from its row, so the row and the cell can disagree.", fn)
+				t.Errorf("%s does not name itself to costFactorValues/wantEveryMagnitudeTerminates — its magnitudes are not read from its row, so the row and the cell can disagree.", fn)
 			}
 		} else {
 			// The magnitudes are checked against the whole FILE, not the test

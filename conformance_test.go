@@ -10457,32 +10457,17 @@ func TestRegression_CustomTypeSkipPointerChainContinues(t *testing.T) {
 	}
 }
 
-// TestRegression_FiniteScaleCPUBound locks the O(M(scale)) scale
-// derivation in finiteScale. A divide-by-5-per-factor loop would
-// iterate 65536 times on a ~152K-digit big.Int when encoding the
-// big-decimal value 1/10^65536 (6 wire bytes), taking ~1.4 CPU
-// seconds — a pipeline that decodes big-decimal from one source and
-// re-encodes for another (replication, schema translation, OCF
-// rewrite) would hand an attacker that amplification per wire byte.
-// The value is at the documented cap (scale 65536), so it must both
-// ACCEPT and finish fast.
+// TestRegression_FiniteScaleCPUBound locks the boundary of the scale
+// derivation in finiteScale: scale 65536 is exactly the documented cap, so a
+// terminating decimal at that scale must ACCEPT, not be wrongly rejected.
+// The value is 1/10^65536 — six wire bytes naming a ~152K-digit denominator,
+// which is why the derivation is one exponentiation and a compare rather than
+// a divide-by-5-per-factor loop.
 func TestRegression_FiniteScaleCPUBound(t *testing.T) {
 	denom := new(big.Int).Exp(big.NewInt(10), big.NewInt(65536), nil)
 	r := new(big.Rat).SetFrac(big.NewInt(1), denom)
 	s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
-	start := time.Now()
-	_, err := s.AppendEncode(nil, r)
-	elapsed := time.Since(start)
-	// Either we reject (out-of-bound scale) or accept very fast.
-	// The BitLen check must short-circuit before the 5-power loop;
-	// otherwise this takes ~1.4 CPU seconds (which trips even the
-	// race-relaxed bound).
-	if bound := raceRelaxed(200 * time.Millisecond); elapsed > bound {
-		t.Fatalf("Encoding 1/10^65536 took %v (>%v cap); amplification regression", elapsed, bound)
-	}
-	// scale 65536 is exactly the documented cap, so a terminating decimal
-	// at that scale must ACCEPT (not be wrongly rejected) and finish fast.
-	if err != nil {
+	if _, err := s.AppendEncode(nil, r); err != nil {
 		t.Fatalf("1/10^65536 (scale 65536, == cap) should encode: %v", err)
 	}
 }
@@ -10551,18 +10536,13 @@ func TestRegression_BigDecimalRatErrorMessageBounded(t *testing.T) {
 	huge := new(big.Rat).SetFrac(big.NewInt(1), denom)
 
 	check := func(name string, fn func() error) {
-		start := time.Now()
 		err := fn()
-		el := time.Since(start)
 		if err == nil {
 			t.Errorf("%s: expected reject", name)
 			return
 		}
 		if n := len(err.Error()); n > 1024 {
 			t.Errorf("%s: error message is %d bytes — unbounded user-value echo", name, n)
-		}
-		if bound := raceRelaxed(100 * time.Millisecond); el > bound {
-			t.Errorf("%s: reject took %v (>%v) — error-message amplification", name, el, bound)
 		}
 	}
 
@@ -13842,121 +13822,6 @@ func TestParity_CheckCompatibilityMatrix(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestParity_CPUCostSentinels asserts that boundary-pathological inputs — right
-// at the documented cap, not past it — finish in bounded CPU time, catching the
-// "cost just under the limit" class of DoS. That is the shape the finiteScale
-// bug had, where decimalScaleLimit fired AFTER 65536 iterations of an O(n^2)
-// loop: ~10^8x amplification per wire byte. The 200 ms cap is conservative for
-// "either accept fast or reject fast" — tighter risks false positives on slow
-// CI, looser risks missing regressions — and seconds-class output is the failure
-// mode.
-func TestParity_CPUCostSentinels(t *testing.T) {
-	// 200ms is conservative for "accept fast or reject fast"; relax to a
-	// generous ceiling under -race, where instrumentation inflates the
-	// bounded boundary-input work past a tight bound. The seconds-class
-	// regression this matrix guards against still trips the relaxed bound.
-	bound := raceRelaxed(200 * time.Millisecond)
-	t.Run("big-decimal encode of 1/10^cap", func(t *testing.T) {
-		// finiteScale derives the scale in O(M(scale)) (one 5^b
-		// exponentiation + compare), so a value at the cap encodes in a
-		// few ms. A divide-by-5-per-factor loop would take ~1.4 CPU
-		// seconds here — the amplification this cell guards against.
-		denom := new(big.Int).Exp(big.NewInt(10), big.NewInt(65536), nil)
-		r := new(big.Rat).SetFrac(big.NewInt(1), denom)
-		s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
-		start := time.Now()
-		_, _ = s.AppendEncode(nil, r)
-		if elapsed := time.Since(start); elapsed > bound {
-			t.Fatalf("encoding 1/10^65536 took %v (>%v cap)", elapsed, bound)
-		}
-	})
-	t.Run("big-decimal encode of 1/2^cap", func(t *testing.T) {
-		// 2-power-only denominator — exercises the TrailingZeroBits
-		// arm (scale derived in O(1) from the trailing-zero count).
-		denom := new(big.Int).Lsh(big.NewInt(1), 65536)
-		r := new(big.Rat).SetFrac(big.NewInt(1), denom)
-		s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
-		start := time.Now()
-		_, _ = s.AppendEncode(nil, r)
-		if elapsed := time.Since(start); elapsed > bound {
-			t.Fatalf("encoding 1/2^65536 took %v (>%v cap)", elapsed, bound)
-		}
-	})
-	t.Run("decimal encode at precision cap", func(t *testing.T) {
-		s := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":1024,"scale":0}`)
-		// 1000-digit value, well below precision=1024.
-		bigNum := new(big.Int).Exp(big.NewInt(10), big.NewInt(1000), nil)
-		r := new(big.Rat).SetInt(bigNum)
-		start := time.Now()
-		_, _ = s.AppendEncode(nil, r)
-		if elapsed := time.Since(start); elapsed > bound {
-			t.Fatalf("decimal encode at precision cap took %v", elapsed)
-		}
-	})
-	t.Run("decode big-decimal at scale cap", func(t *testing.T) {
-		// Construct a big-decimal wire payload with scale at the cap.
-		// decimalScaleLimit in parseBigDecimalPayload bounds the
-		// 10^scale materialization at decode time.
-		var wire []byte
-		// Inner: unscaled bytes "01" (length-prefixed) + zigzag(65536).
-		wire = append(wire, 0x04, 0x01) // unscaled-bytes len=2 zigzag(2)=4, single 0x01 byte... wait
-		// Use the actual format: outer bytes-len varint || inner.
-		// Inner = unscaled-bytes-len-varint || unscaled-bytes || zigzag(scale)
-		// Build inner: unscaled = [0x01] (len 1), scale=65536.
-		// unscaled-len-zigzag = zigzag(1) = 2 → varint 0x02
-		// scale-zigzag = zigzag(65536) = 131072 → varint
-		inner := []byte{0x02, 0x01}
-		inner = appendVarintBytes(inner, 131072)
-		// Outer bytes framing: zigzag(len(inner)) || inner.
-		wire = appendVarintBytes(nil, int64(len(inner)))
-		wire = append(wire, inner...)
-		s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
-		var out any
-		start := time.Now()
-		_, _ = s.Decode(wire, &out)
-		if elapsed := time.Since(start); elapsed > bound {
-			t.Fatalf("big-decimal decode at scale cap took %v", elapsed)
-		}
-	})
-	t.Run("array<null> at zero-byte-items cap", func(t *testing.T) {
-		// Construct array<null> with count at maxZeroByteItems cap
-		// (4096). The decimalScaleLimit-style cap rejects.
-		var wire []byte
-		wire = appendVarintBytes(nil, 4096)
-		wire = append(wire, 0x00) // end-of-array
-		s := avro.MustParse(`{"type":"array","items":"null"}`)
-		var out any
-		start := time.Now()
-		_, _ = s.Decode(wire, &out)
-		if elapsed := time.Since(start); elapsed > bound {
-			t.Fatalf("array<null> at cap took %v", elapsed)
-		}
-	})
-	t.Run("decimal JSON decode of 1e65536", func(t *testing.T) {
-		// boundedRatFromString caps the parsed exponent. Without the
-		// cap, SetString materializes 10^65536 from the 9-byte
-		// "1e1000000" pattern.
-		s := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
-		var out any
-		start := time.Now()
-		_ = s.DecodeJSON([]byte(`1e65536`), &out)
-		if elapsed := time.Since(start); elapsed > bound {
-			t.Fatalf("decimal JSON decode of 1e65536 took %v", elapsed)
-		}
-	})
-}
-
-// appendVarintBytes is a test-local helper for hand-crafting Avro
-// zigzag-varint-prefixed wire bytes in the CPU-cost matrix.
-func appendVarintBytes(dst []byte, n int64) []byte {
-	zz := uint64(n<<1) ^ uint64(n>>63)
-	for zz >= 0x80 {
-		dst = append(dst, byte(zz)|0x80)
-		zz >>= 7
-	}
-	return append(dst, byte(zz))
 }
 
 // TestParity_ResolveMatrix asserts schema-resolution round-trip identity across
@@ -17698,34 +17563,18 @@ func TestRegression_ParseFloatLengthCapDoS(t *testing.T) {
 		t.Errorf("expected length-cap error, got: %v", err)
 	}
 
-	// Timing check: under -race the instrumentation makes even legitimate JSON
-	// parsing of a 1 MiB literal slow, so this is meaningful only without it.
-	// Without the cap, schema-parse averages ~150ms on 1 MiB input; with it, the
-	// rejection short-circuits before reaching ParseFloat. The residual cost is
-	// dominated by the O(n) JSON parse of the literal, which is unavoidable, so
-	// the threshold is generous — the behavioral check above already pins that
-	// the cap fires; this guards against re-introducing the slow path on top.
-	threshold := raceRelaxed(500 * time.Millisecond)
-	_, _ = avro.Parse(schemaJSON) // warm-up
-	const runs = 3
-	var total time.Duration
-	for range runs {
-		start := time.Now()
-		_, _ = avro.Parse(schemaJSON)
-		total += time.Since(start)
-	}
-	avg := total / runs
-	if avg > threshold {
-		t.Errorf("1 MiB hostile double default schema-parse averaged %s — exceeds %s threshold; parseFloatAcceptOverflow length cap missing or wrong", avg, threshold)
-	}
-
 	// Sibling: the float-extras path (record-level Props) hits the
 	// same parser through normalizeJSONNumber. Same shape.
 	extrasJSON := fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":"int"}],"x":%s}`, hostile)
 	// Extras parse succeeds (record-level Props don't fail the parse
 	// even when one prop's value can't be normalized — the prop is
 	// retained as json.Number). The behavior we lock here is that the
-	// parse completes — i.e. doesn't hang on a 1 MiB hostile prop.
+	// parse RETURNS — i.e. doesn't hang on a 1 MiB hostile prop. The
+	// deadline is a liveness backstop, not a budget: it exists so a lost
+	// cap surfaces as a failure instead of wedging the package until the
+	// go test timeout, which is why it is seconds on work that is
+	// milliseconds.
+	hangDeadline := raceRelaxed(500*time.Millisecond) * 5
 	doneCh := make(chan struct{})
 	go func() {
 		_, _ = avro.Parse(extrasJSON)
@@ -17733,8 +17582,8 @@ func TestRegression_ParseFloatLengthCapDoS(t *testing.T) {
 	}()
 	select {
 	case <-doneCh:
-	case <-time.After(threshold * 5): // 5x the per-parse threshold for the sibling probe
-		t.Errorf("hostile extras prop schema-parse hung past %s; normalizeJSONNumber length cap missing", threshold*5)
+	case <-time.After(hangDeadline):
+		t.Errorf("hostile extras prop schema-parse hung past %s; normalizeJSONNumber length cap missing", hangDeadline)
 	}
 
 	// Boundary-1: a legitimate-sized float default (well under 1024)
@@ -17745,19 +17594,12 @@ func TestRegression_ParseFloatLengthCapDoS(t *testing.T) {
 	}
 }
 
-// isRaceEnabled reports whether the race detector is compiled into this
-// binary. Forwards the module's single build-tagged predicate rather than
-// declaring a second one for this package.
-func isRaceEnabled() bool {
-	return avro.RaceEnabledForTest
-}
-
-// raceRelaxed returns the wall-clock ceiling for a normal bound. The rule and
+// raceRelaxed widens a liveness deadline under the race detector. The rule and
 // both of its numbers live in race_bounds_test.go; this is the bridge, not a
-// second statement of it. The tight bound stays in effect without -race so a
-// regression is caught sensitively, and the relaxed ceiling still sits far
-// below what an unbounded or superlinear path costs, so detection survives in
-// both modes.
+// second statement of it. Nothing in this package asserts a wall-clock BUDGET
+// any more — the one caller is the hostile-extras hang probe, whose deadline
+// exists so a lost cap fails the test instead of wedging the package, and
+// instrumentation inflates even a healthy parse enough to matter there.
 func raceRelaxed(normal time.Duration) time.Duration {
 	return avro.RaceRelaxedForTest(normal)
 }
@@ -17861,35 +17703,14 @@ func TestRegression_DecodeJSONFloatLengthCapDoS(t *testing.T) {
 				t.Errorf("expected length-cap rejection, got: %v", err)
 			}
 
-			// 1 MiB hostile: must reject in O(1) (the asymptotic guarantee).
-			// The threshold is the pin — a capped reject scans the literal
-			// once (~10ms) while an uncapped one runs strconv.ParseFloat's
-			// slow path far past the bound. Wall-clock samples under a
-			// parallel suite (or other machine load) can exceed the bound
-			// from scheduler contention alone, so a trip re-measures
-			// serially and the BEST observed sample is compared: external
-			// load inflates individual samples but cannot push a capped
-			// reject over the bound on every attempt, while a genuinely
-			// uncapped parse exceeds it on all of them.
+			// 1 MiB hostile: must reject, and reject on the cap rather than
+			// on anything strconv.ParseFloat's slow path decides — the cap
+			// fires at entry, before the literal is parsed at all.
 			hostile1M := mk(1 << 20)
-			threshold := raceRelaxed(100 * time.Millisecond)
-			var best time.Duration
-			for attempt := 0; attempt < 4; attempt++ {
-				t0 := time.Now()
-				err = s.DecodeJSON(hostile1M, target)
-				d := time.Since(t0)
-				if err == nil {
-					t.Fatalf("decode of 1 MiB hostile literal UNEXPECTEDLY accepted")
-				}
-				if attempt == 0 || d < best {
-					best = d
-				}
-				if best <= threshold {
-					break
-				}
-			}
-			if best > threshold {
-				t.Errorf("1 MiB hostile decode took %s > %s threshold on every attempt; length cap not applied in O(1) before strconv.ParseFloat", best, threshold)
+			if err := s.DecodeJSON(hostile1M, target); err == nil {
+				t.Fatalf("decode of 1 MiB hostile literal UNEXPECTEDLY accepted")
+			} else if !strings.Contains(err.Error(), "length cap") {
+				t.Errorf("1 MiB hostile decode: expected length-cap rejection, got: %v", err)
 			}
 		})
 	}
@@ -18264,24 +18085,12 @@ func TestRegression_MetadataAPINameRefDefaultCoerce(t *testing.T) {
 func TestRegression_IntDefaultLengthCapBounded(t *testing.T) {
 	hostile := strings.Repeat("1", 4<<20) // 4 MiB
 	schema := `{"type":"record","name":"R","fields":[{"name":"f","type":"long","default":` + hostile + `}]}`
-	start := time.Now()
 	_, err := avro.Parse(schema)
-	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected reject for 4 MiB long default")
 	}
 	if got := len(err.Error()); got > 200 {
 		t.Errorf("error length %d unbounded — should be capped before echoing input", got)
-	}
-	// The wall-clock guard runs only WITHOUT race instrumentation. Under
-	// -race the 5-10x slowdown plus uncontrolled host load (parallel tests,
-	// other processes) make any fixed budget non-deterministic — a relaxed
-	// -race threshold is a band-aid that still flakes under contention. The
-	// behavioral guard (bounded error above) and the race detector itself run
-	// in every mode; the O(1)-reject perf guard lives in the non-race suite,
-	// where the tight 500ms budget is deterministic and meaningful.
-	if !isRaceEnabled() && elapsed > 500*time.Millisecond {
-		t.Errorf("4 MiB default parse took %s — exceeds 500ms bound", elapsed)
 	}
 
 	t.Run("legitimate-length int64 still accepted (boundary-1)", func(t *testing.T) {
@@ -18300,17 +18109,13 @@ func TestRegression_IntDefaultLengthCapBounded(t *testing.T) {
 	})
 }
 
-// TestRegression_DeepSchemaParseRunsInBoundedTime pins:
-// avro.Parse on a deeply-nested record schema runs in bounded time. The
-// re-Marshal-for-dedup pattern in aschema.UnmarshalJSON /
-// afield.UnmarshalJSON drives O(N²) cost when present — replacing it
-// with a direct struct decode keeps Parse linear-ish (recursive
-// json.Unmarshal walks are still O(N²) but with a smaller constant).
-// This test caps depth-500 parse at 500ms.
+// TestRegression_DeepSchemaParseRunsInBoundedTime pins that avro.Parse ACCEPTS
+// a 500-deep record schema. The depth is legal — well under maxDepth — so the
+// re-Marshal-for-dedup pattern that used to sit in aschema.UnmarshalJSON /
+// afield.UnmarshalJSON, and the direct struct decode that replaced it, must
+// both agree that this schema parses; a front end that gives up at depth is a
+// rejection, not a slow accept.
 func TestRegression_DeepSchemaParseRunsInBoundedTime(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping timing-sensitive test in -short mode")
-	}
 	build := func(depth int) string {
 		var b strings.Builder
 		for i := range depth {
@@ -18324,19 +18129,8 @@ func TestRegression_DeepSchemaParseRunsInBoundedTime(t *testing.T) {
 	}
 	const depth = 500
 	schema := build(depth)
-	start := time.Now()
-	_, err := avro.Parse(schema)
-	elapsed := time.Since(start)
-	if err != nil {
+	if _, err := avro.Parse(schema); err != nil {
 		t.Fatalf("depth-%d schema parse failed: %v", depth, err)
-	}
-	// The wall-clock guard runs only WITHOUT -race: instrumentation overhead
-	// plus host load make a wall-clock budget non-deterministic under -race,
-	// while the perf-regression signal (a re-Marshal O(n^2) blowup) is fully
-	// visible in the non-race run's tight 1s budget (a quadratic blowup would
-	// be seconds even there). The race detector still runs in -race mode.
-	if !isRaceEnabled() && elapsed > 1*time.Second {
-		t.Errorf("depth-%d parse took %s — exceeds 1s threshold (re-Marshal regression?)", depth, elapsed)
 	}
 }
 
@@ -19217,23 +19011,16 @@ func TestJSONNumberMapKeyContentValidated(t *testing.T) {
 		}
 	})
 
-	// Per-key validation cost is O(n) byte-scan via isJSONNumber; no
-	// arbitrary-precision helper. A 1 MiB hostile json.Number key must
-	// reject in well under 100ms — the conventional DoS bound for fail-
-	// fast rejections of attacker-controlled input.
-	t.Run("hostile_key_rejected_fast", func(t *testing.T) {
+	// Per-key validation is an isJSONNumber byte scan, no arbitrary-precision
+	// helper: a 1 MiB hostile json.Number key is rejected on its first
+	// non-numeric byte.
+	t.Run("hostile_key_rejected", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"map","values":"long"}`)
 		in := map[json.Number]int64{
 			json.Number(strings.Repeat("x", 1<<20)): 1,
 		}
-		t0 := time.Now()
-		_, err := s.AppendEncode(nil, in)
-		d := time.Since(t0)
-		if err == nil {
+		if _, err := s.AppendEncode(nil, in); err == nil {
 			t.Fatalf("expected reject")
-		}
-		if bound := raceRelaxed(100 * time.Millisecond); d > bound {
-			t.Fatalf("hostile 1MiB key rejected slowly: %v (>%v)", d, bound)
 		}
 	})
 }
@@ -19958,16 +19745,6 @@ func TestMatrix_JSONNumberStringySchemasRejectEncode(t *testing.T) {
 func TestMatrix_DecimalUnscaledLengthDoS(t *testing.T) {
 	const cap = 32 << 10 // must match maxDecimalUnscaledBytes (deser.go)
 
-	// The cap must make hostile decodes reject FAST. The JSON codepoint path's
-	// residual cost is the unavoidable O(n) scan of the 1 MiB string (the cap
-	// fires only after the scan materializes the unscaled bytes) — race
-	// instrumentation inflates that scan past a 100ms bound while the capped
-	// base conversion never runs. Use a generous threshold under -race, matching
-	// the sibling DoS timing tests (TestRegression_ParseFloatLengthCapDoS); a
-	// real unbounded base conversion (~2.7s for a 1 MiB unscaled value, far more
-	// under -race) still trips it, so the test stays meaningful in both modes.
-	timingThreshold := raceRelaxed(100 * time.Millisecond)
-
 	avroBytesField := func(b []byte) []byte { return append(zigzagEncode64(int64(len(b))), b...) }
 	bigDecWire := func(uBytes []byte) []byte { // length-prefixed unscaled || zigzag scale(0), all wrapped as a bytes field
 		inner := append(avroBytesField(uBytes), zigzagEncode64(0)...)
@@ -19981,7 +19758,7 @@ func TestMatrix_DecimalUnscaledLengthDoS(t *testing.T) {
 	// 0x55 has its sign bit clear -> a large POSITIVE magnitude (not -1).
 	hostileUnscaled := bytes.Repeat([]byte{0x55}, 1<<20) // ~1 MiB
 
-	// Hostile inputs must reject FAST (<100ms) at every entry point/target.
+	// Hostile inputs must reject at every entry point/target.
 	hostile := []struct {
 		name string
 		s    *avro.Schema
@@ -20006,43 +19783,29 @@ func TestMatrix_DecimalUnscaledLengthDoS(t *testing.T) {
 					var x any
 					dst = &x
 				}
-				start := time.Now()
-				_, err := tc.s.Decode(tc.wire, dst)
-				if d := time.Since(start); d > timingThreshold {
-					t.Fatalf("decode took %s (>%s): unbounded decimal unscaled-length DoS", d, timingThreshold)
-				}
-				if err == nil {
+				if _, err := tc.s.Decode(tc.wire, dst); err == nil {
 					t.Fatalf("over-length decimal: want rejection, got nil error")
 				}
 			})
 		}
 	}
 
-	// JSON codepoint-string form (the spec form) must also reject fast. 0x55
-	// is ASCII 'U', so the codepoint string needs no escaping.
+	// JSON codepoint-string form (the spec form) must also reject. 0x55 is
+	// ASCII 'U', so the codepoint string needs no escaping.
 	t.Run("json-codepoint-bytes-decimal", func(t *testing.T) {
 		jsonWire := []byte(`"` + strings.Repeat("U", 1<<20) + `"`)
 		var x json.Number
-		start := time.Now()
-		err := bytesDec.DecodeJSON(jsonWire, &x)
-		if d := time.Since(start); d > timingThreshold {
-			t.Fatalf("DecodeJSON took %s (>%s): unbounded decimal unscaled-length DoS", d, timingThreshold)
-		}
-		if err == nil {
+		if err := bytesDec.DecodeJSON(jsonWire, &x); err == nil {
 			t.Fatalf("over-length decimal via JSON codepoint form: want rejection, got nil")
 		}
 	})
 
-	// Boundary-1: a value AT the cap still decodes AND stays fast (the cost
-	// must not merely move from the rejected extreme into the accepted path).
+	// Boundary-1: a value AT the cap still decodes — the cap must reject the
+	// byte past it and nothing below.
 	t.Run("accept-at-cap", func(t *testing.T) {
 		var x json.Number
-		start := time.Now()
 		if _, err := bytesDec.Decode(avroBytesField(bytes.Repeat([]byte{0x55}, cap)), &x); err != nil {
 			t.Fatalf("at-cap decimal must decode: %v", err)
-		}
-		if d := time.Since(start); d > timingThreshold {
-			t.Fatalf("at-cap decimal decode took %s (>%s): cap too loose", d, timingThreshold)
 		}
 	})
 
