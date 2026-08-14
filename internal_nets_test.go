@@ -3751,15 +3751,18 @@ func TestCensus_Q22_MagnitudeConsumersAgreeOnTheCeiling(t *testing.T) {
 //                              deep per-node Props/Default value.
 //   C7 cyclic Go type        — decode target / SchemaFor field type whose
 //                              reflect graph is cyclic: unbounded recursion.
-//   C9 registration-scaled   — a registered CustomType must not change Parse's
-//      parse cost              complexity class: the custom-match subtree walks
+//   C9 registration-scaled   — a registered CustomType must not change what
+//      parse cost              Parse can accept: the custom-match subtree walks
 //                              share one per-parse memo, else a
 //                              backward-reference chain or a many-refs cache
-//                              parse goes quadratic. Absolute wall-clock bounds,
-//                              not ratios.
+//                              parse is quadratic in a magnitude the text is
+//                              linear in.
 //
 // Each cell drives the real public API with a hostile input and asserts the
-// bound holds: it returns FAST, never hangs, panics, or crashes the process.
+// bound holds: it RETURNS — never hangs, panics, or crashes the process — with
+// the verdict the input deserves. No cell asserts a wall-clock cost; the caps
+// this package names are what make an unbounded input error out, and a cell
+// that merely got slower while staying under a cap is not what these are for.
 // Where a dedicated regression already pins the extreme case, the cell cites it.
 //
 // RULE: nothing here is ever "closed". A later DoS find EXTENDS this battery

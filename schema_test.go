@@ -12062,16 +12062,16 @@ func TestRegression_NonUnionBranchesInertInRebuild(t *testing.T) {
 
 // ---------- schema_breadth_test.go ----------
 
-// Schema BREADTH — cost against the number of SIBLINGS a schema declares.
+// Schema BREADTH — the number of SIBLINGS a schema declares.
 //
 // A schema's size grows two ways: it nests deeper, or it declares more siblings
 // at one level. Depth is bounded by an explicit pre-scan and pinned by the
-// deep-schema cost tests. Breadth has no cap and needs none — a union of 20000
-// named branches, or a record of 20000 fields, is legal Avro that a schema
-// registry, an RPC handshake, or an OCF header can hand a reader. What it does
-// need is for every pass over those siblings to stay LINEAR in their count,
-// because a pass that scans the sibling list once per sibling turns an O(n)
-// input into O(n^2) work.
+// deep-schema cells. Breadth has no cap and needs none — a union of 20000 named
+// branches, or a record of 20000 fields, is legal Avro that a schema registry,
+// an RPC handshake, or an OCF header can hand a reader. What it does need is for
+// every pass over those siblings to stay LINEAR in their count, because a pass
+// that scans the sibling list once per sibling turns an O(n) input into O(n^2)
+// work.
 //
 // What the cells assert is ACCEPTANCE at this width, through every entry point:
 // a sibling count the spec permits must not be refused, and each surface must
