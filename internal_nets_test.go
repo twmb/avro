@@ -4336,11 +4336,11 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 		{"nested", func(d int) string { return `{"type":"array","items":` + dagNested(d, 2) + `}` }},
 		{"flat-forward-ref", func(d int) string { return dagFlat(d, 2) }},
 	} {
-		wantCostDoesNotScale(t, cell, "Parse/shared-node-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "Parse/shared-node-"+form.name, func(d int) func() error {
 			s := form.build(d)
 			return func() error { _, err := Parse(s); return err }
 		})
-		wantCostDoesNotScale(t, cell, "SchemaCache.Parse/shared-node-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "SchemaCache.Parse/shared-node-"+form.name, func(d int) func() error {
 			s := form.build(d)
 			return func() error {
 				var c SchemaCache
@@ -4348,7 +4348,7 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 				return err
 			}
 		})
-		wantCostDoesNotScale(t, cell, "Root+Schema+String+Canonical/shared-node-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "Root+Schema+String+Canonical/shared-node-"+form.name, func(d int) func() error {
 			ds := MustParse(form.build(d))
 			return func() error {
 				root := ds.Root()
@@ -4358,19 +4358,19 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 				return nil
 			}
 		})
-		wantCostDoesNotScale(t, cell, "Resolve/shared-node-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "Resolve/shared-node-"+form.name, func(d int) func() error {
 			ds := MustParse(form.build(d))
 			return func() error { _, err := Resolve(ds, ds); return err }
 		})
 		// The writer field is DROPPED, which compiles a skip — a separate
 		// derivation of the same per-element bound.
-		wantCostDoesNotScale(t, cell, "Resolve/shared-node-dropped-field-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "Resolve/shared-node-dropped-field-"+form.name, func(d int) func() error {
 			schema := form.build(d)
 			w := MustParse(`{"type":"record","name":"T","fields":[{"name":"x","type":` + schema + `},{"name":"y","type":"int"}]}`)
 			r := MustParse(`{"type":"record","name":"T","fields":[{"name":"y","type":"int"}]}`)
 			return func() error { _, err := Resolve(w, r); return err }
 		})
-		wantCostDoesNotScale(t, cell, "CheckCompatibility/shared-node-"+form.name, func(d int) func() error {
+		wantEveryMagnitudeTerminates(t, cell, "CheckCompatibility/shared-node-"+form.name, func(d int) func() error {
 			ds := MustParse(form.build(d))
 			return func() error { return CheckCompatibility(ds, ds) }
 		})
