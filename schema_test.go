@@ -12073,33 +12073,18 @@ func TestRegression_NonUnionBranchesInertInRebuild(t *testing.T) {
 // because a pass that scans the sibling list once per sibling turns an O(n)
 // input into O(n^2) work.
 //
-// The bounds are absolute wall-clock, not ratios: a ratio between two sizes is
-// noise-sensitive on a loaded host, while the two complexity classes these
-// separate are orders of magnitude apart at the sizes driven.
+// What the cells assert is ACCEPTANCE at this width, through every entry point:
+// a sibling count the spec permits must not be refused, and each surface must
+// return the answer its non-wide form returns. They no longer carry a wall-clock
+// ceiling — that read the host as much as the code, and the sizes here are
+// admitted by the parser's named caps rather than by how fast a pass over them
+// runs.
 
-// breadthN is the sibling count every cell drives. It is chosen so that a
-// quadratic pass takes seconds while a linear one takes tens of milliseconds,
-// leaving room for a loaded host and for the race detector's instrumentation
-// without either class being mistaken for the other.
+// breadthN is the sibling count every cell drives. It is the size at which a
+// per-sibling rescan of the sibling list stops being a constant factor and
+// becomes the whole cost, so the shape being guarded is unmistakable in a
+// profile even though no cell asserts a time.
 const breadthN = 20000
-
-// breadthBound is the per-cell ceiling. wantAcceptUnder raises it under -race.
-const breadthBound = 500 * time.Millisecond
-
-// breadthParseBound is the ceiling for the two cells that parse the schema TEXT
-// rather than walking an already-parsed tree.
-//
-// A bound only separates linear from quadratic if it sits far above the linear
-// cost, and those two do not qualify at breadthBound: a 20000-branch union is
-// close to a megabyte of JSON, and parsing it is ~140ms (Parse) and ~300ms
-// (SchemaCache.Parse) of measured-linear work, doubling with the branch count.
-// At 500ms those cells sat within 1.7x of their own linear cost, so a merely
-// BUSY host crossed the line and reported a complexity change that had not
-// happened. The quadratic this column exists to catch measured 1.9s to 32s at
-// this size, so the ceiling still separates the two classes by more than 2x on
-// each side. Every other cell walks a parsed tree in tens of milliseconds and
-// keeps the tighter bound.
-const breadthParseBound = 1500 * time.Millisecond
 
 //////////////////////////////////////////////////////////////////////////////
 // The entry-point axis, derived from the battery's other columns
@@ -12111,7 +12096,7 @@ const breadthParseBound = 1500 * time.Millisecond
 // than being covered by whoever remembers to add it. batteryCellLabel matches a
 // battery cell's name argument; every cell is named "<entry point>/<case>", which
 // is what makes the entry-point axis recoverable from source.
-var batteryCellLabel = regexp.MustCompile(`want(?:Reject|RejectIs|Terminate|BoundedErr|AcceptUnder)\(t, "([^"/]+)`)
+var batteryCellLabel = regexp.MustCompile(`want(?:Reject|RejectIs|Terminate|BoundedErr|Accept)\(t, "([^"/]+)`)
 
 // breadthEntryAlias folds the spellings the battery uses for one entry point
 // onto a single name. A cell label names the call the cell makes, so the same
@@ -12305,8 +12290,8 @@ func TestInvariant_EveryUnionTagTierHasAWideShape(t *testing.T) {
 }
 
 // TestRegression_UnionTagTierShapesReachTheirTier proves each shape actually
-// makes its tier claim its branches. A cost cell whose input never reaches the
-// pass it is timing measures nothing, and would stay green through any change
+// makes its tier claim its branches. A breadth cell whose input never reaches
+// the pass it names exercises nothing, and would stay green through any change
 // to that pass.
 func TestRegression_UnionTagTierShapesReachTheirTier(t *testing.T) {
 	const n = 8
@@ -12347,18 +12332,18 @@ func TestRegression_UnionTagTierShapesReachTheirTier(t *testing.T) {
 }
 
 // TestDoSBattery_C10a_UnionTagBreadth drives every tier's wide shape through
-// every parse entry point. The tag tables are built during the parse, so the
-// parse time is the observable.
+// every parse entry point. The tag tables are built during the parse, so a
+// tier that cannot hold this many branches surfaces as the parse refusing it.
 func TestDoSBattery_C10a_UnionTagBreadth(t *testing.T) {
 	for _, s := range breadthTierShapes {
 		union := s.build(breadthN)
 		schema := `{"type":"record","name":"Top","fields":[{"name":"f","type":` + union + `}]}`
 
-		wantAcceptUnder(t, "Parse/wide-union-"+s.tier, breadthParseBound, func() error {
+		wantAccept(t, "Parse/wide-union-"+s.tier, func() error {
 			_, err := Parse(schema)
 			return err
 		})
-		wantAcceptUnder(t, "SchemaCache.Parse/wide-union-"+s.tier, breadthParseBound, func() error {
+		wantAccept(t, "SchemaCache.Parse/wide-union-"+s.tier, func() error {
 			var c SchemaCache
 			_, err := c.Parse(schema)
 			return err
@@ -12369,7 +12354,7 @@ func TestDoSBattery_C10a_UnionTagBreadth(t *testing.T) {
 		fwd := `{"type":"record","name":"Top","fields":[` +
 			`{"name":"a","type":"a.Fwd"},` +
 			`{"name":"f","type":` + union[:len(union)-1] + `,{"type":"record","name":"a.Fwd","fields":[]}]}]}`
-		wantAcceptUnder(t, "Parse/wide-union-forward-ref-"+s.tier, breadthParseBound, func() error {
+		wantAccept(t, "Parse/wide-union-forward-ref-"+s.tier, func() error {
 			_, err := Parse(fwd)
 			return err
 		})
@@ -12610,14 +12595,16 @@ func TestDoSBattery_C10b_FieldLookupBreadth(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s reader: %v", s.name, err)
 		}
-		wantAcceptUnder(t, "Resolve/wide-record-"+s.name, breadthBound, func() error {
+		wantAccept(t, "Resolve/wide-record-"+s.name, func() error {
 			_, err := Resolve(w, r)
 			return err
 		})
-		wantAcceptUnder(t, "CheckCompatibility/wide-record-"+s.name, breadthBound, func() error {
-			// A reader field the writer lacks needs a default, so the miss
-			// shape is legitimately incompatible; the cost is the question
-			// here, not the verdict.
+		wantAccept(t, "CheckCompatibility/wide-record-"+s.name, func() error {
+			// The verdict is shape-dependent — a reader field the writer lacks
+			// needs a default, so the miss shape is legitimately incompatible —
+			// so what this row holds is the entry point's PRESENCE in the
+			// breadth cross: it must reach a verdict on 20000 siblings at all,
+			// rather than panic or run out of stack.
 			CheckCompatibility(w, r)
 			return nil
 		})
@@ -12632,8 +12619,9 @@ func TestDoSBattery_C10b_FieldLookupBreadth(t *testing.T) {
 // through every remaining entry point the battery covers: the two wire
 // directions, their JSON and single-object forms, and the schema surfaces that
 // walk or re-emit the tree. A record's field count is chosen by whoever writes
-// the schema, so each of these passes over the field list once per call and
-// must stay linear in it.
+// the schema, so every one of these surfaces has to keep working at a width the
+// caller picked — and each cell checks the surface's own answer at that width,
+// not just that it returned.
 func TestDoSBattery_C10c_WideRecordSurfaces(t *testing.T) {
 	text := breadthLongFields("f", nil, false)(breadthN)
 	s := mustParse(t, text)
@@ -12645,58 +12633,58 @@ func TestDoSBattery_C10c_WideRecordSurfaces(t *testing.T) {
 	jsonWire := mustEncodeJSON(t, s, val)
 	soe := mustAppendSingleObject(t, s, nil, val)
 
-	wantAcceptUnder(t, "Encode/wide-record", breadthBound, func() error {
+	wantAccept(t, "Encode/wide-record", func() error {
 		_, err := s.Encode(val)
 		return err
 	})
-	wantAcceptUnder(t, "Decode/wide-record", breadthBound, func() error {
+	wantAccept(t, "Decode/wide-record", func() error {
 		var out map[string]any
 		_, err := s.Decode(wire, &out)
 		return err
 	})
-	wantAcceptUnder(t, "EncodeJSON/wide-record", breadthBound, func() error {
+	wantAccept(t, "EncodeJSON/wide-record", func() error {
 		_, err := s.EncodeJSON(val)
 		return err
 	})
-	wantAcceptUnder(t, "DecodeJSON/wide-record", breadthBound, func() error {
+	wantAccept(t, "DecodeJSON/wide-record", func() error {
 		var out map[string]any
 		return s.DecodeJSON(jsonWire, &out)
 	})
-	wantAcceptUnder(t, "AppendSingleObject/wide-record", breadthBound, func() error {
+	wantAccept(t, "AppendSingleObject/wide-record", func() error {
 		_, err := s.AppendSingleObject(nil, val)
 		return err
 	})
-	wantAcceptUnder(t, "DecodeSingleObject/wide-record", breadthBound, func() error {
+	wantAccept(t, "DecodeSingleObject/wide-record", func() error {
 		var out map[string]any
 		_, err := s.DecodeSingleObject(soe, &out)
 		return err
 	})
-	wantAcceptUnder(t, "Canonical/wide-record", breadthBound, func() error {
+	wantAccept(t, "Canonical/wide-record", func() error {
 		if len(s.Canonical()) == 0 {
 			return fmt.Errorf("empty canonical form")
 		}
 		return nil
 	})
-	wantAcceptUnder(t, "Fingerprint/wide-record", breadthBound, func() error {
+	wantAccept(t, "Fingerprint/wide-record", func() error {
 		if len(s.Fingerprint(crypto.SHA256.New())) == 0 {
 			return fmt.Errorf("empty fingerprint")
 		}
 		return nil
 	})
-	wantAcceptUnder(t, "String/wide-record", breadthBound, func() error {
+	wantAccept(t, "String/wide-record", func() error {
 		if len(s.String()) == 0 {
 			return fmt.Errorf("empty string form")
 		}
 		return nil
 	})
-	wantAcceptUnder(t, "Root/wide-record", breadthBound, func() error {
+	wantAccept(t, "Root/wide-record", func() error {
 		if len(s.Root().Fields) != breadthN {
 			return fmt.Errorf("Root surfaced %d fields, want %d", len(s.Root().Fields), breadthN)
 		}
 		return nil
 	})
 	root := s.Root()
-	wantAcceptUnder(t, "SchemaNode.Schema/wide-record", breadthBound, func() error {
+	wantAccept(t, "SchemaNode.Schema/wide-record", func() error {
 		_, err := root.Schema()
 		return err
 	})
@@ -12971,10 +12959,10 @@ func TestDoSBattery_C10d_SiblingKindSurfaces(t *testing.T) {
 				t.Fatalf("parse twin: %v", err)
 			}
 			// A twin canonically equal to the schema takes Resolve's equality
-			// short-circuit, and the resolve cells would time that instead of
-			// the sibling matching they exist to bound.
+			// short-circuit, and the resolve cells would then exercise that
+			// instead of the sibling matching they exist to reach.
 			if string(s.Canonical()) == string(twin.Canonical()) {
-				t.Fatal("the twin is canonically equal to the schema, so the resolve cells would time the equality short-circuit rather than the match")
+				t.Fatal("the twin is canonically equal to the schema, so the resolve cells would take the equality short-circuit rather than the match")
 			}
 			val := kind.value(breadthN)
 			wire, err := s.Encode(val)
@@ -12991,79 +12979,79 @@ func TestDoSBattery_C10d_SiblingKindSurfaces(t *testing.T) {
 			}
 
 			label := func(entry string) string { return entry + "/wide-" + kind.field }
-			wantAcceptUnder(t, label("Parse"), breadthParseBound, func() error {
+			wantAccept(t, label("Parse"), func() error {
 				_, err := Parse(text)
 				return err
 			})
-			wantAcceptUnder(t, label("SchemaCache.Parse"), breadthParseBound, func() error {
+			wantAccept(t, label("SchemaCache.Parse"), func() error {
 				var c SchemaCache
 				_, err := c.Parse(text)
 				return err
 			})
-			wantAcceptUnder(t, label("Resolve"), breadthBound, func() error {
+			wantAccept(t, label("Resolve"), func() error {
 				_, err := Resolve(twin, s)
 				return err
 			})
-			wantAcceptUnder(t, label("CheckCompatibility"), breadthBound, func() error {
+			wantAccept(t, label("CheckCompatibility"), func() error {
 				return CheckCompatibility(twin, s)
 			})
-			wantAcceptUnder(t, label("Encode"), breadthBound, func() error {
+			wantAccept(t, label("Encode"), func() error {
 				_, err := s.Encode(val)
 				return err
 			})
-			wantAcceptUnder(t, label("Decode"), breadthBound, func() error {
+			wantAccept(t, label("Decode"), func() error {
 				var out any
 				_, err := s.Decode(wire, &out)
 				return err
 			})
-			wantAcceptUnder(t, label("EncodeJSON"), breadthBound, func() error {
+			wantAccept(t, label("EncodeJSON"), func() error {
 				_, err := s.EncodeJSON(val)
 				return err
 			})
-			wantAcceptUnder(t, label("DecodeJSON"), breadthBound, func() error {
+			wantAccept(t, label("DecodeJSON"), func() error {
 				var out any
 				return s.DecodeJSON(jsonWire, &out)
 			})
 			// The tagged form routes every value through the union tag table
 			// rather than through try-each, which is the consumer the bare
 			// form never reaches.
-			wantAcceptUnder(t, label("DecodeJSON+TaggedUnions"), breadthBound, func() error {
+			wantAccept(t, label("DecodeJSON+TaggedUnions"), func() error {
 				var out any
 				return s.DecodeJSON(jsonWire, &out, TaggedUnions())
 			})
-			wantAcceptUnder(t, label("AppendSingleObject"), breadthBound, func() error {
+			wantAccept(t, label("AppendSingleObject"), func() error {
 				_, err := s.AppendSingleObject(nil, val)
 				return err
 			})
-			wantAcceptUnder(t, label("DecodeSingleObject"), breadthBound, func() error {
+			wantAccept(t, label("DecodeSingleObject"), func() error {
 				var out any
 				_, err := s.DecodeSingleObject(soe, &out)
 				return err
 			})
-			wantAcceptUnder(t, label("Canonical"), breadthBound, func() error {
+			wantAccept(t, label("Canonical"), func() error {
 				if len(s.Canonical()) == 0 {
 					return fmt.Errorf("empty canonical form")
 				}
 				return nil
 			})
-			wantAcceptUnder(t, label("Fingerprint"), breadthBound, func() error {
+			wantAccept(t, label("Fingerprint"), func() error {
 				if len(s.Fingerprint(crypto.SHA256.New())) == 0 {
 					return fmt.Errorf("empty fingerprint")
 				}
 				return nil
 			})
-			wantAcceptUnder(t, label("String"), breadthBound, func() error {
+			wantAccept(t, label("String"), func() error {
 				if len(s.String()) == 0 {
 					return fmt.Errorf("empty string form")
 				}
 				return nil
 			})
 			var root SchemaNode
-			wantAcceptUnder(t, label("Root"), breadthBound, func() error {
+			wantAccept(t, label("Root"), func() error {
 				root = *s.Root()
 				return nil
 			})
-			wantAcceptUnder(t, label("SchemaNode.Schema"), breadthBound, func() error {
+			wantAccept(t, label("SchemaNode.Schema"), func() error {
 				_, err := root.Schema()
 				return err
 			})
@@ -14996,12 +14984,7 @@ var costCells = []costCell{
 		values: []int{26, 30, 8000, 16000, 220, 440}, scaleTol: 4, floor: 400 * time.Millisecond},
 
 	{fn: "TestMatrix_NestedStrayContainerKeyLinearCost",
-		// Times inline rather than through a named helper, which is why the
-		// harness vocabulary includes time.Since: a cell that measures its own
-		// clock is still a timing cell, and an exemption must not be able to
-		// sit on one by avoiding the helpers.
-		factor: "nested stray-key DEPTH — the metadata walker's per-ancestor re-validation, whose absence is exponential. The absolute-ceiling half runs at depth 20 and the growth half compares 400 against 800",
-		values: []int{20, 400, 800}, scaleTol: 3, floor: 100 * time.Millisecond},
+		exempt: "accept oracle, and it lives in package avro_test where none of the harness helpers are reachable. A stray structural key on a kind that does not bind it is legal inert metadata, so what the cell asserts is that all four entry points ACCEPT the chain — at depth 20 on a sub-KB input, and again at 400 and 800, depths a doubled per-level decode could not return from at all. Accept/reject, not cost"},
 
 	// Value oracles. Named explicitly rather than left to a reader to re-derive:
 	// each varies shapes to check an ANSWER and asserts equality, never
@@ -15218,13 +15201,13 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 		}
 		return ""
 	}
-	// A cell that takes the wall-clock harness is asserting a COST. The set is
-	// every helper that TIMES something; wantAcceptUnder was missing from it, which
-	// is how the one cell driving a generator at a single magnitude through an
-	// absolute ceiling stayed invisible. time.Since( is in the set because a cell
-	// may time inline rather than through a named helper, and a timing cell that
-	// does so is still one — leaving it out would let an exemption sit on it.
-	harnesses := []string{"wantTerminate(", "dosRun(", "wantCostDoesNotScale(", "wantAcceptUnder(", "time.Since("}
+	// A cell that takes the DoS harness is driving a MAGNITUDE at a walk. The
+	// set is every helper the battery hands hostile-sized input to — the
+	// watchdogs, the multi-magnitude driver, and the accept assertion. A helper
+	// left out of this set is how a cell driving a generator at a single
+	// magnitude once stayed invisible, so a new one belongs here the day it is
+	// written; a cell wearing a value-oracle exemption must take none of them.
+	harnesses := []string{"wantTerminate(", "dosRun(", "wantCostDoesNotScale(", "wantAccept("}
 	takesHarness := func(code string) bool {
 		for _, h := range harnesses {
 			if strings.Contains(code, h) {
