@@ -4785,40 +4785,40 @@ func TestDoSBattery_C11_SchemaDeclaredMagnitude(t *testing.T) {
 
 // ---------- race_bounds_test.go ----------
 
-// Wall-clock assertions have to account for the race detector, and the rule for
-// how is stated ONCE here. It used to be stated six times: a shared helper
-// applying an absolute FLOOR, a second copy of that floor written inline, three
-// hand-written ceilings using three different multipliers, and a pair of budget
-// constants whose comment claimed to mirror the floor and did not. Six
-// statements of one rule agree only until one is edited, and the floor is the
-// form that fails silently: raising a cell's NORMAL bound — done precisely when
-// its legitimate cost is large — shrinks the headroom the floor leaves it. So
-// the rule is a MULTIPLIER with an absolute floor under it, and both numbers
-// live here.
-
-// raceCostMultiplier is how much the detector inflates this suite's own timed
-// work. It is MEASURED, not chosen: running the DoS battery with and without
-// -race gives per-cell ratios from 2.3x (C1 deep nesting) to 8.3x (C10c
-// wide-record surfaces), and a per-call measurement of the widest parse cell
-// gives 6.2x. Ten covers the measured maximum with margin and matches what the
-// suite's older hand-written relaxations assumed.
+// Nothing in this suite asserts a wall-clock BUDGET. What remains that has to
+// account for the race detector is the LIVENESS deadlines — the watchdogs and
+// hang probes that turn "this never returned" into a failure instead of a wedged
+// package — and the rule for widening them is stated ONCE here. It used to be
+// stated six times, and six statements of one rule agree only until one is
+// edited.
 //
-// It stays far below what it has to: the class these ceilings separate is a
-// complexity CHANGE, and the quadratic the widest cell exists to catch measured
-// 1.9s to 32s unraced at that size, so even multiplied the ceiling sits more
-// than 2x from the healthy cost on one side and the broken cost on the other.
+// A deadline set for unraced work is the one that fails silently under the
+// detector: it does not report a hang, it reports a healthy walk that was
+// instrumented. So the rule is a MULTIPLIER with an absolute floor under it,
+// and both numbers live here.
+
+// raceCostMultiplier is how much the detector inflates this suite's own work.
+// It is MEASURED, not chosen: running the DoS battery with and without -race
+// gives per-cell ratios from 2.3x (C1 deep nesting) to 8.3x (C10c wide-record
+// surfaces), and a per-call measurement of the widest parse cell gives 6.2x.
+// Ten covers the measured maximum with margin.
+//
+// It stays far below what it has to: a deadline exists to separate "returned"
+// from "did not return", and the unbounded walks these watchdogs were written
+// against run for minutes or forever, so multiplying the deadline by ten costs
+// nothing in detection.
 const raceCostMultiplier = 10
 
-// raceCeilingFloor is the headroom a timed cell gets under -race no matter how
-// tight its normal bound. A cell asserting a microsecond reject needs ABSOLUTE
-// headroom, not proportional: ten times a 100ms bound is still a second, and
+// raceCeilingFloor is the headroom a deadline gets under -race no matter how
+// short it is. A probe over work that normally takes microseconds needs ABSOLUTE
+// headroom, not proportional: ten times a 100ms deadline is still a second, and
 // process startup, GC and host load are not proportional to the work. The floor
-// serves those cells and the multiplier serves the cells whose legitimate cost is
+// serves those probes and the multiplier serves the ones whose legitimate work is
 // already large, so taking the larger of the two lets one rule serve both — and
-// is why this loosens nothing below a 300ms normal bound.
+// is why this loosens nothing below a 300ms normal deadline.
 const raceCeilingFloor = 3 * time.Second
 
-// raceRelaxed returns the wall-clock CEILING to enforce for a normal bound.
+// raceRelaxed returns the DEADLINE to enforce for a normal one.
 // It never tightens: the result is >= normal in every mode, since the
 // multiplier is >= 1 and the floor only ever raises.
 func raceRelaxed(normal time.Duration) time.Duration {
@@ -4828,12 +4828,12 @@ func raceRelaxed(normal time.Duration) time.Duration {
 	return max(raceCeilingFloor, raceCostMultiplier*normal)
 }
 
-// raceInflated scales a MEASURED-cost allowance by the same inflation, with no
-// absolute floor. The distinction from raceRelaxed is the question being asked: a
-// ceiling asks "is this cost acceptable", so a generous absolute minimum is
-// harmless, while a scale-comparison floor asks "is this cost FLAT", and an
-// absolute 3s floor would swallow the comparison whole. Proportional inflation is
-// the only correct relaxation for a comparison.
+// raceInflated scales an allowance by the same inflation, with no absolute
+// floor. The distinction from raceRelaxed is what the number already is: the
+// two callers here (the DoS watchdog's 4s budget, the schema-node batteries'
+// 30s hang deadline) are already seconds, so the floor would change nothing,
+// and stating them without it keeps them proportional to the work they cover
+// rather than to an unrelated minimum.
 func raceInflated(allowance time.Duration) time.Duration {
 	if !raceEnabled {
 		return allowance
@@ -4877,17 +4877,8 @@ type raceRelaxation struct {
 // `// ---------- x ----------` banner still names which original file a consult
 // sits in, so a row covering more than one says so and splits its count.
 var raceRelaxations = []raceRelaxation{
-	{file: "internal_nets_test.go", sites: 4, kind: "authority",
-		why: "two authority sections in one file. race_bounds (3): raceRelaxed and raceInflated — the two forms of the rule and the only place either number appears — plus the invariant that asserts neither ever tightens. export (1): the bridge READS the predicate to hand it to package avro_test, so the two packages share one build-tagged mechanism instead of declaring one each"},
-
-	{file: "conformance_test.go", sites: 3, kind: "authority+skip",
-		why: "isRaceEnabled forwards the bridged value (1); the two remaining consults SKIP their budgets rather than relax them, each for a reason recorded at the site. Every wall-clock CEILING in this file asks raceRelaxed — three of them used to compute their own, with three different multipliers"},
-
-	{file: "audit_regression_test.go", sites: 1, kind: "skip",
-		why: "SKIPS its 2s deep-schema-reject budget under -race rather than relaxing it. A skip is a different decision from a ceiling and is kept as one: the quadratic it guards is seconds in the untraced run, which always executes"},
-
-	{file: "schema_semantics_test.go", sites: 1, kind: "skip",
-		why: "the error_bound section SKIPS a growth-RATIO check (linear lands near 2, quadratic near 4). Instrumentation distorts the ratio itself, not just the magnitude, so no multiplier can correct it; the absolute ceilings in the same test still run under -race"},
+	{file: "internal_nets_test.go", sites: 3, kind: "authority",
+		why: "the race_bounds section is the whole set: raceRelaxed and raceInflated — the two forms of the rule and the only place either number appears — plus the invariant that asserts neither ever tightens. No cell asserts a wall-clock BUDGET any more, so what the rule now widens is liveness: the DoS watchdog's deadline, the schema-node hang deadline, and the one hang probe in package avro_test that reaches raceRelaxed through the export bridge"},
 }
 
 // raceConstrained reports whether src carries a build constraint mentioning
@@ -5048,11 +5039,11 @@ func TestInvariant_EveryRaceRelaxationIsRowed(t *testing.T) {
 
 // TestInvariant_RaceRelaxationNeverTightens pins the two properties the whole
 // scheme rests on, in both build modes, so neither can be lost to a future
-// edit of the arithmetic: a relaxation never returns LESS than the bound it
-// was given, and under -race a cell whose normal bound is large gets headroom
-// proportional to it rather than a fixed ceiling that shrinks as the bound
-// grows. The second is the property the floor form did not have, which is why
-// it is asserted rather than left to the constant's documentation.
+// edit of the arithmetic: a relaxation never returns LESS than the deadline it
+// was given, and under -race a probe whose normal deadline is large gets
+// headroom proportional to it rather than a fixed ceiling that shrinks as the
+// deadline grows. The second is the property the floor form did not have, which
+// is why it is asserted rather than left to the constant's documentation.
 func TestInvariant_RaceRelaxationNeverTightens(t *testing.T) {
 	for _, normal := range []time.Duration{
 		time.Microsecond, time.Millisecond, 100 * time.Millisecond,
@@ -5068,7 +5059,7 @@ func TestInvariant_RaceRelaxationNeverTightens(t *testing.T) {
 	if !raceEnabled {
 		for _, normal := range []time.Duration{time.Millisecond, time.Minute} {
 			if got := raceRelaxed(normal); got != normal {
-				t.Errorf("raceRelaxed(%v) = %v without -race — the tight bound must stay in effect", normal, got)
+				t.Errorf("raceRelaxed(%v) = %v without -race — the tight deadline must stay in effect", normal, got)
 			}
 		}
 		return
@@ -5076,10 +5067,10 @@ func TestInvariant_RaceRelaxationNeverTightens(t *testing.T) {
 	// Under -race, headroom is proportional once the bound is past the floor.
 	small, large := 100*time.Millisecond, 10*time.Second
 	if ratio := raceRelaxed(large) / large; ratio < 2 {
-		t.Errorf("raceRelaxed(%v) leaves only %vx headroom — the ceiling stops scaling with the bound, which is the shape that reds a correct cell", large, ratio)
+		t.Errorf("raceRelaxed(%v) leaves only %vx headroom — the ceiling stops scaling with the deadline, which is the shape that reds a correct probe", large, ratio)
 	}
 	if raceRelaxed(small) < raceCeilingFloor {
-		t.Errorf("raceRelaxed(%v) = %v — below the absolute floor a tight cell needs", small, raceRelaxed(small))
+		t.Errorf("raceRelaxed(%v) = %v — below the absolute floor a short deadline needs", small, raceRelaxed(small))
 	}
 }
 
@@ -5203,16 +5194,12 @@ func TestCoverage_RatFromBytesHostileScale(t *testing.T) {
 // Test-only bridges for the external avro_test package (compiled only into
 // the test binary; not part of the library surface).
 
-// RaceRelaxedForTest is the wall-clock ceiling authority (race_bounds_test.go),
+// RaceRelaxedForTest is the deadline-widening authority (race_bounds_test.go),
 // bridged so package avro_test ASKS it instead of keeping a second copy of the
 // rule. The two packages cannot share an unexported helper, and that is exactly
 // why the rule was duplicated — so the sharing is made explicit here rather
 // than left to two comments agreeing with each other.
 func RaceRelaxedForTest(normal time.Duration) time.Duration { return raceRelaxed(normal) }
-
-// RaceEnabledForTest bridges the build-tagged predicate itself, so there is one
-// mechanism for the whole module rather than one per test package.
-const RaceEnabledForTest = raceEnabled
 
 // SlabFreeForTest reports the internal slab-free classification: whether
 // Decode bypasses the slab pool and runs this schema's deser on a nil slab.

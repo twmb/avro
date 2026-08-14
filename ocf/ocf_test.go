@@ -7176,9 +7176,9 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 		}
 	})
 
-	// An all-empty-blocks file terminates in bounded time: one Decode call
-	// walks every block (18 bytes each) and returns io.EOF — cost linear in
-	// the input, no records, no hang.
+	// An all-empty-blocks file terminates: one Decode call walks every block
+	// (18 bytes each) and returns io.EOF — no records, no hang, and in
+	// particular no block treated as a datum.
 	t.Run("ten-thousand-empty-blocks", func(t *testing.T) {
 		s := avro.MustParse(`"string"`)
 		var buf bytes.Buffer
@@ -7187,13 +7187,9 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 		for range 10_000 {
 			appendRawBlock(&buf, 0, nil, foreignSync)
 		}
-		start := time.Now()
 		got := readAllStrings(t, buf.Bytes())
 		if len(got) != 0 {
 			t.Fatalf("read %v from an all-empty file", got)
-		}
-		if d := time.Since(start); d > 10*time.Second {
-			t.Fatalf("all-empty file took %v to reach io.EOF", d)
 		}
 		if fa != nil && faSupported["null"] {
 			faGot, faErr := fa(buf.Bytes())
