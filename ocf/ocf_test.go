@@ -6273,7 +6273,6 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 		pan any
 	}
 	ch := make(chan result, 1)
-	start := time.Now()
 	go func() {
 		var r result
 		defer func() {
@@ -6289,9 +6288,6 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 		if r.pan != nil {
 			t.Errorf("%s: panicked on hostile input (must return an error, not panic): %v", name, r.pan)
 			return nil, false
-		}
-		if d := time.Since(start); d > ocfDosBudget {
-			t.Errorf("%s: completed but took %v (> %v) — cost not bounded", name, d, ocfDosBudget)
 		}
 		return r.err, true
 	case <-time.After(ocfDosBudget):

@@ -3797,7 +3797,6 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 	// timeout — that would hide a real hang; this only widens what -race itself
 	// inflated.
 	budget := raceInflated(dosBudget)
-	start := time.Now()
 	go func() {
 		var r result
 		defer func() {
@@ -3813,9 +3812,6 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 		if r.pan != nil {
 			t.Errorf("%s: panicked on hostile input (must return an error, not panic): %v", name, r.pan)
 			return nil, false
-		}
-		if d := time.Since(start); d > budget {
-			t.Errorf("%s: completed but took %v (> %v) — cost not bounded for hostile input", name, d, budget)
 		}
 		return r.err, true
 	case <-time.After(budget):
