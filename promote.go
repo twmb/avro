@@ -105,12 +105,12 @@ func readBytesPrefix(src []byte, destAvroType, wireTypeName string) (n int, rest
 	return int(length), rest, nil
 }
 
-func promoteStringToBytes(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+func promoteStringToBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	n, src, err := readBytesPrefix(src, "bytes", "string")
 	if err != nil {
 		return nil, err
 	}
-	if err := setBytesValue(indirectAlloc(v), src[:n], "bytes"); err != nil {
+	if err := setBytesValue(indirectAlloc(v), src[:n], "bytes", sl); err != nil {
 		return nil, err
 	}
 	return src[n:], nil
@@ -191,7 +191,7 @@ func promoteIntToLongTimeMicros(src []byte, v reflect.Value, _ *slab) ([]byte, e
 // at the given schema scale. Mirrors deserBytesDecimal but with the
 // length-read shape of promoteStringToBytes.
 func promoteStringToBytesDecimal(scale int) deserfn {
-	return func(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		n, src, err := readBytesPrefix(src, "bytes", "string")
 		if err != nil {
 			return nil, err
@@ -206,7 +206,7 @@ func promoteStringToBytesDecimal(scale int) deserfn {
 			return src[n:], nil
 		}
 		// Fall through to plain bytes target.
-		if err := setBytesValue(v, b, "bytes"); err != nil {
+		if err := setBytesValue(v, b, "bytes", sl); err != nil {
 			return nil, err
 		}
 		return src[n:], nil
@@ -217,7 +217,7 @@ func promoteStringToBytesDecimal(scale int) deserfn {
 // prefixed bytes and dispatches to the same arms as deserBigDecimal
 // (parse as structured big-decimal payload, fall back to raw bytes
 // for opaque-pass-through targets).
-func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	n, src, err := readBytesPrefix(src, "bytes", "string")
 	if err != nil {
 		return nil, err
@@ -226,7 +226,7 @@ func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byt
 	v = indirectAlloc(v)
 	done, err := applyBigDecimalPayload(v, payload)
 	if !done {
-		err = setBytesValue(v, payload, "big-decimal")
+		err = setBytesValue(v, payload, "big-decimal", sl)
 	}
 	if err != nil {
 		return nil, err

@@ -103,20 +103,38 @@ type slab struct {
 	bypassCustom bool
 }
 
-// slabSize is the string-interning slab batch: short decoded strings are
+// slabSize is the slab batch: short decoded strings and byte slices are
 // sub-allocated from one shared buffer to amortize allocation. Perf-only —
 // not a correctness or safety bound; a larger value batches more, a smaller
 // one less.
 const slabSize = 1024
 
-func (s *slab) string(src []byte, n int) string {
+// carve advances past what it returns: a handed-out region is never revisited,
+// which is what makes string's unsafe.String safe across a pooled slab.
+func (s *slab) carve(n int) []byte {
 	if len(s.buf) < n {
 		s.buf = make([]byte, max(slabSize, n))
 	}
 	b := s.buf[:n:n]
-	copy(b, src[:n])
 	s.buf = s.buf[n:]
+	return b
+}
+
+func (s *slab) string(src []byte, n int) string {
+	b := s.carve(n)
+	copy(b, src[:n])
 	return unsafe.String(unsafe.SliceData(b), n)
+}
+
+func (s *slab) bytes(src []byte, n int) []byte {
+	if s == nil || n == 0 {
+		b := make([]byte, n)
+		copy(b, src[:n])
+		return b
+	}
+	b := s.carve(n)
+	copy(b, src[:n])
+	return b
 }
 
 var slabPool = sync.Pool{New: func() any { return &slab{} }}
@@ -474,7 +492,7 @@ func deserBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := setBytesValue(indirectAlloc(v), src[:n], "bytes"); err != nil {
+	if err := setBytesValue(indirectAlloc(v), src[:n], "bytes", sl); err != nil {
 		return nil, err
 	}
 	return src[n:], nil
@@ -2066,19 +2084,15 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		b := make([]byte, s.n)
-		copy(b, src[:s.n])
-		return src[s.n:], setIface(v, reflect.ValueOf(b), "fixed")
+		return src[s.n:], setIface(v, reflect.ValueOf(sl.bytes(src, s.n)), "fixed")
 	}
 	t := v.Type()
 	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
-		b := make([]byte, s.n)
-		copy(b, src[:s.n])
 		// SetBytes (not Set(reflect.ValueOf(b))): a named byte-slice or
 		// named-byte-element slice (type B byte; []B) has element Kind Uint8 but
 		// is not assignable from []byte, so Set panics; SetBytes writes through
 		// the Kind. Mirrors setBytesValue's Slice arm.
-		v.SetBytes(b)
+		v.SetBytes(sl.bytes(src, s.n))
 		return src[s.n:], nil
 	}
 	if t.Kind() == reflect.String {
@@ -2266,25 +2280,18 @@ func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error 
 // the decimal/big-decimal opaque-bytes pass-throughs, and JSON assignBytes
 // so all paths agree on which Go targets accept Avro bytes/fixed AND on
 // the never-alias-the-wire-buffer invariant.
-func setBytesValue(v reflect.Value, b []byte, avroType string) error {
+func setBytesValue(v reflect.Value, b []byte, avroType string, sl *slab) error {
 	switch v.Kind() {
 	case reflect.Interface:
-		// make+copy (not append onto a nil base): empty wire bytes must
-		// surface as a NON-nil empty []byte. A nil result is
-		// nil-equivalent on re-encode, so the nil-first union dispatch
-		// would flip a decoded {"bytes": ""} onto the null branch —
-		// silent value corruption through decode→re-encode. Mirrors the
-		// Slice arm below, deserFixed, and udBytesDeser.
-		owned := make([]byte, len(b))
-		copy(owned, b)
-		return setIface(v, reflect.ValueOf(owned), avroType)
+		// Empty wire bytes must surface as a NON-nil empty []byte: a nil
+		// result is nil-equivalent on re-encode, so the nil-first union
+		// dispatch would flip a decoded {"bytes": ""} onto the null branch.
+		return setIface(v, reflect.ValueOf(sl.bytes(b, len(b))), avroType)
 	case reflect.Slice:
 		if v.Type().Elem().Kind() != reflect.Uint8 {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType}
 		}
-		owned := make([]byte, len(b))
-		copy(owned, b)
-		v.SetBytes(owned)
+		v.SetBytes(sl.bytes(b, len(b)))
 	case reflect.Array:
 		if v.Type().Elem().Kind() != reflect.Uint8 {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType}
@@ -2303,9 +2310,9 @@ func setBytesValue(v reflect.Value, b []byte, avroType string) error {
 
 // setStringValue sets v to the string view of src[:n] (or to a fresh copy when
 // the target borrows past the source buffer). Shared between natural
-// deserString and promoteBytesToString. The slab is used for the interface and
-// string-target paths to avoid an extra copy; the TextUnmarshaler and []byte
-// arms allocate fresh storage so the target owns its bytes.
+// deserString and promoteBytesToString. Every arm but TextUnmarshaler carves
+// from the slab; that one allocates because it parses the bytes rather than
+// keeping them.
 func setStringValue(v reflect.Value, src []byte, n int, sl *slab) error {
 	if v.Kind() == reflect.Interface {
 		return setIface(v, reflect.ValueOf(sl.string(src, n)), "string")
@@ -2328,9 +2335,7 @@ func setStringValue(v reflect.Value, src []byte, n int, sl *slab) error {
 		return setStringTarget(v, sl.string(src, n), "string")
 	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		b := make([]byte, n)
-		copy(b, src[:n])
-		v.SetBytes(b)
+		v.SetBytes(sl.bytes(src, n))
 		return nil
 	}
 	return semErr(v, "string")
@@ -2615,7 +2620,7 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	// text, and the encoder rejects a non-numeric string for a decimal. So
 	// string is numeric-text-only and []byte the sole opaque carrier,
 	// symmetric on both sides.
-	return src, setBytesValue(v, b, "decimal")
+	return src, setBytesValue(v, b, "decimal", sl)
 }
 
 type deserBigDecimal struct{}
@@ -2630,7 +2635,7 @@ func (s *deserBigDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte, 
 	v = indirectAlloc(v)
 	done, err := applyBigDecimalPayload(v, payload)
 	if !done {
-		err = setBytesValue(v, payload, "big-decimal")
+		err = setBytesValue(v, payload, "big-decimal", sl)
 	}
 	if err != nil {
 		return nil, err

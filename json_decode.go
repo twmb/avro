@@ -742,7 +742,7 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny, ra
 		}
 		return setIface(v, reflect.ValueOf(val), "bytes")
 	}
-	return assignBytes(v, b, node, raw)
+	return assignBytes(v, b, node, raw, ctx.slab)
 }
 
 func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny, raw bool) error {
@@ -786,7 +786,7 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny, ra
 		}
 		return setIface(v, reflect.ValueOf(decodeLogicalFixed(b, node)), "fixed")
 	}
-	return assignBytes(v, b, node, raw)
+	return assignBytes(v, b, node, raw, ctx.slab)
 }
 
 // assignBytes assigns decoded bytes to a typed target, handling decimal,
@@ -800,9 +800,9 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny, ra
 // when suppressLogical fires). Without this, a suppressed bytes/fixed node
 // with a decimal/uuid/duration logicalType still transformed on the JSON
 // side (e.g. "decimal" → *big.Rat) while binary handed back raw bytes.
-func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool) error {
+func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool, sl *slab) error {
 	if raw {
-		return setBytesValue(v, b, node.kind)
+		return setBytesValue(v, b, node.kind, sl)
 	}
 	// Each arm fires only on the kind its logical is spec-valid on, so the
 	// typed-target transform set matches the *any path and
@@ -873,7 +873,7 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool) error {
 	// setBytesValue handles slice/array/string (and would handle the
 	// interface arm too; the toAny branch upstream already covered
 	// interface targets for this call site).
-	return setBytesValue(v, b, node.kind)
+	return setBytesValue(v, b, node.kind, sl)
 }
 
 // hasDecimalBareNumberArm reports whether node is a logical-typed bytes/
