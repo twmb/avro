@@ -17982,3 +17982,82 @@ func wolverine() Superhero {
 		},
 	}
 }
+
+// TestInvariant_SlabNeverRewindsHandedOutMemory pins the property that lets
+// slab.string return an unsafe.String over pooled memory: buf only ever
+// shrinks from the front, or is replaced wholesale by a fresh make. It is
+// never rewound. Every string the slab has handed out aliases a region of some
+// buf, so reclaiming that memory does not free it — it hands the same bytes
+// out twice and silently mutates strings the caller already holds, long after
+// Decode returned. A decoded string used as a map key changes value in place.
+//
+// The slab struct itself IS pooled and reused (put deliberately retains buf),
+// so "the memory is fresh each call" is not what makes this safe. Only the
+// never-rewound rule does.
+func TestInvariant_SlabNeverRewindsHandedOutMemory(t *testing.T) {
+	sl := &slab{}
+
+	type region struct{ start, end uintptr }
+	var handed []region
+	var held, want []string
+
+	for i := range 300 {
+		// Sizes stride across slabSize so the buffer is exhausted and
+		// replaced several times; a rewind that only shows up at the
+		// replacement boundary is the one worth catching.
+		w := fmt.Sprintf("v%03d-%s", i, strings.Repeat("x", i%53))
+		got := sl.string([]byte(w), len(w))
+		if got != w {
+			t.Fatalf("slab.string returned %q, want %q", got, w)
+		}
+		p := uintptr(unsafe.Pointer(unsafe.StringData(got)))
+		// held keeps every handed-out region reachable for the whole test, so
+		// the allocator cannot recycle one into a later buf and stage an
+		// "overlap" that is not a rewind.
+		held = append(held, got)
+		want = append(want, w)
+		handed = append(handed, region{p, p + uintptr(len(got))})
+
+		if len(sl.buf) == 0 {
+			continue
+		}
+		bs := uintptr(unsafe.Pointer(unsafe.SliceData(sl.buf)))
+		be := bs + uintptr(len(sl.buf))
+		for j, r := range handed {
+			if bs < r.end && r.start < be {
+				t.Fatalf("after %d strings, the slab's remaining buf [%#x,%#x) overlaps the region handed out for string %d [%#x,%#x): buf was rewound",
+					i+1, bs, be, j, r.start, r.end)
+			}
+		}
+	}
+
+	for i, s := range held {
+		if s != want[i] {
+			t.Errorf("string %d mutated by %d later slab allocations: got %q, want %q", i, len(held)-i-1, s, want[i])
+		}
+	}
+}
+
+// TestInvariant_SlabPutDoesNotReclaimBuf guards the same rule at the one place
+// it would plausibly be broken. put hands the slab back for reuse, so
+// reclaiming the tail there — sl.buf = sl.buf[:0], or sl.buf = nil to "free"
+// it — reads like an obvious win and costs nothing visible in any test that
+// does not hold a decoded string across two decodes.
+//
+// Read from source rather than executed: calling put publishes the slab to the
+// pool, and reading its fields afterward races with whoever Gets it next.
+func TestInvariant_SlabPutDoesNotReclaimBuf(t *testing.T) {
+	const decl = "func (sl *slab) put()"
+	src := readFile(t, "deser.go")
+	i := strings.Index(src, decl)
+	if i < 0 {
+		t.Fatalf("%s not found in deser.go — this guard reads it from source, so a rename must update the guard, not silence it", decl)
+	}
+	body := src[i:]
+	if e := strings.Index(body, "\n}\n"); e >= 0 {
+		body = body[:e+2]
+	}
+	if strings.Contains(body, "sl.buf") {
+		t.Errorf("slab.put touches sl.buf:\n\n%s\nbuf must carry over untouched. Every string slab.string returned aliases it; resetting or re-slicing here hands the same bytes out twice.", body)
+	}
+}
