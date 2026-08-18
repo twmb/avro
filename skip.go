@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -258,6 +259,13 @@ func buildSkip(w *schemaNode, mbw *minBytesWalk) skipfn {
 			return nil, fmt.Errorf("cannot skip unknown type %q", w.kind)
 		}
 	}
+}
+
+// skipUnbuildable stands in where a field's skipper could not be compiled
+// because the node behind it is missing. Reaching it is a wiring bug, not bad
+// input, so it errors rather than dereferencing nil.
+func skipUnbuildable(_ []byte, _ *slab) ([]byte, error) {
+	return nil, errors.New("avro: internal: record field has no skipper")
 }
 
 // skipToDeser wraps a skipfn as a deserfn that ignores the reflect.Value.

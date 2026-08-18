@@ -392,16 +392,43 @@ type cachedMapping struct {
 	omitzero []bool
 }
 
-// typeFieldMapping returns the field index paths for each schema field in the
-// given Go type. It handles embedded (anonymous) structs and inline-tagged
+// unmapped reports whether schema field i has no Go field — the sentinel
+// [typeFieldMappingSkip] leaves behind for [SkipUnknown]. A mapped field's
+// path always has at least one element, so an empty one cannot collide.
+func (m *cachedMapping) unmapped(i int) bool { return len(m.indices[i]) == 0 }
+
+// mappingKey keys the field-map cache. skipUnknown belongs in the key because
+// it changes what is compiled: without it in the key, one call site's mapping
+// answers another site's question in the opposite mode.
+type mappingKey struct {
+	t           reflect.Type
+	skipUnknown bool
+}
+
+// typeFieldMapping maps every schema field to a Go field, erroring on the first
+// with no match. This is the ENCODE spelling and the strict default: a struct
+// that does not cover the schema must not encode, or the fields it lacks go out
+// as zero values.
+func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*cachedMapping, error) {
+	return typeFieldMappingSkip(fieldNames, cache, t, false)
+}
+
+// typeFieldMappingSkip returns the field index paths for each schema field in
+// the given Go type. It handles embedded (anonymous) structs and inline-tagged
 // fields by recursing into them. Avro-tagged fields take priority over
 // name-matched fields, and shallower fields take priority over deeper ones.
 //
+// With skipUnknown, a schema field the Go type has no home for yields a nil
+// index path instead of an error; see [cachedMapping.unmapped]. An AMBIGUOUS
+// name still errors either way — the type does have fields for it, and picking
+// one arbitrarily is not skipping.
+//
 // The result is cached in the provided sync.Map for subsequent calls with the
-// same type.
-func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*cachedMapping, error) {
+// same type and mode.
+func typeFieldMappingSkip(fieldNames []string, cache *sync.Map, t reflect.Type, skipUnknown bool) (*cachedMapping, error) {
+	ckey := mappingKey{t, skipUnknown}
 	if cache != nil {
-		if v, ok := cache.Load(t); ok {
+		if v, ok := cache.Load(ckey); ok {
 			return v.(*cachedMapping), nil
 		}
 	}
@@ -555,6 +582,11 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 		}
 		e, exists := m[name]
 		if !exists {
+			if skipUnknown {
+				ats = append(ats, nil)
+				ozs = append(ozs, false)
+				continue
+			}
 			// truncForError: name is a schema field name with no length cap
 			// (validName grammar / WithLaxNames). It rides in .Err, not the
 			// render-truncated .Field, so SemanticError.Error() echoes it raw
@@ -568,7 +600,7 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 
 	result := &cachedMapping{indices: ats, omitzero: ozs}
 	if cache != nil {
-		cache.Store(t, result)
+		cache.Store(ckey, result)
 	}
 	return result, nil
 }

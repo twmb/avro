@@ -98,13 +98,40 @@ type resolvedRecord struct {
 	wireOps        []wireOp
 	defaults       []defaultOp
 	cache          sync.Map
+	// mbw is the resolution's walk, reused for the skippers [SkipUnknown]
+	// compiles lazily in wireSkips — the same walk the dropped-field skippers
+	// above were built on.
+	mbw      *minBytesWalk
+	skipOnce sync.Once
+	skips    []skipfn
+}
+
+// wireSkips compiles a skipper per MATCHED wire op, once. Only a decode into a
+// struct that omits a reader field ever asks, so the compile stays off Resolve,
+// where it would cost one walk of the writer per field.
+func (rr *resolvedRecord) wireSkips() []skipfn {
+	rr.skipOnce.Do(func() {
+		rr.skips = make([]skipfn, len(rr.wireOps))
+		for i, op := range rr.wireOps {
+			// No fresh walk when mbw is nil — see deserRecord.fieldSkips.
+			switch {
+			case op.readerIdx < 0:
+			case op.wnode == nil || rr.mbw == nil:
+				rr.skips[i] = skipUnbuildable
+			default:
+				rr.skips[i] = buildSkip(op.wnode, rr.mbw)
+			}
+		}
+	})
+	return rr.skips
 }
 
 // wireOp describes how to handle a single writer field during deserialization.
 type wireOp struct {
-	readerIdx int     // index in the reader's field list; -1 means skip
-	read      deserfn // non-nil when readerIdx >= 0
-	skip      skipfn  // non-nil when readerIdx == -1
+	readerIdx int         // index in the reader's field list; -1 means skip
+	read      deserfn     // non-nil when readerIdx >= 0
+	skip      skipfn      // non-nil when readerIdx == -1
+	wnode     *schemaNode // writer node behind read; wireSkips compiles from it
 }
 
 // defaultOp fills in a reader field that is absent from the writer.
@@ -276,6 +303,7 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 	rr := &resolvedRecord{
 		readerNames:    make([]string, len(r.fields)),
 		readerNameVals: make([]reflect.Value, len(r.fields)),
+		mbw:            ctx.minBytes,
 	}
 	for i, rf := range r.fields {
 		rr.readerNames[i] = rf.name
@@ -330,6 +358,7 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 		rr.wireOps = append(rr.wireOps, wireOp{
 			readerIdx: ri,
 			read:      resolved.deser,
+			wnode:     wf.node,
 		})
 	}
 
@@ -529,15 +558,25 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 }
 
 func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
-	mapping, err := typeFieldMapping(rr.readerNames, &rr.cache, t)
+	mapping, err := typeFieldMappingSkip(rr.readerNames, &rr.cache, t, sl.skipUnknown)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, op := range rr.wireOps {
+	var skips []skipfn
+	for i, op := range rr.wireOps {
 		if op.readerIdx < 0 {
 			if src, err = op.skip(src, sl); err != nil {
 				return nil, err
+			}
+			continue
+		}
+		if mapping.unmapped(op.readerIdx) {
+			if skips == nil {
+				skips = rr.wireSkips()
+			}
+			if src, err = skips[i](src, sl); err != nil {
+				return nil, recordFieldError(t, rr.readerNames[op.readerIdx], err)
 			}
 			continue
 		}
@@ -551,6 +590,10 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 	}
 
 	for _, d := range rr.defaults {
+		// A reader field with no Go field has nothing to fill.
+		if mapping.unmapped(d.readerIdx) {
+			continue
+		}
 		fv, ferr := fieldByIndex(v, mapping.indices[d.readerIdx])
 		if ferr != nil {
 			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], ferr)

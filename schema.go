@@ -1161,6 +1161,12 @@ type builder struct {
 	// (provisional), so their memo must not leak into finalize, which recomputes
 	// on the fully-wired graph.
 	minBytes *minBytesWalk
+	// skipWalk is the parse's walk for [SkipUnknown]'s per-field skippers,
+	// which compile at DECODE time. Separate from minBytes for the same reason
+	// minBytes is separate from finalize's: a walk drained by one phase must
+	// not charge another. Shared across the parse's records, since the schema
+	// picks how many there are.
+	skipWalk *minBytesWalk
 }
 
 // validNameErr validates a simple name using the builder's configured validator.
@@ -1204,6 +1210,7 @@ func (b *builder) nest() *builder {
 		allowReRegister: b.allowReRegister,
 		depth:           b.depth,
 		minBytes:        b.minBytes,
+		skipWalk:        b.skipWalk,
 	}
 }
 
@@ -1684,6 +1691,9 @@ func (b *builder) build(parentName string, s *aschema) error {
 	// sites never dereference a nil walk. See b.minBytes.
 	if b.minBytes == nil {
 		b.minBytes = newMinBytesWalk()
+	}
+	if b.skipWalk == nil {
+		b.skipWalk = newMinBytesWalk()
 	}
 	b.depth++
 	defer func() { b.depth-- }()
@@ -2925,6 +2935,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			serRecord:   sr,
 			deserRecord: dr,
 		}
+		// The node and the parse's skip walk back dr.fieldSkips, which
+		// compiles lazily at decode time — after every field fixup has landed.
+		dr.node = nd
+		dr.mbw = b.skipWalk
 		b.registerNamed(o.Name, &namedType{node: nd})
 		b.node = nd
 

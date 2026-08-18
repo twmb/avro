@@ -1449,13 +1449,16 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 	if dr == nil {
 		return &SemanticError{GoType: v.Type(), AvroType: "record", Err: errors.New("no record metadata")}
 	}
-	mapping, err := typeFieldMapping(dr.names, &dr.cache, v.Type())
+	mapping, err := typeFieldMappingSkip(dr.names, &dr.cache, v.Type(), ctx.slab.skipUnknown)
 	if err != nil {
 		return err
 	}
 	return ctx.iterateRecordFields(node,
 		func(idx int, key string) error {
 			f := &node.fields[idx]
+			if mapping.unmapped(idx) {
+				return ctx.scanner.skipValue()
+			}
 			fv, err := fieldByIndex(v, mapping.indices[idx])
 			if err != nil {
 				return recordFieldError(v.Type(), f.name, err)
@@ -1467,7 +1470,7 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 		},
 		func(idx int) error {
 			f := &node.fields[idx]
-			if len(mapping.indices[idx]) == 0 {
+			if mapping.unmapped(idx) {
 				// Struct has no field for this Avro field — nothing to fill.
 				// Mirrors decodeRecord's tolerance of struct-field omission.
 				return nil

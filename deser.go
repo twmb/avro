@@ -88,6 +88,7 @@ type slab struct {
 	depth           int // recursion depth; bumped at recursive dispatch sites
 	taggedUnions    bool
 	tagLogicalTypes bool
+	skipUnknown     bool
 	// customMatches counts CustomType decoders that MATCHED (returned a result
 	// rather than ErrSkipCustomType) during a decode. A custom-decoder wrapper
 	// saves it before probing and compares after: an unchanged count means no
@@ -169,6 +170,7 @@ func (sl *slab) put() {
 	sl.depth = 0
 	sl.taggedUnions = false
 	sl.tagLogicalTypes = false
+	sl.skipUnknown = false
 	sl.customMatches = 0
 	sl.bypassCustom = false
 	slabPool.Put(sl)
@@ -220,9 +222,9 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	// Slab-free schemas (scalar leaves, no custom wiring) never touch the
 	// slab, so skip the pool entirely: a nil slab keeps scalar decodes
 	// allocation-free even when GC has drained the pool. Opts only ever
-	// alter slab state (and are inert outside union paths, which are never
-	// slab-free), so their mere presence takes the pooled path to keep the
-	// nil-slab proof trivial.
+	// alter slab state (and are inert outside union and record paths, which
+	// are never slab-free), so their mere presence takes the pooled path to
+	// keep the nil-slab proof trivial.
 	if s.slabFree && len(opts) == 0 {
 		return s.deser(src, rv.Elem(), nil)
 	}
@@ -231,6 +233,7 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 		cfg := parseOpts(opts)
 		sl.taggedUnions = cfg.tagged
 		sl.tagLogicalTypes = cfg.tagLogical
+		sl.skipUnknown = cfg.skipUnknown
 	}
 	rest, err := s.deser(src, rv.Elem(), sl)
 	sl.put()
@@ -544,14 +547,42 @@ func (f *deserRecordField) avroType() string {
 type deserRecord struct {
 	fields []deserRecordField
 	names  []string
-	cache  sync.Map // map[reflect.Type]*cachedMapping
-	fast   sync.Map // map[reflect.Type]*fastRecordDeser — per-Go-type compiled unsafe path
+	cache  sync.Map // map[mappingKey]*cachedMapping
+	fast   sync.Map // map[mappingKey]*fastRecordDeser — per-Go-type compiled unsafe path
+	// node and mbw back the per-field skippers [SkipUnknown] needs; see
+	// fieldSkips. mbw is the PARSE's skip walk, shared by every record it
+	// built.
+	node     *schemaNode
+	mbw      *minBytesWalk
+	skipOnce sync.Once
+	skips    []skipfn
+}
+
+// fieldSkips compiles one skipper per record field, once. A record that never
+// decodes into a partial struct never compiles any: the schema chooses how many
+// records exist, so this must stay off the unconditional build path.
+func (s *deserRecord) fieldSkips() []skipfn {
+	s.skipOnce.Do(func() {
+		s.skips = make([]skipfn, len(s.fields))
+		for i := range s.skips {
+			// No fresh walk when mbw is nil: a per-record walk would multiply
+			// the per-walk allowance by a record count the schema picks. Every
+			// record built by a parse carries the parse's walk, so nil here is
+			// a wiring bug, and refusing is the only sound answer.
+			if s.mbw == nil || s.node == nil || i >= len(s.node.fields) || s.node.fields[i].node == nil {
+				s.skips[i] = skipUnbuildable
+				continue
+			}
+			s.skips[i] = buildSkip(s.node.fields[i].node, s.mbw)
+		}
+	})
+	return s.skips
 }
 
 // fastFor returns the compiled unsafe fast path for t, or nil if not
 // yet compiled. Sibling of [serRecord.fastFor]; see that comment.
-func (s *deserRecord) fastFor(t reflect.Type) *fastRecordDeser {
-	if v, ok := s.fast.Load(t); ok {
+func (s *deserRecord) fastFor(t reflect.Type, skipUnknown bool) *fastRecordDeser {
+	if v, ok := s.fast.Load(mappingKey{t, skipUnknown}); ok {
 		return v.(*fastRecordDeser)
 	}
 	return nil
@@ -559,15 +590,15 @@ func (s *deserRecord) fastFor(t reflect.Type) *fastRecordDeser {
 
 // loadOrCompileFast returns the compiled fast path for t, compiling
 // and storing it on first call. Sibling of [serRecord.loadOrCompileFast].
-func (s *deserRecord) loadOrCompileFast(t reflect.Type) *fastRecordDeser {
-	if fast := s.fastFor(t); fast != nil {
+func (s *deserRecord) loadOrCompileFast(t reflect.Type, skipUnknown bool) *fastRecordDeser {
+	if fast := s.fastFor(t, skipUnknown); fast != nil {
 		return fast
 	}
-	fast := compileFastDeser(s.fields, s.names, &s.cache, t)
+	fast := compileFastDeser(s, t, skipUnknown)
 	if fast == nil {
 		return nil
 	}
-	actual, _ := s.fast.LoadOrStore(t, fast)
+	actual, _ := s.fast.LoadOrStore(mappingKey{t, skipUnknown}, fast)
 	return actual.(*fastRecordDeser)
 }
 
@@ -639,13 +670,13 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		return src, nil
 	}
 	if v.CanAddr() {
-		if fast := s.loadOrCompileFast(t); fast != nil {
+		if fast := s.loadOrCompileFast(t, sl.skipUnknown); fast != nil {
 			return deserRecordFast(src, fast, v, sl)
 		}
 	}
 	// compileFastDeser returned nil because typeFieldMapping failed;
 	// re-call to surface the error.
-	_, err = typeFieldMapping(s.names, &s.cache, t)
+	_, err = typeFieldMappingSkip(s.names, &s.cache, t, sl.skipUnknown)
 	return nil, err
 }
 

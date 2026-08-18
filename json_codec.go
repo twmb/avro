@@ -68,6 +68,23 @@ func (tagLogicalTypes) opt() {}
 // [TaggedUnions].
 func TagLogicalTypes() Opt { return tagLogicalTypes{} }
 
+type skipUnknown struct{}
+
+func (skipUnknown) opt() {}
+
+// SkipUnknown lets a Go struct that maps only SOME of a record's fields decode:
+// a record field with no Go field is skipped on the wire instead of erroring.
+// Nested records skip on the same rule.
+//
+// Applies to [Schema.Decode], [Schema.DecodeJSON] and
+// [Schema.DecodeSingleObject]. It is a DECODE option only — encoding from a
+// struct that does not cover the record still errors, with or without it,
+// because the fields the struct lacks would silently go out as zero values.
+//
+// A field name the Go type maps AMBIGUOUSLY (two same-depth fields claiming it)
+// still errors: the type does have fields for it, so there is nothing to skip.
+func SkipUnknown() Opt { return skipUnknown{} }
+
 type linkedinFloats struct{}
 
 func (linkedinFloats) opt() {}
@@ -89,9 +106,10 @@ func (linkedinFloats) opt() {}
 func LinkedinFloats() Opt { return linkedinFloats{} }
 
 type optConfig struct {
-	tagged     bool
-	tagLogical bool
-	linkedin   bool
+	tagged      bool
+	tagLogical  bool
+	linkedin    bool
+	skipUnknown bool
 }
 
 func parseOpts(opts []Opt) optConfig {
@@ -104,6 +122,8 @@ func parseOpts(opts []Opt) optConfig {
 			cfg.tagLogical = true
 		case linkedinFloats:
 			cfg.linkedin = true
+		case skipUnknown:
+			cfg.skipUnknown = true
 		}
 	}
 	return cfg
@@ -184,6 +204,7 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 	// value, a JSON-vs-binary and intra-call inconsistency on the option.
 	sl.taggedUnions = cfg.tagged
 	sl.tagLogicalTypes = cfg.tagLogical
+	sl.skipUnknown = cfg.skipUnknown
 	ctx := &jsonDecoder{
 		scanner: &jsonScanner{data: src},
 		slab:    sl,

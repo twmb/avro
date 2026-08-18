@@ -14640,6 +14640,22 @@ var minBytesConstructionSites = []minBytesConstructionSite{
 				return err
 			}}}},
 
+	{file: "schema.go", context: "b.skipWalk = newMinBytesWalk()",
+		scope: "the parse's skipWalk, shared across every SkipUnknown field skipper the parse's records compile — lazily, at decode time, so it is a phase of its own and inherits neither the build walk's exhausted allowance nor its provisional memo",
+		factors: []reachFactor{{name: "records compiled per parse (lazy, at decode)", values: reachCounts,
+			drive: func(n int) error {
+				top := nRecordsOverSCC(n, reachLevels)
+				s, err := Parse(`{"type":"record","name":"Outer","fields":[{"name":"drop","type":` + top + `},{"name":"keep","type":"int"}]}`)
+				if err != nil {
+					return err
+				}
+				var out struct {
+					Keep int32 `avro:"keep"`
+				}
+				_, err = s.Decode(nRecordsOverSCCWire(n, reachLevels), &out, SkipUnknown())
+				return err
+			}}}},
+
 	{file: "schema.go", context: "mbw := newMinBytesWalk()",
 		scope: "one walk before finalize's container-fixup loop — the FINALIZE path (forward refs)",
 		factors: []reachFactor{{name: "containers per parse (forward refs)", values: reachCounts,

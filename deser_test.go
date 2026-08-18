@@ -18061,3 +18061,470 @@ func TestInvariant_SlabPutDoesNotReclaimBuf(t *testing.T) {
 		t.Errorf("slab.put touches sl.buf:\n\n%s\nbuf must carry over untouched. Every string slab.string returned aliases it; resetting or re-slicing here hands the same bytes out twice.", body)
 	}
 }
+
+//////////////////
+// SKIP UNKNOWN //
+//////////////////
+
+// skipUnknownSchema exercises one field of every kind that skips differently:
+// a varint, a length-prefixed run, both block-framed containers, a union, a
+// fixed run, and a nested record whose own skip is compiled lazily.
+const skipUnknownSchema = `{"type":"record","name":"R","fields":[
+	{"name":"a","type":"int"},
+	{"name":"b","type":"string"},
+	{"name":"c","type":{"type":"array","items":"long"}},
+	{"name":"d","type":["null","string"]},
+	{"name":"e","type":{"type":"map","values":"bytes"}},
+	{"name":"f","type":{"type":"fixed","name":"F","size":3}},
+	{"name":"g","type":{"type":"record","name":"Inner","fields":[
+		{"name":"x","type":"int"},
+		{"name":"y","type":"string"},
+		{"name":"z","type":{"type":"array","items":"string"}}]}},
+	{"name":"h","type":"double"}
+]}`
+
+type skipUnknownInnerFull struct {
+	X int32    `avro:"x"`
+	Y string   `avro:"y"`
+	Z []string `avro:"z"`
+}
+
+type skipUnknownFull struct {
+	A int32                `avro:"a"`
+	B string               `avro:"b"`
+	C []int64              `avro:"c"`
+	D *string              `avro:"d"`
+	E map[string][]byte    `avro:"e"`
+	F [3]byte              `avro:"f"`
+	G skipUnknownInnerFull `avro:"g"`
+	H float64              `avro:"h"`
+}
+
+// skipUnknownPartial maps the FIRST and LAST fields only, so a skip that
+// over- or under-advances anywhere in between corrupts H rather than
+// silently landing on the right byte.
+type skipUnknownPartial struct {
+	A int32   `avro:"a"`
+	H float64 `avro:"h"`
+}
+
+func skipUnknownFullValue() skipUnknownFull {
+	d := "dee"
+	return skipUnknownFull{
+		A: 7,
+		B: "bee",
+		C: []int64{1, 2, 3},
+		D: &d,
+		E: map[string][]byte{"k": []byte("v"), "": {}},
+		F: [3]byte{9, 8, 7},
+		G: skipUnknownInnerFull{X: 11, Y: "why", Z: []string{"", "zz"}},
+		H: 2.5,
+	}
+}
+
+// skipUnknownWire encodes the full value and appends a sentinel byte, so a
+// decode that stops on the wrong byte is caught by the leftover check rather
+// than only by a wrong field value.
+func skipUnknownWire(t *testing.T, s *Schema) []byte {
+	t.Helper()
+	b, err := s.Encode(skipUnknownFullValue())
+	if err != nil {
+		t.Fatalf("encode full: %v", err)
+	}
+	return append(b, 0xAB)
+}
+
+func TestSkipUnknownPartialStruct(t *testing.T) {
+	s := MustParse(skipUnknownSchema)
+	wire := skipUnknownWire(t, s)
+
+	var got skipUnknownPartial
+	rest, err := s.Decode(wire, &got, SkipUnknown())
+	if err != nil {
+		t.Fatalf("decode with SkipUnknown: %v", err)
+	}
+	if got.A != 7 || got.H != 2.5 {
+		t.Errorf("got %+v, want {A:7 H:2.5}", got)
+	}
+	if len(rest) != 1 || rest[0] != 0xAB {
+		t.Errorf("skips advanced to the wrong byte: leftover %v, want [171]", rest)
+	}
+
+	// Inert by default: the same type and the same schema must still refuse.
+	var got2 skipUnknownPartial
+	if _, err := s.Decode(wire, &got2); err == nil {
+		t.Error("decode without SkipUnknown accepted a partial struct")
+	}
+
+	// SOME includes none: a struct mapping no field at all still has to walk
+	// the whole record.
+	var none struct{}
+	rest, err = s.Decode(wire, &none, SkipUnknown())
+	if err != nil {
+		t.Fatalf("decode into struct{}: %v", err)
+	}
+	if len(rest) != 1 || rest[0] != 0xAB {
+		t.Errorf("struct{} leftover %v, want [171]", rest)
+	}
+}
+
+// TestSkipUnknownRecursive: a self-recursive record's skipper is compiled
+// lazily inside its own skipRecord, so the wire is what terminates it.
+func TestSkipUnknownRecursive(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"N","fields":[
+		{"name":"v","type":"int"},
+		{"name":"next","type":["null","N"]},
+		{"name":"tail","type":"long"}]}`)
+	type full struct {
+		V    int32 `avro:"v"`
+		Next *full `avro:"next"`
+		Tail int64 `avro:"tail"`
+	}
+	wire, err := s.Encode(full{1, &full{2, &full{3, nil, 30}, 20}, 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire = append(wire, 0xAB)
+	// The struct drops "next", so the whole recursive chain is skipped.
+	var got struct {
+		V    int32 `avro:"v"`
+		Tail int64 `avro:"tail"`
+	}
+	rest, err := s.Decode(wire, &got, SkipUnknown())
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.V != 1 || got.Tail != 10 {
+		t.Errorf("got %+v, want {V:1 Tail:10}", got)
+	}
+	if len(rest) != 1 || rest[0] != 0xAB {
+		t.Errorf("leftover %v, want [171]", rest)
+	}
+}
+
+func TestSkipUnknownNested(t *testing.T) {
+	s := MustParse(skipUnknownSchema)
+	wire := skipUnknownWire(t, s)
+
+	// The outer struct keeps g and h; the inner keeps only y. Both levels are
+	// partial, so the nested record must skip on its own account.
+	type inner struct {
+		Y string `avro:"y"`
+	}
+	var got struct {
+		G inner   `avro:"g"`
+		H float64 `avro:"h"`
+	}
+	rest, err := s.Decode(wire, &got, SkipUnknown())
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.G.Y != "why" || got.H != 2.5 {
+		t.Errorf("got %+v, want inner y=why h=2.5", got)
+	}
+	if len(rest) != 1 || rest[0] != 0xAB {
+		t.Errorf("leftover %v, want [171]", rest)
+	}
+}
+
+// TestSkipUnknownCacheKeyIsolation pins that the compiled mapping is keyed by
+// the MODE as well as the Go type. One *Schema, one Go type, both modes, in
+// both orders: whichever ran first must not answer for the other.
+func TestSkipUnknownCacheKeyIsolation(t *testing.T) {
+	for _, order := range []struct {
+		name string
+		opt  []Opt
+	}{
+		{"skip-first", []Opt{SkipUnknown()}},
+		{"strict-first", nil},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			s := MustParse(skipUnknownSchema)
+			wire := skipUnknownWire(t, s)
+			run := func(opts ...Opt) error {
+				var got skipUnknownPartial
+				_, err := s.Decode(wire, &got, opts...)
+				if err == nil && (got.A != 7 || got.H != 2.5) {
+					return fmt.Errorf("decoded %+v, want {A:7 H:2.5}", got)
+				}
+				return err
+			}
+			if err := run(order.opt...); (err == nil) != (len(order.opt) == 1) {
+				t.Fatalf("priming decode: err=%v", err)
+			}
+			// Now both modes, twice each, interleaved.
+			for i := range 2 {
+				if err := run(SkipUnknown()); err != nil {
+					t.Errorf("round %d: SkipUnknown decode failed: %v", i, err)
+				}
+				if err := run(); err == nil {
+					t.Errorf("round %d: strict decode accepted a partial struct", i)
+				}
+			}
+		})
+	}
+}
+
+// TestSkipUnknownDoesNotRelaxEncode is the hazard the option is deliberately
+// one-sided about: a struct that does not cover the record would encode zeros
+// for the fields it lacks.
+func TestSkipUnknownDoesNotRelaxEncode(t *testing.T) {
+	s := MustParse(skipUnknownSchema)
+	v := skipUnknownPartial{A: 1, H: 2}
+	for _, tc := range []struct {
+		name string
+		fn   func(opts ...Opt) error
+	}{
+		{"Encode", func(opts ...Opt) error { _, err := s.Encode(v, opts...); return err }},
+		{"AppendEncode", func(opts ...Opt) error { _, err := s.AppendEncode(nil, v, opts...); return err }},
+		{"EncodeJSON", func(opts ...Opt) error { _, err := s.EncodeJSON(v, opts...); return err }},
+		{"AppendSingleObject", func(opts ...Opt) error { _, err := s.AppendSingleObject(nil, v, opts...); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The missing-field error SPECIFICALLY: an encode that mapped the
+			// record's fields loosely and then failed further along, on a
+			// struct handed to a string encoder, would satisfy a bare "errored"
+			// while having already relaxed the mapping.
+			for _, opts := range [][]Opt{nil, {SkipUnknown()}} {
+				err := tc.fn(opts...)
+				if err == nil {
+					t.Fatalf("opts=%v: encode accepted a partial struct", opts)
+				}
+				if !strings.Contains(err.Error(), "missing field") {
+					t.Errorf("opts=%v: got %v, want the missing-field error", opts, err)
+				}
+			}
+		})
+	}
+}
+
+// TestSkipUnknownThroughContainers reaches the record through every wrapper
+// that has its own decode path: a union branch, an array element, a map value,
+// and a pointer element (the unsafe null-union and array-of-pointer paths).
+func TestSkipUnknownThroughContainers(t *testing.T) {
+	const rec = `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"drop","type":"string"},{"name":"h","type":"double"}]}`
+	type full struct {
+		A    int32   `avro:"a"`
+		Drop string  `avro:"drop"`
+		H    float64 `avro:"h"`
+	}
+	type part struct {
+		A int32   `avro:"a"`
+		H float64 `avro:"h"`
+	}
+	fv := full{A: 7, Drop: "x", H: 2.5}
+	check := func(t *testing.T, gotA int32, gotH float64) {
+		t.Helper()
+		if gotA != 7 || gotH != 2.5 {
+			t.Errorf("got a=%v h=%v, want 7 / 2.5", gotA, gotH)
+		}
+	}
+
+	t.Run("union", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"u","type":["null",` + rec + `]}]}`)
+		wire, err := s.Encode(struct {
+			U *full `avro:"u"`
+		}{&fv})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			U *part `avro:"u"`
+		}
+		if _, err := s.Decode(wire, &got, SkipUnknown()); err != nil {
+			t.Fatal(err)
+		}
+		if got.U == nil {
+			t.Fatal("union branch decoded as null")
+		}
+		check(t, got.U.A, got.U.H)
+	})
+
+	t.Run("array", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"l","type":{"type":"array","items":` + rec + `}}]}`)
+		wire, err := s.Encode(struct {
+			L []full `avro:"l"`
+		}{[]full{fv, fv}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			L []part `avro:"l"`
+		}
+		if _, err := s.Decode(wire, &got, SkipUnknown()); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.L) != 2 {
+			t.Fatalf("got %d elements, want 2", len(got.L))
+		}
+		for _, e := range got.L {
+			check(t, e.A, e.H)
+		}
+	})
+
+	t.Run("array-of-pointer", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"l","type":{"type":"array","items":` + rec + `}}]}`)
+		wire, err := s.Encode(struct {
+			L []*full `avro:"l"`
+		}{[]*full{&fv}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			L []*part `avro:"l"`
+		}
+		if _, err := s.Decode(wire, &got, SkipUnknown()); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.L) != 1 || got.L[0] == nil {
+			t.Fatalf("got %v, want one non-nil element", got.L)
+		}
+		check(t, got.L[0].A, got.L[0].H)
+	})
+
+	t.Run("map", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"m","type":{"type":"map","values":` + rec + `}}]}`)
+		wire, err := s.Encode(struct {
+			M map[string]full `avro:"m"`
+		}{map[string]full{"k": fv}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			M map[string]part `avro:"m"`
+		}
+		if _, err := s.Decode(wire, &got, SkipUnknown()); err != nil {
+			t.Fatal(err)
+		}
+		e, ok := got.M["k"]
+		if !ok {
+			t.Fatalf("got %v, want key k", got.M)
+		}
+		check(t, e.A, e.H)
+	})
+}
+
+// TestSkipUnknownResolved covers the resolution path, whose struct decode has
+// its own field map and its own wire ops: a reader field the Go struct lacks
+// must skip the WRITER's bytes, and a default-filled one must simply not fill.
+func TestSkipUnknownResolved(t *testing.T) {
+	w := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"gone","type":"string"},
+		{"name":"drop","type":{"type":"array","items":"string"}},
+		{"name":"h","type":"double"}]}`)
+	r := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"long"},
+		{"name":"drop","type":{"type":"array","items":"string"}},
+		{"name":"added","type":"string","default":"dflt"},
+		{"name":"h","type":"double"}]}`)
+	res, err := Resolve(w, r)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	wire, err := w.Encode(struct {
+		A    int32    `avro:"a"`
+		Gone string   `avro:"gone"`
+		Drop []string `avro:"drop"`
+		H    float64  `avro:"h"`
+	}{7, "g", []string{"p", "q"}, 2.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire = append(wire, 0xAB)
+
+	// The struct omits "drop" (present on the wire, must skip) and "added"
+	// (absent from the writer, filled from the default — nothing to fill).
+	var got struct {
+		A int64   `avro:"a"`
+		H float64 `avro:"h"`
+	}
+	rest, err := res.Decode(wire, &got, SkipUnknown())
+	if err != nil {
+		t.Fatalf("resolved decode: %v", err)
+	}
+	if got.A != 7 || got.H != 2.5 {
+		t.Errorf("got %+v, want {A:7 H:2.5}", got)
+	}
+	if len(rest) != 1 || rest[0] != 0xAB {
+		t.Errorf("leftover %v, want [171]", rest)
+	}
+	var strict struct {
+		A int64   `avro:"a"`
+		H float64 `avro:"h"`
+	}
+	if _, err := res.Decode(wire, &strict); err == nil {
+		t.Error("resolved decode without SkipUnknown accepted a partial struct")
+	}
+}
+
+func TestSkipUnknownJSON(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"drop","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"string"}]}},
+		{"name":"dflt","type":"string","default":"d"},
+		{"name":"h","type":"double"}]}`)
+	const src = `{"a":7,"drop":{"x":"gone"},"h":2.5}`
+	var got struct {
+		A int32   `avro:"a"`
+		H float64 `avro:"h"`
+	}
+	if err := s.DecodeJSON([]byte(src), &got, SkipUnknown()); err != nil {
+		t.Fatalf("DecodeJSON: %v", err)
+	}
+	if got.A != 7 || got.H != 2.5 {
+		t.Errorf("got %+v, want {A:7 H:2.5}", got)
+	}
+	var strict struct {
+		A int32   `avro:"a"`
+		H float64 `avro:"h"`
+	}
+	if err := s.DecodeJSON([]byte(src), &strict); err == nil {
+		t.Error("DecodeJSON without SkipUnknown accepted a partial struct")
+	}
+}
+
+func TestSkipUnknownSingleObject(t *testing.T) {
+	s := MustParse(skipUnknownSchema)
+	wire, err := s.AppendSingleObject(nil, skipUnknownFullValue())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got skipUnknownPartial
+	if _, err := s.DecodeSingleObject(wire, &got, SkipUnknown()); err != nil {
+		t.Fatalf("DecodeSingleObject: %v", err)
+	}
+	if got.A != 7 || got.H != 2.5 {
+		t.Errorf("got %+v, want {A:7 H:2.5}", got)
+	}
+	var strict skipUnknownPartial
+	if _, err := s.DecodeSingleObject(wire, &strict); err == nil {
+		t.Error("DecodeSingleObject without SkipUnknown accepted a partial struct")
+	}
+}
+
+// TestSkipUnknownAmbiguousStillErrors: an ambiguous name is not an absent one.
+// The type HAS fields for it, and picking one arbitrarily is not skipping.
+func TestSkipUnknownAmbiguousStillErrors(t *testing.T) {
+	type left struct {
+		V int32 `avro:"v"`
+	}
+	type right struct {
+		V int32 `avro:"v"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"v","type":"int"}]}`)
+	wire := []byte{2}
+	var got struct {
+		left
+		right
+	}
+	_, err := s.Decode(wire, &got, SkipUnknown())
+	if err == nil {
+		t.Fatal("SkipUnknown swallowed an ambiguous field name")
+	}
+	// The ambiguity error specifically, not any error: skipping the field
+	// would also "fail" if the wire then ran short.
+	if !strings.Contains(err.Error(), "duplicate field name") {
+		t.Errorf("got %v, want the duplicate-field-name error", err)
+	}
+}

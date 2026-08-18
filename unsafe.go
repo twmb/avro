@@ -57,6 +57,7 @@ type fastFieldDeser struct {
 	deser   udeserfn // non-nil for unsafe-optimized fields (primitives)
 	slowFn  deserfn  // non-nil for reflect-based fields (complex types)
 	slowIdx []int    // field index path for fieldByIndex (used with slowFn)
+	skip    skipfn   // non-nil when SkipUnknown found no Go field for this one
 }
 
 func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t reflect.Type) *fastRecordSer {
@@ -110,15 +111,25 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 	return fast
 }
 
-func compileFastDeser(fields []deserRecordField, names []string, cache *sync.Map, t reflect.Type) *fastRecordDeser {
-	mapping, err := typeFieldMapping(names, cache, t)
+func compileFastDeser(rec *deserRecord, t reflect.Type, skipUnknown bool) *fastRecordDeser {
+	fields := rec.fields
+	mapping, err := typeFieldMappingSkip(rec.names, &rec.cache, t, skipUnknown)
 	if err != nil {
 		return nil
 	}
 	fast := &fastRecordDeser{typ: t, fields: make([]fastFieldDeser, len(fields))}
 	allFast := true
+	var skips []skipfn
 	for i := range fields {
 		f := &fields[i]
+		if mapping.unmapped(i) {
+			if skips == nil {
+				skips = rec.fieldSkips()
+			}
+			allFast = false
+			fast.fields[i] = fastFieldDeser{name: f.name, skip: skips[i]}
+			continue
+		}
 		offset, goType, ok := computeFieldOffset(t, mapping.indices[i])
 		var fn udeserfn
 		if ok {
@@ -206,7 +217,9 @@ func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *sla
 	var err error
 	for i := range fast.fields {
 		f := &fast.fields[i]
-		if f.deser != nil {
+		if f.skip != nil {
+			src, err = f.skip(src, sl)
+		} else if f.deser != nil {
 			src, err = f.deser(src, unsafe.Add(base, f.offset), sl)
 		} else {
 			fv, ferr := fieldByIndex(v, f.slowIdx)
@@ -577,7 +590,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		}
 		rec := f.meta.deserRecord
 		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			return deserRecordVia(src, rec.fastFor(goType), rec, goType, p, sl)
+			return deserRecordVia(src, rec.fastFor(goType, sl.skipUnknown), rec, goType, p, sl)
 		}
 	}
 
@@ -1483,7 +1496,7 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nul
 			sl.depth--
 			return src, err
 		}
-		src, err = deserRecordVia(src, rec.fastFor(innerType), rec, innerType, pp, sl)
+		src, err = deserRecordVia(src, rec.fastFor(innerType, sl.skipUnknown), rec, innerType, pp, sl)
 		sl.depth--
 		return src, err
 	}
@@ -1793,7 +1806,7 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minIt
 						}
 					}
 				}
-				fast := rec.fastFor(innerType)
+				fast := rec.fastFor(innerType, sl.skipUnknown)
 				useFast := fast != nil && fast.allFast
 				var err error
 				for i := range n {
