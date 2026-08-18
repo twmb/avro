@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
@@ -9350,5 +9351,139 @@ func writeInts(t testing.TB, w *Writer, n int) {
 		if err := w.Encode(&v); err != nil {
 			t.Fatalf("Encode: %v", err)
 		}
+	}
+}
+
+//////////////////////
+// WITH DECODE OPTS //
+//////////////////////
+
+// decodeOptsSchema has one non-null union so the tagging options have
+// something to act on, plus a string so the aliasing guard has wire bytes to
+// point at.
+const decodeOptsSchema = `{"type":"record","name":"R","fields":[
+	{"name":"u","type":["null","string"]},
+	{"name":"t","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}]}`
+
+func writeDecodeOptsFile(t *testing.T) []byte {
+	t.Helper()
+	s := mustParse(t, decodeOptsSchema)
+	var buf bytes.Buffer
+	w := mustNewWriter(t, &buf, s)
+	if err := w.Encode(map[string]any{"u": "hello", "t": time.UnixMilli(1).UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	mustClose(t, w)
+	return buf.Bytes()
+}
+
+// TestWithDecodeOptsReachesTheDatumDecode: without it the reader's Decode
+// takes no options at all, so TaggedUnions and TagLogicalTypes — which only
+// act on an *any target — are unreachable from an OCF reader.
+func TestWithDecodeOptsReachesTheDatumDecode(t *testing.T) {
+	file := writeDecodeOptsFile(t)
+	for _, c := range []struct {
+		name  string
+		opts  []ReaderOpt
+		wantU any
+	}{
+		{"bare", nil, "hello"},
+		{"tagged", []ReaderOpt{WithDecodeOpts(avro.TaggedUnions())},
+			map[string]any{"string": "hello"}},
+		{"tagged+logical", []ReaderOpt{WithDecodeOpts(avro.TaggedUnions(), avro.TagLogicalTypes())},
+			map[string]any{"string": "hello"}},
+		// Cumulative, so two calls compose rather than the last one winning.
+		{"two calls", []ReaderOpt{WithDecodeOpts(avro.TaggedUnions()), WithDecodeOpts(avro.TagLogicalTypes())},
+			map[string]any{"string": "hello"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			rd, err := NewReader(bytes.NewReader(file), c.opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rd.Close()
+			var v any
+			if err := rd.Decode(&v); err != nil {
+				t.Fatal(err)
+			}
+			m, ok := v.(map[string]any)
+			if !ok {
+				t.Fatalf("got %#v, want a map", v)
+			}
+			if !reflect.DeepEqual(m["u"], c.wantU) {
+				t.Errorf("u: got %#v, want %#v", m["u"], c.wantU)
+			}
+			// TagLogicalTypes qualifies the branch name, and only with
+			// TaggedUnions — so the timestamp branch tells the two apart.
+			wantT := any(time.UnixMilli(1).UTC())
+			switch c.name {
+			case "tagged":
+				wantT = map[string]any{"long": time.UnixMilli(1).UTC()}
+			case "tagged+logical", "two calls":
+				wantT = map[string]any{"long.timestamp-millis": time.UnixMilli(1).UTC()}
+			}
+			if !reflect.DeepEqual(m["t"], wantT) {
+				t.Errorf("t: got %#v, want %#v", m["t"], wantT)
+			}
+		})
+	}
+}
+
+// ocfWithin reports whether p points inside b.
+func ocfWithin(p unsafe.Pointer, b []byte) bool {
+	if p == nil || len(b) == 0 {
+		return false
+	}
+	base := uintptr(unsafe.Pointer(unsafe.SliceData(b)))
+	q := uintptr(p)
+	return q >= base && q < base+uintptr(len(b))
+}
+
+// TestWithDecodeOptsNeverAliasesTheBlockBuffer: block is replaced on every
+// block read, so a decoded value pointing into it would change under the
+// caller. WithDecodeOpts drops an aliasing option rather than forwarding it.
+//
+// The block is read explicitly first so the buffer the datum decodes OUT of is
+// in hand; Decode then finds remain non-zero and does not read another.
+func TestWithDecodeOptsNeverAliasesTheBlockBuffer(t *testing.T) {
+	file := writeDecodeOptsFile(t)
+	rd, err := NewReader(bytes.NewReader(file), WithDecodeOpts(avro.AliasInput()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rd.Close()
+	if err := rd.readBlock(); err != nil {
+		t.Fatal(err)
+	}
+	block := rd.block
+	var out struct {
+		U *string    `avro:"u"`
+		T *time.Time `avro:"t"`
+	}
+	if err := rd.Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.U == nil || *out.U != "hello" {
+		t.Fatalf("got %v, want hello", out.U)
+	}
+	if ocfWithin(unsafe.Pointer(unsafe.StringData(*out.U)), block) {
+		t.Error("the decoded string points into the reader's block buffer, which the next block read overwrites")
+	}
+
+	// The control, which is what keeps the check above from passing for the
+	// wrong reason: the SAME schema and the SAME bytes DO alias when the
+	// option reaches Decode, so the containment test can see aliasing.
+	var direct struct {
+		U *string    `avro:"u"`
+		T *time.Time `avro:"t"`
+	}
+	if _, err := rd.schema.Decode(block, &direct, avro.AliasInput()); err != nil {
+		t.Fatal(err)
+	}
+	if direct.U == nil {
+		t.Fatal("control decode produced no value")
+	}
+	if !ocfWithin(unsafe.Pointer(unsafe.StringData(*direct.U)), block) {
+		t.Fatal("the control did not alias, so this cell cannot tell aliasing from its absence")
 	}
 }

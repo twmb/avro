@@ -97,6 +97,7 @@ import (
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
 	"github.com/twmb/avro"
+	"github.com/twmb/avro/internal/optmark"
 )
 
 // Codec compresses and decompresses OCF data blocks.
@@ -210,6 +211,10 @@ type optSchemaOpts []avro.SchemaOpt
 
 func (optSchemaOpts) readerOpt() {}
 func (optSchemaOpts) writerOpt() {}
+
+type optDecodeOpts []avro.Opt
+
+func (optDecodeOpts) readerOpt() {}
 
 // WithCodec sets the compression codec. The default is null (no compression).
 // WithCodec can be used as both a [WriterOpt] and a [ReaderOpt]. The four
@@ -370,6 +375,31 @@ func WithMaxDecompressedBlockBytes(n int64) ReaderOpt { return optMaxDecompresse
 // needs it whenever the header schema requires an option to parse at all.
 // [NewWriter] ignores it: its schema is already parsed by the caller.
 func WithSchemaOpts(opts ...avro.SchemaOpt) Opt { return optSchemaOpts(opts) }
+
+// WithDecodeOpts passes [avro.Opt] values to the [avro.Schema.Decode] behind
+// every [Reader.Decode]. Without it that call takes no options at all, so
+// [avro.TaggedUnions] and [avro.TagLogicalTypes] — which change what a union
+// decodes to in an *any target — are unreachable from an OCF reader. Options
+// that do not apply to binary decode are silently ignored, per [avro.Opt].
+//
+// Repeated calls are cumulative. [NewWriter] and [NewAppendWriter] ignore it:
+// nothing on the write side decodes.
+//
+// An option that would make decoded values REFERENCE the decode input, such as
+// [avro.AliasInput], is dropped here rather than forwarded. A reader decodes out
+// of its block buffer, which is replaced on every block, so the values it handed
+// back would point into memory the next read overwrites. Dropping is by the
+// marker such options carry, not by a list of names, so one added later is
+// dropped by this reader without it being edited.
+func WithDecodeOpts(opts ...avro.Opt) ReaderOpt {
+	kept := make(optDecodeOpts, 0, len(opts))
+	for _, o := range opts {
+		if _, aliases := o.(optmark.AliasesInput); !aliases {
+			kept = append(kept, o)
+		}
+	}
+	return kept
+}
 
 // DeflateCodec returns a [Codec] using raw DEFLATE compression at the given
 // level (e.g. [flate.DefaultCompression]).
@@ -941,6 +971,9 @@ type Reader struct {
 	maxBlockBytes   int64
 	maxDecompressed int64
 	closed          bool
+	// decodeOpts are the caller's [WithDecodeOpts], already stripped of
+	// anything that would alias block — which this reader replaces per block.
+	decodeOpts []avro.Opt
 }
 
 // noEOF converts a bare io.EOF from a mid-structure read into
@@ -1007,6 +1040,7 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 	var maxBlockBytes int64
 	var maxDecompressed int64
 	var schemaOpts []avro.SchemaOpt
+	var decodeOpts []avro.Opt
 	adopted := -1
 	// The header names ONE codec; every other supplied codec is an offer this
 	// constructor declines and nothing else will ever close — see
@@ -1029,6 +1063,8 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 			maxDecompressed = o.n
 		case optSchemaOpts:
 			schemaOpts = append(schemaOpts, o...)
+		case optDecodeOpts:
+			decodeOpts = append(decodeOpts, o...)
 		}
 	}
 	if readerSchema != nil && readerSchemaFn != nil {
@@ -1073,6 +1109,7 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 		meta:            meta,
 		maxBlockBytes:   maxBlockBytes,
 		maxDecompressed: maxDecompressed,
+		decodeOpts:      decodeOpts,
 	}
 
 	// After the header parse, so the callback can inspect the writer schema
@@ -1112,7 +1149,7 @@ func (rd *Reader) Decode(v any) error {
 			return err
 		}
 	}
-	rest, err := rd.schema.Decode(rd.block, v)
+	rest, err := rd.schema.Decode(rd.block, v, rd.decodeOpts...)
 	if err != nil {
 		// noEOF: a datum error matching io.EOF (e.g. a CustomType decode
 		// callback returning it) must not surface as the clean-end sentinel.
