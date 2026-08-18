@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"reflect"
 	"slices"
@@ -216,6 +217,248 @@ func (n *SchemaNode) Schema(opts ...SchemaOpt) (*Schema, error) {
 		return nil, fmt.Errorf("avro: marshaling schema node: %w", err)
 	}
 	return Parse(string(b), opts...)
+}
+
+// ExpandReferences returns a copy of n's tree with every name reference
+// replaced by the definition it names, so each occurrence of a repeated named
+// type carries the full body rather than only the first.
+//
+// A reference resolves the way [SchemaNode.Schema] resolves it: against the
+// definitions in n's own tree first, then against the definition [Schema.Root]
+// stamped it with, so a subtree extracted from a Root tree expands even when
+// the definition lives outside it. A reference carrying usage-site attributes
+// of its own ({"type":"Inner","doc":"x"}) is left as written — a definition
+// cannot hold a second doc or namespace, and Schema would collapse the expanded
+// copy back to a reference and lose them again.
+//
+// Two rules leave a reference in place, and both are decided ONCE for the whole
+// tree, per NAME. That is what makes every copy of a name identical, which
+// [SchemaNode.Schema] requires: it reads two same-named definitions with
+// different bodies as a conflict and refuses the tree.
+//
+//   - A name that CLOSES a reference cycle never expands, since expanding a
+//     recursive definition does not terminate. One name per cycle is enough,
+//     and it is chosen once for the whole tree, mutual recursion included.
+//     Deciding per occurrence instead — expanding whichever copy is not yet on
+//     the current path — gives one copy the recursive body and another the
+//     expanded one.
+//   - Nothing expands when the FULLY expanded tree would exceed an internal
+//     ceiling. Each reference expands to a copy of its definition, so a chain of
+//     definitions each naming the previous twice doubles per level and a few
+//     hundred bytes of schema would otherwise demand a tree no machine holds.
+//     Stopping partway is not an option for the same reason as above: it is the
+//     half-expanded copy that conflicts with the whole one.
+//
+// n is not modified. The copy is deep through the schema structure and through
+// the Aliases, Symbols, Fields, Branches and Props containers; the VALUES
+// inside Props and [SchemaField.Default] are shared, since neither tree writes
+// them.
+//
+// [SchemaNode.Schema] collapses repeats back to references on emit, so
+// n.ExpandReferences().Schema() and n.Schema() produce the same schema. It
+// re-spells a collapsed repeat by FULLNAME, so a reference the source wrote as
+// an in-scope short name comes back qualified — the same type, named the way
+// the canonical form names it.
+func (n *SchemaNode) ExpandReferences() *SchemaNode {
+	if n == nil {
+		return nil
+	}
+	x := &expander{
+		table:  map[string]*SchemaNode{},
+		cyclic: map[string]bool{},
+		onPath: map[string]bool{},
+		done:   map[string]bool{},
+		sizes:  map[string]int{},
+	}
+	collectNamedTypes(n, x.table)
+	x.markCycles(n, "", 0)
+	x.expand = x.sizeOf(n, "", 0) <= maxExpandedNodes
+	out := x.copy(n, "", 0, true)
+	return &out
+}
+
+// maxExpandedNodes bounds the node count a fully expanded tree may reach. It
+// sits well below [maxSchemaJSONNodes] because the unit is heavier — a
+// SchemaNode is a few hundred bytes of Go struct where a JSON node is one map
+// entry — and the ceiling has to leave a result a caller can actually hold. Far
+// above any real schema, whose expanded node count is in the hundreds.
+const maxExpandedNodes = 1 << 18
+
+// expander carries one ExpandReferences run: the name graph's verdicts, then
+// the copy that acts on them.
+//
+// The three passes are separate because each needs the previous one's answer
+// for the WHOLE tree. Cycles decide which references may be followed; that set
+// decides what a name's expanded size is; that total decides whether anything
+// expands at all. Each pass walks every definition once (memoized per name), so
+// all three are linear in the tree.
+type expander struct {
+	table  map[string]*SchemaNode // fullname → definition
+	cyclic map[string]bool        // names that reach themselves; never expanded
+	onPath map[string]bool        // markCycles: names open on the current path
+	done   map[string]bool        // markCycles: names already walked
+	sizes  map[string]int         // fullname → expanded node count, saturating
+	expand bool                   // false when the full expansion is over the ceiling
+}
+
+// resolve returns the definition n names and the fullname to key it by, or nil
+// when n is not a bare reference to anything. n's own tree wins, then the
+// [Schema.Root] stamp — the order [SchemaNode.Schema] splices in, so the two
+// surfaces cannot bind one reference to different definitions. A stamped target
+// from outside the tree joins the table, so every later pass sees it.
+func (x *expander) resolve(n *SchemaNode, ns string) (*SchemaNode, string) {
+	if !nodeCarriesOnlyType(n) {
+		return nil, ""
+	}
+	t := lookupNameRef(n, x.table, ns)
+	if t == nil {
+		if !nodeRefTargetAgrees(n) {
+			return nil, ""
+		}
+		t = n.refTarget
+	}
+	fn := nodeFullname(t)
+	if fn == "" {
+		return nil, ""
+	}
+	if _, have := x.table[fn]; !have {
+		x.table[fn] = t
+	}
+	return t, fn
+}
+
+// markCycles fills x.cyclic with a name from every reference cycle, by DFS over
+// the name graph: a reference to a name already open on the path is a back
+// edge, and its head goes in the set. Every cycle contains a back edge under any
+// DFS, so cutting the heads cuts every cycle — which is what makes the follow in
+// copy terminate without a per-path guard of its own.
+//
+// The set is a superset of "on a cycle" only in exotic graphs, and being
+// conservative only leaves a reference unexpanded. What matters is that it is
+// ONE set, computed once, so the answer does not depend on where a reference
+// sits.
+func (x *expander) markCycles(n *SchemaNode, ns string, depth int) {
+	if n == nil || depth > maxSchemaJSONDepth {
+		return
+	}
+	if t, fn := x.resolve(n, ns); t != nil {
+		switch {
+		case x.onPath[fn]:
+			x.cyclic[fn] = true
+		case !x.done[fn]:
+			x.onPath[fn] = true
+			x.markCycles(t, "", depth+1) // a definition opens its own scope
+			delete(x.onPath, fn)
+			x.done[fn] = true
+		}
+		return
+	}
+	child := nsForChildren(n, ns)
+	if n.Type == "array" {
+		x.markCycles(n.Items, child, depth+1)
+	}
+	if n.Type == "map" {
+		x.markCycles(n.Values, child, depth+1)
+	}
+	if isRecordKind(n.Type) {
+		for i := range n.Fields {
+			x.markCycles(&n.Fields[i].Type, child, depth+1)
+		}
+	}
+	for i := range n.Branches {
+		x.markCycles(&n.Branches[i], child, depth+1)
+	}
+}
+
+// sizeOf reports how many nodes n expands to, saturating at one past the
+// ceiling so a doubling chain cannot overflow the sum. A reference to a cyclic
+// name counts as the one node it stays.
+func (x *expander) sizeOf(n *SchemaNode, ns string, depth int) int {
+	if n == nil || depth > maxSchemaJSONDepth {
+		return 0
+	}
+	if t, fn := x.resolve(n, ns); t != nil {
+		if x.cyclic[fn] {
+			return 1
+		}
+		if v, ok := x.sizes[fn]; ok {
+			return v
+		}
+		// The non-cyclic names form a DAG, so one memo per name is exact and
+		// the walk stays linear however many references reach it.
+		v := x.sizeOf(t, "", depth+1)
+		x.sizes[fn] = v
+		return v
+	}
+	total := 1
+	child := nsForChildren(n, ns)
+	add := func(v int) {
+		total = min(total+v, maxExpandedNodes+1)
+	}
+	if n.Type == "array" {
+		add(x.sizeOf(n.Items, child, depth+1))
+	}
+	if n.Type == "map" {
+		add(x.sizeOf(n.Values, child, depth+1))
+	}
+	if isRecordKind(n.Type) {
+		for i := range n.Fields {
+			add(x.sizeOf(&n.Fields[i].Type, child, depth+1))
+		}
+	}
+	for i := range n.Branches {
+		add(x.sizeOf(&n.Branches[i], child, depth+1))
+	}
+	return total
+}
+
+// copy deep-copies n, replacing it with the definition it names when n is a
+// bare reference to a name the two verdicts admit.
+//
+// follow is cleared for a definition-shaped body sitting at a STRAY key,
+// matching stampNameRefs: the parser binds no names there, so nothing in it is
+// a reference. Such a body is still copied, just not read for names.
+func (x *expander) copy(n *SchemaNode, ns string, depth int, follow bool) SchemaNode {
+	if follow && x.expand && depth <= maxSchemaJSONDepth {
+		if t, fn := x.resolve(n, ns); t != nil && !x.cyclic[fn] {
+			return x.copy(t, "", depth, true)
+		}
+	}
+	out := *n // struct copy; carries the hidden Root stamps, as an extraction does
+	out.Aliases = slices.Clone(n.Aliases)
+	out.Symbols = slices.Clone(n.Symbols)
+	out.Props = maps.Clone(n.Props)
+	// Depth stops the descent, not just the follow: a tree this deep is past
+	// what [SchemaNode.Schema] accepts anyway, and the alternative is the stack.
+	if depth > maxSchemaJSONDepth {
+		return out
+	}
+	child := nsForChildren(n, ns)
+	if n.Items != nil {
+		items := x.copy(n.Items, child, depth+1, follow && n.Type == "array")
+		out.Items = &items
+	}
+	if n.Values != nil {
+		values := x.copy(n.Values, child, depth+1, follow && n.Type == "map")
+		out.Values = &values
+	}
+	if len(n.Fields) > 0 {
+		out.Fields = slices.Clone(n.Fields)
+		for i := range out.Fields {
+			out.Fields[i].Aliases = slices.Clone(n.Fields[i].Aliases)
+			out.Fields[i].Props = maps.Clone(n.Fields[i].Props)
+			out.Fields[i].Type = x.copy(&n.Fields[i].Type, child, depth+1, follow && isRecordKind(n.Type))
+		}
+	}
+	if len(n.Branches) > 0 {
+		out.Branches = slices.Clone(n.Branches)
+		for i := range out.Branches {
+			// Branches stay followable on every kind: no JSON key routes a
+			// stray there, so only genuine union parsing populates them.
+			out.Branches[i] = x.copy(&n.Branches[i], child, depth+1, follow)
+		}
+	}
+	return out
 }
 
 // deduper tracks named type definitions during toJSONDedup and records

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------
@@ -985,4 +986,394 @@ func FuzzSchemaTagDefaultParity(f *testing.F) {
 			t.Fatalf("tag default differs for %q\n stdlib %#v\n shared %#v", in, want, got)
 		}
 	})
+}
+
+////////////////////////
+// EXPAND REFERENCES  //
+////////////////////////
+
+// expandCountNodes counts every SchemaNode in a tree, descending the same
+// structure ExpandReferences copies.
+func expandCountNodes(n *SchemaNode, depth int) int {
+	if n == nil || depth > maxSchemaJSONDepth {
+		return 0
+	}
+	c := 1
+	c += expandCountNodes(n.Items, depth+1)
+	c += expandCountNodes(n.Values, depth+1)
+	for i := range n.Fields {
+		c += expandCountNodes(&n.Fields[i].Type, depth+1)
+	}
+	for i := range n.Branches {
+		c += expandCountNodes(&n.Branches[i], depth+1)
+	}
+	return c
+}
+
+// expandJSON renders a node for comparison. json.Marshal walks the exported
+// fields only, which is exactly the surface a caller can see.
+func expandJSON(t *testing.T, n *SchemaNode) string {
+	t.Helper()
+	b, err := json.Marshal(n)
+	if err != nil {
+		t.Fatalf("marshaling node: %v", err)
+	}
+	return string(b)
+}
+
+// TestExpandReferencesRepeatedType: every occurrence of a repeated named type
+// carries the full body, wherever the occurrence sits.
+func TestExpandReferencesRepeatedType(t *testing.T) {
+	s := mustParse(t, `{"type":"record","name":"Top","namespace":"ns","fields":[
+		{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}},
+		{"name":"b","type":"ns.Inner"},
+		{"name":"c","type":{"type":"array","items":"Inner"}},
+		{"name":"d","type":{"type":"map","values":"ns.Inner"}},
+		{"name":"e","type":["null","Inner"]}]}`)
+	e := s.Root().ExpandReferences()
+
+	full := func(n *SchemaNode) bool {
+		return n != nil && n.Type == "record" && n.Name == "Inner" &&
+			n.Namespace == "ns" && len(n.Fields) == 1 && n.Fields[0].Name == "x"
+	}
+	for _, c := range []struct {
+		name string
+		node *SchemaNode
+	}{
+		{"a (the definition)", &e.Fields[0].Type},
+		{"b (a plain reference)", &e.Fields[1].Type},
+		{"c (an array item)", e.Fields[2].Type.Items},
+		{"d (a map value)", e.Fields[3].Type.Values},
+		{"e (a union branch)", &e.Fields[4].Type.Branches[1]},
+	} {
+		if !full(c.node) {
+			t.Errorf("%s: not expanded: %s", c.name, expandJSON(t, c.node))
+		}
+	}
+}
+
+// TestExpandReferencesCyclesStayReferences: expanding a recursive definition
+// does not terminate, so the edge that closes the cycle keeps its reference.
+func TestExpandReferencesCyclesStayReferences(t *testing.T) {
+	t.Run("self", func(t *testing.T) {
+		s := mustParse(t, `{"type":"record","name":"N","fields":[
+			{"name":"next","type":["null","N"]},
+			{"name":"v","type":"int"}]}`)
+		e := s.Root().ExpandReferences()
+		back := e.Fields[0].Type.Branches[1]
+		if back.Type != "N" || len(back.Fields) != 0 {
+			t.Errorf("self back-reference expanded: %s", expandJSON(t, &back))
+		}
+		if len(e.Fields) != 2 || e.Fields[1].Type.Type != "int" {
+			t.Errorf("the rest of the record was lost: %s", expandJSON(t, e))
+		}
+	})
+	t.Run("mutual", func(t *testing.T) {
+		// A and B name each other, so BOTH are on the cycle and neither
+		// expands anywhere. Expanding whichever copy is not yet on the path
+		// would give one B the recursive body and another the expanded one,
+		// and Schema reads two same-named bodies that differ as a conflict.
+		s := mustParse(t, `{"type":"record","name":"Top","fields":[
+			{"name":"x","type":{"type":"record","name":"A","fields":[
+				{"name":"b","type":{"type":"record","name":"B","fields":[
+					{"name":"a","type":["null","A"]}]}}]}},
+			{"name":"y","type":"B"}]}`)
+		e := s.Root().ExpandReferences()
+		inA := e.Fields[0].Type.Fields[0].Type // B, inside A
+		backA := inA.Fields[0].Type.Branches[1]
+		if backA.Type != "A" || len(backA.Fields) != 0 {
+			t.Errorf("the cycle-closing reference to A expanded: %s", expandJSON(t, &backA))
+		}
+		// B does not close the cycle, so it expands — and every copy of it has
+		// to come out identical, which is the whole reason the verdict is per
+		// name rather than per position.
+		atY := e.Fields[1].Type
+		if atY.Type != "record" || atY.Name != "B" {
+			t.Fatalf("B did not expand: %s", expandJSON(t, &atY))
+		}
+		if a, b := expandJSON(t, &inA), expandJSON(t, &atY); a != b {
+			t.Errorf("two copies of B differ:\n %s\n %s", a, b)
+		}
+		if _, err := e.Schema(); err != nil {
+			t.Errorf("mutually recursive expansion does not rebuild: %v", err)
+		}
+	})
+}
+
+// TestExpandReferencesDoesNotMutateReceiver: the receiver is unchanged, and
+// nothing in the result shares a container with it.
+func TestExpandReferencesDoesNotMutateReceiver(t *testing.T) {
+	s := mustParse(t, `{"type":"record","name":"Top","namespace":"ns","doc":"d","aliases":["Alt"],"extra":1,"fields":[
+		{"name":"a","type":{"type":"enum","name":"E","symbols":["X","Y"],"extra":2},"aliases":["aa"],"fx":3},
+		{"name":"b","type":"ns.E"},
+		{"name":"c","type":{"type":"array","items":"E"}}]}`)
+	r := s.Root()
+	before := expandJSON(t, r)
+	e := r.ExpandReferences()
+	if after := expandJSON(t, r); after != before {
+		t.Errorf("receiver changed:\n before %s\n after  %s", before, after)
+	}
+
+	// Writing through every container the result hands back must not reach the
+	// receiver either.
+	if n := expandMutateAll(e, 0); n < 8 {
+		t.Fatalf("only %d containers to write through; the cell is not reaching the result's structure", n)
+	}
+	if after := expandJSON(t, r); after != before {
+		t.Errorf("writing to the result reached the receiver:\n before %s\n after  %s", before, after)
+	}
+}
+
+// expandMutateAll writes through every container in n's tree, returning how
+// many it wrote to. Written as a walk rather than a list of paths so it keeps
+// reaching the containers whatever the expansion produced.
+func expandMutateAll(n *SchemaNode, depth int) int {
+	if n == nil || depth > maxSchemaJSONDepth {
+		return 0
+	}
+	c := 0
+	for i := range n.Aliases {
+		n.Aliases[i], c = "MUTATED", c+1
+	}
+	for i := range n.Symbols {
+		n.Symbols[i], c = "MUTATED", c+1
+	}
+	for k := range n.Props {
+		n.Props[k], c = "MUTATED", c+1
+	}
+	c += expandMutateAll(n.Items, depth+1)
+	c += expandMutateAll(n.Values, depth+1)
+	for i := range n.Fields {
+		for j := range n.Fields[i].Aliases {
+			n.Fields[i].Aliases[j], c = "MUTATED", c+1
+		}
+		for k := range n.Fields[i].Props {
+			n.Fields[i].Props[k], c = "MUTATED", c+1
+		}
+		n.Fields[i].Name, c = "MUTATED", c+1
+		c += expandMutateAll(&n.Fields[i].Type, depth+1)
+	}
+	for i := range n.Branches {
+		c += expandMutateAll(&n.Branches[i], depth+1)
+	}
+	return c
+}
+
+// expandRoundTripSchemas are the shapes ExpandReferences must leave a schema's
+// meaning untouched for.
+var expandRoundTripSchemas = []struct {
+	name   string
+	schema string
+	// fullDiffers marks the cases where the rebuilt text differs from the
+	// unexpanded rebuild in reference SPELLING alone: Schema re-spells a
+	// collapsed repeat by fullname, so a source reference written as an
+	// in-scope short name comes back qualified. The canonical comparison,
+	// which normalizes both to the fullname, still runs.
+	fullDiffers bool
+}{
+	{"repeat", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"I"}]}`, false},
+	{"namespaced", `{"type":"record","name":"Top","namespace":"a.b","fields":[{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"a.b.I"},{"name":"c","type":"I"}]}`, true},
+	{"null-namespace-escape", `{"type":"record","name":"Top","namespace":"a.b","fields":[{"name":"a","type":{"type":"record","name":"I","namespace":"","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":".I"}]}`, true},
+	{"cross-namespace", `{"type":"record","name":"Top","namespace":"a","fields":[{"name":"a","type":{"type":"record","name":"I","namespace":"c.d","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"c.d.I"}]}`, false},
+	{"recursive", `{"type":"record","name":"N","fields":[{"name":"n","type":["null","N"]},{"name":"v","type":"int"}]}`, false},
+	{"mutual", `{"type":"record","name":"A","fields":[{"name":"b","type":{"type":"record","name":"B","fields":[{"name":"a","type":["null","A"]}]}},{"name":"b2","type":"B"}]}`, false},
+	{"enum-and-fixed", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"enum","name":"E","symbols":["X"]}},{"name":"b","type":"E"},{"name":"c","type":{"type":"fixed","name":"F","size":4}},{"name":"d","type":"F"}]}`, false},
+	{"wrapped-reference", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":{"type":"I","tag":"keep"}}]}`, false},
+	{"defaults", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"I","default":{"x":1}}]}`, false},
+	{"props-and-docs", `{"type":"record","name":"Top","doc":"","aliases":[],"fields":[{"name":"a","type":{"type":"record","name":"I","doc":"hi","fields":[{"name":"x","type":"int","doc":""}]}},{"name":"b","type":"I"}]}`, false},
+	{"array-of-map-of-ref", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":{"type":"array","items":{"type":"map","values":"I"}}}]}`, false},
+	{"no-references", `{"type":"record","name":"Top","fields":[{"name":"x","type":"int"},{"name":"y","type":{"type":"array","items":"string"}}]}`, false},
+	{"primitive", `"int"`, false},
+	{"union-top", `["null",{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]},{"type":"record","name":"J","fields":[{"name":"i","type":"I"}]}]`, false},
+	{"deep-chain", `{"type":"record","name":"R2","fields":[{"name":"a","type":{"type":"record","name":"R1","fields":[{"name":"a","type":{"type":"record","name":"R0","fields":[{"name":"v","type":"int"}]}},{"name":"b","type":"R0"}]}},{"name":"b","type":"R1"}]}`, false},
+}
+
+// TestExpandReferencesRoundTrips: Schema collapses repeats back to references
+// on emit, so expanding first must land on exactly the same schema.
+func TestExpandReferencesRoundTrips(t *testing.T) {
+	for _, c := range expandRoundTripSchemas {
+		t.Run(c.name, func(t *testing.T) {
+			s := mustParse(t, c.schema)
+			e := s.Root().ExpandReferences()
+			got, err := e.Schema()
+			if err != nil {
+				t.Fatalf("rebuilding the expanded tree: %v", err)
+			}
+			if string(got.Canonical()) != string(s.Canonical()) {
+				t.Errorf("canonical form changed:\n got  %s\n want %s", got.Canonical(), s.Canonical())
+			}
+			// The full form too: canonical drops docs, props and defaults, so
+			// on its own it would not notice an expansion that lost them.
+			// The full form too — canonical drops docs, props and defaults, so
+			// on its own it would not notice an expansion that lost them.
+			// Compared against the tree rebuilt WITHOUT expanding, so the
+			// difference measured is the expansion and not Schema's own
+			// re-emission of the source text.
+			plain, err := s.Root().Schema()
+			if err != nil {
+				t.Fatalf("rebuilding the unexpanded tree: %v", err)
+			}
+			if same := got.String() == plain.String(); same == c.fullDiffers {
+				t.Errorf("full form: same=%v, want same=%v\n got  %s\n want %s",
+					same, !c.fullDiffers, got.String(), plain.String())
+			}
+		})
+	}
+}
+
+// expandDoublingSchema names one record per level, each holding its
+// predecessor once as a definition and once as a reference. The text grows
+// linearly and the fully expanded tree grows as 2^levels.
+func expandDoublingSchema(levels int) string {
+	s := `{"type":"record","name":"R0","fields":[{"name":"v","type":"int"}]}`
+	for i := 1; i <= levels; i++ {
+		s = fmt.Sprintf(`{"type":"record","name":"R%d","fields":[{"name":"a","type":%s},{"name":"b","type":"R%d"}]}`,
+			i, s, i-1)
+	}
+	return s
+}
+
+// TestExpandReferencesIsBounded: a schema whose full expansion is over the
+// ceiling comes back copied but NOT expanded. Stopping partway is not an
+// option — a half-expanded copy of a name conflicts with the whole one and
+// Schema refuses the tree — so the verdict is all or nothing.
+func TestExpandReferencesIsBounded(t *testing.T) {
+	// 2^20 expanded nodes against a 2^18 ceiling, from ~40 lines of text.
+	s := mustParse(t, expandDoublingSchema(20))
+	r := s.Root()
+	in := expandCountNodes(r, 0)
+	if in > 500 {
+		t.Fatalf("the input itself is %d nodes; this cell measures expansion, not input size", in)
+	}
+	if got := expandCountNodes(s.Root().ExpandReferences(), 0); got != in {
+		t.Errorf("expanded to %d nodes; over the ceiling the copy must stay at the input's %d", got, in)
+	}
+	// Still a valid tree: what was not expanded is what it already was.
+	if _, err := s.Root().ExpandReferences().Schema(); err != nil {
+		t.Errorf("the unexpanded copy no longer rebuilds: %v", err)
+	}
+
+	// The same shape UNDER the ceiling expands in full, so the cell measures
+	// the ceiling and not a blanket refusal to expand.
+	small := mustParse(t, expandDoublingSchema(10))
+	sr := small.Root()
+	se := sr.ExpandReferences()
+	sin, sout := expandCountNodes(sr, 0), expandCountNodes(se, 0)
+	if sout <= sin {
+		t.Errorf("a %d-node tree whose full expansion fits the ceiling came back at %d nodes", sin, sout)
+	}
+	if sout > maxExpandedNodes {
+		t.Errorf("expanded to %d nodes, over the %d ceiling", sout, maxExpandedNodes)
+	}
+	if _, err := se.Schema(); err != nil {
+		t.Errorf("the fully expanded tree does not rebuild: %v", err)
+	}
+}
+
+// TestExpandReferencesSizeSaturates: the ceiling is decided from a COUNT, and
+// that count saturates. A doubling chain reaches 2^40 in forty lines of text,
+// so a sum that kept adding would be judged on a number the walk cannot hold —
+// and nothing is built to find out.
+func TestExpandReferencesSizeSaturates(t *testing.T) {
+	r := mustParse(t, expandDoublingSchema(40)).Root()
+	x := &expander{
+		table:  map[string]*SchemaNode{},
+		cyclic: map[string]bool{},
+		onPath: map[string]bool{},
+		done:   map[string]bool{},
+		sizes:  map[string]int{},
+	}
+	collectNamedTypes(r, x.table)
+	x.markCycles(r, "", 0)
+	if got := x.sizeOf(r, "", 0); got != maxExpandedNodes+1 {
+		t.Errorf("sized the 2^40 expansion at %d, want the saturation value %d", got, maxExpandedNodes+1)
+	}
+	// And a tree that fits is sized exactly, so saturation is not just "always
+	// return the cap".
+	small := mustParse(t, expandDoublingSchema(3)).Root()
+	y := &expander{
+		table:  map[string]*SchemaNode{},
+		cyclic: map[string]bool{},
+		onPath: map[string]bool{},
+		done:   map[string]bool{},
+		sizes:  map[string]int{},
+	}
+	collectNamedTypes(small, y.table)
+	y.markCycles(small, "", 0)
+	y.expand = true
+	if got, want := y.sizeOf(small, "", 0), expandCountNodes(small.ExpandReferences(), 0); got != want {
+		t.Errorf("sized the expansion at %d, but it built %d nodes", got, want)
+	}
+}
+
+// TestExpandReferencesDeepTree: nesting past the supported limit stops the
+// walk rather than the stack, and everything above the limit is still copied.
+func TestExpandReferencesDeepTree(t *testing.T) {
+	deep := &SchemaNode{Type: "int"}
+	for range maxSchemaJSONDepth + 200 {
+		deep = &SchemaNode{Type: "array", Items: deep}
+	}
+	done := make(chan *SchemaNode, 1)
+	go func() { done <- deep.ExpandReferences() }()
+	var got *SchemaNode
+	select {
+	case got = <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("ExpandReferences did not return on a deeply nested tree")
+	}
+	a, b := got, deep
+	for i := range 100 {
+		if a == nil || a.Type != "array" || a.Items == nil {
+			t.Fatalf("level %d: got %v, want an array", i, a)
+		}
+		if a == b || a.Items == b.Items {
+			t.Fatalf("level %d shares a node with the receiver", i)
+		}
+		a, b = a.Items, b.Items
+	}
+}
+
+// TestExpandReferencesExtractedSubtree: a subtree lifted out of a Root tree
+// carries the stamp Root left on its references, so it expands even though the
+// definition lives outside it — the same resolution Schema splices with.
+func TestExpandReferencesExtractedSubtree(t *testing.T) {
+	s := mustParse(t, `{"type":"record","name":"Top","namespace":"ns","fields":[
+		{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}},
+		{"name":"b","type":"Inner"}]}`)
+	sub := s.Root().Fields[1].Type // just the reference node
+	if sub.Type != "ns.Inner" && sub.Type != "Inner" {
+		t.Fatalf("expected a reference node, got %s", expandJSON(t, &sub))
+	}
+	e := sub.ExpandReferences()
+	if e.Type != "record" || e.Name != "Inner" || len(e.Fields) != 1 {
+		t.Fatalf("extracted reference did not expand: %s", expandJSON(t, e))
+	}
+	if _, err := e.Schema(); err != nil {
+		t.Errorf("expanded extraction does not rebuild: %v", err)
+	}
+}
+
+// TestExpandReferencesWrappedReferenceKept: a reference carrying usage-site
+// attributes stays as written. A definition cannot hold a second doc, and
+// Schema would collapse the expanded copy back to a reference and lose the
+// custom properties that rode on it.
+func TestExpandReferencesWrappedReferenceKept(t *testing.T) {
+	s := mustParse(t, `{"type":"record","name":"Top","fields":[
+		{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},
+		{"name":"b","type":{"type":"I","tag":"keep"}}]}`)
+	e := s.Root().ExpandReferences()
+	b := e.Fields[1].Type
+	if b.Type != "I" || len(b.Fields) != 0 {
+		t.Errorf("wrapped reference expanded: %s", expandJSON(t, &b))
+	}
+	if b.Props["tag"] != "keep" {
+		t.Errorf("wrapped reference lost its property: %s", expandJSON(t, &b))
+	}
+}
+
+func TestExpandReferencesNil(t *testing.T) {
+	var n *SchemaNode
+	if got := n.ExpandReferences(); got != nil {
+		t.Errorf("got %v, want nil", got)
+	}
 }

@@ -12141,6 +12141,11 @@ var capNotABound = map[string]string{
 	// width cells, where an allowance counting the wrong UNIT would — this one is
 	// charged per child examined, since entering a node costs its child count.
 	"maxMinBytesWork": "a walk allowance that loosens a derived bound, not a bound on accepted input — nothing is refused for exceeding it",
+	// ExpandReferences is a metadata-API transform, not a reader: it takes a
+	// tree the parser already accepted and decides how much of it to COPY. Over
+	// the ceiling it returns the same tree unexpanded, so no input is refused
+	// and no producer has anything to comply with.
+	"maxExpandedNodes": "a ceiling on how large a copy ExpandReferences will build, not a bound on accepted input — over it the tree comes back unexpanded rather than rejected",
 }
 
 // TestInvariant_EveryCapIsClassified is the completeness half: a cap added

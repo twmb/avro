@@ -428,6 +428,10 @@ var censusRegistry = []censusQuestion{
 				repr: "parse + build literal sets", site: `case "record", "error":`, file: "schema.go",
 				note: "same form-vs-answer split for the RECORD half: the build arms and the parse grammar spell the record kinds literally where a switch cannot call isRecordKind.",
 			},
+			{
+				repr: "reference expansion, three passes", site: "isRecordKind (markCycles / sizeOf / copy)", file: "schema_node.go",
+				note: "ExpandReferences walks the tree three times — cycles, then sizes, then the copy — and each asks the shared predicate rather than spelling the kinds. The three must agree exactly: a pass that descended a kind the others did not would size a tree it never builds, or build one it never sized.",
+			},
 		},
 		tells: []censusTell{
 			{pattern: `isNamedKind`, counts: map[string]int{
@@ -435,7 +439,7 @@ var censusRegistry = []censusQuestion{
 				"schema_node.go": 13, "schema_parse.go": 2, "schema_walk.go": 1, "schema.go": 5,
 			}},
 			{pattern: `isRecordKind`, counts: map[string]int{
-				"schema_canonical.go": 1, "schema_for.go": 2, "schema_node.go": 10,
+				"schema_canonical.go": 1, "schema_for.go": 2, "schema_node.go": 13,
 				"schema_parse.go": 1, "schema_walk.go": 1,
 			}},
 			// branchIsNamedKind is the *schemaNode twin of isNamedKind: by the
@@ -574,16 +578,20 @@ var censusRegistry = []censusQuestion{
 			{repr: "metadata render, primitive arm", site: "nodeCarriesOnlyType", file: "schema_node.go"},
 			{repr: "metadata render, name-reference arm", site: "nodeCarriesOnlyType", file: "schema_node.go"},
 			{
+				repr: "reference expansion, is this a bare reference", site: "nodeCarriesOnlyType", file: "schema_node.go",
+				note: "ExpandReferences asks the same question to decide what may be replaced by a definition. A reference carrying anything of its own must NOT be — Schema would collapse the expanded copy back to a reference and lose it — which is exactly this predicate's question, not a looser one.",
+			},
+			{
 				repr: "the shared field-set walk", site: "nodeCarriesNothingBut", file: "schema_node.go",
 				note: "not a second answerer but the ONE walk both questions run — Q16 and Q17 differ only in the exemption function they pass. Two structurally identical reflect loops is the shape this pair of questions was already burned by, so there is one loop and the difference is data.",
 			},
 		},
 		tells: []censusTell{
 			{pattern: `nodeCarriesOnlyType`, counts: map[string]int{
-				// Definition, its two call sites, and three doc references
+				// Definition, its three call sites, and three doc references
 				// (counted with grep -o; doc comments count, and reasoning
 				// about the number has been wrong every time).
-				"schema_node.go": 6,
+				"schema_node.go": 7,
 			}},
 			{pattern: `bareEmissionExempt`, counts: map[string]int{
 				"schema_node.go": 3,

@@ -14247,7 +14247,7 @@ var budgetedWalks = []budgetedWalk{
 	{fn: "minBytes", file: "deser.go", class: schemaDAG,
 		factors:       "containers x paths-per-walk x children-per-node",
 		binds:         "one minBytesWalk SHARED per operation (containers) + done memo (paths) + per-child allowance charge (children)",
-		reachingPaths: "THREE constructions, each shared across one operation: build (b.minBytes on the builder, forward refs fixed in finalize AND backward refs resolved to a fully-built node at build), finalize (one mbw before the container-fixup loop), and resolve (ctx.minBytes) — which also carries the SKIP path, since a dropped field's record compile is deferred to decode time but joins the resolution's walk rather than starting its own. The standalone schemaMinBytes is a fourth, single-node, outside any loop and with no production caller. Guarded by TestInvariant_MinBytesReachingPaths (the set, from source) and TestInvariant_EveryReachingPathBoundIsMeasured (each path's counts, driven at two values)"},
+		reachingPaths: "FOUR constructions, each shared across one operation: build (b.minBytes on the builder, forward refs fixed in finalize AND backward refs resolved to a fully-built node at build), finalize (one mbw before the container-fixup loop), resolve (ctx.minBytes) — which also carries the resolution's SKIP path, since a dropped field's record compile is deferred to decode time but joins the resolution's walk rather than starting its own — and the parse's skipWalk, which carries SkipUnknown's per-field skippers, likewise compiled at decode time and likewise shared rather than one per record. The standalone schemaMinBytes is a fifth, single-node, outside any loop and with no production caller. Guarded by TestInvariant_MinBytesReachingPaths (the set, from source) and TestInvariant_EveryReachingPathBoundIsMeasured (each path's counts, driven at two values)"},
 	{fn: "checkCompat", file: "compat.go", class: schemaDAG,
 		factors:       "distinct (reader,writer) node pairs x children-per-pair",
 		binds:         "the seen map[nodePair]bool memo, threaded from CheckCompatibility with no defer-delete, so each pair is walked once",
@@ -14262,6 +14262,18 @@ var budgetedWalks = []budgetedWalk{
 			"MEASURED BY TestMatrix_SchemaNodeWalkBudgetBattery / TestRegression_SchemaNodeDuplicateNamedDefinitionBounded / TestMatrix_SchemaForCustomSchemaBudgetAxes, which hand-build the trees Parse cannot express — " +
 			"a PARSED schema is deduped before it reaches this walk, so no parse-driven cell can red this bound, and one that claimed to was renamed",
 		reachingPaths: "one walkBudget per metadata-API call (toJSONDedup), from Root().Schema()/String()/Canonical(); each walks the whole tree once"},
+	{fn: "markCycles", file: "schema_node.go", class: schemaDAG,
+		factors:       "definitions x nodes per definition",
+		binds:         "the done memo — a name is walked once per run, and an unfollowed reference is a leaf, so the walk is linear in the tree however many references reach one name",
+		reachingPaths: "one: the maps created in ExpandReferences, one pass before the sizing"},
+	{fn: "sizeOf", file: "schema_node.go", class: schemaDAG,
+		factors:       "definitions x nodes per definition",
+		binds:         "the sizes memo. markCycles has cut every reference cycle first, so the names this pass follows form a DAG and one memo entry per name is exact; the sum saturates at the ceiling so a doubling chain cannot overflow it",
+		reachingPaths: "one: the same expander, between markCycles and the copy"},
+	{fn: "copy", file: "schema_node.go", class: schemaDAG,
+		factors:       "output nodes = input nodes x expansion multiplier",
+		binds:         "the maxExpandedNodes budget, decided from sizeOf BEFORE any node is built: over it nothing expands and the walk is linear in the input, under it the output is the counted size. Deciding mid-walk is what this cannot do — a half-expanded copy of a name conflicts with the whole one and Schema refuses the tree",
+		reachingPaths: "one: the same expander, after the two verdict passes"},
 	{fn: "collectLocalNames", file: "schema_node.go", class: schemaDAG,
 		factors:       "distinct nodes x names per node",
 		binds:         "the visited map[*SchemaNode]struct{} memo (mark on entry, return on hit)",
@@ -14912,6 +14924,12 @@ type costCell struct {
 }
 
 var costCells = []costCell{
+	{fn: "TestExpandReferencesIsBounded",
+		exempt: "value oracle: drives the doubling chain at two levels and asserts the NODE COUNT of each result — the input's count over the ceiling, more than the input under it. The ceiling is decided from a count before anything is built, so the consequence is a size and not a deadline; a watchdog would pass on a walk that quietly built nothing"},
+
+	{fn: "TestExpandReferencesSizeSaturates",
+		exempt: "value oracle: asserts the sizing pass reports the saturation value for a 2^40 expansion and the exact count for one that fits. Equality of a number, computed without building anything"},
+
 	{fn: "TestInvariant_EveryMinBytesEntryPointIsBounded",
 		factor: "dagNested DEPTH — the PATHS factor: without the memo this is 2^depth, so 13 vs 26 is a 8192x separation",
 		values: []int{13, 26}},
