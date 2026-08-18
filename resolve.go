@@ -136,7 +136,13 @@ type wireOp struct {
 
 // defaultOp fills in a reader field that is absent from the writer.
 type defaultOp struct {
-	readerIdx      int
+	readerIdx int
+	// encodedDefault is handed to deser as its src, uncopied, by all three of
+	// the deserStruct, deserInterface and deserMap fill loops. We can do that
+	// for two reasons: no deserfn writes through its src, and under
+	// [AliasInput] a decoded value may point back into this buffer, which is
+	// what that option already tells the caller not to write to. Copying here
+	// would buy nothing and cost an allocation per default per decode.
 	encodedDefault []byte
 	deser          deserfn
 }
@@ -503,8 +509,6 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 		elem.SetZero()
 	}
 
-	// Apply defaults. The deserfn does not write to its src, so pass the
-	// encoded default bytes directly without copying.
 	for _, d := range rr.defaults {
 		if _, err = d.deser(d.encodedDefault, elem, sl); err != nil {
 			return nil, recordFieldError(nil, rr.readerNames[d.readerIdx], err)
@@ -598,7 +602,7 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 		if ferr != nil {
 			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], ferr)
 		}
-		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), fv, sl); err != nil {
+		if _, err = d.deser(d.encodedDefault, fv, sl); err != nil {
 			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], err)
 		}
 	}

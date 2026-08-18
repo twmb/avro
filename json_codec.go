@@ -95,30 +95,39 @@ func (aliasInput) opt() {}
 // decoding from a buffer it reuses can drop it without introspecting the type.
 func (aliasInput) AvroOptAliasesInput() {}
 
-// AliasInput makes decoded strings and byte slices point INTO src rather than
-// copying out of it. It applies to [Schema.Decode] and
-// [Schema.DecodeSingleObject]; [Schema.DecodeJSON] ignores it, because a JSON
-// string carrying an escape cannot alias and aliasing only the unescaped ones
-// would make the guarantee vary field by field.
+// AliasInput makes decoded strings and byte slices point into the bytes they
+// were read from rather than copying out of them, overriding the default of
+// copying every one. It applies to [Schema.Decode] and
+// [Schema.DecodeSingleObject]. [Schema.DecodeJSON] ignores it: a JSON string
+// carrying an escape cannot alias, and aliasing only the unescaped ones would
+// make the guarantee vary field by field.
 //
-// CONTRACT: src must not be modified after the decode. Every aliased value
-// changes with it, including strings, which Go otherwise guarantees are
-// immutable. Lifetime is not the concern — the reference keeps src alive —
-// MUTATION is. The retention is the other cost: one aliased field, however
-// small, pins the whole src buffer for as long as it is held. Decode from a
-// buffer you are about to reuse, or hold one field of a large message for a
-// long time, and this option is the wrong one.
+// You must not modify anything the decode returns. An aliased value is the
+// memory it was read from, so writing to one rewrites that memory, including
+// through a string, which Go otherwise guarantees is immutable. Lifetime is
+// not the concern; the reference keeps that memory alive.
+//
+// That memory is usually src, where a stray write costs you only your own
+// buffer. It is not always src: a field filled from the schema's default
+// aliases the parsed [Schema], which every decode of that schema shares, so a
+// write there reaches every later decode on every goroutine. You never have to
+// tell the two apart, because the rule is the same for both.
+//
+// Retention is the other cost. One aliased field, however small, pins the whole
+// buffer it points into for as long as you hold it. If you decode from a buffer
+// you are about to reuse, or keep one field of a large message for a long time,
+// this is the wrong option.
 //
 // Aliased: string and []byte targets of the string, bytes and fixed kinds,
-// including inside an any and including those kinds under a uuid logical type.
+// inside an any as well, under a uuid logical type as well, and map keys.
 // Copied, as always: [N]byte (an array is a value), [encoding.TextUnmarshaler]
-// (it parses the bytes), and every logical type that builds a new Go value —
-// decimal, the timestamps, and the hex-dash uuid string form.
+// (it parses the bytes), and every logical type that builds a new Go value,
+// meaning decimal, the timestamps, and the hex-dash uuid string form.
 //
-// It is an [Opt] and deliberately NOT a [SchemaOpt]: ocf.WithSchemaOpts
+// This is an [Opt] and deliberately not a [SchemaOpt]. ocf.WithSchemaOpts
 // forwards SchemaOpts into an OCF reader, whose block buffer is overwritten
 // every block, so an option reaching there would hand out memory that changes
-// under the caller.
+// under you.
 func AliasInput() Opt { return aliasInput{} }
 
 type linkedinFloats struct{}

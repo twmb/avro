@@ -8,8 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/importer"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"math"
 	"math/big"
+	"os"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -18967,5 +18973,351 @@ func TestInvariant_ResolvedJSONDropsAliasingOpts(t *testing.T) {
 	}
 	if !strings.Contains(line, "dropAliasingOpts(opts)") {
 		t.Errorf("decodeJSONResolved forwards the caller's options raw:\n    %s\nThe buffer it decodes is an intermediate this function allocated, not the caller's src.", strings.TrimSpace(line))
+	}
+}
+
+// foreignBufferDecodeSites rows every call in the package that hands a decode
+// function a src buffer other than the one its caller is decoding. Such a
+// buffer outlives the call or is shared, so under [AliasInput] a decoded value
+// can point into memory the caller never supplied, which is sound only where
+// the contract covers it. Each row states what makes its buffer safe to hand
+// out.
+//
+// Keyed "enclosing func: callee: arg0", the spelling
+// TestInvariant_ForeignBufferDecodeSitesAreRowed derives.
+var foreignBufferDecodeSites = map[string]string{
+	"deser: (&deserFixed{…}).deser: append(b[:0:0], b...)": "a fresh copy of just this value's payload, made so the delegate's remainder is the copy's tail rather than the caller's; nothing else can reach it, so aliasing it is aliasing per-call garbage the value itself keeps alive",
+
+	"applyFieldDefault: node.deserRecord.fields[idx].fn: enc": "the schema's pre-encoded default; DecodeJSON never sets the alias flag, so this path copies out of it regardless",
+
+	"deserInterface: d.deser: d.encodedDefault": "the schema's pre-encoded default, shared by every decode of this resolution; AliasInput's contract forbids writing to anything a decode returns, which is what makes handing it out sound",
+	"deserMap: d.deser: d.encodedDefault":       "same buffer and same rule as deserInterface",
+	"deserStruct: d.deser: d.encodedDefault":    "same buffer and same rule as deserInterface; a struct target is not a different contract",
+}
+
+// fallbackImporter tries compiled export data first and re-asks a source
+// importer for anything it cannot resolve.
+type fallbackImporter struct{ fast, slow types.Importer }
+
+func (i fallbackImporter) Import(path string) (*types.Package, error) {
+	if p, err := i.fast.Import(path); err == nil {
+		return p, nil
+	}
+	return i.slow.Import(path)
+}
+
+// typedPackageFiles type-checks the package's non-test sources so a derivation
+// can ask what a call's callee *is* rather than what it is spelled.
+func typedPackageFiles(t *testing.T) (*token.FileSet, []*ast.File, *types.Package, *types.Info) {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	var files []*ast.File
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", n, err)
+		}
+		files = append(files, f)
+	}
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}}
+	// Compiled export data for everything it covers, source only for what it
+	// does not, which is this module's own internal package. Type-checking the
+	// stdlib from source instead costs seconds, and we run inside the -race
+	// gate, whose headroom is what we are conserving.
+	conf := types.Config{Importer: fallbackImporter{
+		fast: importer.Default(),
+		slow: importer.ForCompiler(fset, "source", nil),
+	}}
+	pkg, err := conf.Check("github.com/twmb/avro", fset, files, info)
+	if err != nil {
+		t.Fatalf("type-checking the package: %v", err)
+	}
+	return fset, files, pkg, info
+}
+
+// TestInvariant_ForeignBufferDecodeSitesAreRowed derives, from the type
+// checker rather than from a spelling, every call whose callee has a deserfn's
+// or skipfn's signature and whose first argument is not the enclosing src, and
+// requires each to be rowed. Signature rather than named type on purpose: a
+// method value like (&deserFixed{n}).deser has the shape without the name, and
+// keying on the name would drop it.
+//
+// It reds in both directions: a new site that feeds a decode some other buffer
+// fails here, and a row whose site has vanished fails too.
+func TestInvariant_ForeignBufferDecodeSitesAreRowed(t *testing.T) {
+	fset, files, pkg, info := typedPackageFiles(t)
+	sigOf := func(name string) *types.Signature {
+		o := pkg.Scope().Lookup(name)
+		if o == nil {
+			t.Fatalf("%s is gone from the package; this derivation names it, so a rename must update the guard rather than silence it", name)
+		}
+		return o.Type().Underlying().(*types.Signature)
+	}
+	deser, skip := sigOf("deserfn"), sigOf("skipfn")
+
+	found := map[string]bool{}
+	for _, f := range files {
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				ce, ok := n.(*ast.CallExpr)
+				if !ok || len(ce.Args) == 0 {
+					return true
+				}
+				if tv, ok := info.Types[ce.Fun]; ok && tv.IsType() {
+					return true // a deserfn(x) conversion, not a call
+				}
+				ft := info.TypeOf(ce.Fun)
+				if ft == nil {
+					return true
+				}
+				sig, ok := ft.Underlying().(*types.Signature)
+				if !ok || (!types.Identical(sig, deser) && !types.Identical(sig, skip)) {
+					return true
+				}
+				if a0 := types.ExprString(ce.Args[0]); a0 != "src" {
+					found[fd.Name.Name+": "+types.ExprString(ce.Fun)+": "+a0] = true
+				}
+				return true
+			})
+		}
+	}
+	if len(found) == 0 {
+		t.Fatalf("the derivation found no decode call at all across %d files; the walk is broken, not the package", len(files))
+	}
+	for site := range found {
+		if _, ok := foreignBufferDecodeSites[site]; !ok {
+			t.Errorf("%s\n  hands a decode a buffer that is not its caller's src. Row it with what makes that buffer safe to hand out, or pass the caller's src.", site)
+		}
+	}
+	for site := range foreignBufferDecodeSites {
+		if !found[site] {
+			t.Errorf("foreignBufferDecodeSites rows %q, which the source no longer contains", site)
+		}
+	}
+	_ = fset
+}
+
+// byteSourceCase drives one byte source, meaning the buffer a decoded value may
+// point into, against a target shape. The axis exists because the alias
+// contract is a rule about the values a decode returns, not about src: the
+// memory behind one is src for a field read off the wire and the parsed Schema
+// for a field filled from its default, and a net that only ever decodes
+// wire-read fields cannot tell those apart.
+type byteSourceCase struct {
+	name string
+	// decoder is called *once* per cell and returns the closure the cell drives.
+	// Once, because the schema has to be built outside the two runs: the memory
+	// a default-filled value points into belongs to one parsed schema, so a
+	// cell that re-parses per run compares two schemas and can never observe
+	// sharing, whatever the code does.
+	decoder func(t *testing.T) func(src []byte) unsafe.Pointer
+	// wire builds a fresh src for each run.
+	wire func(t *testing.T) []byte
+	// inSrc is whether the returned value must point *into* the src it was
+	// handed. shared is whether two independent decodes must hand back the
+	// same address, which is what "points at something the schema owns" looks
+	// like from outside the package.
+	inSrc  bool
+	shared bool
+}
+
+// aliasResolvedDefaultSchemas builds writer and resolved reader for a record
+// whose second field exists only on the reader, filled from a bytes default.
+func aliasResolvedDefaultSchemas(t *testing.T) (writer, resolved *Schema) {
+	t.Helper()
+	w := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	r := MustParse("{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+		"{\"name\":\"a\",\"type\":\"int\"}," +
+		"{\"name\":\"d\",\"type\":\"bytes\",\"default\":\"\\u0001\\u0002\\u0003\"}]}")
+	res, err := Resolve(w, r)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	return w, res
+}
+
+func aliasResolvedWire(t *testing.T) []byte {
+	t.Helper()
+	w, _ := aliasResolvedDefaultSchemas(t)
+	b, err := w.Encode(map[string]any{"a": int32(7)})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return b
+}
+
+// aliasByteSourceCases crosses byte source with the target shapes that reach
+// it. Expectations come from the contract, not from current behavior: a value
+// read off the wire under AliasInput points into src and so cannot be shared
+// between two decodes; a value filled from the schema's default points at
+// memory the schema owns and so *is* shared; a path that does not honor the
+// option points at neither.
+var aliasByteSourceCases = []byteSourceCase{
+	{
+		name: "caller-src/struct",
+		wire: func(t *testing.T) []byte { return []byte{6, 'a', 'b', 'c'} },
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			s := MustParse(`"bytes"`)
+			return func(src []byte) unsafe.Pointer {
+				var got []byte
+				mustAliasDecode(t, s, src, &got, AliasInput())
+				return bytePtr(got)
+			}
+		},
+		inSrc: true, shared: false,
+	},
+	{
+		name: "schema-default/struct",
+		wire: aliasResolvedWire,
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			_, res := aliasResolvedDefaultSchemas(t)
+			return func(src []byte) unsafe.Pointer {
+				var got struct {
+					A int32  `avro:"a"`
+					D []byte `avro:"d"`
+				}
+				mustAliasDecode(t, res, src, &got, AliasInput())
+				return bytePtr(got.D)
+			}
+		},
+		inSrc: false, shared: true,
+	},
+	{
+		name: "schema-default/map",
+		wire: aliasResolvedWire,
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			_, res := aliasResolvedDefaultSchemas(t)
+			return func(src []byte) unsafe.Pointer {
+				got := map[string]any{}
+				mustAliasDecode(t, res, src, &got, AliasInput())
+				return bytePtr(got["d"].([]byte))
+			}
+		},
+		inSrc: false, shared: true,
+	},
+	{
+		name: "schema-default/interface",
+		wire: aliasResolvedWire,
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			_, res := aliasResolvedDefaultSchemas(t)
+			return func(src []byte) unsafe.Pointer {
+				var got any
+				mustAliasDecode(t, res, src, &got, AliasInput())
+				return bytePtr(got.(map[string]any)["d"].([]byte))
+			}
+		},
+		inSrc: false, shared: true,
+	},
+	{
+		name: "schema-default/no-option",
+		wire: aliasResolvedWire,
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			_, res := aliasResolvedDefaultSchemas(t)
+			return func(src []byte) unsafe.Pointer {
+				got := map[string]any{}
+				mustAliasDecode(t, res, src, &got)
+				return bytePtr(got["d"].([]byte))
+			}
+		},
+		inSrc: false, shared: false,
+	},
+	{
+		name: "json-default/ignores-option",
+		wire: func(t *testing.T) []byte { return []byte(`{"a":7}`) },
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			s := MustParse("{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+				"{\"name\":\"a\",\"type\":\"int\"}," +
+				"{\"name\":\"d\",\"type\":\"bytes\",\"default\":\"\\u0001\\u0002\\u0003\"}]}")
+			return func(src []byte) unsafe.Pointer {
+				got := map[string]any{}
+				if err := s.DecodeJSON(src, &got, AliasInput()); err != nil {
+					t.Fatalf("DecodeJSON: %v", err)
+				}
+				return bytePtr(got["d"].([]byte))
+			}
+		},
+		inSrc: false, shared: false,
+	},
+	{
+		name: "synthesized-copy/fixed-decimal-escape",
+		wire: func(t *testing.T) []byte { return []byte{1, 2, 3, 4} },
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			s := MustParse(`{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":9,"scale":2}`)
+			return func(src []byte) unsafe.Pointer {
+				var got []byte
+				mustAliasDecode(t, s, src, &got, AliasInput())
+				return bytePtr(got)
+			}
+		},
+		inSrc: false, shared: false,
+	},
+}
+
+// TestMatrix_AliasInputByteSource crosses the buffer a decoded value may point
+// into with the target shape that reaches it.
+//
+// The oracle is memory, not a sibling decode path: where an address lies
+// relative to a buffer the test allocated is answerable from the input alone,
+// so a defect the aliasing and copying paths would share cannot hide behind
+// their agreement.
+func TestMatrix_AliasInputByteSource(t *testing.T) {
+	sources := map[string]int{}
+	for _, c := range aliasByteSourceCases {
+		t.Run(c.name, func(t *testing.T) {
+			sources[strings.SplitN(c.name, "/", 2)[0]]++
+
+			decode := c.decoder(t)
+			src1 := c.wire(t)
+			// The rowed reason every foreign buffer is safe to hand over
+			// starts with "no deserfn writes through its src". That is a claim
+			// about behavior, so every cell checks it rather than trusting the
+			// comment: a decode that scribbled on its input would rewrite the
+			// schema's own default bytes on the cells that pass one.
+			untouched := append([]byte(nil), src1...)
+			p1 := decode(src1)
+			if !bytes.Equal(src1, untouched) {
+				t.Errorf("the decode wrote through its src: %x became %x", untouched, src1)
+			}
+			if p1 == nil {
+				t.Fatal("decode returned no payload address; the cell measured nothing")
+			}
+			if in := aliasOffset(p1, src1) >= 0; in != c.inSrc {
+				t.Errorf("value points into src = %v, want %v", in, c.inSrc)
+			}
+
+			// A second decode over a separate buffer: an address that repeats
+			// cannot be a copy handed back twice, since the two runs allocate
+			// independently.
+			src2 := c.wire(t)
+			p2 := decode(src2)
+			if got := p1 == p2; got != c.shared {
+				t.Errorf("two decodes share a backing address = %v, want %v", got, c.shared)
+			}
+			if c.inSrc && aliasOffset(p2, src2) < 0 {
+				t.Error("second run stopped pointing into its own src")
+			}
+		})
+	}
+	// Liveness floor: every source arm must have actually run, or an axis this
+	// matrix claims to cross is carrying no value.
+	for _, want := range []string{"caller-src", "schema-default", "json-default", "synthesized-copy"} {
+		if sources[want] == 0 {
+			t.Errorf("byte source %q was never realized; the axis is dead", want)
+		}
+	}
+	if sources["schema-default"] < 4 {
+		t.Errorf("schema-default ran %d target shapes, want the struct/map/interface/no-option set", sources["schema-default"])
 	}
 }

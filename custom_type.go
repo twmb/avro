@@ -134,6 +134,11 @@ type CustomType struct {
 	//
 	// The schema argument is shared across concurrent callback invocations;
 	// see [CustomType.Encode] for the read-only contract.
+	// A []byte v is not always yours to write to either. Under [AliasInput] it
+	// points into the decode input, and for a field filled from its schema
+	// default that input is the parsed [Schema], which every decode of that
+	// schema shares. Read it or copy from it, but do not write through it.
+	// Returning it is fine; that is what the option is for.
 	Decode func(v any, schema *SchemaNode) (any, error)
 
 	// Set by NewCustomType; if true and AvroType is "", Parse returns

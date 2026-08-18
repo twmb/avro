@@ -1503,11 +1503,11 @@ func (ctx *jsonDecoder) applyFieldDefault(target reflect.Value, node *schemaNode
 	if node.serRecord == nil || idx >= len(node.serRecord.fields) {
 		return fmt.Errorf("record has no pre-encoded default for field %d", idx)
 	}
+	// The schema's own buffer is the src, uncopied, on the same reasoning as
+	// the resolved record's fill loops; see defaultOp.encodedDefault. Here we
+	// also never alias it, because DecodeJSON ignores [AliasInput].
 	enc := node.serRecord.fields[idx].defaultBytes
-	// Copy the encoded bytes — deserfns may slab-substring into src
-	// and we don't want them to reach into the schema's shared default.
-	src := append([]byte(nil), enc...)
-	_, err := node.deserRecord.fields[idx].fn(src, target, ctx.slab)
+	_, err := node.deserRecord.fields[idx].fn(enc, target, ctx.slab)
 	return err
 }
 
