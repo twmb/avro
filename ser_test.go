@@ -21,23 +21,23 @@ import (
 	"time"
 )
 
-// avroTypeReads names every expression in the package that reads an
-// avroType out of a fieldMeta, and says what is doing the reading.
+// avroTypeReads names every expression in the package that reads an avroType
+// out of a fieldMeta, and says what is doing the reading.
 //
-// A record field does not store its Avro type; it asks its fieldMeta through
+// A record field does not store its Avro type. It asks its fieldMeta through
 // serRecordField.avroType / deserRecordField.avroType, which answer "" when
-// there is no meta to ask. That accessor is the reason the compilers can
-// dispatch before proving meta non-nil, so a site that reaches around it and
-// writes f.meta.avroType would fault exactly where the accessor declines —
-// and the two spellings differ by four characters.
+// there is no meta to ask. That accessor is why the compilers can dispatch
+// before proving meta non-nil. A site that reaches around it and writes
+// f.meta.avroType faults exactly where the accessor declines, and the two
+// spellings differ by four characters.
 //
-// Reads off a bare *fieldMeta are a different thing and are rowed as such:
-// the walkers already hold the meta, and there is no field indirection to go
+// Reads off a bare *fieldMeta are a different thing, so we row them as such.
+// The walkers already hold the meta, and there is no field indirection to go
 // around.
 var avroTypeReads = map[string]string{
 	"avroType: f.meta.avroType": "the encode accessor itself",
 	// The decode accessor's body is spelled identically and collapses into
-	// the row above; both are named here so a reader is not left hunting.
+	// the row above. We name both here so a reader is not left hunting.
 
 	"ifaceFnForPrimitive: meta.avroType":                   "bare *fieldMeta",
 	"tryCompileFieldSer: inner.avroType":                   "bare *fieldMeta",
@@ -71,8 +71,8 @@ func TestAvroTypeReadsAreRowed(t *testing.T) {
 				continue
 			}
 			// A CallExpr is visited before its Fun, so recording call
-			// targets on the way down is enough to tell the accessor call
-			// f.avroType() from a field read f.meta.avroType.
+			// targets on the way down is enough. We can then tell the
+			// accessor call f.avroType() from a field read f.meta.avroType.
 			callTargets := map[ast.Node]bool{}
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				if ce, ok := n.(*ast.CallExpr); ok {
@@ -362,10 +362,10 @@ func TestSerRecordMapNullField(t *testing.T) {
 }
 
 // TestEncodeCyclicInput covers the depth-bound fix. A cyclic
-// map[string]any (m["next"] = m) against a recursive schema would
-// otherwise stack-overflow the goroutine — fatal in Go (not
-// recoverable via recover). The encoder now bails with a clean error.
-// Both the binary and JSON encoders are covered.
+// map[string]any (m["next"] = m) against a recursive schema would otherwise
+// stack-overflow the goroutine. That is fatal in Go and not recoverable via
+// recover. We now bail with a clean error, and we cover both the binary and
+// JSON encoders.
 func TestEncodeCyclicInput(t *testing.T) {
 	s := mustParse(t, nodeRecursiveSchema)
 	node := map[string]any{"value": int32(1)}
@@ -398,11 +398,11 @@ func TestEncodeCyclicInput(t *testing.T) {
 			t.Fatalf("expected errTooDeep, got %v", err)
 		}
 	})
-	// Struct fast path: map[string]any goes through serRecord.ser (slow
-	// path which checks depth), but a struct with a *Self field is encoded
-	// via the unsafe fast-field chain (usNullUnionRecord -> serRecordFastPtr
-	// -> field fn -> usNullUnionRecord -> ...). That chain bypasses
-	// serRecord.ser entirely, so the depth check must live on
+	// Struct fast path: map[string]any goes through serRecord.ser, the slow
+	// path that checks depth. But a struct with a *Self field encodes via
+	// the unsafe fast-field chain (usNullUnionRecord -> serRecordFastPtr ->
+	// field fn -> usNullUnionRecord -> ...). That chain bypasses
+	// serRecord.ser entirely, so we must put the depth check on
 	// serRecordFastPtr itself.
 	type cyclicStructNode struct {
 		Value int32             `avro:"value"`
@@ -443,8 +443,8 @@ func TestEncodeCyclicInput(t *testing.T) {
 }
 
 // TestDecodeDeepInputDoesntPanic ensures the decoder bails with errTooDeep
-// rather than stack-overflowing on deeply nested encoded data. Mirrors
-// TestEncodeCyclicInput on the decode side. Uses the binary fast-field
+// rather than stack-overflowing on deeply nested encoded data. We mirror
+// TestEncodeCyclicInput on the decode side, driving the binary fast-field
 // chain (udNullUnionRecord -> deserRecordFastPtr -> field fn -> ...).
 func TestDecodeDeepInputDoesntPanic(t *testing.T) {
 	s := mustParse(t, nodeRecursiveSchema)
@@ -452,7 +452,7 @@ func TestDecodeDeepInputDoesntPanic(t *testing.T) {
 		Value int32 `avro:"value"`
 		Next  *node `avro:"next"`
 	}
-	// Build deeply-nested binary: 5000 levels of "value=0, next=valueByte".
+	// Deeply-nested binary: 5000 levels of "value=0, next=valueByte".
 	var src []byte
 	for range 5000 {
 		src = append(src, 0)    // value (zigzag 0)
@@ -519,11 +519,11 @@ func TestDecodeDeepInputDoesntPanic(t *testing.T) {
 		}
 	})
 	// JSON union trial loop: decodeUnionObject and decodeUnionBare iterate
-	// each branch on failure. The per-branch error must propagate
-	// errTooDeep rather than being swallowed and reported as
-	// "no union branch matched". Builds deeply-nested JSON for a
-	// recursive ["null","Node"] schema; at maxDepth the decode must
-	// surface errTooDeep, not the trial-loop's generic error.
+	// each branch on failure. The per-branch error must propagate errTooDeep
+	// rather than being swallowed and reported as "no union branch matched".
+	// We build deeply-nested JSON for a recursive ["null","Node"] schema. At
+	// maxDepth the decode must surface errTooDeep, not the trial-loop's
+	// generic error.
 	t.Run("json_union_trial_propagates", func(t *testing.T) {
 		var src []byte
 		for range 5000 {
@@ -538,8 +538,8 @@ func TestDecodeDeepInputDoesntPanic(t *testing.T) {
 				t.Fatalf("panicked: %v", r)
 			}
 		}()
-		// Decode into *any so decodeUnionObject's toAny=true branch
-		// runs (the path the bug was in).
+		// We decode into *any so decodeUnionObject's toAny=true branch
+		// runs; that is the path the bug was in.
 		var out any
 		err := s.DecodeJSON(src, &out)
 		if err == nil {
@@ -579,10 +579,10 @@ func TestParseDeeplyNestedSchema(t *testing.T) {
 }
 
 // TestIndirectCyclicInterfaceDoesntLoop ensures every pointer/interface
-// unwrap loop in the library (indirect, indirectAlloc, isNilValue,
-// appendAvroJSON's deref, customEncode's deref) caps at
-// maxIndirectDepth so `var p any; p = &p` (a real cycle through the
-// empty interface) terminates instead of spinning forever.
+// unwrap loop in the library caps at maxIndirectDepth. Those loops are
+// indirect, indirectAlloc, isNilValue, appendAvroJSON's deref, and
+// customEncode's deref. With the cap, `var p any; p = &p`, a real cycle
+// through the empty interface, terminates instead of spinning forever.
 func TestIndirectCyclicInterfaceDoesntLoop(t *testing.T) {
 	s := mustParse(t, `"int"`)
 	var p any
@@ -684,8 +684,8 @@ func TestSerUnionAllFail(t *testing.T) {
 }
 
 func TestSerNullNonNilableType(t *testing.T) {
-	// serNull should not panic when given a non-nilable type (int, string, etc.).
-	// It should return errNonNil, not crash.
+	// serNull must not panic on a non-nilable type (int, string, etc.). We
+	// want errNonNil, not a crash.
 	v := reflect.ValueOf(42)
 	_, err := serNull(nil, v, 0)
 	if err != errNonNil {
@@ -700,7 +700,7 @@ func TestSerNullNonNilableType(t *testing.T) {
 
 func TestSerNullGenericUnionNonNilable(t *testing.T) {
 	// 3-branch union takes the generic serUnion.ser path, which tries
-	// serNull first. Pins that serNull tolerates non-nilable types
+	// serNull first. We pin that serNull tolerates non-nilable types
 	// (e.g. int32) without panicking, falling through to the int branch.
 	s := mustParse(t, `["null","int","string"]`)
 	// int32 is non-nilable; serNull must not panic, and the int branch should match.
@@ -767,7 +767,7 @@ func TestSerTaggedUnionNullUnion(t *testing.T) {
 }
 
 func TestSerTaggedUnionRoundTrip(t *testing.T) {
-	// Decode with TaggedUnions → Encode should round-trip.
+	// Decode with TaggedUnions, then Encode, should round-trip.
 	schema := `{"type":"record","name":"R","fields":[
 		{"name":"id","type":"long"},
 		{"name":"payload","type":["null","string","int"]}
@@ -782,11 +782,10 @@ func TestSerTaggedUnionRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Decode with tagged unions.
 	var native any
 	mustDecode(t, s, bin1, &native, TaggedUnions())
-	// native.payload is now map[string]any{"string": "hello"}.
-	// Re-encode should work.
+	// native.payload is now map[string]any{"string": "hello"}, and we must
+	// be able to re-encode it.
 	bin2, err := s.Encode(native)
 	if err != nil {
 		t.Fatalf("re-encode: %v", err)
@@ -863,7 +862,7 @@ func TestSerTaggedUnionNested(t *testing.T) {
 		if err != nil {
 			t.Fatalf("re-encode: %v", err)
 		}
-		// Map iteration order is non-deterministic, so compare decoded values.
+		// Map iteration order is non-deterministic, so we compare decoded values.
 		var decoded any
 		if _, err := s.Decode(bin2, &decoded); err != nil {
 			t.Fatalf("decode re-encoded: %v", err)
@@ -931,13 +930,12 @@ func TestSerTaggedUnionNested(t *testing.T) {
 }
 
 func TestSerTaggedUnionMapBranchFallback(t *testing.T) {
-	// A map with a key that matches a branch name but whose value fails
-	// to encode on that branch should fall back to trying the map as a
-	// raw value on other branches.
+	// A map with a key matching a branch name, but whose value fails to
+	// encode on that branch, falls back: we try the map as a raw value on
+	// other branches.
 	s := mustParse(t, `["null",{"type":"map","values":"string"},"int"]`)
-	// Key "int" matches the int branch, but the value "not-an-int"
-	// fails on the int branch. The map should then be tried on the
-	// map branch as a one-entry map.
+	// Key "int" matches the int branch, but the value "not-an-int" fails
+	// there. We then try the map on the map branch as a one-entry map.
 	data := map[string]any{"int": "not-an-int"}
 	bin := mustEncode(t, s, data)
 	var out any
@@ -952,10 +950,10 @@ func TestSerTaggedUnionMapBranchFallback(t *testing.T) {
 // union encoder peels Pointer/Interface chains before recognizing a
 // tagged-union map, matching the JSON encoder's entry-peel
 // (appendAvroJSON at json_codec.go) and isNilValue's loop (ser.go).
-// serUnion.tryUnwrapTagged must peel every Pointer and Interface layer
-// — &m and any(&m) wrapping a tagged-form map must encode identically
-// to m and any(m). Pins binary↔JSON parity at top-level, inside
-// arrays of unions, and inside record fields of union type.
+// serUnion.tryUnwrapTagged must peel every Pointer and Interface layer:
+// &m and any(&m) wrapping a tagged-form map must encode identically to m
+// and any(m). We pin binary/JSON parity at top level, inside arrays of
+// unions, and inside record fields of union type.
 func TestMatrix_TaggedUnionEncodeIndirection(t *testing.T) {
 	m := map[string]any{"int": int32(42)}
 	wantInt32 := int32(42)
@@ -974,7 +972,7 @@ func TestMatrix_TaggedUnionEncodeIndirection(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				bin := mustAppendEncode(t, s, nil, tc.in)
 				jsonOut := mustAppendEncodeJSON(t, s, nil, tc.in)
-				// Binary↔binary round-trip: decode should produce the same int.
+				// Binary round-trip: decode should produce the same int.
 				var out any
 				mustDecode(t, s, bin, &out)
 				if out != wantInt32 {
@@ -991,8 +989,8 @@ func TestMatrix_TaggedUnionEncodeIndirection(t *testing.T) {
 	t.Run("3-branch top-level", func(t *testing.T) {
 		s := MustParse(`["null","int","string"]`)
 		// 3-branch goes through the generic serUnion.ser path; 2-branch
-		// goes through serNullUnionAt. Both share tryUnwrapTagged so a
-		// single fix closes both, but lock both explicitly.
+		// goes through serNullUnionAt. Both share tryUnwrapTagged, so a
+		// single fix closes both. We lock both explicitly anyway.
 		bin, err := s.AppendEncode(nil, &m)
 		if err != nil {
 			t.Fatalf("3-branch AppendEncode(&m): %v", err)
@@ -1034,17 +1032,17 @@ func TestMatrix_TaggedUnionEncodeIndirection(t *testing.T) {
 	})
 
 	t.Run("nil cases still picked up by nil-first dispatch", func(t *testing.T) {
-		// The peel-before-tagged-check must NOT route a nil pointer/
-		// interface into the tagged-map branch — it must fall through
-		// to the nil-first dispatch and pick the null branch. Pins
-		// that the peel never hijacks nil into try-each.
+		// The peel-before-tagged-check must NOT route a nil pointer or
+		// interface into the tagged-map branch; it must fall through to
+		// the nil-first dispatch and pick the null branch. We pin that the
+		// peel never hijacks nil into try-each.
 		s := MustParse(`["null","int"]`)
 		var nilMap *map[string]any
 		bin, err := s.AppendEncode(nil, nilMap)
 		if err != nil {
 			t.Fatalf("AppendEncode(nilMap): %v", err)
 		}
-		// varint(0) = byte 0x00 → null branch.
+		// varint(0) = byte 0x00, the null branch.
 		if len(bin) != 1 || bin[0] != 0x00 {
 			t.Fatalf("nil *map: got %x, want [00] (null branch)", bin)
 		}
@@ -1059,8 +1057,8 @@ func TestMatrix_TaggedUnionEncodeIndirection(t *testing.T) {
 	})
 
 	t.Run("non-tagged map shapes still rejected", func(t *testing.T) {
-		// A pointer to a map whose key matches NO branch must still
-		// fail (not silently match the wrong branch).
+		// A pointer to a map whose key matches no branch must still
+		// fail, not silently match the wrong branch.
 		s := MustParse(`["null","int"]`)
 		unknown := map[string]any{"notABranch": int32(42)}
 		if _, err := s.AppendEncode(nil, &unknown); err == nil {
@@ -1256,7 +1254,7 @@ func TestSerIndirectNilInterface(t *testing.T) {
 }
 
 func TestSerNilPointerPrimitives(t *testing.T) {
-	// Exercise indirect nil error in each primitive serializer.
+	// Indirect nil error in each primitive serializer.
 	tests := []struct {
 		name   string
 		schema string
@@ -1335,7 +1333,8 @@ func TestSerMapValueError(t *testing.T) {
 }
 
 func TestSerFixedNonAddressableValue(t *testing.T) {
-	// Pass array by value (not pointer) to exercise non-addressable path.
+	// We pass the array by value, not a pointer, to reach the
+	// non-addressable path.
 	s := mustParse(t, `{"type":"fixed","name":"f","size":4}`)
 	// Pass directly as interface{}, not as &v. The value inside the
 	// interface is not addressable.
@@ -1486,7 +1485,7 @@ func TestSerNestedCDCPipeline(t *testing.T) {
 		t.Errorf("since: got %v, want %v", got, want)
 	}
 
-	// "tags" was missing from input — should use default [].
+	// "tags" was missing from input, so the default [] applies.
 	tags := m["tags"].([]any)
 	if len(tags) != 0 {
 		t.Errorf("tags: got %v, want []", tags)
@@ -1570,7 +1569,7 @@ func TestSerErrorDottedPath(t *testing.T) {
 		]
 	}`
 	s := mustParse(t, schema)
-	// zip is a string, should be int — error should show "address.zip".
+	// zip is a string, should be int; the error must show "address.zip".
 	input := map[string]any{
 		"id": "abc",
 		"address": map[string]any{
@@ -1640,8 +1639,8 @@ func TestSerDecimalCoercion(t *testing.T) {
 				if _, err := s.Decode(refDst, &ref); err != nil {
 					t.Fatalf("decode ref: %v", err)
 				}
-				// float64(3.14) has precision loss, so compare the
-				// decoded values rather than exact byte equality.
+				// float64(3.14) has precision loss, so we compare
+				// decoded values rather than exact bytes.
 				if tt.name == "float64" {
 					// Just verify it decodes without error and is close.
 					f, _ := got.Float64()
@@ -2041,10 +2040,10 @@ func TestSerIntCoercionToFloat(t *testing.T) {
 }
 
 // TestSerIntCoercionToFloatPrecision verifies the lossy-destination
-// policy for int → float encode: values within the target's mantissa
+// policy for int-to-float encode: values within the target's mantissa
 // preserve precision exactly, values beyond silently IEEE-round. Matches
 // Java's Number.floatValue()/doubleValue() and fastavro's float()
-// coercion — see [appendAvroFloat32] / [appendAvroFloat64].
+// coercion; see [appendAvroFloat32] / [appendAvroFloat64].
 func TestSerIntCoercionToFloatPrecision(t *testing.T) {
 	sf := mustParse(t, `"float"`)
 	sd := mustParse(t, `"double"`)
@@ -2114,7 +2113,7 @@ func TestSerFixedAcceptsString(t *testing.T) {
 }
 
 func TestSerJSONRoundtrip(t *testing.T) {
-	// This tests the rpk use case: json.Unmarshal → Encode → Decode → json.Marshal.
+	// The rpk use case: json.Unmarshal, Encode, Decode, json.Marshal.
 	tests := []struct {
 		name      string
 		schema    string
@@ -2225,7 +2224,7 @@ func TestSerJSONRoundtrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// Compare unmarshaled to avoid map ordering issues.
+			// We compare unmarshaled values to avoid map ordering issues.
 			var gotU, expU any
 			mustUnmarshal(t, got, &gotU)
 			mustUnmarshal(t, []byte(tt.expRecord), &expU)
@@ -2299,10 +2298,10 @@ func TestDurationBytesRoundTrip(t *testing.T) {
 
 // TestRegression_SerArrayFloatSilentInf pins the lossy-destination
 // policy: array<float> with []float64{1e40} silently narrows to +Inf
-// on the wire (matches Java/fastavro). Parity check across serFloat
+// on the wire (matches Java/fastavro). We check parity across serFloat
 // (top-level), serArray.serFloat (specialized array), serMap.serFloat
-// (specialized map), and usFloat (unsafe) — every float-encode path
-// must apply the same policy uniformly.
+// (specialized map), and usFloat (unsafe). Every float-encode path must
+// apply the same policy uniformly.
 func TestRegression_SerArrayFloatSilentInf(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"float"}`)
 	huge := 1e40
@@ -2326,7 +2325,7 @@ func TestRegression_SerMapFloatSilentInf(t *testing.T) {
 // TestRegression_SerArrayFloatAcceptsInt verifies that the specialized
 // array<float> path accepts integer elements (silently IEEE-rounding
 // beyond float32's 24-bit mantissa), matching the single-value serFloat
-// path. Pins int → float lossy-destination acceptance for the
+// path. We pin int-to-float lossy-destination acceptance for the
 // specialized array path.
 func TestRegression_SerArrayFloatAcceptsInt(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"float"}`)
@@ -2354,7 +2353,7 @@ func TestRegression_SerArrayDoubleAcceptsInt(t *testing.T) {
 }
 
 // TestSafeUnsafeFloat32OverflowParity locks in that the safe and unsafe
-// encode paths agree on the lossy-destination policy: float64 → float32
+// encode paths agree on the lossy-destination policy: float64 to float32
 // narrowing produces ±Inf on the wire without error, matching Java's
 // (float)doubleValue() silent narrowing.
 func TestSafeUnsafeFloat32OverflowParity(t *testing.T) {
@@ -2396,11 +2395,11 @@ func TestSafeUnsafeUint64LongOverflowParity(t *testing.T) {
 	}
 }
 
-// textBytesMarshaler is a []byte-kind type that ALSO implements
+// textBytesMarshaler is a []byte-kind type that *also* implements
 // TextMarshaler / TextUnmarshaler. The two precedence orders disagree
 // on it: a []byte-first order encodes the raw bytes, a TextMarshaler-
-// first order encodes the text. Used by the array/map/JSON parity
-// regression tests below to lock in the correct precedence.
+// first order encodes the text. The array/map/JSON parity regression
+// tests below use it to lock in the correct precedence.
 type textBytesMarshaler []byte
 
 func (b textBytesMarshaler) MarshalText() ([]byte, error) {
@@ -2415,7 +2414,7 @@ func (b *textBytesMarshaler) UnmarshalText(text []byte) error {
 // TestRegression_SerArrayStringTextMarshaler locks in that the
 // specialized array<string> ser path resolves a []byte-kind value that
 // also implements TextMarshaler via its text representation, not its
-// raw bytes — matching scalar serString. The shared appendAvroString
+// raw bytes, matching scalar serString. The shared appendAvroString
 // helper enforces the precedence across all three sites (scalar,
 // array, map).
 func TestRegression_SerArrayStringTextMarshaler(t *testing.T) {
@@ -2500,7 +2499,7 @@ func TestRegression_OmitzeroNilPointerIsZero(t *testing.T) {
 		t.Errorf("unsafe vs reflect wire differ: % x vs % x", wireAddr, wireVal)
 	}
 	mustEncodeJSON(t, s, &v)
-	// The null branch is index 0 → single 0x00 byte.
+	// The null branch is index 0, a single 0x00 byte.
 	if len(wireAddr) != 1 || wireAddr[0] != 0x00 {
 		t.Errorf("nil omitzero field: got wire % x, want 00 (null branch)", wireAddr)
 	}
@@ -2516,10 +2515,10 @@ func TestRegression_OmitzeroNilPointerIsZero(t *testing.T) {
 	}
 }
 
-// ozPtrCounter has a POINTER-receiver IsZero that treats the sentinel 7 as
-// "zero" — a value that DISAGREES with the structural zero (0). Honoring it is
-// therefore observable in both directions: 7 (structurally non-zero) must be
-// omitted, and 0 (structurally zero) must NOT be omitted.
+// ozPtrCounter has a pointer-receiver IsZero that treats the sentinel 7 as
+// "zero", a value that disagrees with the structural zero (0). Honoring it is
+// observable in both directions: 7 (structurally non-zero) must be omitted,
+// and 0 (structurally zero) must NOT be omitted.
 type ozPtrCounter int64
 
 func (c *ozPtrCounter) IsZero() bool { return *c == 7 }
@@ -2530,18 +2529,19 @@ type ozValCounter int64
 
 func (c ozValCounter) IsZero() bool { return c == 7 }
 
-// omitzero must honor an IsZero() method regardless of whether its receiver is a
-// value or a pointer (doc.go: "fields whose IsZero() method returns true"). A
-// value-typed field whose type has a POINTER-receiver IsZero is addressable when
-// encoding &struct, so (&field).IsZero() is callable; valueIsZero reached only the
-// value method set, silently encoding the value instead of the default/null. The
-// sentinel (7) disagrees with structural zero (0) so both directions are pinned,
-// and the reflect, unsafe and JSON encode paths all route through valueIsZero.
+// omitzero must honor an IsZero() method whether its receiver is a value or
+// a pointer (doc.go: "fields whose IsZero() method returns true"). A
+// value-typed field whose type has a *pointer*-receiver IsZero is addressable
+// when encoding &struct, so (&field).IsZero() is callable. valueIsZero
+// reached only the value method set, silently encoding the value instead of
+// the default or null. The sentinel (7) disagrees with structural zero (0),
+// so we pin both directions. The reflect, unsafe and JSON paths all route
+// through valueIsZero.
 func TestMatrix_OmitzeroPointerReceiverIsZero(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"f","type":["null","long"],"default":null}]}`)
-	null := []byte{0x00}      // union index 0 (null branch) — omitzero acted
-	longZero := []byte{2, 0}  // union index 1 (long), value 0 — not omitted
+	null := []byte{0x00}      // union index 0 (null branch); omitzero acted
+	longZero := []byte{2, 0}  // union index 1 (long), value 0; not omitted
 	longThree := []byte{2, 6} // union index 1 (long), value 3 (zigzag 6)
 
 	// encodeAll returns the reflect (value) and unsafe (&value, addressable)
@@ -2625,10 +2625,10 @@ type withUnexportedEmbedPtr struct {
 }
 
 // A nil anonymous embedded *struct must not panic on encode: its promoted
-// fields encode as zero (symmetric with decode allocating the embedded
-// pointer). Decode into a struct whose embedded pointer is named via an
-// UNEXPORTED type must error cleanly, not panic (Go reflection cannot
-// allocate/set through an unexported embedded pointer).
+// fields encode as zero, symmetric with decode allocating the embedded
+// pointer. Decoding into a struct whose embedded pointer is named via an
+// unexported type must error cleanly, not panic: Go reflection cannot
+// allocate or set through an unexported embedded pointer.
 func TestRegression_EmbeddedPointerStructNoPanic(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"c","type":"int"}]}`)
 
@@ -2647,7 +2647,7 @@ func TestRegression_EmbeddedPointerStructNoPanic(t *testing.T) {
 			t.Errorf("unsafe vs reflect: % x vs % x", wAddr, wVal)
 		}
 		mustEncodeJSON(t, s, &v)
-		// a=0 (zero-filled), c=3 → zig-zag 0x00, 0x06.
+		// a=0 (zero-filled), c=3, so zig-zag 0x00, 0x06.
 		var got withNilEmbedPtr
 		mustDecode(t, s, wAddr, &got)
 		if got.EmbeddedInner == nil || got.A != 0 || got.C != 3 {
@@ -2665,11 +2665,11 @@ func TestRegression_EmbeddedPointerStructNoPanic(t *testing.T) {
 	})
 
 	t.Run("unexported embedded decode works when pre-allocated", func(t *testing.T) {
-		// The refusal above is specific to a NIL unexported embedded
-		// pointer (reflection cannot allocate it — writing the pointer
-		// field itself is what's off-limits). Writing a promoted EXPORTED
-		// field through a non-nil unexported embed is permitted, so a
-		// caller who allocates the embed before decoding must succeed.
+		// The refusal above is specific to a nil unexported embedded
+		// pointer: reflection cannot allocate it, because writing the
+		// pointer field itself is what is off-limits. Writing a promoted
+		// exported field through a non-nil unexported embed is permitted,
+		// so a caller who allocates the embed first must succeed.
 		wire := mustAppendEncode(t, s, nil, &withNilEmbedPtr{EmbeddedInner: &EmbeddedInner{A: 7}, C: 3})
 		got := withUnexportedEmbedPtr{unexportedInner: &unexportedInner{}}
 		if _, err := s.Decode(wire, &got); err != nil {
@@ -2682,7 +2682,7 @@ func TestRegression_EmbeddedPointerStructNoPanic(t *testing.T) {
 }
 
 // A multi-pointer field (**T / **Record) mapped to ["null", T] holding
-// &(*T)(nil) — a non-nil outer pointer wrapping a nil inner — is
+// &(*T)(nil), a non-nil outer pointer wrapping a nil inner, is
 // nil-equivalent per isNilValue, so it must encode as the null branch.
 // The unsafe struct fast-path enter peeled only the outer pointer and
 // committed to the value branch (then faulted on the nil inner), diverging
@@ -2711,7 +2711,7 @@ func TestRegression_UnsafeMultiPtrNullUnionNil(t *testing.T) {
 	if !bytes.Equal(wAddr, wVal) {
 		t.Errorf("unsafe vs reflect diverge: % x vs % x", wAddr, wVal)
 	}
-	// Both null → two 0x00 bytes.
+	// Both null, so two 0x00 bytes.
 	if len(wAddr) != 2 || wAddr[0] != 0x00 || wAddr[1] != 0x00 {
 		t.Errorf("got wire % x, want 00 00 (both null branches)", wAddr)
 	}
@@ -2719,15 +2719,15 @@ func TestRegression_UnsafeMultiPtrNullUnionNil(t *testing.T) {
 }
 
 // TestMatrix_TextAppenderHeaderGrowth pins appendAvroString's AppendText
-// inline-write slow path: it reserves a 1-byte length placeholder, lets
-// AppendText write directly into dst, then — when the real text length needs
-// MORE varint header bytes than the placeholder — grows dst by exactly the
-// difference and shifts the text right. Every other AppendText test uses short
-// values that stay on the 1-byte-header fast path, so the grow arithmetic had no
-// wire-level coverage, and an over- or under-grow there leaves trailing garbage
-// or truncates, corrupting the wire for the NEXT field. This drives text lengths
-// across both varint-width boundaries and asserts an exact round trip both
-// standalone and as the first field of a record.
+// inline-write slow path. It reserves a 1-byte length placeholder and lets
+// AppendText write directly into dst. It then grows dst by exactly the
+// difference and shifts the text right, when the real length needs more varint
+// header bytes than the placeholder. Every other AppendText test uses short
+// values that stay on the 1-byte-header fast path, so the grow arithmetic had
+// no wire-level coverage. An over- or under-grow leaves trailing garbage or
+// truncates, corrupting the wire for the next field. We drive text lengths across both
+// varint-width boundaries and assert an exact round trip, standalone and as the
+// first field of a record.
 func TestMatrix_TextAppenderHeaderGrowth(t *testing.T) {
 	s := MustParse(`"string"`)
 	rec := MustParse(`{"type":"record","name":"R","fields":[
@@ -2778,9 +2778,9 @@ func TestMatrix_TextAppenderHeaderGrowth(t *testing.T) {
 // type (int32 for "int", int64/int for "long", float32/float64, bool,
 // string) with a direct read+emit loop, bypassing the per-element
 // appendAvro* dispatch. A named element type of the same underlying kind
-// routes through the GENERAL appendAvro* path instead. This pins the
-// invariant that the two produce byte-identical wire — the fast loop must
-// never diverge from the general path, including at boundary values.
+// routes through the general appendAvro* path instead. The two must produce
+// byte-identical wire: the fast loop may never diverge from the general
+// path, including at boundary values.
 
 type fpInt32 int32
 type fpInt64 int64
@@ -2794,8 +2794,8 @@ func TestMatrix_ArrayElementFastPathMatchesGeneral(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
-		fast   any // builtin element type → fast loop
-		gen    any // named element type → general appendAvro* path
+		fast   any // builtin element type takes the fast loop
+		gen    any // named element type takes the general appendAvro* path
 	}{
 		{"int", `{"type":"array","items":"int"}`,
 			[]int32{0, 1, -1, math.MaxInt32, math.MinInt32},
@@ -2851,9 +2851,9 @@ func TestMatrix_ArrayElementFastPathMatchesGeneral(t *testing.T) {
 }
 
 // Decode-side native path: a builtin []V decodes via the concrete-slice loop
-// (s[i]=v); a named slice type and a named-element type must fall back to the
-// reflect loop (the unnamed-[]V assertion returns handled=false) and still
-// decode correctly with src untouched on the fallthrough.
+// (s[i]=v). A named slice type and a named-element type must fall back to the
+// reflect loop, since the unnamed-[]V assertion returns handled=false. They
+// must still decode correctly, with src untouched on the fallthrough.
 func TestRegression_ArrayDecodeNamedFallback(t *testing.T) {
 	type namedSlice []int32
 	type namedElem int32
@@ -2865,12 +2865,12 @@ func TestRegression_ArrayDecodeNamedFallback(t *testing.T) {
 	if !reflect.DeepEqual(builtin, want) {
 		t.Fatalf("native []int32: %v != %v", builtin, want)
 	}
-	var ns namedSlice // named slice type → fallback
+	var ns namedSlice // named slice type, so the fallback
 	mustDecode(t, s, wire, &ns)
 	if !reflect.DeepEqual([]int32(ns), want) {
 		t.Fatalf("named slice fallback: %v", ns)
 	}
-	var ne []namedElem // named elem type → fallback
+	var ne []namedElem // named elem type, so the fallback
 	mustDecode(t, s, wire, &ne)
 	if !reflect.DeepEqual(ne, []namedElem{0, 1, -1, math.MaxInt32, math.MinInt32}) {
 		t.Fatalf("named elem fallback: %v", ne)
@@ -2889,13 +2889,14 @@ func TestRegression_MapValueFastPathMatchesGeneral(t *testing.T) {
 
 // ---------- array_zerobyte_compat_test.go ----------
 
-// TestRegression_ArrayZeroByteProducerCompliance pins producer-side compliance
-// with the decoder's zero-byte-item cap. The decoder rejects an array of more than
-// maxZeroByteItems zero-byte items as a deliberate DoS defense, but the core array
-// ENCODER had no matching check, so s.Encode produced a tiny wire that s.Decode
-// then rejected — a silent self-incompatible round trip, the same class as the OCF
-// zero-byte writer bound: every reader-side cap needs a producer-side compliance
-// check. Everything at or below the cap still round-trips.
+// TestRegression_ArrayZeroByteProducerCompliance pins producer-side
+// compliance with the decoder's zero-byte-item cap. The decoder rejects an
+// array of more than maxZeroByteItems zero-byte items as a deliberate DoS
+// defense. The core array encoder had no matching check, so s.Encode produced
+// a tiny wire that s.Decode then rejected. That is a silent self-incompatible
+// round trip, the same class as the OCF zero-byte writer bound. Every reader-side cap needs a
+// producer-side compliance check. Everything at or below the cap still
+// round-trips.
 func TestRegression_ArrayZeroByteProducerCompliance(t *testing.T) {
 	zeroByteItemSchemas := []struct {
 		label  string
@@ -2919,7 +2920,7 @@ func TestRegression_ArrayZeroByteProducerCompliance(t *testing.T) {
 		t.Run(zb.label, func(t *testing.T) {
 			s := MustParse(zb.schema)
 
-			// At the cap: must encode AND round-trip (self-readable).
+			// At the cap: must encode and round-trip (self-readable).
 			atCap := fill(zb.item, maxZeroByteItems)
 			wire, err := s.AppendEncode(nil, atCap)
 			if err != nil {
@@ -2933,8 +2934,8 @@ func TestRegression_ArrayZeroByteProducerCompliance(t *testing.T) {
 				t.Fatalf("round-trip length: got %d want %d", len(back), maxZeroByteItems)
 			}
 
-			// One past the cap: the encoder must REJECT (producer compliance),
-			// not emit a wire the decoder rejects.
+			// One past the cap: we must reject at encode time, not emit a
+			// wire the decoder rejects.
 			over := fill(zb.item, maxZeroByteItems+1)
 			if _, err := s.AppendEncode(nil, over); err == nil {
 				t.Fatalf("encoder produced a %d zero-byte-item array the decoder rejects (self-incompatible); want an encode-time error", maxZeroByteItems+1)
@@ -2946,10 +2947,10 @@ func TestRegression_ArrayZeroByteProducerCompliance(t *testing.T) {
 }
 
 // TestRegression_ArrayZeroByteSkipPathCompliance covers the resolution skip
-// path: a writer record with an array<null> field the reader drops. Because
-// the encoder now refuses to PRODUCE an over-cap zero-byte array, no such wire
-// reaches the skip path from a twmb writer — the self-incompatibility is
-// resolved at its source. The under-cap case still resolves+skips cleanly.
+// path: a writer record with an array<null> field the reader drops. Because we
+// now refuse to produce an over-cap zero-byte array, no such wire reaches the
+// skip path from one of our own writers, so the self-incompatibility is
+// resolved at its source. The under-cap case still resolves and skips cleanly.
 func TestRegression_ArrayZeroByteSkipPathCompliance(t *testing.T) {
 	wSchema := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"drop","type":{"type":"array","items":"null"}},
@@ -2983,15 +2984,15 @@ func TestRegression_ArrayZeroByteSkipPathCompliance(t *testing.T) {
 
 // ---------- array_zerobyte_unsafe_test.go ----------
 
-// TestRegression_ArrayZeroByteUnsafePathCompliance covers the UNSAFE array
+// TestRegression_ArrayZeroByteUnsafePathCompliance covers the unsafe array
 // encoders (usArrayRecord / usArrayPtrRecord / usArrayDirect), reached when an
-// array of zero-byte items is an addressable struct field. The first fix added
-// the producer-side maxZeroByteItems check only to the reflect serArray.ser;
-// its unsafe twins write the count + body with no guard, so a struct field
-// []EmptyRecord / []*EmptyRecord / [][0]byte of more than maxZeroByteItems
-// elements still encoded to a tiny wire the decoder rejects. (Sibling sweep:
-// the reflect and unsafe array encoders must share one compliance helper so
-// they cannot drift — that is what this pins.)
+// array of zero-byte items is an addressable struct field. The first fix
+// added the producer-side maxZeroByteItems check only to the reflect
+// serArray.ser. Its unsafe twins write the count and body with no guard, so a
+// struct field []EmptyRecord / []*EmptyRecord / [][0]byte of more than
+// maxZeroByteItems elements still encoded to a tiny wire the decoder rejects.
+// The reflect and unsafe array encoders must share one compliance helper so
+// they cannot drift, which is what we pin here.
 func TestRegression_ArrayZeroByteUnsafePathCompliance(t *testing.T) {
 	type emptyRec struct{}
 
@@ -3059,7 +3060,7 @@ func TestRegression_ArrayZeroByteUnsafePathCompliance(t *testing.T) {
 				t.Fatalf("SELF-INCOMPATIBILITY (unsafe path): encoded at the cap but cannot decode: %v", err)
 			}
 
-			// Over the cap: the unsafe encoder must REJECT, not emit a wire
+			// Over the cap: the unsafe encoder must reject, not emit a wire
 			// the decoder refuses.
 			if _, err := s.AppendEncode(nil, c.over); err == nil {
 				t.Fatal("unsafe array encoder produced an over-cap zero-byte array the decoder rejects; want an encode-time error")
@@ -3072,13 +3073,13 @@ func TestRegression_ArrayZeroByteUnsafePathCompliance(t *testing.T) {
 
 // ---------- empty_bytes_identity_test.go ----------
 
-// Decoding empty Avro bytes into `any` must produce a NON-nil []byte. A nil
-// []byte is nil-equivalent on re-encode — the documented nil-first union
-// dispatch sends Go nil to the null branch — so a nil result flips {"bytes": ""}
-// to null through any decode→re-encode pipeline:
+// Decoding empty Avro bytes into `any` must produce a non-nil []byte. A nil
+// []byte is nil-equivalent on re-encode, because the documented nil-first
+// union dispatch sends Go nil to the null branch, so a nil result flips
+// {"bytes": ""} to null through any decode and re-encode pipeline:
 //
 //	["null","bytes"] wire 02 00 (bytes branch, length 0)
-//	  → decode → []byte(nil) → re-encode → 00 (null branch)   ← corruption
+//	  -> decode -> []byte(nil) -> re-encode -> 00 (null branch)   <- corrupt
 //
 // Java decodes empty bytes to an empty non-null ByteBuffer and fastavro to b"",
 // both re-encoding onto the bytes branch; twmb's JSON decoder, deserFixed and
@@ -3101,7 +3102,7 @@ func TestRegression_EmptyBytesDecodeNonNil(t *testing.T) {
 	}
 
 	// The union round-trip consequence: the bytes branch survives a
-	// decode→re-encode cycle.
+	// decode and re-encode cycle.
 	u := MustParse(`["null","bytes"]`)
 	w1 := []byte{0x02, 0x00} // bytes branch, length 0
 	var ua any
@@ -3123,7 +3124,7 @@ func TestRegression_EmptyBytesDecodeNonNil(t *testing.T) {
 		t.Fatalf("JSON decoded %T nil=%v; want non-nil []byte", ja, ja == nil)
 	}
 
-	// The string→bytes promotion path shares setBytesValue, so a
+	// The string-to-bytes promotion path shares setBytesValue, so a
 	// promoted empty string also surfaces as non-nil bytes.
 	ws := MustParse(`"string"`)
 	rb := MustParse(`"bytes"`)
@@ -3140,8 +3141,8 @@ func TestRegression_EmptyBytesDecodeNonNil(t *testing.T) {
 		t.Fatalf("promoted empty string decoded as %T nil=%v; want non-nil []byte", pa, pa == nil)
 	}
 
-	// Encoding a Go-nil []byte still picks the null branch (the
-	// documented nil-first dispatch is about ENCODE inputs, untouched).
+	// Encoding a Go-nil []byte still picks the null branch: the
+	// documented nil-first dispatch is about encode inputs, untouched.
 	wNil, err := u.AppendEncode(nil, []byte(nil))
 	if err != nil {
 		t.Fatalf("encode nil []byte: %v", err)
@@ -3153,17 +3154,18 @@ func TestRegression_EmptyBytesDecodeNonNil(t *testing.T) {
 
 // ---------- min_bytes_standin_test.go ----------
 
-// A per-element minimum selects which block-count RULE applies, and the rules are
-// not ordered: zero takes the zero-byte cap, positive takes the buffer-relative
-// bound, and neither is uniformly looser. So the walk may never round a minimum UP
-// when it cannot compute one — reporting 1 for a type whose true minimum is 0 does
-// not loosen the bound, it moves a legitimately zero-byte container onto a rule it
-// cannot satisfy. The walk has two places it cannot compute: an unwired forward
-// reference (nil child) and an exhausted allowance. Both used to report 1.
+// A per-element minimum selects which block-count rule applies, and the rules
+// are not ordered: zero takes the zero-byte cap, positive takes the
+// buffer-relative bound, and neither is uniformly looser. So the walk may never
+// round a minimum *up* when it cannot compute one. Reporting 1 for a type whose
+// true minimum is 0 does not loosen the bound, it moves a legitimately
+// zero-byte container onto a rule it cannot satisfy. The walk has two places it
+// cannot compute: an unwired forward reference (nil child) and an exhausted
+// allowance. Both used to report 1.
 
 // standInSCC is a cyclic SCC deep enough that one walk over it exhausts the
 // min-bytes allowance. Defined first and fully wired, so a later container over
-// "L0" resolves to a built node on the BUILD path.
+// "L0" resolves to a built node on the build path.
 func standInSCC(levels int) string {
 	inner := `["null","L0"]`
 	for i := levels - 1; i >= 0; i-- {
@@ -3179,10 +3181,10 @@ func standInSCC(levels int) string {
 const standInSCCLevels = 26
 
 // TestRegression_ZeroMinimumContainerAfterDrainedAllowance pins the exhaustion
-// stand-in. Two schemas differing ONLY in field order: the shared walk is
+// stand-in. Two schemas differing only in field order: the shared walk is
 // drained by the SCC container before the zero-byte container is reached in one
 // and after it in the other. Both must accept the array their own encoder
-// produced — an uncomputed minimum may change how loose a bound is, never
+// produced. An uncomputed minimum may change how loose a bound is, never
 // whether a valid wire passes.
 func TestRegression_ZeroMinimumContainerAfterDrainedAllowance(t *testing.T) {
 	mk := func(drainFirst bool) string {
@@ -3220,23 +3222,23 @@ func TestRegression_ZeroMinimumContainerAfterDrainedAllowance(t *testing.T) {
 }
 
 // TestMatrix_ZeroMinimumContainerBehindForwardRef pins the nil-child stand-in.
-// The forward reference must sit BELOW the container's direct child, and that is
-// the whole shape — do not "simplify" this to an array-of-forward-reference.
+// The forward reference must sit *below* the container's direct child, and that
+// is the whole shape: do not "simplify" this to an array-of-forward-reference.
 //
-// A container whose DIRECT child is the forward reference is registered in
-// containerFixups, and finalize re-derives its minimum once the reference is
+// A container whose direct child is the forward reference is registered in
+// containerFixups. finalize re-derives its minimum once the reference is
 // wired, so the build-time answer is overwritten and the nil stand-in never
 // reaches the wire path. That is the "direct" control below, correct on both
-// declaration orders even without this fix. One level down, nothing re-patches:
-// the array's items is an inline record, immediately resolvable, so the array is
-// NOT a fixup — while that record's own FIELD is the forward reference, so the
-// walk sees a nil child at build and the value it computes there is the value
-// the decoder uses forever.
+// declaration orders even without this fix. One level down, nothing
+// re-patches. The array's items is an inline record, immediately resolvable,
+// so the array is NOT a fixup. That record's own field is the forward
+// reference, so the walk sees a nil child at build, and the value it computes
+// there is the value the decoder uses forever.
 func TestMatrix_ZeroMinimumContainerBehindForwardRef(t *testing.T) {
 	const later = `{"type":"record","name":"Later","fields":[]}` // true minimum: 0 wire bytes
-	// nested: items is an inline record whose FIELD is the forward reference.
+	// nested: items is an inline record whose field is the forward reference.
 	const nested = `{"type":"array","items":{"type":"record","name":"Inner","fields":[{"name":"g","type":"Later"}]}}`
-	// direct: items IS the forward reference — the fixup re-derives this one.
+	// direct: items is the forward reference itself; the fixup re-derives it.
 	const direct = `{"type":"array","items":"Later"}`
 
 	for _, c := range []struct {
@@ -3287,11 +3289,11 @@ type standInCase struct {
 	name     string
 	src      string
 	value    func(n int) map[string]any // the record value carrying n elements
-	zeroMin  bool                       // the element's TRUE minimum is 0
+	zeroMin  bool                       // the element's true minimum is 0
 	countKey string                     // field holding the container under test
 }
 
-// standInCases crosses STAND-IN SOURCE x CONTAINER x ELEMENT-TRUE-MINIMUM.
+// standInCases crosses stand-in source x container x element-true-minimum.
 // The stand-in source is the axis the bug turned on; the element's true minimum
 // is the axis that decides which rule is correct, and holding it at "positive"
 // is why an over-reporting stand-in looked harmless.
@@ -3351,7 +3353,7 @@ func standInCases() []standInCase {
 			{"positive-min/int", `"int"`, intElem, false},
 		} {
 			z := `{"name":"z","type":` + container.wrap(elem.src) + `}`
-			// none: the control — nothing prevents the walk from computing.
+			// none: the control, nothing prevents the walk from computing.
 			cs = append(cs, standInCase{
 				name: "none/" + container.kind + "/" + elem.kind, src: rec(z),
 				value: container.val(elem.mk), zeroMin: elem.zero, countKey: "z",
@@ -3364,7 +3366,7 @@ func standInCases() []standInCase {
 			})
 		}
 		// nil-child: the element's own subtree holds an unwired forward
-		// reference at build. Crossed against BOTH true minima, because the
+		// reference at build. Crossed against both true minima, because the
 		// stand-in is only wrong for one of them.
 		for _, elem := range []struct {
 			kind   string
@@ -3395,9 +3397,9 @@ func standInCases() []standInCase {
 }
 
 // TestMatrix_MinBytesStandInNeverOverReports is the class net. Its oracle is
-// ENCODE-IMPLIES-DECODE — this package's own encoder produces the wire, so its
-// own decoder must accept it — which is calibration-free and reads nothing off
-// the walk's current behavior.
+// encode-implies-decode: our own encoder produces the wire, so our own decoder
+// must accept it. That is calibration-free and reads nothing off the walk's
+// current behavior.
 //
 // The DoS half runs on every cell too: a bound that stopped false-rejecting by
 // disappearing would pass the accept half alone.
@@ -3410,7 +3412,7 @@ func TestMatrix_MinBytesStandInNeverOverReports(t *testing.T) {
 			}
 			// A count that exercises the rule: for a zero-minimum element the
 			// documented zero-byte cap is the only thing bounding it, so sit
-			// exactly ON the cap.
+			// exactly on the cap.
 			n := maxZeroByteItems
 			if !c.zeroMin {
 				n = 512
@@ -3453,10 +3455,10 @@ func indexOfBlockCount(wire []byte, n int) int {
 }
 
 // TestRegression_ZeroByteItemCapStillHolds is the boundary-1 half of the pins
-// above: the fix must not have bought acceptance by dropping the cap. AT the cap
-// accepts, one past it rejects — on a schema with no stand-in and on one where
-// the walk was drained, so the unknown RULE is held to the same limit as the
-// computed one.
+// above: the fix must not have bought acceptance by dropping the cap. At the
+// cap accepts, one past it rejects, on a schema with no stand-in and on one
+// where the walk was drained, so the unknown rule is held to the same limit as
+// the computed one.
 //
 // The over-cap wire is hand-built because the encoder enforces the same cap
 // (encoding 4097 zero-byte items is refused), which is itself the property that
@@ -3502,24 +3504,25 @@ func TestRegression_ZeroByteItemCapStillHolds(t *testing.T) {
 //
 // The behavioral cells live next door (magnitude_arithmetic_matrix_test.go);
 // they can only see arithmetic that reaches an observable outcome. Two things
-// they cannot see are here: the invariant the PRODUCER of a derived bound
+// they cannot see are here: the invariant the producer of a derived bound
 // owes its callers, and the enumeration of every site in the package where a
 // magnitude meets an arithmetic operator at all.
 // ---------------------------------------------------------------------------
 
 // TestInvariant_SchemaMinBytesSaturates is what makes a ceiling at the producer
-// sufficient. Two properties, both derived from what a per-element minimum MEANS
-// rather than from what the code returns:
+// sufficient. Two properties, both derived from what a per-element minimum
+// means rather than from what the code returns:
 //
 //   - It is a byte count, so it is never negative, and `1 + it` (which three
-//     callers compute) is never zero — a zero divides, and a negative one turns
+//     callers compute) is never zero: a zero divides, and a negative one turns
 //     a buffer-relative bound into its own opposite.
-//   - A value that provably occupies at least one wire byte must report at least
-//     one. Reporting zero or less is not a loose bound but a MISCLASSIFICATION:
-//     the zero-byte element cap and the buffer-relative bound are different
-//     rules with different limits, and a non-positive minimum silently routes an
-//     element through the wrong one. That half is invisible to a decode test,
-//     because both rules end in an error for a truncated wire.
+//   - A value that provably occupies at least one wire byte must report at
+//     least one. Reporting zero or less is not a loose bound but a
+//     misclassification. The zero-byte element cap and the buffer-relative
+//     bound are different rules with different limits, and a non-positive
+//     minimum silently routes an element through the wrong one. That half is
+//     invisible to a decode test, because both rules end in an error for a
+//     truncated wire.
 func TestInvariant_SchemaMinBytesSaturates(t *testing.T) {
 	const huge = `{"type":"fixed","name":"HF","size":9223372036854775807}`
 	// Sums that wrap: a small lead, then magnitudes large enough to carry the
@@ -3541,11 +3544,11 @@ func TestInvariant_SchemaMinBytesSaturates(t *testing.T) {
 		{"huge-fixed", huge, true},
 		{"sum-wraps-to-zero", sumToZero, true},
 		{"sum-wraps-negative", sumToNeg, true},
-		// A union reports one byte for its branch index plus its SMALLEST
+		// A union reports one byte for its branch index plus its smallest
 		// branch, so a union carrying a null branch reports 1 no matter what
 		// else is in it. Only a union whose every branch is huge drives the
-		// union arm's own arithmetic — the ["null", huge] shape below is the
-		// one that looks like it covers this and does not.
+		// union arm's own arithmetic; the ["null", huge] shape below looks
+		// like it covers this and does not.
 		{"union-of-huge-only", `[` + huge + `]`, true},
 		{"union-of-two-huge", `[` + huge + `,{"type":"fixed","name":"HF2","size":9223372036854775806}]`, true},
 		{"huge-fixed-in-union", `["null",` + huge + `]`, true},
@@ -3594,10 +3597,10 @@ func TestInvariant_SchemaMinBytesSaturates(t *testing.T) {
 }
 
 // TestInvariant_UnionMinimumCoversItsBranches catches the one wrong answer a
-// range check cannot: a union arm that scans for the smallest branch starting
-// from a SENTINEL reports the no-branches answer whenever a branch's own
-// minimum happens to equal that sentinel — and the no-branches answer is 1,
-// which is small, plausible, and inside every bound anyone would assert.
+// range check cannot. A union arm that scans for the smallest branch starting
+// from a sentinel reports the no-branches answer whenever a branch's own
+// minimum happens to equal that sentinel. The no-branches answer is 1, which
+// is small, plausible, and inside every bound anyone would assert.
 //
 // The property is calibration-free: a union writes a branch index and then a
 // branch, so it cannot cost less than its cheapest branch costs alone.
@@ -3632,7 +3635,7 @@ func TestInvariant_UnionMinimumCoversItsBranches(t *testing.T) {
 }
 
 // TestInvariant_SaturateSchemaMagnitudeIsTotal pins the accessor's own
-// contract, which every consumer leans on: the result is in range for ANY
+// contract, which every consumer leans on: the result is in range for any
 // input, including the ones no parse can produce today. A consumer that has
 // to ask whether its input was already validated is a consumer that will
 // eventually guess wrong.
@@ -3654,12 +3657,12 @@ func TestInvariant_SaturateSchemaMagnitudeIsTotal(t *testing.T) {
 	}
 }
 
-// TestInvariant_MagnitudeCeilingSurvivesItsLargestMultiplier is the reason the
-// ceiling has the value it does. The package's consumers do not just add
-// magnitudes, they scale them — the widest is bits-per-byte in the decimal
-// capacity calculation — and the ceiling has to leave that product inside a
-// 32-bit int so the arithmetic is safe on every build, not just the ones
-// where int happens to be 64 bits.
+// TestInvariant_MagnitudeCeilingSurvivesItsLargestMultiplier is the reason
+// the ceiling has the value it does. Our consumers do not just add
+// magnitudes, they scale them. The widest is bits-per-byte in the decimal
+// capacity calculation. The ceiling has to leave that product inside a 32-bit
+// int, so the arithmetic is safe on every build, not just the ones where int
+// happens to be 64 bits.
 func TestInvariant_MagnitudeCeilingSurvivesItsLargestMultiplier(t *testing.T) {
 	const int32Max = 1<<31 - 1
 	if got := int64(maxSchemaMagnitude) * magnitudeWidestMultiplier; got > int32Max {
@@ -3677,25 +3680,26 @@ func TestInvariant_MagnitudeCeilingSurvivesItsLargestMultiplier(t *testing.T) {
 // The enumeration: every site in the package where a schema-declared magnitude
 // meets an arithmetic operator. Three conditions, all required:
 //
-//  1. An operand carries a magnitude the schema TEXT chose. The only primitive
-//     one is a `fixed` size, the parser leaving its upper bound open; precision
-//     and scale are parse-capped, and counts are bounded by the input length.
-//     But magnitude PROPAGATES: through arithmetic, through a function that
+//  1. An operand carries a magnitude the schema text chose. The only primitive
+//     one is a `fixed` size, whose upper bound the parser leaves open;
+//     precision and scale are parse-capped, and counts are bounded by the
+//     input length.
+//     But magnitude propagates: through arithmetic, through a function that
 //     returns it, and through one it is passed into. A per-record sum over field
 //     minimums holds no `.size` anywhere in its expression and is the wrap this
 //     file exists for, which is why a set built by grepping `.size` is wrong.
 //  2. The operator can leave the integer range: + - * / % <<, or a make()
-//     length. Comparisons cannot — `a < b` has the same answer at every
-//     magnitude — and neither can formatting or assignment. This is why grepping
-//     `.size` OVER-reports: most of its reads are comparisons.
-//  3. The value is an INTEGER. A magnitude handed on as []byte, string or
+//     length. Comparisons cannot, since `a < b` has the same answer at every
+//     magnitude, and neither can formatting or assignment. This is why grepping
+//     `.size` over-reports: most of its reads are comparisons.
+//  3. The value is an integer. A magnitude handed on as []byte, string or
 //     *big.Int has left the integer domain.
 //
 // So the rule is reachability, not a pattern, and it is derived below rather
 // than listed: seeds are the magnitude-bearing fields, and taint flows to
 // integer-typed returns and parameters until it stops growing. The derivation
-// deliberately OVER-approximates — it has no types, so a reflect.Type's Size()
-// reads as a magnitude — and every over-report is a row saying so.
+// deliberately over-approximates, since it has no types and so reads a
+// reflect.Type's Size() as a magnitude; every over-report is a row saying so.
 // ---------------------------------------------------------------------------
 
 type magVerdict string
@@ -3708,7 +3712,7 @@ const (
 	magBoundedHere magVerdict = "bounded-here"
 	// An over-report: the operand is not a schema-declared magnitude.
 	magNotAMagnitude magVerdict = "not-a-magnitude"
-	// Wrapping IS the operation's definition.
+	// Wrapping is the operation's definition.
 	magWrapIsTheContract magVerdict = "wrap-is-the-contract"
 )
 
@@ -3720,7 +3724,7 @@ type magnitudeSite struct {
 }
 
 // magnitudeSites classifies every site the derivation reports. A site that
-// appears with no row FAILS: that is a new consumer of a magnitude, and the
+// appears with no row fails. That is a new consumer of a magnitude, and the
 // point of the table is that someone has to say what happens to it at the top
 // of the range. A row naming no site fails too, so the table cannot go stale
 // while reading as coverage.
@@ -3901,7 +3905,7 @@ func magUsesIdent(n ast.Node, names map[string]bool) bool {
 }
 
 // magTainted returns every identifier in fd carrying a magnitude: its tainted
-// PARAMETERS plus locals assigned from a seed, a magnitude-returning call, or
+// parameters plus locals assigned from a seed, a magnitude-returning call, or
 // another tainted identifier. The local loop runs to a fixpoint so order of
 // assignment inside the function does not matter.
 func magTainted(fd *ast.FuncDecl, st *magTaint) map[string]bool {
@@ -4112,15 +4116,15 @@ func magScan(t *testing.T) (map[string]int, map[string]bool) {
 
 // TestInvariant_EveryMagnitudeArithmeticSiteIsClassified is the completeness
 // half. A new expression that puts a schema-declared magnitude under an
-// arithmetic operator lands with no row and fails here until someone says what
-// it does at the top of the range; a row that names no site fails too, so the
-// table cannot quietly describe code that no longer exists.
+// arithmetic operator lands with no row. It fails here until someone says
+// what it does at the top of the range. A row that names no site fails too,
+// so the table cannot quietly describe code that no longer exists.
 func TestInvariant_EveryMagnitudeArithmeticSiteIsClassified(t *testing.T) {
 	counts, magFns := magScan(t)
 
 	// Anti-rot: the derivation is name-based, so a rename of the seed fields
 	// or of the producer would leave it scanning for nothing and reporting a
-	// clean table. These two functions ARE the class; if the fixpoint stops
+	// clean table. These two functions *are* the class; if the fixpoint stops
 	// finding them, the guard is watching an empty set.
 	for _, want := range []string{"minBytesFromChildren", "maxDecimalDigits"} {
 		if !magFns[want] {
@@ -4177,11 +4181,11 @@ func magCountVerdict(v magVerdict) int {
 }
 
 // TestInvariant_ClippedMagnitudeStillRejects is the control for the one thing
-// saturation gives up: a magnitude above the ceiling yields a LOOSER
+// saturation gives up: a magnitude above the ceiling yields a looser
 // buffer-relative bound than the true magnitude would. The bound still has to
 // refuse a block that cannot fit, which for any buffer below the ceiling it
-// does on the bound itself — so the concession costs an error message on
-// absurd schemas and nothing else.
+// does on the bound itself, so the concession costs an error message on absurd
+// schemas and nothing else.
 func TestInvariant_ClippedMagnitudeStillRejects(t *testing.T) {
 	// Each element needs 2^40 bytes; the ceiling clips that to 2^27.
 	s := mustParse(t, `{"type":"array","items":{"type":"fixed","name":"CBF","size":1099511627776}}`)
@@ -4197,17 +4201,17 @@ func TestInvariant_ClippedMagnitudeStillRejects(t *testing.T) {
 // ---------- union_tag_tiers_test.go ----------
 
 // ---------------------------------------------------------------------------
-// The tag namespace's TIER SET is derived, not listed.
+// The tag namespace's tier set is derived, not listed.
 //
 // Two consumers read it: findUnionBranch resolves a caller-written name, and
-// fillUnionTagTables builds the binary tagged-map lookup. Both walk unionTagTiers,
-// so neither can grow a tier the other lacks. What remains possible is someone
-// adding a tier by HAND inside one of them, or adding one to the slice that no
-// test ever reaches — and those are what these guards refuse.
+// fillUnionTagTables builds the binary tagged-map lookup. Both walk
+// unionTagTiers, so neither can grow a tier the other lacks. What remains
+// possible is someone adding a tier by hand inside one of them, or adding one
+// to the slice that no test ever reaches; those are what these guards refuse.
 // ---------------------------------------------------------------------------
 
 // unionTagTierCount is the number of tiers the suite knows how to reach. It is
-// stated here so that adding a tier is a DECISION: the count fails, and the
+// stated here so that adding a tier is a decision: the count fails, and the
 // person adding it has to extend the corpus in
 // TestInvariant_EveryUnionTagTierIsReachable rather than let a tier ship
 // unexercised.
@@ -4255,9 +4259,9 @@ func funcBody(t *testing.T, file, fn string) string {
 }
 
 // TestInvariant_UnionTagTiersAreDerived is the source-level half: both
-// consumers must reach the tier set by WALKING it. A tier open-coded inside
-// either one is invisible to the other, which is the drift this whole
-// structure exists to remove — and it is exactly how the legacy
+// consumers must reach the tier set by walking it. A tier open-coded inside
+// either one is invisible to the other. That is the drift this whole
+// structure exists to remove, and it is exactly how the legacy
 // "<kind>.<logicalType>" spelling came to be honored by the resolver and not
 // by the lookup table.
 func TestInvariant_UnionTagTiersAreDerived(t *testing.T) {
@@ -4265,7 +4269,7 @@ func TestInvariant_UnionTagTiersAreDerived(t *testing.T) {
 	if n := strings.Count(resolver, "range unionTagTiers"); n != 1 {
 		t.Errorf("scanUnionBranch walks the tier slice %d times, want exactly 1", n)
 	}
-	// One scan over the branches, and it must be the one INSIDE the tier walk.
+	// One scan over the branches, and it must be the one inside the tier walk.
 	// A second scan is a hand-written tier: it answers names the lookup table
 	// will never register.
 	if n := strings.Count(resolver, "range union.branches"); n != 1 {
@@ -4405,7 +4409,7 @@ func TestInvariant_EveryUnionTagTierIsReachable(t *testing.T) {
 
 // TestInvariant_GuardedTiersRefuseAmbiguity states the rule the guarded flag
 // encodes, over every guarded tier: a name two branches claim within one tier
-// resolves NOWHERE. Silently taking the first is a coin flip between two
+// resolves nowhere. Silently taking the first is a coin flip between two
 // branches the caller may have meant either of, and the two wires would have
 // to make the same coin flip to stay in agreement.
 func TestInvariant_GuardedTiersRefuseAmbiguity(t *testing.T) {
@@ -4457,13 +4461,13 @@ func TestInvariant_GuardedTiersRefuseAmbiguity(t *testing.T) {
 	}
 }
 
-// TestInvariant_UnionTagResolveDoesNotAllocate locks the property that made it
-// safe to route the resolver through a shared tier slice rather than leaving
-// the rules open-coded: a tier appends its claim into a stack buffer and the
-// comparison `string(claimed) == name` is a compare, not a conversion, so
+// TestInvariant_UnionTagResolveDoesNotAllocate locks the property that made
+// it safe to route the resolver through a shared tier slice rather than
+// leaving the rules open-coded. A tier appends its claim into a stack buffer.
+// The comparison `string(claimed) == name` is a compare, not a conversion, so
 // resolving a tag allocates nothing however many tiers exist. A tier that
-// builds its claim some other way — fmt, a map lookup, strings.Join — would
-// put an allocation on a per-value JSON path, and this is where that shows up.
+// builds its claim some other way (fmt, a map lookup, strings.Join) would put
+// an allocation on a per-value JSON path, and this is where that shows up.
 func TestInvariant_UnionTagResolveDoesNotAllocate(t *testing.T) {
 	s := MustParse(`["null",{"type":"long","logicalType":"timestamp-millis"},` +
 		`{"type":"fixed","name":"F","namespace":"n","size":16,"logicalType":"uuid"},` +
@@ -4487,22 +4491,22 @@ func TestInvariant_UnionTagResolveDoesNotAllocate(t *testing.T) {
 // ---------- text_appender_contract_test.go ----------
 
 // freshShortAppender violates the encoding.TextAppender contract by
-// returning a fresh slice instead of appending to its input — the
+// returning a fresh slice instead of appending to its input, the
 // realistic implementation bug `return []byte(s), nil`. Its returned
-// slice is SHORTER than the accumulated output the encoder handed it.
+// slice is shorter than the accumulated output we handed it.
 type freshShortAppender struct{}
 
 func (freshShortAppender) AppendText(b []byte) ([]byte, error) { return []byte("x"), nil }
 
 // TestRegression_AppendTextShortReturnNamedError pins that a
-// contract-violating TextAppender whose returned slice is SHORTER than
-// its input surfaces as a named *SemanticError from binary encode —
-// never a slice-bounds panic. appendAvroString's inline-write backfill
-// derives the text length from the returned slice; without the length
-// guard the arithmetic indexes dst[mark:...] past the end of the fresh
-// short slice and panics the calling goroutine. The record's first
-// field makes the accumulated output longer than the fresh return, the
-// shape that drives the arithmetic out of bounds.
+// contract-violating TextAppender whose returned slice is shorter than
+// its input surfaces as a named *SemanticError from binary encode, never
+// a slice-bounds panic. appendAvroString's inline-write backfill derives
+// the text length from the returned slice; without the length guard the
+// arithmetic indexes dst[mark:...] past the end of the fresh short slice
+// and panics the calling goroutine. The record's first field makes the
+// accumulated output longer than the fresh return, the shape that drives
+// the arithmetic out of bounds.
 func TestRegression_AppendTextShortReturnNamedError(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -4557,15 +4561,15 @@ type appenderStruct struct {
 //   - No return shape may panic, anywhere.
 //   - A legal append, including a zero-length one, produces wire bytes
 //     byte-identical to encoding the equivalent plain string.
-//   - A fresh return SHORTER than the input is the detectable violation — the
-//     backfill length arithmetic would go negative — and yields the named
+//   - A fresh return shorter than the input is the detectable violation, since
+//     the backfill length arithmetic would go negative, and yields the named
 //     *SemanticError at every position.
 //   - A fresh return >= the input length passes the length guard and is NOT
-//     detectable without a per-string memcmp the encoder deliberately does not
-//     pay for the caller's own contract violation, the same way
-//     encoding/json/v2's jsontext.AppendRaw trusts the append contract. Those
-//     shapes return nil with the output replaced by the fresh slice's content
-//     and the header backfilled; the exact bytes are pinned below.
+//     detectable without a per-string memcmp we deliberately do not pay for
+//     the caller's own contract violation, the same way encoding/json/v2's
+//     jsontext.AppendRaw trusts the append contract. Those shapes return nil
+//     with the output replaced by the fresh slice's content and the header
+//     backfilled; the exact bytes are pinned below.
 //   - An error return surfaces the appender's error.
 func TestMatrix_AppendTextReturnShapes(t *testing.T) {
 	recordSchema := `{"type":"record","name":"R","fields":[
@@ -4608,8 +4612,8 @@ func TestMatrix_AppendTextReturnShapes(t *testing.T) {
 		// Position-dependent detectability (Documenting): at top level
 		// the 1-byte fresh-short return has the same length as its input
 		// (the placeholder is the only accumulated byte), so the
-		// shorter-than-input violation is not length-detectable there —
-		// the cell lands in the documented undetectable class and
+		// shorter-than-input violation is not length-detectable there.
+		// The cell lands in the documented undetectable class and
 		// encodes the empty string (the backfilled header is the entire
 		// output). At every other position the accumulated output
 		// exceeds the fresh return and the guard names the violation.
@@ -4655,7 +4659,8 @@ func TestMatrix_AppendTextReturnShapes(t *testing.T) {
 				if class == "guard" {
 					// A guard cell whose observed output is pinned in
 					// goldens is a position where the length information
-					// does not exist (see the goldens doc) — silent there.
+					// does not exist (see the goldens doc), so it is
+					// silent there.
 					if _, undetectable := goldens[pos.name+"/"+sh.mode]; undetectable {
 						class = "silent"
 					}
@@ -4701,13 +4706,13 @@ func TestMatrix_AppendTextReturnShapes(t *testing.T) {
 }
 
 // TestMatrix_AppendTextReturnShapesJSONImmunity pins that the JSON
-// encoder cannot be affected by any AppendText return shape: it
+// encoder cannot be affected by any AppendText return shape. It
 // materializes text via AppendText(nil) (textValue), so the returned
-// bytes simply ARE the text — there is no backfill arithmetic to
-// corrupt and nothing to guard. Documenting: for contract-violating
-// appenders the two wire formats legitimately differ — binary rejects
-// the shorter-than-input return via the backfill guard while JSON
-// emits the fresh slice's content verbatim.
+// bytes simply are the text. There is no backfill arithmetic to corrupt
+// and nothing to guard. Documenting: for contract-violating appenders the
+// two wire formats legitimately differ, since binary rejects the
+// shorter-than-input return via the backfill guard while JSON emits the
+// fresh slice's content verbatim.
 func TestMatrix_AppendTextReturnShapesJSONImmunity(t *testing.T) {
 	recordSchema := `{"type":"record","name":"R","fields":[
 		{"name":"a","type":"string"},{"name":"b","type":"string"}]}`
@@ -4715,7 +4720,7 @@ func TestMatrix_AppendTextReturnShapesJSONImmunity(t *testing.T) {
 		name   string
 		schema string
 		val    func(v contractAppender) any
-		wrap   func(cell string) string // cell JSON → full document
+		wrap   func(cell string) string // wraps cell JSON into a document
 	}{
 		{"top-level", `"string"`,
 			func(v contractAppender) any { return v },
@@ -4771,15 +4776,16 @@ func TestMatrix_AppendTextReturnShapesJSONImmunity(t *testing.T) {
 //
 //   - For a bytes-shaped UUID wire (fixed+uuid), a [16]byte-shaped Go type is
 //     authoritative by its raw bytes and the text interface is NOT consulted.
-//     The 16 bytes ARE the UUID, so a MarshalText→parseUUID round trip would be
-//     redundant and would let a non-canonical text method diverge the wires.
-//   - Everywhere the text interface IS consulted, it is tried BEFORE the
-//     reflect.String fast path and, for enum, before the int-ordinal arm —
+//     The 16 bytes are the UUID, so a MarshalText plus parseUUID round trip
+//     would be redundant and would let a non-canonical text method diverge
+//     the wires.
+//   - Everywhere the text interface is consulted, it is tried BEFORE the
+//     reflect.String fast path and, for enum, before the int-ordinal arm,
 //     matching encoding/json's preference for TextMarshaler and Java's
 //     name-based enum matching.
 
 // nonCanonicalArrUUID is a [16]byte that also implements the text
-// interfaces, deliberately NON-canonically: MarshalText ignores the bytes
+// interfaces, deliberately non-canonically: MarshalText ignores the bytes
 // and returns the all-zero UUID; UnmarshalText ignores its input and
 // writes all-0xFF. For fixed+uuid the wire is the raw 16 bytes, so if
 // either text method fired the encoded/decoded value would reflect
@@ -4853,8 +4859,8 @@ func TestRegression_StringKindPrefersTextMarshaler(t *testing.T) {
 	in := upperString("hello")
 
 	bin := mustEncode(t, s, in)
-	// 1-byte length prefix (zigzag(5)=0x0a), then the MARSHALED form
-	// "HELLO" — not the raw underlying string "hello".
+	// 1-byte length prefix (zigzag(5)=0x0a), then the marshaled form
+	// "HELLO", NOT the raw underlying string "hello".
 	if got := string(bin[1:]); got != "HELLO" {
 		t.Fatalf("binary wire body = %q, want HELLO (TextMarshaler, not the raw string)", got)
 	}
@@ -4876,16 +4882,16 @@ func TestRegression_StringKindPrefersTextMarshaler(t *testing.T) {
 	}
 }
 
-// TestRegression_StringKindTextMarshalerConsistentAcrossContexts pins that
-// a string-kind type with text methods is handled identically whether it
+// TestRegression_StringKindTextMarshalerConsistentAcrossContexts pins that a
+// string-kind type with text methods is handled identically whether it
 // appears as a scalar, a struct field, or a container element. The unsafe
 // struct fast paths (usString / udStringDeser) and the array/map fast loops
 // (which capture reflect.Value.SetString) bypass appendAvroString /
-// setStringValue, so they must be gated off for text-method types — else a
-// struct field or container element would encode/decode its raw string
+// setStringValue, so we must gate them off for text-method types. Otherwise a
+// struct field or container element would encode and decode its raw string
 // while the same value as a scalar uses MarshalText/UnmarshalText.
 func TestRegression_StringKindTextMarshalerConsistentAcrossContexts(t *testing.T) {
-	// struct field — exercises usString / udStringDeser compile gates.
+	// struct field: exercises usString / udStringDeser compile gates.
 	t.Run("struct field", func(t *testing.T) {
 		type rec struct {
 			F upperString `avro:"f"`
@@ -4907,7 +4913,7 @@ func TestRegression_StringKindTextMarshalerConsistentAcrossContexts(t *testing.T
 		}
 	})
 
-	// array element — exercises the deserArrayStringLoop fast-loop gate.
+	// array element: exercises the deserArrayStringLoop fast-loop gate.
 	t.Run("array element", func(t *testing.T) {
 		s := MustParse(`{"type":"array","items":"string"}`)
 		bin := mustEncode(t, s, []upperString{"hello", "world"})
@@ -4926,7 +4932,7 @@ func TestRegression_StringKindTextMarshalerConsistentAcrossContexts(t *testing.T
 		}
 	})
 
-	// map value — exercises the deserMapStringBlock fast-loop gate.
+	// map value: exercises the deserMapStringBlock fast-loop gate.
 	t.Run("map value", func(t *testing.T) {
 		s := MustParse(`{"type":"map","values":"string"}`)
 		bin := mustEncode(t, s, map[string]upperString{"k": "hello"})
@@ -5006,13 +5012,13 @@ func TestRegression_EnumTextMarshalerNameMatchOverOrdinal(t *testing.T) {
 	}
 }
 
-// SchemaFor must infer fixed(16) uuid for a ,uuid-tagged [16]byte EVEN WHEN
-// the type implements a text interface. The codec trusts the raw bytes of a
-// uuid-on-fixed [16]byte and never consults its text method (see
-// TestRegression_FixedUUIDByteArrayTrustsRawBytes), so inferring a plain Avro
-// "string" silently drops both the fixed(16) shape and the uuid logical type,
-// and produces a different wire format / fingerprint than an identical
-// text-less [16]byte field. The text-interface arm in inferType must not
+// SchemaFor must infer fixed(16) uuid for a ,uuid-tagged [16]byte even when
+// the type implements a text interface. We trust the raw bytes of a
+// uuid-on-fixed [16]byte and never consult its text method (see
+// TestRegression_FixedUUIDByteArrayTrustsRawBytes). Inferring a plain Avro
+// "string" would silently drop both the fixed(16) shape and the uuid logical
+// type. It would also produce a different wire format and fingerprint than an
+// identical text-less [16]byte field. The text-interface arm in inferType must not
 // intercept a uuid [16]byte headed for the fixed(16) Array case.
 func TestRegression_SchemaForUUIDByteArrayWithTextMethod(t *testing.T) {
 	// Bug case: nonCanonicalArrUUID is a [16]byte with MarshalText +
@@ -5047,17 +5053,17 @@ func TestRegression_SchemaForUUIDByteArrayWithTextMethod(t *testing.T) {
 // ---------- decode_reencode_audit_test.go ----------
 
 // TestDecodeReencodeSymmetry verifies that values the decoder produces can be
-// re-encoded by the encoder: a pair where decode succeeds but encode of the
-// decoded value fails would be a round-trip asymmetry. It exercises every Avro
-// type with *any and one or more representative typed targets, then re-encodes
-// each decoded value — wire-byte canonicalization on the encoder side is fine,
-// the Go-value round trip being what is locked in.
+// re-encoded: a pair where decode succeeds but encode of the decoded value
+// fails would be a round-trip asymmetry. It exercises every Avro type with
+// *any and one or more representative typed targets, then re-encodes each
+// decoded value. Wire-byte canonicalization on the encode side is fine; the
+// Go-value round trip is what is locked in.
 //
-// Documented intentional asymmetries are excluded and pinned by their own tests
-// — TestTextUnmarshalerOnlyDecodeOnly below for the TextUnmarshaler-only case,
-// the one this sweep would otherwise report. Both of this sentence's previous
-// pointers had rotted, so an exclusion the reader could not check read as one
-// they could.
+// Documented intentional asymmetries are excluded and pinned by their own
+// tests: TestTextUnmarshalerOnlyDecodeOnly below covers the
+// TextUnmarshaler-only case, the one this sweep would otherwise report. Both
+// of this sentence's previous pointers had rotted, so an exclusion the reader
+// could not check read as one they could.
 func TestDecodeReencodeSymmetry(t *testing.T) {
 	type tc struct {
 		name   string
@@ -5220,13 +5226,12 @@ func TestDecodeReencodeSymmetry(t *testing.T) {
 }
 
 // textUnmarshalerOnly implements UnmarshalText but not MarshalText or
-// AppendText — the standard Go pattern for parse-only types (config
-// values, enums, lookup keys, one-way ingest pipelines). Decode
-// accepts; encode of the produced value rejects because the type
-// provides no text-out method. This asymmetry matches Go's stdlib
-// idiom — TextUnmarshaler is explicitly a one-way interface — and
-// the library doesn't force users to write no-op MarshalText shims
-// on types they only ever decode into.
+// AppendText, the standard Go pattern for parse-only types (config
+// values, enums, lookup keys, one-way ingest pipelines). Decode accepts;
+// encode of the produced value rejects because the type provides no
+// text-out method. That asymmetry matches Go's stdlib idiom, where
+// TextUnmarshaler is explicitly a one-way interface, and we do not force
+// no-op MarshalText shims onto a decode-only type.
 type textUnmarshalerOnly struct{ Got string }
 
 func (t *textUnmarshalerOnly) UnmarshalText(b []byte) error {
@@ -5234,11 +5239,10 @@ func (t *textUnmarshalerOnly) UnmarshalText(b []byte) error {
 	return nil
 }
 
-// TestTextUnmarshalerOnlyDecodeOnly pins the documented one-way
-// pattern: Decode into a TextUnmarshaler-only target succeeds; the
-// caller doesn't need a sibling MarshalText. Re-encoding the produced
-// value would fail (no text-out method), but that's by user choice —
-// the type is decode-only.
+// TestTextUnmarshalerOnlyDecodeOnly pins the documented one-way pattern.
+// Decode into a TextUnmarshaler-only target succeeds, with no sibling
+// MarshalText required. Re-encoding the produced value fails for want of a
+// text-out method, which is the point: the type is decode-only.
 func TestTextUnmarshalerOnlyDecodeOnly(t *testing.T) {
 	s := MustParse(`"string"`)
 	wire := mustAppendEncode(t, s, nil, "hello")
@@ -5258,9 +5262,9 @@ func TestTextUnmarshalerOnlyDecodeOnly(t *testing.T) {
 	}
 }
 
-// ptrMarshalerSymmetry has MarshalText and UnmarshalText both on the
-// pointer receiver. Used to verify symmetric encode/decode discovery
-// of pointer-receiver text methods.
+// ptrMarshalerSymmetry has MarshalText and UnmarshalText both on the pointer
+// receiver. We use it to verify symmetric encode/decode discovery of
+// pointer-receiver text methods.
 type ptrMarshalerSymmetry struct{ val string }
 
 func (m *ptrMarshalerSymmetry) MarshalText() ([]byte, error) { return []byte(m.val), nil }
@@ -5288,8 +5292,8 @@ func (u *uuidViaText) UnmarshalText(b []byte) error {
 }
 
 // TestTextInterfaceCoverageForEnumAndFixedUUID pins that the text-shaped
-// Avro sites — enum and fixed+uuid — accept Text* on both binary and
-// JSON paths. Parity with string and string+uuid which already accept.
+// Avro sites, enum and fixed+uuid, accept Text* on both the binary and
+// JSON paths, in parity with string and string+uuid which already accept.
 func TestTextInterfaceCoverageForEnumAndFixedUUID(t *testing.T) {
 	t.Run("enum binary round-trip via Text*", func(t *testing.T) {
 		s := MustParse(`{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"]}`)
@@ -5355,10 +5359,10 @@ func TestTextInterfaceCoverageForEnumAndFixedUUID(t *testing.T) {
 // by canonical field name across every map encode path (binary map[string]any,
 // binary typed-map with a plain string key, binary typed-map with a named
 // string-key subtype, plus the JSON equivalents). Aliases are a reader-side
-// concept — none of the three reference impls consult them on encode — so input
-// keyed by an alias hits the missing-field path like any other unrecognized key,
-// and a canonical key present alongside an extra alias key is silently accepted,
-// the alias key simply not being consulted.
+// concept, and none of the three reference implementations consult them on
+// encode. So input keyed by an alias hits the missing-field path like any
+// other unrecognized key. A canonical key present alongside an extra alias key
+// is silently accepted, the alias key simply not being consulted.
 func TestMapRecordEncodeIgnoresAliases(t *testing.T) {
 	schema := `{"type":"record","name":"R","fields":[
 		{"name":"new_name","type":"long","aliases":["old_name"]}
@@ -5396,8 +5400,8 @@ func TestMapRecordEncodeIgnoresAliases(t *testing.T) {
 	})
 
 	t.Run("binary map[string]int64 via alias key: missing-field error", func(t *testing.T) {
-		// Exercises the typed-map encode path (map[string]T with plain
-		// string key — different from map[string]any).
+		// Exercises the typed-map encode path (map[string]T with a plain
+		// string key, unlike map[string]any).
 		if _, err := s.AppendEncode(nil, map[string]int64{"old_name": 42}); err == nil {
 			t.Fatalf("expected missing-key error on typed-map encode; encode accepted alias")
 		}

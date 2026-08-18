@@ -13582,3 +13582,54 @@ for the round's OWN ledger line"). Originals compressed in the second pass:
 The (e1)–(e6) Instance narratives were compressed in the same pass; their full
 text is in archive #1 above, under "§Audit conventions — rule 1 preamble, (e),
 (e1)-(e6), the label prohibition, (f) (verbatim)".
+
+## Distillation archive (2026-08-18) — the 2026-08-13 ledger line, verbatim
+
+Filed late: the 2026-08-13 line cited an archive section under its own date that was
+never written, so the line could not be compressed without losing it. This is that
+text; the live ledger keeps the measurements a later round reads and cites here for
+the rest.
+
+- 2026-08-13 · 6534411 · WALL-CLOCK RATIO conversion · test-and-doc only, NO
+  code commits (source byte-identical to 4e94ec5), so the quarantine boundary
+  STAYS 41aabfa · 0 behavioral · base + ocf GREEN, **-race GREEN (root 296.4s
+  against base 275.3s; the DEFAULT 600s timeout is the budget and CI passes no
+  -timeout)**, test-name set IDENTICAL to base in all three build
+  configurations (default 33,551 / `-tags=cisuite` 33,560 / `-race` 33,551).
+  **72 timing assertions across 26 cells were absolute wall-clock ceilings; 68
+  are now RATIOS between two problem sizes and 4 stay absolute saying why at
+  their sites.** Tolerances are the geometric mean of a MEASURED healthy ratio
+  and a MEASURED broken one; **21 neuters, every converted cell RED**,
+  16x–3478x. **1 GAP, measured and written down rather than claimed away: a
+  ratio divides CPU contention out (green at 6x oversubscription, GOMAXPROCS=2)
+  but NOT memory-bandwidth starvation** — the two sides hold working sets
+  differing by the magnitude, cache is not shared proportionally, and a
+  64-MiB-per-core streaming antagonist inflates the breadth column's 9.6–12 to
+  22–38. Widening the span does not escape it (a factor, not an offset: at 16x,
+  19–23 becomes 67–74). The ceilings fail harder under the same antagonist,
+  five to seven cells against two to six. Three harness defects found by
+  loading the host rather than by reasoning (phase-sampled sides, unpaired
+  minima, unequal sample counts) → alternating rounds, smallest-ratio round.
+  Three -race SKIPS retired; raceRelaxations rows 4 → 2. **AUDIT_CORE
+  distillation: 54,620 → 54,422 bytes (-198); bound 55,000 — was under −380
+  before this line, which would have CROSSED it.** Archive (2026-08-13) NOT
+  WRITTEN — write it, then compress this line.
+
+### AUDIT_CORE.md §Round ledger — the 2026-08-06 line, verbatim
+
+- 2026-08-06 · 8f08bdf · DISTILLATION + pin-battery batch 3 (decimal remainder)
+  · test-and-doc only, NO code commits, so the quarantine boundary STAYS
+  41aabfa · 0 behavioral · base + ocf GREEN, **-race GREEN** (root 290.0s, ocf
+  33.7s, 0 races). **AUDIT_CORE distillation: 59,316 → 53,794 bytes (−5,522);
+  bound 55,000, was CROSSED +4,316, then under −1,206 before this line.**
+  Verbatim originals → archive (2026-08-06 #1), prose only. 11 pins graded, 5
+  deleted, 384 → 379. **1 GAP: the union JSON digit-token dispatcher had a cell
+  for big-decimal ONLY** → `TestMatrix_UnionBareNumberDispatchByLogicalCarrier`,
+  logical × carrier (DERIVED from `hasDecimalBareNumberArm`'s verdicts) ×
+  context, 16 cells, oracle = the branch decoded STANDALONE. Three neuters,
+  three DISJOINT reds, TRIPLE held (RUN=17): 8 / 12 / the 4 negatives. The
+  OPPOSITE-direction attack caught the new matrix's OWN defect — a refusal-shape
+  assertion must separate *declined* from *entered-then-failed*, which differ
+  only in the wrapped-cause suffix. Batch 2's un-findable form neuter FOUND:
+  swap the emitted form for one that STILL round-trips. Narrative + the two
+  shell-quoting mis-measurements: archive (2026-08-06 #2).

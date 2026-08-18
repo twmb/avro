@@ -24,19 +24,19 @@ import (
 
 // ---------- java_differential_test.go ----------
 
-// This file is behind the `cisuite` build tag so it ONLY runs in CI (where
-// the JVM + avro-tools jar are provisioned): `go test -tags=cisuite`. A plain
-// `go test ./...` never compiles or runs it. CI builds testdata/oracle/
-// SchemaOracle.java against the avro-tools fat jar and sets AVRO_TOOLS_JAR;
-// see .github/workflows/test.yml.
+// This file is behind the `cisuite` build tag, so it *only* runs in CI: `go
+// test -tags=cisuite`. CI is where the JVM + avro-tools jar are provisioned.
+// A plain `go test ./...` never compiles or runs it. CI builds
+// testdata/oracle/SchemaOracle.java against the avro-tools fat jar and sets
+// AVRO_TOOLS_JAR. See .github/workflows/test.yml.
 
-// TestDifferentialJavaFingerprint cross-checks twmb's Parsing Canonical Form and
-// CRC-64-AVRO fingerprint against org.apache.avro.SchemaNormalization via the
-// SchemaOracle subprocess. Unlike the static schema-tests.txt vectors, it
-// exercises the cases those omit — named types referenced multiple times, and
-// forward references — i.e. the canonical first-occurrence behavior against live
-// Java. When Java rejects a schema twmb accepts, that parse-level divergence is
-// logged rather than failed: there is no Java fingerprint to compare, and the
+// TestDifferentialJavaFingerprint cross-checks twmb's Parsing Canonical Form
+// and CRC-64-AVRO fingerprint against org.apache.avro.SchemaNormalization via
+// the SchemaOracle subprocess. The static schema-tests.txt vectors omit named
+// types referenced multiple times and forward references. We exercise those
+// here, against live Java, for the canonical first-occurrence behavior. When
+// Java rejects a schema twmb accepts, that parse-level divergence is logged
+// rather than failed. There is no Java fingerprint to compare, and the
 // acceptance difference is surfaced for triage rather than asserted away.
 func TestDifferentialJavaFingerprint(t *testing.T) {
 	in, out := schemaOraclePipes(t, "set AVRO_TOOLS_JAR to the avro-tools fat jar to run the Java differential")
@@ -82,14 +82,15 @@ func TestDifferentialJavaFingerprint(t *testing.T) {
 		{"int", `"int"`},
 		{"record", `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`},
 		// Named type defined then referenced twice (backward). Java parses
-		// this; the canonical first-occurrence transform must keep twmb's
-		// output byte-identical to Java's here (definition IS first occurrence).
+		// this. The canonical first-occurrence transform must keep twmb's
+		// output byte-identical to Java's here: the definition *is* the first
+		// occurrence.
 		{"define-then-ref-twice", `{"type":"record","name":"o","fields":[{"name":"a","type":{"type":"record","name":"i","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"i"},{"name":"c","type":"i"}]}`},
 		{"namespaced define-then-ref", `{"type":"record","name":"o","namespace":"com.x","fields":[{"name":"a","type":{"type":"record","name":"i","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"i"}]}`},
 		{"recursive", `{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]}]}`},
 		// Forward references: Java may or may not accept these in a single
-		// parse. If it rejects, the divergence is logged (twmb is more
-		// lenient); if it accepts, twmb's first-occurrence canonical/
+		// parse. If it rejects, the divergence is logged, since twmb is more
+		// lenient. If it accepts, twmb's first-occurrence canonical form and
 		// fingerprint must match.
 		{"forward-ref", `{"type":"record","name":"outer","fields":[{"name":"ref","type":{"type":"inner"}},{"name":"def","type":{"type":"record","name":"inner","fields":[{"name":"x","type":"int"}]}}]}`},
 		{"namespaced forward-ref", `{"type":"record","name":"Outer","namespace":"com.x","fields":[{"name":"a","type":"Inner"},{"name":"b","type":{"type":"record","name":"Inner","fields":[{"name":"v","type":"int"}]}}]}`},
@@ -133,13 +134,13 @@ func TestDifferentialJavaFingerprint(t *testing.T) {
 // ---------- java_matrix_differential_test.go ----------
 
 // Behind the `cisuite` build tag: runs only where the JVM + avro-tools jar
-// are provisioned (see .github/workflows/test.yml), via
-// `go test -tags=cisuite`. Plain `go test ./...` never compiles this file.
+// are provisioned, via `go test -tags=cisuite`. See
+// .github/workflows/test.yml. Plain `go test ./...` never compiles this file.
 
 // startMatrixJavaOracle launches SchemaOracle and returns two closures over
-// one subprocess: rt (the "RT" command — Java binary-decodes our bytes and
-// re-encodes them) and fpCanon (the bare-schema command — Java's
-// parsingFingerprint64 + Parsing Canonical Form).
+// one subprocess. rt drives the "RT" command, where Java binary-decodes our
+// bytes and re-encodes them. fpCanon drives the bare-schema command, Java's
+// parsingFingerprint64 + Parsing Canonical Form.
 func startMatrixJavaOracle(t *testing.T) (
 	rt func(t *testing.T, schema string, binary []byte) (ok bool, jsonOut, binOut []byte, errMsg string),
 	fpCanon func(t *testing.T, schema string) (ok bool, fp int64, canon, errMsg string),
@@ -147,8 +148,8 @@ func startMatrixJavaOracle(t *testing.T) (
 	t.Helper()
 	in, out := schemaOraclePipes(t, "set AVRO_TOOLS_JAR to the avro-tools fat jar to run the Java matrix differential")
 
-	// The oracle protocol is one request line per response line; schemas
-	// composed by the matrix contain newlines, so compact them first.
+	// The oracle protocol is one request line per response line. Schemas
+	// composed by the matrix contain newlines, so we compact them first.
 	compact := func(t *testing.T, schema string) string {
 		t.Helper()
 		var buf bytes.Buffer
@@ -223,8 +224,8 @@ func startMatrixJavaOracle(t *testing.T) (
 	return rt, fpCanon
 }
 
-// javaMatrixCheck runs the two Java-oracle checks for one composed cell:
-// Java's binary re-encode of twmb's wire must be byte-identical, and Java's
+// javaMatrixCheck runs the two Java-oracle checks for one composed cell.
+// Java's binary re-encode of twmb's wire must be byte-identical. Java's
 // canonical form + Rabin fingerprint must match twmb's.
 func javaMatrixCheck(t *testing.T, rt func(*testing.T, string, []byte) (bool, []byte, []byte, string),
 	fpCanon func(*testing.T, string) (bool, int64, string, string),
@@ -256,7 +257,7 @@ func javaMatrixCheck(t *testing.T, rt func(*testing.T, string, []byte) (bool, []
 }
 
 // TestDifferentialJavaMatrix drives every (fragment × context) matrix cell
-// through the Apache Avro Java reference: wire-layout and canonical-form
+// through the Apache Avro Java reference. Wire-layout and canonical-form
 // agreement on arbitrary composed schemas, not just curated vectors.
 func TestDifferentialJavaMatrix(t *testing.T) {
 	rt, fpCanon := startMatrixJavaOracle(t)
@@ -274,9 +275,9 @@ func TestDifferentialJavaMatrix(t *testing.T) {
 	}
 }
 
-// TestDifferentialJavaMatrixRecursion covers the recursive shapes — Java is
-// the ONE external oracle that accepts forward references (the twmb+Java
-// extension fastavro rejects), so the fwd-ref shapes run here unskipped.
+// TestDifferentialJavaMatrixRecursion covers the recursive shapes. Java is
+// the *one* external oracle that accepts forward references, the twmb+Java
+// extension fastavro rejects. So the fwd-ref shapes run here unskipped.
 func TestDifferentialJavaMatrixRecursion(t *testing.T) {
 	rt, fpCanon := startMatrixJavaOracle(t)
 	for _, sh := range recShapes() {
@@ -288,12 +289,12 @@ func TestDifferentialJavaMatrixRecursion(t *testing.T) {
 	}
 }
 
-// TestDifferentialJavaAcceptance: schema-ACCEPTANCE parity with the Java
+// TestDifferentialJavaAcceptance: schema-*acceptance* parity with the Java
 // reference over every composed cell and every structurally-broken mutant.
-// Java enforces the full mutator set (missing fields/symbols/size/name,
-// duplicates, nested unions, negative sizes, empty field names), so unlike
-// the fastavro twin nothing is scoped out. The bare-schema oracle command
-// doubles as the parse probe: OK means Java parsed it, ERR means rejected.
+// Java enforces the full mutator set: missing fields/symbols/size/name,
+// duplicates, nested unions, negative sizes, empty field names. So unlike the
+// fastavro twin, we scope nothing out. The bare-schema oracle command doubles
+// as the parse probe: OK means Java parsed it, ERR means rejected.
 func TestDifferentialJavaAcceptance(t *testing.T) {
 	_, fpCanon := startMatrixJavaOracle(t)
 	for _, cell := range acceptanceCells() {
@@ -310,11 +311,11 @@ func TestDifferentialJavaAcceptance(t *testing.T) {
 	}
 }
 
-// jsonSemanticEqual compares two JSON documents by VALUE: objects by key,
-// arrays by index, numbers by exact rational value (Jackson spells float
-// zero "0.0" where twmb writes "0"; both are the same number), strings by
-// codepoints (Jackson writes high bytes raw, twmb escapes \u00XX; both
-// decode identically).
+// jsonSemanticEqual compares two JSON documents by *value*: objects by key,
+// arrays by index, numbers by exact rational value, strings by codepoints.
+// Jackson spells float zero "0.0" where twmb writes "0"; both are the same
+// number. Jackson writes high bytes raw where twmb escapes \u00XX; both
+// decode identically.
 func jsonSemanticEqual(a, b []byte) bool {
 	var av, bv any
 	da := json.NewDecoder(bytes.NewReader(a))
@@ -365,20 +366,20 @@ func jsonSemanticEqual(a, b []byte) bool {
 }
 
 // TestDifferentialJavaJSONForm compares twmb's Avro-JSON encoding against
-// Java's JsonEncoder per cell, semantically. Scoped to non-logical
-// fragments: Java's GENERIC datum path writes logical types in underlying
-// form (raw longs) while twmb writes the enriched form (RFC 3339 strings) —
-// a documented representation difference, not a parity target. twmb runs
-// with TaggedUnions because Java's JsonEncoder always writes the
-// {branch: value} union envelope.
+// Java's JsonEncoder per cell, semantically. Scoped to non-logical fragments.
+// Java's *generic* datum path writes logical types in underlying form (raw
+// longs) while twmb writes the enriched form (RFC 3339 strings). That is a
+// documented representation difference, not a parity target. twmb runs with
+// TaggedUnions because Java's JsonEncoder always writes the {branch: value}
+// union envelope.
 func TestDifferentialJavaJSONForm(t *testing.T) {
 	rt, _ := startMatrixJavaOracle(t)
-	// rec0 (the zero-field record) is excluded: avro-tools 1.12.0's
-	// JsonEncoder emits ZERO BYTES for an empty record — and for any
-	// document containing one — observed empirically via the RT oracle
-	// (the generator appears to never complete/flush the empty object).
-	// twmb's "{}" is the only valid JSON for an empty record and matches
-	// fastavro; Java's empty output is not a parity target.
+	// We exclude rec0, the zero-field record. avro-tools 1.12.0's JsonEncoder
+	// emits *zero bytes* for an empty record, and for any document containing
+	// one. That is observed empirically via the RT oracle: the generator
+	// appears to never complete or flush the empty object. twmb's "{}" is the
+	// only valid JSON for an empty record and matches fastavro. Java's empty
+	// output is not a parity target.
 	eligible := map[string]bool{
 		"null": true, "boolean": true, "int": true, "long": true,
 		"float": true, "double": true, "string": true, "bytes": true,
@@ -417,16 +418,16 @@ func TestDifferentialJavaJSONForm(t *testing.T) {
 
 // ---------- java_value_differential_test.go ----------
 
-// This file is behind the `cisuite` build tag so it ONLY runs in CI (where the
-// JVM + avro-tools jar are provisioned): `go test -tags=cisuite`. A plain
-// `go test ./...` never compiles or runs it. CI builds testdata/oracle/
-// SchemaOracle.java against the avro-tools fat jar and sets AVRO_TOOLS_JAR;
-// see .github/workflows/test.yml.
+// This file is behind the `cisuite` build tag, so it *only* runs in CI: `go
+// test -tags=cisuite`. CI is where the JVM + avro-tools jar are provisioned.
+// A plain `go test ./...` never compiles or runs it. CI builds
+// testdata/oracle/SchemaOracle.java against the avro-tools fat jar and sets
+// AVRO_TOOLS_JAR. See .github/workflows/test.yml.
 
-// startSchemaOracle launches the SchemaOracle subprocess (skipping when the
-// JVM/jar is unavailable) and returns an rt function that drives its "RT"
-// command: send (schema, avro binary), get back Java's JSON re-encode and
-// binary re-encode of the same datum.
+// startSchemaOracle launches the SchemaOracle subprocess, skipping when the
+// JVM/jar is unavailable. It returns an rt function driving the "RT" command:
+// send (schema, avro binary), get back Java's JSON re-encode and binary
+// re-encode of the same datum.
 func startSchemaOracle(t *testing.T) func(t *testing.T, schema string, binary []byte) (ok bool, jsonOut, binOut []byte, errMsg string) {
 	t.Helper()
 	in, out := schemaOraclePipes(t, "set AVRO_TOOLS_JAR to the avro-tools fat jar to run the Java value differential")
@@ -469,12 +470,12 @@ func startSchemaOracle(t *testing.T) func(t *testing.T, schema string, binary []
 	}
 }
 
-// jsonValueEqual reports whether two JSON documents encode the same value,
-// ignoring non-semantic text differences: number formatting ("1" vs "1.0",
+// jsonValueEqual reports whether two JSON documents encode the same value. It
+// ignores non-semantic text differences: number formatting ("1" vs "1.0",
 // exponent forms), \uXXXX escaping vs raw UTF-8 for the same code points
-// (including hex case), and object key order. Numbers compare as float64 —
-// adequate for the float/bytes/map cases routed here (precision-critical
-// long cases use byte comparison instead).
+// (including hex case), and object key order. Numbers compare as float64,
+// adequate for the float/bytes/map cases routed here. Precision-critical long
+// cases use byte comparison instead.
 func jsonValueEqual(a, b []byte) (bool, error) {
 	var av, bv any
 	da := json.NewDecoder(strings.NewReader(string(a)))
@@ -531,19 +532,19 @@ func jsonValueEqual(a, b []byte) (bool, error) {
 	return eq(av, bv), nil
 }
 
-// TestDifferentialJavaValueMatrix sweeps a (schema x value) corpus through the
-// SchemaOracle RT command, asserting VALUE-level wire parity with Java on both
-// formats. On binary, Java decodes twmb's Encode output and re-encodes it, and
-// the re-encode must be byte-identical — multi-entry maps compare decoded-back,
-// entry order being unspecified on both sides. On JSON, twmb's EncodeJSON
-// (TaggedUnions, the spec form Java emits) must match Java's JsonEncoder, with
-// cmpJSON choosing byte-identical comparison where the text is canonical and
-// value-equal where equally-valid texts differ.
+// TestDifferentialJavaValueMatrix sweeps a (schema x value) corpus through
+// the SchemaOracle RT command. We assert *value*-level wire parity with Java
+// on both formats. On binary, Java decodes twmb's Encode output and
+// re-encodes it, and the re-encode must be byte-identical. Multi-entry maps
+// compare decoded-back, entry order being unspecified on both sides. On JSON,
+// twmb's EncodeJSON (TaggedUnions, the spec form Java emits) must match
+// Java's JsonEncoder. cmpJSON chooses byte-identical comparison where the
+// text is canonical, value-equal where equally-valid texts differ.
 //
-// Logical-typed values ride as their RAW base-type wire values through Java's
-// generic datum path, which is exactly what the Avro JSON encoding of a logical
-// type is. Failures are reported with Errorf so one CI run yields the complete
-// divergence list.
+// Logical-typed values ride as their *raw* base-type wire values through
+// Java's generic datum path, which is exactly what the Avro JSON encoding of
+// a logical type is. We report failures with Errorf so one CI run yields the
+// complete divergence list.
 func TestDifferentialJavaValueMatrix(t *testing.T) {
 	rt := startSchemaOracle(t)
 
@@ -558,7 +559,7 @@ func TestDifferentialJavaValueMatrix(t *testing.T) {
 		cmpJSON string
 		skipBin bool // multi-entry map: binary entry order unspecified
 	}{
-		// Primitives — canonical JSON text, byte-exact on both wires.
+		// Primitives: canonical JSON text, byte-exact on both wires.
 		{"null", `"null"`, nil, cmpBytes, false},
 		{"bool-true", `"boolean"`, true, cmpBytes, false},
 		{"bool-false", `"boolean"`, false, cmpBytes, false},
@@ -575,13 +576,13 @@ func TestDifferentialJavaValueMatrix(t *testing.T) {
 		// non-ASCII as raw UTF-8.
 		{"string-unicode-bmp", `"string"`, "héllo 世界", cmpBytes, false},
 		// Supplementary-plane (astral) characters: Jackson escapes them as a
-		// UTF-16 surrogate pair (U+1F986 -> 🦆); twmb writes raw
-		// UTF-8 (f0 9f a6 86). Same string value, both valid JSON texts.
+		// UTF-16 surrogate pair (U+1F986 -> 🦆). twmb writes raw UTF-8 (f0 9f
+		// a6 86). Same string value, both valid JSON texts.
 		{"string-unicode-astral", `"string"`, "héllo 世界 🦆", cmpValue, false},
 		{"bytes-empty", `"bytes"`, []byte{}, cmpBytes, false},
 		{"bytes-ascii", `"bytes"`, []byte("hi"), cmpBytes, false},
 
-		// Floats/doubles — same value, possibly different (equally valid)
+		// Floats/doubles: same value, possibly different (equally valid)
 		// JSON number text between Go and Jackson.
 		{"float-1.5", `"float"`, float32(1.5), cmpValue, false},
 		{"float-zero", `"float"`, float32(0), cmpValue, false},
@@ -589,16 +590,16 @@ func TestDifferentialJavaValueMatrix(t *testing.T) {
 		{"double-pi", `"double"`, 3.14159, cmpValue, false},
 		{"double-huge", `"double"`, 1e300, cmpValue, false},
 		// Non-finite floats: twmb's default emits the Java-convention quoted
-		// strings ("NaN"/"Infinity"/"-Infinity"); this asserts the convention
+		// strings ("NaN"/"Infinity"/"-Infinity"). This asserts the convention
 		// claim against live Java rather than trusting the doc.
 		{"float-nan", `"float"`, float32(math.NaN()), cmpValue, false},
 		{"double-nan", `"double"`, math.NaN(), cmpValue, false},
 		{"double-inf", `"double"`, math.Inf(1), cmpValue, false},
 		{"double-neginf", `"double"`, math.Inf(-1), cmpValue, false},
 
-		// bytes/fixed with non-printable content: codepoint-string JSON form;
-		// twmb escapes all non-ASCII as \u00XX, Jackson emits raw UTF-8 for
-		// the same code points (and uppercase hex when it does escape) — same
+		// bytes/fixed with non-printable content: codepoint-string JSON form.
+		// twmb escapes all non-ASCII as \u00XX. Jackson emits raw UTF-8 for
+		// the same code points, and uppercase hex when it does escape. Same
 		// value, different text.
 		{"bytes-binary", `"bytes"`, []byte{0x00, 0x1f, 0x80, 0xff}, cmpValue, false},
 		{"fixed-ascii", `{"type":"fixed","name":"F4","size":4}`, []byte("abcd"), cmpBytes, false},
@@ -609,7 +610,7 @@ func TestDifferentialJavaValueMatrix(t *testing.T) {
 		// Enum.
 		{"enum", `{"type":"enum","name":"E","symbols":["A","B","C"]}`, "B", cmpBytes, false},
 
-		// Unions — tagged (spec) form on the JSON side.
+		// Unions: tagged (spec) form on the JSON side.
 		{"union-int-branch", `["null","int"]`, int32(7), cmpBytes, false},
 		{"union-null-branch", `["null","int"]`, nil, cmpBytes, false},
 		{"union-string-branch", `["null","string"]`, "x", cmpBytes, false},
@@ -635,7 +636,7 @@ func TestDifferentialJavaValueMatrix(t *testing.T) {
 			map[string]any{"next": nil}, cmpBytes, false},
 
 		// Int/long-backed logical types: the JSON wire is the base integer,
-		// canonical text — byte-exact. Values are the enriched Go types twmb's
+		// canonical text, byte-exact. Values are the enriched Go types twmb's
 		// built-in logical encoders accept.
 		{"date", `{"type":"int","logicalType":"date"}`, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), cmpBytes, false},
 		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, 3 * time.Hour, cmpBytes, false},
@@ -647,7 +648,7 @@ func TestDifferentialJavaValueMatrix(t *testing.T) {
 		{"local-timestamp-micros", `{"type":"long","logicalType":"local-timestamp-micros"}`, time.UnixMilli(1700000000000).UTC(), cmpBytes, false},
 		{"local-timestamp-nanos", `{"type":"long","logicalType":"local-timestamp-nanos"}`, time.Unix(1700000000, 5).UTC(), cmpBytes, false},
 
-		// Bytes/fixed-backed logical types: codepoint-string JSON form —
+		// Bytes/fixed-backed logical types: codepoint-string JSON form, so
 		// value comparison (escaping style differs, value must not).
 		{"decimal-bytes", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(12345, 100), cmpValue, false},
 		{"decimal-fixed", `{"type":"fixed","name":"DF","size":8,"logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(12345, 100), cmpValue, false},
@@ -668,7 +669,7 @@ func TestDifferentialJavaValueMatrix(t *testing.T) {
 				t.Fatalf("twmb Encode: %v", err)
 			}
 			// TaggedUnions: the spec union form, which is what Java's
-			// JsonEncoder emits; a no-op for non-union schemas.
+			// JsonEncoder emits. A no-op for non-union schemas.
 			twJSON, err := s.EncodeJSON(c.value, avro.TaggedUnions())
 			if err != nil {
 				t.Fatalf("twmb EncodeJSON: %v", err)
@@ -718,14 +719,14 @@ func TestDifferentialJavaValueMatrix(t *testing.T) {
 	}
 }
 
-// TestDifferentialJavaInvalidUTF8 cross-checks the JSON encode of invalid-UTF-8
-// string content against Java: twmb writes such bytes VERBATIM on the binary
-// wire but coerces each invalid byte to U+FFFD on the JSON wire, since a raw
-// 0xff cannot appear in an RFC 8259 JSON string. That split is DOCUMENTED POLICY
-// precisely BECAUSE it matches Java byte-for-byte, which this verifies live. The
-// per-case parity is ASSERTED, so an avro-tools upgrade that changes Java's
-// behavior fails CI and forces the rationale to be revisited rather than
-// silently rotting.
+// TestDifferentialJavaInvalidUTF8 cross-checks the JSON encode of
+// invalid-UTF-8 string content against Java. twmb writes such bytes
+// *verbatim* on the binary wire. On the JSON wire we coerce each invalid byte
+// to U+FFFD, since a raw 0xff cannot appear in an RFC 8259 JSON string. That
+// split is documented policy precisely because it matches Java byte-for-byte,
+// which this verifies live. The per-case parity is asserted, so an avro-tools
+// upgrade that changes Java's behavior fails CI and forces the rationale to
+// be revisited rather than silently rotting.
 func TestDifferentialJavaInvalidUTF8(t *testing.T) {
 	rt := startSchemaOracle(t)
 
@@ -782,18 +783,18 @@ func TestDifferentialJavaInvalidUTF8(t *testing.T) {
 
 // TestDifferentialJavaWireLeniencies executes, against live Java, the
 // specific Java wire-level behaviors this package's comments cite as the
-// rationale for its own decode leniencies and test exclusions. Each cell
-// hand-frames non-canonical (or degenerate) writer bytes, round-trips them
-// through Java's decoder via the RT oracle, and asserts Java's DOCUMENTED
-// verdict — so an avro-tools upgrade that changes the behavior fails CI
-// instead of silently rotting the citation.
+// rationale for our own decode leniencies and test exclusions. Each cell
+// hand-frames non-canonical (or degenerate) writer bytes and round-trips them
+// through Java's decoder via the RT oracle. Each then asserts Java's
+// *documented* verdict, so an avro-tools upgrade that changes the behavior
+// fails CI instead of silently rotting the citation.
 func TestDifferentialJavaWireLeniencies(t *testing.T) {
 	rt := startSchemaOracle(t)
 
 	t.Run("boolean non-1 byte decodes false", func(t *testing.T) {
-		// BinaryDecoder.readBoolean is `return n == 1` — byte 2 is false
-		// (BinaryDecoder.java:150-151). twmb's Decode matches Java here;
-		// fastavro diverges (any non-zero is True there). This cell pins the
+		// BinaryDecoder.readBoolean is `return n == 1`, so byte 2 is false
+		// (BinaryDecoder.java:150-151). twmb's Decode matches Java here.
+		// fastavro diverges: any non-zero is True there. This cell pins the
 		// Java anchor the leniency comment on Schema.Decode cites.
 		ok, jsonOut, binOut, errMsg := rt(t, `"boolean"`, []byte{0x02})
 		if !ok {
@@ -808,8 +809,8 @@ func TestDifferentialJavaWireLeniencies(t *testing.T) {
 	t.Run("overlong union index varint accepted", func(t *testing.T) {
 		// BinaryDecoder.readIndex is a plain readInt() varint loop that
 		// accepts non-minimal encodings within 5 bytes. 0x82 0x00 is the
-		// two-byte overlong form of index 1; Java must decode the union's
-		// int branch and re-encode the canonical single-byte form. Pins the
+		// two-byte overlong form of index 1. Java must decode the union's int
+		// branch and re-encode the canonical single-byte form. Pins the
 		// readNullUnionIndex parity comment in deser.go.
 		ok, jsonOut, binOut, errMsg := rt(t, `["null","int"]`, []byte{0x82, 0x00, 0x0e})
 		if !ok {
@@ -824,14 +825,15 @@ func TestDifferentialJavaWireLeniencies(t *testing.T) {
 	})
 
 	t.Run("empty record JsonEncoder emits zero bytes", func(t *testing.T) {
-		// avro-tools 1.12.0's JsonEncoder emits NOTHING for a datum that is
-		// entirely empty records: the grammar's implicit actions only run when a
-		// terminal pulls advance(), and an empty record has no terminals
-		// (JsonGrammarGenerator.java:83-90; the flush drain's `while (pos > 1)`
-		// guard at Parser.java:108 never fires). twmb's "{}" is the only valid JSON
-		// for an empty record and matches fastavro. This cell pins Java's CURRENT
-		// zero-byte output — why rec0 is excluded from TestDifferentialJavaJSONForm
-		// — and flips when a Java release fixes the bug.
+		// avro-tools 1.12.0's JsonEncoder emits *nothing* for a datum that is
+		// entirely empty records. The grammar's implicit actions only run
+		// when a terminal pulls advance(), and an empty record has no
+		// terminals (JsonGrammarGenerator.java:83-90; the flush drain's
+		// `while (pos > 1)` guard at Parser.java:108 never fires). twmb's
+		// "{}" is the only valid JSON for an empty record and matches
+		// fastavro. This cell pins Java's *current* zero-byte output, which
+		// is why rec0 is excluded from TestDifferentialJavaJSONForm, and
+		// flips when a Java release fixes the bug.
 		ok, jsonOut, binOut, errMsg := rt(t, `{"type":"record","name":"E0","fields":[]}`, nil)
 		if !ok {
 			t.Fatalf("Java rejected the empty-record round-trip: %q", errMsg)
@@ -848,14 +850,15 @@ func TestDifferentialJavaWireLeniencies(t *testing.T) {
 // ---------- attribute_placement_census_java_test.go ----------
 
 // TestDifferentialJavaAcceptanceAttributePlacement drives a representative
-// subset of the attribute x placement census through the Java oracle: Java
-// accepts every cell — stray attributes are either reserved-and-ignored via
+// subset of the attribute x placement census through the Java oracle. Java
+// accepts every cell. Stray attributes are either reserved-and-ignored via
 // SCHEMA_RESERVED or kept as props, including the structural-key cells twmb
-// rejects per NOT_BUGS #63 — and for every cell twmb also accepts, Java's
-// Parsing Canonical Form must equal twmb's, proving both strip the stray
-// identically and so the Rabin fingerprints agree. The "error" kind is excluded:
+// rejects per NOT_BUGS #63. For every cell twmb also accepts, Java's Parsing
+// Canonical Form must equal twmb's. That proves both strip the stray
+// identically, so the Rabin fingerprints agree. The "error" kind is excluded:
 // standalone error schemas are a protocol-context type in Java's parser, and
-// twmb's record-alias handling for it is pinned against the record twin locally.
+// twmb's record-alias handling for it is pinned against the record twin
+// locally.
 func TestDifferentialJavaAcceptanceAttributePlacement(t *testing.T) {
 	_, fpCanon := startMatrixJavaOracle(t)
 
@@ -907,7 +910,7 @@ func TestDifferentialJavaAcceptanceAttributePlacement(t *testing.T) {
 
 	// The stray-namespace scoping composition: Java, like twmb and
 	// fastavro, resolves a named type defined under a namespace-carrying
-	// array in the ENCLOSING scope.
+	// array in the *enclosing* scope.
 	t.Run("namespace-scoping", func(t *testing.T) {
 		const def = `{"name":"f","type":{"type":"array","namespace":"x","items":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}}`
 		src := `{"type":"record","name":"top.R","fields":[` + def + `,{"name":"g","type":"top.Inner"}]}`
@@ -936,8 +939,8 @@ func TestDifferentialJavaAcceptanceAttributePlacement(t *testing.T) {
 	})
 }
 
-// startSchemaOracle launches the Java SchemaOracle subprocess and returns its
-// stdin plus a buffered reader over its stdout, skipping when the JVM or the
+// schemaOraclePipes launches the Java SchemaOracle subprocess and returns its
+// stdin plus a buffered reader over its stdout. It skips when the JVM or the
 // avro-tools jar is unavailable. Cleanup closes stdin and reaps the process.
 func schemaOraclePipes(t *testing.T, skipMsg string) (io.WriteCloser, *bufio.Reader) {
 	t.Helper()

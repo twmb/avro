@@ -70,13 +70,13 @@ func ExampleNewWriter() {
 	// Bob is 25
 }
 
-// ExampleWithReaderSchemaFunc demonstrates choosing the reader schema based
-// on state that's only available after the OCF header is parsed — for
-// example, a metadata key that distinguishes between old and new file
-// variants, or a writer-schema shape that changed between versions of the
-// producer. The callback runs after NewReader has read the header, so
-// rd.Schema() and rd.Metadata() are populated; whatever schema it returns
-// becomes the reader schema for resolution against the writer schema.
+// ExampleWithReaderSchemaFunc demonstrates choosing the reader schema based on
+// state that is only available after the OCF header is parsed: a metadata key
+// that distinguishes old from new file variants, say, or a writer-schema shape
+// that changed between versions of the producer. The callback runs after
+// NewReader has read the header, so rd.Schema() and rd.Metadata() are
+// populated. Whatever schema it returns becomes the reader schema, resolved
+// against the writer schema.
 func ExampleWithReaderSchemaFunc() {
 	// Producer v1 wrote records with a legacy field name:
 	v1Schema := avro.MustParse(`{
@@ -97,10 +97,10 @@ func ExampleWithReaderSchemaFunc() {
 		log.Fatal(err)
 	}
 
-	// Our application reads with two reader schemas — one per producer
-	// version — each using the spec-correct field name "ts" but declaring
-	// the old name as an alias so records from either version decode into
-	// the same struct without coalescing.
+	// We read with two reader schemas, one per producer version. Each uses
+	// the spec-correct field name "ts" but declares the old name as an
+	// alias, so records from either version decode into the same struct
+	// without coalescing.
 	v1Reader := avro.MustParse(`{
 		"type": "record", "name": "Event",
 		"fields": [{"name": "ts", "type": "long", "aliases": ["legacy_ts"]}]
@@ -191,17 +191,17 @@ func ExampleNewReader_evolution() {
 
 // ---------- block_alloc_regression_test.go ----------
 
-// TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate pins that a reader with a
-// raised WithMaxBlockBytes does not eagerly allocate an attacker-declared block
-// size before reading the payload. A caller who raises the cap to a very large
-// value — the natural way to say "accept big blocks" — used to expose readBlock's
-// make([]byte, declaredSize): a tiny hostile file declaring a 256 TiB block with
-// no payload drove that to an unrecoverable "fatal error: out of memory", a
-// runtime.throw no recover() can catch.
+// TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate pins that a reader with
+// a raised WithMaxBlockBytes does not eagerly allocate an attacker-declared
+// block size before reading the payload. Raising the cap to a very large value
+// is the natural way to say "accept big blocks", and it used to expose
+// readBlock's make([]byte, declaredSize): a tiny hostile file declaring a 256
+// TiB block with no payload drove that to an unrecoverable "fatal error: out
+// of memory", a runtime.throw no recover() can catch.
 //
-// The reader now reads incrementally once the declared size exceeds the
+// We now read incrementally once the declared size exceeds the
 // eager-allocation window, so the buffer grows only to the bytes actually
-// present. Reaching the assertion without the process dying IS the pin; the
+// present. Reaching the assertion without the process dying is the pin; the
 // boundary-1 case is held by TestRegression_OCFLargeDatumReaderCap.
 func TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate(t *testing.T) {
 	// A valid header for "long", reused for its embedded 16-byte sync marker.
@@ -211,16 +211,16 @@ func TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate(t *testing.T) {
 	hdr := hb.Bytes()
 	sync := hdr[len(hdr)-16:]
 
-	// One hostile block: count=1, a 256 TiB declared compressed size, and NO
-	// payload bytes (the file ends right after the size + sync framing).
+	// One hostile block: count=1, a 256 TiB declared compressed size, and
+	// *no* payload bytes (the file ends right after the size + sync framing).
 	var file bytes.Buffer
 	file.Write(hdr)
 	file.Write(binary.AppendVarint(nil, 1))     // count
 	file.Write(binary.AppendVarint(nil, 1<<48)) // declared size = 256 TiB
 	file.Write(sync)
 
-	// Cap raised ABOVE the declared size, so the size>maxBlockBytes guard does
-	// not fire and the read path itself must stay bounded.
+	// Cap raised *above* the declared size, so the size>maxBlockBytes guard
+	// does not fire and the read path itself must stay bounded.
 	r := mustNewReader(t, bytes.NewReader(file.Bytes()), ocf.WithMaxBlockBytes(1<<50))
 	var v int64
 	if err := r.Decode(&v); err == nil {
@@ -232,17 +232,17 @@ func TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate(t *testing.T) {
 
 // A reader configured with a codec instance via WithCodec must enforce
 // WithMaxDecompressedBlockBytes the same way a name-resolved codec does: by
-// PREVENTING the over-cap allocation, not by decompressing the whole block and
-// rejecting after. The reader passes its cap to the codec's DecompressBounded at
-// decode time, so the bound reaches a supplied instance — and a
-// NopCloser-wrapped one, which forwards the capability. Without this, deflate
+// preventing the over-cap allocation, *not* by decompressing the whole block
+// and rejecting after. We pass our cap to the codec's DecompressBounded at
+// decode time, so the bound reaches a supplied instance, and a NopCloser-wrapped
+// one too, since the wrapper forwards the capability. Without this, deflate
 // decompresses via an unbounded io.ReadAll and a tiny deflate bomb materializes
 // in full before any rejection.
 //
-// The pin is the ALLOCATION: a block declaring far more decompressed bytes than
-// the cap must be rejected having allocated only on the order of the cap, which
-// an over-cap allocation would show as a TotalAlloc delta near the decompressed
-// size.
+// The pin is the allocation: a block declaring far more decompressed bytes
+// than the cap must be rejected having allocated only on the order of the cap.
+// An over-cap allocation would show as a TotalAlloc delta near the
+// decompressed size.
 func TestRegression_OCFUserBuiltinCodecBoundsDecompression(t *testing.T) {
 	const datumSize = 8 << 20 // 8 MiB decompressed (highly compressible -> tiny compressed)
 	const cap = 256 << 10     // 256 KiB decompressed cap
@@ -311,13 +311,13 @@ func TestRegression_OCFUserBuiltinCodecBoundsDecompression(t *testing.T) {
 // The .avro files in testdata/avro-share are vendored from Apache Avro
 // (apache/avro), Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0
 
-// TestDifferentialOCFCorpus decodes the real, Java-produced OCF files shipped in
-// Apache Avro's share/test/data and checks the decoded records against the known
-// contents of weather.json — proving twmb reads actual reference output across
-// every codec it supports and that the decoded VALUES are correct. The corpus is
-// vendored at ocf/testdata/avro-share (see PROVENANCE.md), so this runs by
-// default with no external dependency; point AVRO_SHARE_DATA at a live clone to
-// run against upstream instead.
+// TestDifferentialOCFCorpus decodes the real, Java-produced OCF files shipped
+// in Apache Avro's share/test/data and checks the decoded records against the
+// known contents of weather.json. That proves we read actual reference output
+// across every codec we support, and that the decoded values are correct. The
+// corpus is vendored at ocf/testdata/avro-share (see PROVENANCE.md), so this
+// runs by default with no external dependency; point AVRO_SHARE_DATA at a live
+// clone to run against upstream instead.
 type weatherRec struct {
 	Station string `avro:"station"`
 	Time    int64  `avro:"time"`
@@ -386,7 +386,7 @@ func TestDifferentialOCFCorpus(t *testing.T) {
 		})
 	}
 
-	// Sorted variant: same records, writer reordered them — compare as a set.
+	// Sorted variant: same records, writer reordered them, so compare as a set.
 	t.Run("weather-sorted.avro", func(t *testing.T) {
 		got := readWeather(t, "weather-sorted.avro")
 		sortWeather(got)
@@ -426,21 +426,22 @@ func TestDifferentialOCFCorpus(t *testing.T) {
 
 // ---------- large_datum_test.go ----------
 
-// TestRegression_OCFLargeDatumReaderCap documents, via test, the OCF block-size
-// contract: the writer writes freely (no producer-side cap, matching Java's
-// DataFileWriter and fastavro), while the reader caps block size for DoS safety
-// (defaults 64 MiB). A single Avro datum cannot be split across blocks, so a
-// value larger than the reader default forms one block a DEFAULT reader refuses
-// — but with an ACTIONABLE error naming the option to raise — and it reads back
-// once the reader's caps are raised to match. (We deliberately do NOT enforce a
-// producer-side cap; the reader is where the DoS knob lives.)
+// TestRegression_OCFLargeDatumReaderCap documents, via test, the OCF
+// block-size contract: the writer writes freely (no producer-side cap,
+// matching Java's DataFileWriter and fastavro), while the reader caps block
+// size for DoS safety (defaults 64 MiB). A single Avro datum cannot be split
+// across blocks. A value larger than the reader default therefore forms one
+// block a default reader refuses, with an actionable error naming the option to
+// raise, and it reads back once the reader's caps are raised to match. We
+// deliberately do *not* enforce a producer-side cap; the reader is where the DoS
+// knob lives.
 func TestRegression_OCFLargeDatumReaderCap(t *testing.T) {
 	s := avro.MustParse(`"bytes"`)
 	const n = 80 << 20 // 80 MiB > the 64 MiB reader default
 	blob := make([]byte, n)
 	blob[0], blob[n-1] = 0xAB, 0xCD // sentinels for an integrity spot-check
 
-	// The writer accepts a large datum freely — no producer-side cap.
+	// The writer accepts a large datum freely: no producer-side cap.
 	var buf bytes.Buffer
 	w, err := ocf.NewWriter(&buf, s)
 	if err != nil {
@@ -451,8 +452,8 @@ func TestRegression_OCFLargeDatumReaderCap(t *testing.T) {
 	}
 	mustClose(t, w)
 
-	// A DEFAULT reader refuses the oversized block — with an error that names
-	// the option to raise (not a silent failure, and not a cryptic one).
+	// A default reader refuses the oversized block, with an error that names
+	// the option to raise: not a silent failure, and not a cryptic one.
 	rDefault, err := ocf.NewReader(bytes.NewReader(buf.Bytes()))
 	if err != nil {
 		t.Fatalf("NewReader (default): %v", err)

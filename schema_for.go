@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaOpt configures schema construction via [Parse], [SchemaCache.Parse],
-// or [SchemaFor]. Inapplicable options are silently ignored.
+// or [SchemaFor]. We silently ignore an option that does not apply.
 type SchemaOpt interface{ schemaOpt() }
 
 type schemaOpts struct {
@@ -30,53 +30,57 @@ type withName string
 
 func (withName) schemaOpt() {}
 
-// WithName overrides the Avro record name in [SchemaFor]. By default
-// the Go struct name is used. Ignored by [Parse].
+// WithName overrides the Avro record name in [SchemaFor], which otherwise
+// uses the Go struct name. Ignored by [Parse].
 func WithName(name string) SchemaOpt { return withName(name) }
 
 // SchemaFor infers an Avro schema from the Go type T. T must be a struct.
 //
-// Field names are taken from the avro struct tag, falling back to the Go
-// field name. The following tag options are supported:
+// We take field names from the avro struct tag, falling back to the Go field
+// name. The following tag options are supported:
 //
 //   - avro:"-" excludes the field
 //   - avro:",inline" flattens a nested struct's fields into the parent
 //   - avro:",omitzero" is recorded but does not affect the schema
 //   - avro:",alias=old_name" adds a field alias (repeatable)
-//   - avro:",type-alias=old_name" adds an alias to the field's named type (record, enum, fixed; repeatable)
-//   - avro:",default=value" sets the field's default value (must be last option; scalars only)
-//   - avro:",timestamp-millis" overrides the logical type (also: timestamp-micros,
-//     timestamp-nanos, date, time-millis, time-micros)
+//   - avro:",type-alias=old_name" adds an alias to the field's named type
+//     (record, enum, fixed; repeatable)
+//   - avro:",default=value" sets the field's default value (must be last
+//     option; scalars only)
+//   - avro:",timestamp-millis" overrides the logical type (also:
+//     timestamp-micros, timestamp-nanos, date, time-millis, time-micros)
 //   - avro:",decimal(precision,scale)" sets the decimal logical type
 //   - avro:",uuid" sets the uuid logical type
 //
 // Type inference:
-//   - bool → boolean
-//   - int8, int16, int32 → int
-//   - int, int64, uint32 → long
-//   - uint8, uint16 → int
-//   - float32 → float
-//   - float64 → double
-//   - string → string
-//   - []byte → bytes
-//   - [N]byte → fixed (size N, name from Go type name or "fixed_N")
-//   - *T → ["null", T] union with default null (a pointer chain of any
-//     depth — **T, ***T — collapses to the same single nullable union)
-//   - []T → array
-//   - map[string]T → map
-//   - struct → record (recursive)
-//   - time.Time → long with timestamp-millis (override with tag)
-//   - time.Duration → int with time-millis (override with tag; a Duration is a
-//     span of time, so it is only meaningful with the time-millis/time-micros
-//     logicals — overriding it onto date or a timestamp-* logical maps a
-//     duration onto a point in time, and a large Duration overflows the
-//     narrower wire type)
-//   - avro.Duration → fixed(12) with the duration logical type (the dedicated
-//     Go type for the Avro duration logical — little-endian months/days/
-//     milliseconds; recognized by type, takes no tag, and does not accept one)
-//   - *big.Rat → requires explicit decimal(p,s) tag
-//   - [16]byte with uuid tag → fixed(16) with uuid logical type
-//   - string (or text marshaler type) with uuid tag → string with uuid logical type
+//   - bool -> boolean
+//   - int8, int16, int32 -> int
+//   - int, int64, uint32 -> long
+//   - uint8, uint16 -> int
+//   - float32 -> float
+//   - float64 -> double
+//   - string -> string
+//   - []byte -> bytes
+//   - [N]byte -> fixed (size N, name from Go type name or "fixed_N")
+//   - *T -> ["null", T] union with default null (a pointer chain of any
+//     depth, **T or ***T, collapses to the same single nullable union)
+//   - []T -> array
+//   - map[string]T -> map
+//   - struct -> record (recursive)
+//   - time.Time -> long with timestamp-millis (override with tag)
+//   - time.Duration -> int with time-millis (override with tag; a Duration
+//     is a span of time, so it is only meaningful with the
+//     time-millis/time-micros logicals: overriding it onto date or a
+//     timestamp-* logical maps a duration onto a point in time, and a large
+//     Duration overflows the narrower wire type)
+//   - avro.Duration -> fixed(12) with the duration logical type (the
+//     dedicated Go type for the Avro duration logical: little-endian
+//     months/days/milliseconds, recognized by type, takes no tag and does
+//     not accept one)
+//   - *big.Rat -> requires explicit decimal(p,s) tag
+//   - [16]byte with uuid tag -> fixed(16) with uuid logical type
+//   - string (or text marshaler type) with uuid tag -> string with uuid
+//     logical type
 func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	var o schemaOpts
 	var customTypes []CustomType
@@ -103,15 +107,15 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	}
 	seen := make(map[reflect.Type]seenForm)
 	// applied is threaded globally alongside seen. type-alias dedup keys on a
-	// named type's fullname, and seen guarantees exactly one definition per type
-	// across the whole inference, so the applied state must span the whole call
-	// too. A per-record map made cross-record identical aliases on a shared named
-	// type spuriously reject: the type is defined (alias recorded) in one record
-	// but referenced from another record whose fresh map is empty, so the
-	// reference fell into the "defined without type-alias" branch. applied is only
-	// SET at a definition (addTypeAliases applied==true) and only READ at a
-	// reference, so global scope never false-accepts — same-name distinct-type
-	// collisions are still caught independently by dedupNamedTypes.
+	// named type's fullname, and seen guarantees exactly one definition per
+	// type across the whole inference, so the applied state must span the whole
+	// call too. A per-record map made cross-record identical aliases on a shared
+	// named type spuriously reject: the type is defined (alias recorded) in one
+	// record but referenced from another record whose fresh map is empty, so the
+	// reference fell into the "defined without type-alias" branch. applied is
+	// only set at a definition (addTypeAliases applied==true) and only read at a
+	// reference, so global scope never false-accepts; dedupNamedTypes still
+	// catches same-name distinct-type collisions independently.
 	applied := make(appliedTypeAliases)
 	s, err := inferRecord(t, name, o.namespace, seen, customTypes, applied)
 	if err != nil {
@@ -131,17 +135,17 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 // resolveNameScope resolves a named-kind node's identity at its position,
 // following the parser's rules (spec, "Names"): a dotted name is a fullname
 // whose namespace attribute is ignored; an explicit namespace attribute
-// (including the "" inheritance escape) is authoritative; otherwise the
-// name inherits the enclosing namespace. Returns the resolved fullname and
-// the namespace scope the node opens for its children (record fields
-// resolve inside it). Shared by dedupNamedTypes and normalizeSchemaScope so
-// the keying walk and the equality walk cannot drift on scope rules.
+// (including the "" inheritance escape) is authoritative; otherwise the name
+// inherits the enclosing namespace. We return the resolved fullname and the
+// namespace scope the node opens for its children (record fields resolve
+// inside it). dedupNamedTypes and normalizeSchemaScope share it, so the
+// keying walk and the equality walk cannot drift on scope rules.
 //
-// Reserved keys are read by exact name: the tree this walk keys is the
-// tree Parse will consume, and Parse matches reserved attribute names
-// only by their exact lowercase spelling (a case-variant key is an
-// ordinary custom property — see [Schema.Root]), so exact reads here key
-// definitions exactly as Parse binds them.
+// We read reserved keys by exact name: the tree this walk keys is the tree
+// Parse will consume, and Parse matches reserved attribute names only by
+// their exact lowercase spelling (a case-variant key is an ordinary custom
+// property; see [Schema.Root]), so exact reads here key definitions exactly
+// as Parse binds them.
 func resolveNameScope(v map[string]any, enclosingNS string) (full, ns string) {
 	name, _ := v["name"].(string)
 	short := name
@@ -155,13 +159,13 @@ func resolveNameScope(v map[string]any, enclosingNS string) (full, ns string) {
 }
 
 // normalizeSchemaScope returns a copy of a schema tree with every name
-// resolved against its position — named definitions carry their fullname in
-// "name" with no separate namespace attribute, and bare name references are
-// qualified by the enclosing scope — so two renderings of one definition
+// resolved against its position: named definitions carry their fullname in
+// "name" with no separate namespace attribute, and we qualify bare name
+// references by the enclosing scope. Two renderings of one definition then
 // compare equal exactly when they denote the same types. The raw relative
 // JSON of one definition can differ by position (an explicit namespace
-// attribute at one site, inheritance at another; dotted vs split
-// spellings), so dedupNamedTypes compares this normalized form.
+// attribute at one site, inheritance at another; dotted vs split spellings),
+// so dedupNamedTypes compares this normalized form.
 func normalizeSchemaScope(v any, enclosingNS string) any {
 	switch v := v.(type) {
 	case map[string]any:
@@ -178,15 +182,15 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 		}
 		// Key classification is by exact name, matching the Parse this
 		// tree feeds (see resolveNameScope): only the exact lowercase
-		// spelling is the reserved attribute, so only it normalizes — a
+		// spelling is the reserved attribute, so only it normalizes. A
 		// case-variant key is an ordinary custom property and compares
 		// verbatim like any other.
 		//
-		// Structural keys normalize only on the kind that BINDS them
+		// Structural keys normalize only on the kind that *binds* them
 		// (fields on record/error, items on array, values on map),
 		// mirroring the parser's kind-keyed grammar: on any other kind
 		// the key is inert as-written metadata (never name-bound), so it
-		// compares VERBATIM — two occurrences are one definition exactly
+		// compares verbatim. Two occurrences are one definition exactly
 		// when their inert content is byte-identical, not merely
 		// spelling-equivalent under a scope the parser never applies.
 		for k, val := range v {
@@ -241,15 +245,15 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 
 // pinCustomSchemaScope pins the namespace scope of a CustomType.Schema
 // subtree that is about to be embedded inside a namespaced SchemaFor tree.
-// toJSON renders the subtree relative to the null namespace, so a named
-// node that neither carries a dotted name nor a namespace attribute
-// declares the NULL namespace — but at a namespaced embedding position the
-// parser's inheritance would capture it into the surrounding namespace,
-// silently renaming the user's declared type. Inject the "namespace":""
-// inheritance escape on each such node — the same escape toJSONWalk emits
-// for a null-namespace type inside a namespaced scope. The walk stops at
-// the first named node on every path: once a node pins its scope (dotted
-// name, explicit attribute, or this injection), everything below it renders
+// toJSON renders the subtree relative to the null namespace, so a named node
+// that neither carries a dotted name nor a namespace attribute declares the
+// null namespace; at a namespaced embedding position the parser's
+// inheritance would then capture it into the surrounding namespace, silently
+// renaming your declared type. We inject the "namespace":"" inheritance
+// escape on each such node, the same escape toJSONWalk emits for a
+// null-namespace type inside a namespaced scope. The walk stops at the first
+// named node on every path: once a node pins its scope (dotted name,
+// explicit attribute, or this injection), everything below it renders
 // relative to that node and is position-independent already.
 func pinCustomSchemaScope(v any) {
 	switch v := v.(type) {
@@ -269,7 +273,7 @@ func pinCustomSchemaScope(v any) {
 			return
 		}
 		// Unnamed containers pass the enclosing scope through; descend to
-		// the named frontier — only through the key the node's kind BINDS
+		// the named frontier, only through the key the node's kind *binds*
 		// (items on array, values on map), mirroring the parser's
 		// kind-keyed grammar. On any other kind the key is inert
 		// as-written metadata: a named-kind-shaped value inside it is
@@ -292,25 +296,25 @@ func pinCustomSchemaScope(v any) {
 	}
 }
 
-// renderCustomSchemaTree renders a CustomType.Schema subtree for embedding into
-// a SchemaFor tree. It is a metadata walk over CALLER-owned storage, which
+// renderCustomSchemaTree renders a CustomType.Schema subtree for embedding
+// into a SchemaFor tree. It is a metadata walk over storage you own, which
 // gives it two boundary duties:
 //
 //   - The error-reporting walk, not the bare one, so an over-budget or
 //     unnamed-cyclic subtree fails the build by name. The bare walk truncates
-//     to nil — correct for the error-LESS surfaces, where the alternative is a
-//     panic — but a truncated Props VALUE parses cleanly as a null prop, so
+//     to nil, correct for the error-less surfaces where the alternative is a
+//     panic, but a truncated Props value parses cleanly as a null prop, so
 //     nothing downstream would catch the alteration.
 //
-//   - Deep-copy AND canonicalize before returning. The walk hands Props
-//     containers over BY REFERENCE when they need no JSON fixup, and the
-//     composition walkers write into the tree they are given —
-//     pinCustomSchemaScope injects "namespace":"", dedupNamedTypes rewrites
-//     slots into references — so without the copy those writes land in the
-//     caller's SchemaNode. Without canonicalizeTreeValue, a caller-typed value
-//     like `type M map[string]any` passes every walker type-switch untouched
-//     while Parse binds its marshal as real structure. This render is the only
-//     way caller-owned containers enter the pre-Parse tree.
+//   - Deep-copy *and* canonicalize before returning. The walk hands Props
+//     containers over by reference when they need no JSON fixup, and the
+//     composition walkers write into the tree they are given
+//     (pinCustomSchemaScope injects "namespace":"", dedupNamedTypes rewrites
+//     slots into references), so without the copy those writes land in your
+//     SchemaNode. Without canonicalizeTreeValue, a caller-typed value like
+//     `type M map[string]any` passes every walker type-switch untouched
+//     while Parse binds its marshal as real structure. This render is the
+//     only way containers you own enter the pre-Parse tree.
 func renderCustomSchemaTree(n *SchemaNode) (any, error) {
 	d := &deduper{
 		defined: make(map[string]*SchemaNode),
@@ -323,23 +327,23 @@ func renderCustomSchemaTree(n *SchemaNode) (any, error) {
 	return deepCopyJSONTree(tree), nil
 }
 
-// deepCopyJSONTree copies AND CANONICALIZES every container level of a rendered
-// tree, so the composition walkers see every value Parse will bind and no
-// mutating walker reaches storage shared with the source SchemaNode.
+// deepCopyJSONTree copies *and* canonicalizes every container level of a
+// rendered tree, so the composition walkers see every value Parse will bind
+// and no mutating walker reaches storage shared with the source SchemaNode.
 //
-// The copy: []string aliases/symbols arrive by reference (emitStrings returns
-// the caller's slice), and addTypeAliases appends to a type's "aliases" — an
-// append into a caller slice with spare capacity writes their backing array
-// past its length, which no deep-equal of the caller's tree can detect.
+// The copy: []string aliases/symbols arrive by reference (emitStrings
+// returns your slice), and addTypeAliases appends to a type's "aliases". An
+// append into your slice with spare capacity writes your backing array past
+// its length, which no deep-equal of your tree can detect.
 //
-// The canonicalization: the tree's semantics are its json.Marshal output, and a
-// caller-typed `type M map[string]any` marshals identically to its canonical
-// twin, so left alone it threads through every walker type-switch untouched
-// while Parse binds its marshal as real structure.
+// The canonicalization: the tree's semantics are its json.Marshal output,
+// and a caller-typed `type M map[string]any` marshals identically to its
+// canonical twin, so left alone it threads through every walker type-switch
+// untouched while Parse binds its marshal as real structure.
 //
-// Nil-ness is part of the marshal image — a nil map marshals null, an empty one
-// {} — so every arm preserves it exactly. Scalar leaves stay shared; []byte
-// never survives a render.
+// Nil-ness is part of the marshal image (a nil map marshals null, an empty
+// one {}), so every arm preserves it exactly. Scalar leaves stay shared;
+// []byte never survives a render.
 func deepCopyJSONTree(v any) any {
 	switch v := v.(type) {
 	case map[string]any:
@@ -384,20 +388,20 @@ func deepCopyJSONTree(v any) any {
 
 // canonicalizeTreeValue rewrites a caller-typed tree value into the
 // canonical Go shape whose json.Marshal output is identical: a named
-// string-keyed map into map[string]any, a named slice/array into []any
-// (or []string when every element is a plain string kind, matching the
-// aliases/symbols form), a byte-kinded slice into []byte, named leaves
-// into their predeclared types, with pointers and interfaces unwrapped.
-// A nil named map/slice canonicalizes to nil — its marshal image is null,
+// string-keyed map into map[string]any, a named slice/array into []any (or
+// []string when every element is a plain string kind, matching the
+// aliases/symbols form), a byte-kinded slice into []byte, named leaves into
+// their predeclared types, with pointers and interfaces unwrapped. A nil
+// named map/slice canonicalizes to nil, its marshal image being null,
 // exactly like its canonical twin's. Values whose marshal is self-defined
-// (own MarshalJSON/MarshalText, json.Number — treeValueMarshalOpaque) and
+// (own MarshalJSON/MarshalText, json.Number: treeValueMarshalOpaque) and
 // shapes with no stable same-marshal canonical twin (structs; maps with
 // non-string-kind keys, whose MarshalText output is the key on every
 // toolchain; slices whose elements' marshal is position-dependent) stay as
-// they are: opaque leaves the walkers pass through untouched and Parse
-// reads from the marshal — the documented residual posture. Cyclic
-// values cannot reach here: the render's budgeted walk (valueWalkLimit)
-// errors on them before the copy runs.
+// they are: opaque leaves the walkers pass through untouched and Parse reads
+// from the marshal, the documented residual posture. Cyclic values cannot
+// reach here: the render's budgeted walk (valueWalkLimit) errors on them
+// before the copy runs.
 func canonicalizeTreeValue(v any) any {
 	if v == nil || treeValueMarshalOpaque(v) {
 		return v
@@ -466,25 +470,25 @@ func canonicalizeTreeValue(v any) any {
 }
 
 // dedupNamedTypes walks a JSON-like schema tree (maps, slices, strings) and
-// replaces a repeated, IDENTICAL named-type definition (record/enum/fixed)
+// replaces a repeated, identical named-type definition (record/enum/fixed)
 // with a name reference. It tracks the enclosing namespace exactly as the
 // parser does (resolveNameScope: a named definition opens its own scope),
 // so:
 //
-//   - definitions key on their RESOLVED FULLNAME, since name equality is
+//   - definitions key on their resolved fullname, since name equality is
 //     defined on the fullname (spec, "Names"), so a.X and X coexist;
-//   - a repeat dedups to a DOTTED fullname reference, which re-binds
-//     position-independently. A null-namespace type has no dotted spelling, so
-//     its bare reference is emitted only in a null enclosing scope — at a
+//   - a repeat dedups to a dotted fullname reference, which re-binds
+//     position-independently. A null-namespace type has no dotted spelling,
+//     so its bare reference is emitted only in a null enclosing scope: at a
 //     namespaced position a bare name binds in the enclosing namespace and
-//     references have no "namespace":"" escape, so that corner returns a named
-//     error rather than a wrong-binding reference;
-//   - two occurrences compare SCOPE-NORMALIZED, since one definition's relative
-//     JSON differs by position.
+//     references have no "namespace":"" escape, so that corner returns a
+//     named error rather than a wrong-binding reference;
+//   - two occurrences compare scope-normalized, since one definition's
+//     relative JSON differs by position.
 //
-// It also enforces one definition per fullname. Two DIFFERENT definitions
-// claiming one name — two Go types, or two forms of one type, like a [16]byte
-// named "uuid" used both ,uuid and plain — error rather than emit an
+// It also enforces one definition per fullname. Two different definitions
+// claiming one name, two Go types or two forms of one type like a [16]byte
+// named "uuid" used both ,uuid and plain, error rather than emit an
 // unrepresentable schema. This is the single general collision check; the
 // fixed/record/enum arms above need not detect it.
 func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any, error) {
@@ -511,7 +515,7 @@ func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any,
 							"fixed/record/enum fullname); each Avro named type must be unique — rename a Go type so the "+
 							"names are distinct", full)
 					}
-					// Identical — emit a reference. A dotted fullname
+					// Identical, so emit a reference. A dotted fullname
 					// re-binds position-independently; a null-namespace
 					// fullname is spellable only from a null enclosing
 					// scope.
@@ -530,16 +534,16 @@ func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any,
 		// resolve in the record's own namespace scope; items and values
 		// belong to unnamed array/map nodes, which pass the scope through
 		// (childNS == enclosingNS there). Reads and rewrites use the
-		// exact reserved spelling — the only spelling Parse binds (see
+		// exact reserved spelling, the only spelling Parse binds (see
 		// resolveNameScope).
 		//
-		// Each descent is gated on the kind that BINDS the key (fields on
-		// record/error, items on array, values on map), mirroring the
+		// Each descent is gated on the kind that *binds* the key (fields
+		// on record/error, items on array, values on map), mirroring the
 		// parser's kind-keyed grammar: on any other kind the key is inert
-		// as-written metadata. Walking it would register definitions
-		// Parse never binds — a later genuine definition of the same
-		// fullname would then dedup into a dangling reference or report a
-		// false duplicate — so the stray passes through untouched.
+		// as-written metadata. Walking it would register definitions Parse
+		// never binds, and a later genuine definition of the same fullname
+		// would then dedup into a dangling reference or report a false
+		// duplicate, so the stray passes through untouched.
 		if isRecordKind(typ) {
 			if fields, ok := v["fields"].([]map[string]any); ok {
 				for i := range fields {
@@ -595,15 +599,13 @@ func MustSchemaFor[T any](opts ...SchemaOpt) *Schema {
 	return s
 }
 
-// avroFullName returns the Avro fullname for a named type: the namespace
-// and name joined by a dot, or the bare name when there is no namespace.
-// This is the single identity a named type is registered under (seen[t])
-// and referenced by, so every site that needs a named type's identity —
-// the record definition, a later name reference, and the type-alias dedup
-// in inferField — derives it the same way and cannot drift. (The drift it
-// prevents: registering under the bare name while referencing by fullname,
-// so a same-type/identical-alias pair is wrongly seen as a fresh
-// definition once a namespace is configured.)
+// avroFullName is the single identity we register a named type under
+// (seen[t]) and reference it by. Every site needing that identity derives it
+// here, the record definition, a later name reference, and inferField's
+// type-alias dedup, so the three cannot drift. The drift it prevents:
+// registering under the bare name while referencing by fullname, so a
+// same-type/identical-alias pair is wrongly seen as a fresh definition once a
+// namespace is configured.
 func avroFullName(namespace, name string) string {
 	if namespace == "" {
 		return name
@@ -612,7 +614,7 @@ func avroFullName(namespace, name string) string {
 }
 
 // seenForm records, per visited type, the Avro name a type was registered
-// under and — for a [16]byte fixed — which form emitted it. The form bit lets
+// under and, for a [16]byte fixed, which form emitted it. The form bit lets
 // a [16]byte type whose name equals the uuid logical name ("uuid") be caught
 // as a name collision when used as both a ,uuid logical and a plain fixed,
 // rather than silently merged.
@@ -622,8 +624,8 @@ type seenForm struct {
 }
 
 // inferRecord builds a schema map for a struct type. The seen map tracks
-// types that have been visited so repeat references (both recursive and
-// shared) emit a named reference instead of a duplicate definition.
+// visited types, so a repeat reference (recursive or shared) emits a named
+// reference instead of a duplicate definition.
 func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType, applied appliedTypeAliases) (any, error) {
 	if sf, ok := seen[t]; ok {
 		return sf.name, nil
@@ -675,13 +677,13 @@ type schemaField struct {
 // resolved (tagged wins over untagged, shallower wins over deeper, and a tie
 // at the winning depth is an ambiguity to report).
 //
-// Resolving HERE rather than inside the walk is the contract, not a layout
-// choice. The rule ranges over the whole collected set, since a shallower field
-// declared anywhere above an embedded struct takes the name. Per recursion
-// level it would decide on a partial set — calling a collision ambiguous before
-// the level that resolves it is read, rejecting a type Go's own promotion
-// accepts — and would read root-accumulated index paths against whatever nested
-// type that level was visiting.
+// Resolving *here* rather than inside the walk is the contract, not a layout
+// choice. The rule ranges over the whole collected set, since a shallower
+// field declared anywhere above an embedded struct takes the name. Per
+// recursion level it would decide on a partial set, calling a collision
+// ambiguous before the level that resolves it is read, rejecting a type Go's
+// own promotion accepts, and would read root-accumulated index paths against
+// whatever nested type that level was visiting.
 //
 // typeFieldMapping answers the same question for encode and decode and keeps
 // its resolution outside its recursion for the same reason. Agreeing on the
@@ -695,21 +697,22 @@ func collectFields(root reflect.Type, visited map[reflect.Type]bool) ([]schemaFi
 	return resolvePromotedFields(root, raw)
 }
 
-// collectFieldsRaw walks a struct type depth-first, handling embedded structs
-// and inline tags, and returns every promoted field it finds in encounter
-// order — shallower first, which is what the resolution downstream relies on.
-// It deliberately does NOT resolve name collisions; see collectFields.
+// collectFieldsRaw walks a struct type depth-first, handling embedded
+// structs and inline tags, and returns every promoted field it finds in
+// encounter order, shallower first, which is what the resolution downstream
+// relies on. It deliberately does NOT resolve name collisions; see
+// collectFields.
 func collectFieldsRaw(t reflect.Type, index []int, visited map[reflect.Type]bool) ([]schemaField, error) {
 	if visited[t] {
 		return nil, nil
 	}
-	// PER-PATH marking, in lockstep with typeFieldMapping's collect
-	// (reflect.go): the on-path check terminates embed CYCLES, but a type
-	// reachable through two SIBLING embed paths must be collected at each
-	// occurrence — so the shallower one reaches the shallowest-wins dedup,
-	// and a type genuinely inlined twice surfaces as the duplicate-field
-	// collision it is (rather than being silently pruned). The two walkers
-	// must agree, so this marking discipline is kept identical.
+	// Per-path marking, in lockstep with typeFieldMapping's collect
+	// (reflect.go): the on-path check terminates embed cycles, but a type
+	// reachable through two sibling embed paths must be collected at each
+	// occurrence, so the shallower one reaches the shallowest-wins dedup and a
+	// type genuinely inlined twice surfaces as the duplicate-field collision it
+	// is, rather than being silently pruned. The two walkers must agree, so we
+	// keep this marking discipline identical.
 	visited[t] = true
 	defer delete(visited, t)
 
@@ -733,8 +736,8 @@ func collectFieldsRaw(t reflect.Type, index []int, visited map[reflect.Type]bool
 				// Same guard as the named-field path below, in the same
 				// position relative to the exact-match skip: an embedded
 				// struct is where "-,opt" is likeliest to be written, and
-				// deferring to Avro's name grammar is not a substitute —
-				// WithLaxNames can accept "-", and then the embed silently
+				// deferring to Avro's name grammar is no substitute, since
+				// WithLaxNames can accept "-" and then the embed silently
 				// becomes a field the tag asked to skip.
 				if err := checkSkipDirectiveExact(sf.Name, tag); err != nil {
 					return nil, err
@@ -745,8 +748,8 @@ func collectFieldsRaw(t reflect.Type, index []int, visited map[reflect.Type]bool
 				}
 				if parts[0] != "" {
 					// Explicit name on embedded struct: treat as named field.
-					// inline is incompatible with an explicit name — the name
-					// says "make this a field"; inline says "flatten, no field."
+					// inline is incompatible with an explicit name; the name
+					// says "make this a field", inline says "flatten, no field."
 					for _, p := range parts[1:] {
 						if p == "inline" {
 							return nil, fmt.Errorf("avro: field %s has tag %q: inline is incompatible with an explicit field name (inline flattens the embed; there is no field at this position to name)",
@@ -808,13 +811,13 @@ func collectFieldsRaw(t reflect.Type, index []int, visited map[reflect.Type]bool
 			}
 		}
 		if hasInline {
-			// inline flattens the embedded struct into the parent — the
+			// inline flattens the embedded struct into the parent, so the
 			// embed has no field of its own at this position. Other tag
 			// options apply to a field (name, default=, alias=,
 			// type-alias=, omitzero, logical-type tags) and have no
 			// target with inline. Reject rather than silently drop so
 			// typos surface here instead of producing a schema that
-			// quietly ignores the user's tag.
+			// quietly ignores your tag.
 			if parts[0] != "" {
 				return nil, fmt.Errorf("avro: field %s has tag %q: inline is incompatible with an explicit field name (inline flattens the embed; there is no field at this position to name)",
 					sf.Name, truncForError(tag))
@@ -854,8 +857,9 @@ func collectFieldsRaw(t reflect.Type, index []int, visited map[reflect.Type]bool
 }
 
 // resolvePromotedFields decides which promoted field owns each Avro name,
-// over the COMPLETE set collected from t. See collectFields: the rule ranges
-// over the whole set, and t is the type raw's index paths are rooted at.
+// over the *complete* set collected from t. See collectFields: the rule
+// ranges over the whole set, and t is the type raw's index paths are rooted
+// at.
 func resolvePromotedFields(t reflect.Type, raw []schemaField) ([]schemaField, error) {
 	// Deduplicate. Must agree with reflect.go's typeFieldMapping so
 	// SchemaFor's inferred schema and the runtime field mapping pick the
@@ -863,19 +867,20 @@ func resolvePromotedFields(t reflect.Type, raw []schemaField) ([]schemaField, er
 	// the encode/decode field-mapping contract: "a tagged field wins over an
 	// untagged one at any depth; among fields with the same tagged status,
 	// the shallowest wins"):
-	//   1. Tagged beats untagged at ANY depth. A tiebreaker, so not ambiguous.
-	//      Runs first.
+	//   1. Tagged beats untagged at any depth. A tiebreaker, so not
+	//      ambiguous. Runs first.
 	//   2. Among same-tagged-status fields the shallower wins. Without this,
-	//      dedup keeps first-seen — the DEEPER field, since nested-struct
+	//      dedup keeps first-seen, the *deeper* field, since nested-struct
 	//      fields are appended to raw before outer ones.
-	//   3. Only a same-depth, same-tagged-status collision AT THE WINNING DEPTH
-	//      is ambiguous; picking one silently loses data at encode. Java's
-	//      setFields rejects a duplicate (Schema.java:981) and hamba likewise.
-	//      The decision is DEFERRED: a shallower field declared LATER — the
-	//      common "embeds first, own fields after" layout — resolves a
-	//      same-depth deep collision, so erroring the instant two deep fields
-	//      collide would reject a struct whose name a shallower field
-	//      unambiguously owns. typeFieldMapping and Go's promotion defer too.
+	//   3. Only a same-depth, same-tagged-status collision at the winning
+	//      depth is ambiguous; picking one silently loses data at encode.
+	//      Java's setFields rejects a duplicate (Schema.java:981) and hamba
+	//      likewise. The decision is deferred: a shallower field declared
+	//      later, the common "embeds first, own fields after" layout,
+	//      resolves a same-depth deep collision, so erroring the instant two
+	//      deep fields collide would reject a struct whose name a shallower
+	//      field unambiguously owns. typeFieldMapping and Go's promotion
+	//      defer too.
 	type entry struct {
 		idx int
 		schemaField
@@ -938,17 +943,17 @@ func resolvePromotedFields(t reflect.Type, raw []schemaField) ([]schemaField, er
 
 // checkSkipDirectiveExact rejects an avro tag that begins with the "-" skip
 // directive without being exactly "-" ("-,omitzero", "-foo"). The directive
-// is exact-match only, so anything else is a typo: the user meant to skip but
-// left options attached, or means a field literally named "-", which Avro's
-// naming rules reject anyway — and which [WithLaxNames] would let through as
-// a real field the tag asked to skip.
+// is exact-match only, so anything else is a typo: you meant to skip but
+// left options attached, or you mean a field literally named "-", which
+// Avro's naming rules reject anyway and which [WithLaxNames] would let
+// through as a real field the tag asked to skip.
 //
 // Both tag-reading paths in collectFields call this immediately after their
 // own exact `tag == "-"` skip: the named-field path and the anonymous
 // embedded-struct path, which handles its own tag and never reaches the
-// named path's checks. Sharing one implementation is what keeps the two from
-// drifting on the directive's grammar, and the position after the exact-match
-// skip is what keeps plain "-" skipping on both.
+// named path's checks. Sharing one implementation keeps the two from
+// drifting on the directive's grammar, and the position after the
+// exact-match skip keeps plain "-" skipping on both.
 func checkSkipDirectiveExact(fieldName, tag string) error {
 	if !strings.HasPrefix(tag, "-") {
 		return nil
@@ -957,9 +962,9 @@ func checkSkipDirectiveExact(fieldName, tag string) error {
 		fieldName, truncForError(tag), "-")
 }
 
-// splitTag splits a struct tag value on commas, but respects parentheses
-// and brackets. For example, "name,decimal(10,2),alias=[a,b]" splits into
-// ["name", "decimal(10,2)", "alias=[a,b]"].
+// splitTag splits a struct tag value on commas, respecting parentheses and
+// brackets: "name,decimal(10,2),alias=[a,b]" splits into ["name",
+// "decimal(10,2)", "alias=[a,b]"].
 func splitTag(tag string) ([]string, error) {
 	var parts []string
 	var stack []rune
@@ -982,13 +987,14 @@ func splitTag(tag string) ([]string, error) {
 			if len(stack) == 0 {
 				parts = append(parts, tag[start:i])
 				start = i + 1
-				// default= consumes the rest of the tag verbatim — its
+				// default= consumes the rest of the tag verbatim: its
 				// value may be an arbitrary string containing unbalanced
-				// brackets/parens (e.g. `default=note (a`) or commas. Stop
-				// splitting and bracket-checking at this boundary so the
-				// value is preserved rather than rejected as an "unclosed
-				// (". parseSchemaTag's default= arm already documents that
-				// it takes the rest of the tag as the last option.
+				// brackets/parens (e.g. `default=note (a`) or commas.
+				// Stop splitting and bracket-checking at this boundary so
+				// the value is preserved rather than rejected as an
+				// "unclosed (". parseSchemaTag's default= arm already
+				// documents that it takes the rest of the tag as the last
+				// option.
 				if strings.HasPrefix(tag[start:], "default=") {
 					parts = append(parts, tag[start:])
 					return parts, nil
@@ -1003,9 +1009,9 @@ func splitTag(tag string) ([]string, error) {
 	return parts, nil
 }
 
-// parseBracketedValues parses a tag value that is either a single value or
-// a bracket-delimited list: "foo" returns ["foo"], "[foo,bar]" returns
-// ["foo", "bar"]. Returns an error for empty values or empty brackets.
+// parseBracketedValues parses a tag value that is either a single value or a
+// bracket-delimited list: "foo" gives ["foo"], "[foo,bar]" gives ["foo",
+// "bar"]. An empty value or empty brackets is an error.
 func parseBracketedValues(s string) ([]string, error) {
 	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
 		inner := s[1 : len(s)-1]
@@ -1026,7 +1032,6 @@ func parseBracketedValues(s string) ([]string, error) {
 	return []string{s}, nil
 }
 
-// parseSchemaTag parses the avro struct tag parts into a schemaField.
 func parseSchemaTag(sf reflect.StructField, parts []string, index []int) (schemaField, error) {
 	f := schemaField{
 		name:   parts[0],
@@ -1093,20 +1098,20 @@ var (
 )
 
 // appliedTypeAliases tracks type-alias values applied to each named type,
-// keyed by type name. Used to accept identical aliases on later fields
-// referencing the same type, while rejecting contradictory ones.
+// keyed by type name. We accept identical aliases on later fields referencing
+// the same type, and reject contradictory ones.
 type appliedTypeAliases map[string][]string
 
 // tagDefaultValue reads a `default=` struct tag's raw text as a JSON value,
 // falling back to the text verbatim as a string.
 //
-// The fallback is what makes an unquoted tag (`default=hello`) usable, and it
-// takes the WHOLE text: a decode that stopped after the first JSON value would
-// turn `42 oops` into the number 42, silently dropping what the author wrote.
+// The fallback makes an unquoted tag (`default=hello`) usable, and it takes
+// the *whole* text: a decode that stopped after the first JSON value would
+// turn `42 oops` into the number 42, silently dropping what you wrote.
 // Trailing content therefore means "this was never JSON", not "this is JSON
-// plus junk" — the same verdict decimal()'s trailing-junk guard reaches.
+// plus junk", the same verdict decimal()'s trailing-junk guard reaches.
 //
-// Numbers come back as their literal, which is what keeps a long default like
+// Numbers come back as their literal, which keeps a long default like
 // 9223372036854775807 from round-tripping through float64 into
 // 9.223372036854776e+18 and being rejected by the parse it feeds.
 func tagDefaultValue(raw string) any {
@@ -1124,7 +1129,6 @@ func tagDefaultValue(raw string) any {
 	return v
 }
 
-// inferField builds the Avro field definition for a single struct field.
 func inferField(f schemaField, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType, applied appliedTypeAliases) (map[string]any, error) {
 	fieldDef := map[string]any{
 		"name": f.name,
@@ -1141,7 +1145,7 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]seenForm,
 			applied[r.refName] = f.typeAlias
 		case r.refName != "":
 			if prev, ok := applied[r.refName]; ok && slices.Equal(prev, f.typeAlias) {
-				// Identical aliases — accept silently.
+				// Identical aliases, so accept silently.
 			} else if ok {
 				return nil, fmt.Errorf("type-alias on field %q conflicts with type-alias already applied to type %q on an earlier field", f.name, r.refName)
 			} else {
@@ -1159,8 +1163,8 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]seenForm,
 	if f.dflt != nil {
 		v := tagDefaultValue(*f.dflt)
 		fieldDef["default"] = v
-		// A narrow Go integer kind maps to a WIDER Avro type (int8/16 and
-		// uint8/16 → int; uint32 / uint → long), so a default that is a
+		// A narrow Go integer kind maps to a wider Avro type (int8/16 and
+		// uint8/16 to int; uint32 / uint to long), so a default that is a
 		// valid Avro int/long but exceeds the Go field's range builds a
 		// schema whose own default cannot be materialized back into the
 		// field at decode-fill time. Reject it here for consistency with
@@ -1184,18 +1188,18 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]seenForm,
 // an integer kind; non-integer defaults and non-integer fields return nil
 // and leave type compatibility to Parse's Avro-type validation.
 //
-// The default's integer value is extracted via defaultAsInt64 — the SAME
-// lenient parser the wire default-fill path uses — so exponent / whole-
-// number-float literals (e.g. "4e3") are caught here exactly as the wire
-// path would catch them at decode time, instead of only the plain-integer
-// forms. A value defaultAsInt64 can't read as an integer (a string,
-// fractional, or > int64 default) is left to Parse, which validates it
-// against the Avro type.
+// The default's integer value is extracted via defaultAsInt64, the same
+// lenient parser the wire default-fill path uses, so exponent and
+// whole-number-float literals (e.g. "4e3") are caught here exactly as the
+// wire path would catch them at decode time, instead of only the
+// plain-integer forms. A value defaultAsInt64 can't read as an integer (a
+// string, fractional, or > int64 default) is left to Parse, which validates
+// it against the Avro type.
 func checkIntDefaultFitsGoKind(v any, t reflect.Type) error {
 	// Bound the peel so a cyclic pointer type (`type P *P`, whose Elem is
 	// itself) terminates instead of looping forever. This is reached only
-	// when a CustomType matched the field — so inferType returned before its
-	// own (now-bounded) recursion — and a default is present. Past the cap the
+	// when a CustomType matched the field, so inferType returned before its
+	// own (now-bounded) recursion, and a default is present. Past the cap the
 	// type is still a pointer, so the switch below treats it as non-integer
 	// and defers to Parse. Mirrors indirect/indirectAlloc's maxIndirectDepth.
 	for i := 0; i < maxIndirectDepth && t.Kind() == reflect.Pointer; i++ {
@@ -1230,19 +1234,21 @@ var avroPrimitives = map[string]bool{
 	"float": true, "double": true, "string": true, "bytes": true,
 }
 
-// isNullBranchTree reports whether a union branch in a PRE-PARSE schema tree
-// is the "null" type, in either spelling Avro admits: the bare primitive
-// string "null", or an object whose "type" is "null". Props and a logicalType
-// on a wrapped null are inert — Avro defines no null logical type, so nothing
-// can consume either key and the branch's type and wire form are unchanged —
-// so a carrier-bearing wrapped null is still a null branch.
+// isNullBranchTree reports whether a union branch in a pre-Parse schema
+// tree is the "null" type, in either spelling Avro admits: the bare
+// primitive string "null", or an object whose "type" is "null". Props and a
+// logicalType on a wrapped null are inert, since Avro defines no null
+// logical type, so nothing can consume either key and the branch's type and
+// wire form are unchanged: a carrier-bearing wrapped null is still a null
+// branch.
 //
-// The `any`-tree mirror of [aschema.isNullBranch]. The two must agree, because
-// this tree is handed straight to that parser: a branch this calls non-null and
-// the parser calls null emits a shape contradicting its parsed meaning. One
-// asker per representation — isNullBranch for the parsed tree, the normalized
-// node kind for the compiled and metadata trees, this for pre-Parse — so a new
-// asker here belongs in this function, not in a fresh bare-spelling compare.
+// The `any`-tree mirror of [aschema.isNullBranch]. The two must agree,
+// because this tree is handed straight to that parser: a branch this calls
+// non-null and the parser calls null emits a shape contradicting its parsed
+// meaning. One asker per representation (isNullBranch for the parsed tree,
+// the normalized node kind for the compiled and metadata trees, this for
+// pre-Parse), so a new asker here belongs in this function, not in a fresh
+// bare-spelling compare.
 func isNullBranchTree(v any) bool {
 	switch v := v.(type) {
 	case string:
@@ -1254,29 +1260,26 @@ func isNullBranchTree(v any) bool {
 	return false
 }
 
-// typeAliasResult describes what addTypeAliases found.
 type typeAliasResult struct {
 	applied bool   // alias was added to a type definition
 	refName string // non-empty if schema was a named type reference (definition is elsewhere)
 }
 
 // addTypeAliases walks through unions, arrays, and maps to find the
-// innermost named type (record, enum, fixed) and adds aliases to it.
-// For unions, aliases are added to the first named-type branch found
-// (typically the only one in a ["null", T] union produced by *T).
-// This supports the type-alias struct tag, which sets aliases on the
-// named type referenced by a field (as opposed to alias= which sets
-// aliases on the field itself).
+// innermost named type (record, enum, fixed) and adds aliases to it. For
+// unions, aliases are added to the first named-type branch found (typically
+// the only one in a ["null", T] union produced by *T). This supports the
+// type-alias struct tag, which sets aliases on the named type referenced by
+// a field, as opposed to alias= which sets aliases on the field itself.
 //
-// Like the composition walkers, this reads reserved keys by exact name, as the
-// Parse consuming the tree binds them: only the exact lowercase spelling is
-// reserved, and a Props case-variant is an ordinary custom property — so the
-// walk
-// descends and writes exactly the keys Parse will bind. The one consumer
-// with no Parse counterpart is refName: a per-build bookkeeping key
-// (applied[]), which only needs to be CONSISTENT across occurrences
-// within one build — the shared exact reads make every occurrence
-// resolve it identically.
+// Like the composition walkers, this reads reserved keys by exact name, as
+// the Parse consuming the tree binds them: only the exact lowercase spelling
+// is reserved, and a Props case-variant is an ordinary custom property, so
+// the walk descends and writes exactly the keys Parse will bind. The one
+// consumer with no Parse counterpart is refName, a per-build bookkeeping key
+// (applied[]) that only needs to be consistent across occurrences within one
+// build; the shared exact reads make every occurrence resolve it
+// identically.
 func addTypeAliases(schema any, aliases []string) typeAliasResult {
 	switch s := schema.(type) {
 	case map[string]any:
@@ -1284,14 +1287,14 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 		switch {
 		case isNamedKind(typ):
 			appendTypeAliasValues(s, aliases)
-			// refName must be the type's fullname (namespace + name) — the
+			// refName must be the type's fullname (namespace + name), the
 			// same identity inferRecord registers in seen[t] and a later
 			// field's name reference resolves to. The definition carries
 			// name and namespace as separate keys; join them so the dedup
 			// in inferField keys both the defining and referencing fields
-			// by one identity. (A namespace-less type's fullname is its
+			// by one identity. A namespace-less type's fullname is its
 			// bare name, so fixed types and no-namespace records are
-			// unchanged.)
+			// unchanged.
 			name, _ := s["name"].(string)
 			ns, _ := s["namespace"].(string)
 			return typeAliasResult{applied: true, refName: avroFullName(ns, name)}
@@ -1328,17 +1331,17 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 }
 
 // appendTypeAliasValues merges the tag's aliases into the type's existing
-// exact-key "aliases" attribute — the only spelling Parse binds (a
-// Props-carried case-variant is an ordinary custom property, left
-// untouched beside the real attribute). The existing value is []string or
-// []any on every route: freshly-inferred literals build []string, and the
-// render boundary canonicalizes every caller-typed array shape into
-// []string/[]any fresh copies (deepCopyJSONTree/canonicalizeTreeValue —
-// so the appends below never write into a caller-owned backing array).
-// The one shape that reaches here outside those two is a marshal-opaque
-// value (its own MarshalJSON/MarshalText): left untouched for Parse to
-// read from its marshal, the documented opacity residual — a merge would
-// require marshaling it early, and its output is its author's contract.
+// exact-key "aliases" attribute, the only spelling Parse binds (a
+// Props-carried case-variant is an ordinary custom property, left untouched
+// beside the real attribute). The existing value is []string or []any on
+// every route: freshly-inferred literals build []string, and the render
+// boundary canonicalizes every caller-typed array shape into []string/[]any
+// fresh copies (deepCopyJSONTree/canonicalizeTreeValue), so the appends
+// below never write into a caller-owned backing array. The one shape that
+// reaches here outside those two is a marshal-opaque value (its own
+// MarshalJSON/MarshalText): left untouched for Parse to read from its
+// marshal, the documented opacity residual, since a merge would require
+// marshaling it early and its output is its author's contract.
 func appendTypeAliasValues(s map[string]any, aliases []string) {
 	v, ok := s["aliases"]
 	if !ok {
@@ -1358,12 +1361,11 @@ func appendTypeAliasValues(s map[string]any, aliases []string) {
 	}
 }
 
-// baseTypeForLogical returns the underlying Avro type required by the
-// given logical type per the Avro 1.12 spec. Used by SchemaFor's
-// inferType to produce schemas that validateLogical (schema.go) will
-// accept regardless of the Go source type's natural Avro mapping —
-// e.g. time-millis MUST annotate int even when the Go field is
-// time.Time (whose default mapping is long).
+// baseTypeForLogical returns the underlying Avro type required by the given
+// logical type per the Avro 1.12 spec. SchemaFor's inferType uses it to
+// produce schemas that validateLogical (schema.go) will accept regardless of
+// the Go source type's natural Avro mapping: time-millis must annotate int
+// even when the Go field is time.Time, whose default mapping is long.
 func baseTypeForLogical(logical, fallback string) string {
 	switch logical {
 	case "date", "time-millis":
@@ -1378,27 +1380,27 @@ func baseTypeForLogical(logical, fallback string) string {
 
 // inferType returns the Avro schema for a Go type.
 //
-// ptrChain is the number of CONSECUTIVE pointer levels already unwrapped to
-// reach t, reset to 0 at every record-field / array-item / map-value boundary
-// (the codec calls indirect/indirectAlloc fresh on each such leaf value). The
-// pointer arm caps it: the codec's indirect/indirectAlloc (reflect.go) unwrap
-// at most maxIndirectDepth pointer levels, so SchemaFor must refuse a deeper
-// chain at BUILD time rather than emit a ["null",T] the codec then rejects with
-// errIndirectDeep — a build-accepts/encode-rejects asymmetry. This also
-// terminates a cyclic non-struct pointer type (type P *P) at the cap instead
-// of recursing to the maxDepth ceiling.
+// ptrChain is the number of consecutive pointer levels already unwrapped to
+// reach t, reset to 0 at every record-field / array-item / map-value
+// boundary (the codec calls indirect/indirectAlloc fresh on each such leaf
+// value). The pointer arm caps it: the codec's indirect/indirectAlloc
+// (reflect.go) unwrap at most maxIndirectDepth pointer levels, so we must
+// refuse a deeper chain at build time rather than emit a ["null",T] the codec
+// then rejects with errIndirectDeep, a build-accepts/encode-rejects
+// asymmetry. This also terminates a cyclic non-struct pointer type
+// (type P *P) at the cap instead of recursing to the maxDepth ceiling.
 func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType, applied appliedTypeAliases, depth, ptrChain int) (any, error) {
-	// A recursive non-struct Go type — `type S []S`, `type P *P`,
-	// `type M map[string]M`, or a long-enough pointer/slice/map chain — has
-	// a cyclic type graph, and the pointer/slice/map arms below recurse on
-	// the element type. Struct cycles terminate via seen[t] (a struct
-	// registers its name before recursing into its fields), but a non-struct
-	// type registers no name, so the recursion would run until the goroutine
-	// stack overflows and the process dies. Bound it at maxDepth — the same
-	// ceiling the wire pipeline enforces — so such a type returns a clean
-	// error. depth resets to 0 at each record-field boundary (inferField),
-	// so a chain of distinct nested structs stays bounded by seen, not depth,
-	// and only an unbroken non-struct chain accrues depth here.
+	// A recursive non-struct Go type (`type S []S`, `type P *P`,
+	// `type M map[string]M`, or a long-enough pointer/slice/map chain) has a
+	// cyclic type graph, and the pointer/slice/map arms below recurse on the
+	// element type. Struct cycles terminate via seen[t] (a struct registers its
+	// name before recursing into its fields), but a non-struct type registers no
+	// name, so the recursion would run until the goroutine stack overflows and
+	// the process dies. Bound it at maxDepth, the same ceiling the wire pipeline
+	// enforces, so such a type returns a clean error. depth resets to 0 at each
+	// record-field boundary (inferField), so a chain of distinct nested structs
+	// stays bounded by seen, not depth, and only an unbroken non-struct chain
+	// accrues depth here.
 	if depth >= maxDepth {
 		return nil, fmt.Errorf("avro: type %s nests too deeply or is recursive (exceeds depth %d); a recursive non-struct type such as `type T []T`, `*T`, or `map[string]T` has no Avro schema representation", t, maxDepth)
 	}
@@ -1407,9 +1409,9 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if ct.GoType != nil && ct.GoType == t {
 			// The custom supplies the field's schema, so a logical-type tag
 			// on the field has nothing to apply to. Accepting it would
-			// silently drop the user's tag — the lying-schema outcome the
+			// silently drop your tag, the lying-schema outcome the
 			// logical-tag strictness rejects everywhere else (the
-			// avro.Duration and uuid/decimal wrong-kind arms) — so reject
+			// avro.Duration and uuid/decimal wrong-kind arms), so reject
 			// with the remedy: the logical type belongs on the CustomType.
 			if logical != "" {
 				return nil, fmt.Errorf("avro: a CustomType is registered for %s and supplies the schema; the field's logical-type tag %q has no effect — remove the tag, or set LogicalType/Schema on the CustomType", t, logical)
@@ -1441,15 +1443,14 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}
 	}
 
-	// Pointer → nullable union. A pointer means "nullable", and the codecs
-	// treat a pointer chain as a single nullable level (indirect /
-	// indirectAlloc). Recurse one level — so an intermediate pointer type
-	// can still match a registered CustomType — then collapse: if the
-	// inner already inferred to a null-first union (a deeper pointer like
-	// **T, or a CustomType whose schema is ["null", …]), return it
-	// unwrapped rather than nesting. Avro forbids a union immediately
-	// inside a union, so wrapping each level would emit an unparseable
-	// ["null", ["null", T]].
+	// A pointer becomes a nullable union: a pointer means "nullable", and the
+	// codecs treat a pointer chain as a single nullable level (indirect /
+	// indirectAlloc). Recurse one level, so an intermediate pointer type can
+	// still match a registered CustomType, then collapse: if the inner already
+	// inferred to a null-first union (a deeper pointer like **T, or a CustomType
+	// whose schema is ["null", ...]), return it unwrapped rather than nesting.
+	// Avro forbids a union immediately inside a union, so wrapping each level
+	// would emit an unparseable ["null", ["null", T]].
 	if t.Kind() == reflect.Pointer {
 		// The codec unwraps at most maxIndirectDepth consecutive pointer levels
 		// (indirect/indirectAlloc both accept a chain bottoming at a non-pointer
@@ -1470,14 +1471,13 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		return []any{"null", inner}, nil
 	}
 
-	// Logical types for known Go types. The base type is determined by
-	// the logical's spec-required underlying Avro type (NOT by the Go
-	// source type), so e.g. `time.Time` tagged time-millis correctly
-	// emits {int, time-millis} and `time.Duration` tagged
-	// timestamp-millis correctly emits {long, timestamp-millis}.
-	// Reject non-time logicals (uuid, decimal) on time types — they
-	// would emit an invalid {long, uuid} or {long, decimal} schema
-	// which Parse soft-drops, silently losing the user's tag.
+	// Logical types for known Go types. The base type is determined by the
+	// logical's spec-required underlying Avro type, NOT by the Go source type,
+	// so e.g. `time.Time` tagged time-millis correctly emits {int, time-millis}
+	// and `time.Duration` tagged timestamp-millis correctly emits {long,
+	// timestamp-millis}. Reject non-time logicals (uuid, decimal) on time
+	// types: they would emit an invalid {long, uuid} or {long, decimal} schema
+	// which Parse soft-drops, silently losing your tag.
 	inferTimeLike := func(defaultLogical string) (any, error) {
 		lt := logical
 		if lt == "" {
@@ -1502,18 +1502,18 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	case avroDurationType:
 		// avro.Duration is the dedicated Go type for the Avro duration logical:
 		// a fixed(12) whose bytes are little-endian months/days/milliseconds.
-		// Recognition is BY TYPE (avro.Duration is a struct, so this case must
-		// fire before the struct→record path below, which would otherwise
-		// decompose its exported uint32 fields into a record) — there is no
-		// "duration" tag option and none is needed: unlike *big.Rat→decimal,
-		// the duration logical carries no parameters, so the bare type
-		// suffices. A non-empty logical here is therefore always a tag the
-		// user mis-attached (uuid / decimal / a time logical); reject it
-		// rather than silently emitting the duration schema and dropping the
-		// tag, matching the strict-reject posture of the time/uuid/decimal
-		// arms. The fixed name "duration" is safe even when a plain
-		// `type duration [12]byte` is also present: dedupNamedTypes rejects any
-		// Avro name claimed by two different definitions.
+		// Recognition is by type (avro.Duration is a struct, so this case must
+		// fire before the struct-to-record path below, which would otherwise
+		// decompose its exported uint32 fields into a record). There is no
+		// "duration" tag option and none is needed: unlike the *big.Rat decimal
+		// mapping, the duration logical carries no parameters, so the bare type
+		// suffices. A non-empty logical here is therefore always a mis-attached
+		// tag (uuid / decimal / a time logical); reject it rather than silently
+		// emitting the duration schema and dropping the tag, matching the
+		// strict-reject posture of the time/uuid/decimal arms. The fixed name
+		// "duration" is safe even when a plain `type duration [12]byte` is also
+		// present: dedupNamedTypes rejects any Avro name claimed by two different
+		// definitions.
 		if logical != "" {
 			return nil, fmt.Errorf("avro: avro.Duration maps to the duration logical type (a fixed(12)); it does not support logical type %q — remove the tag", logical)
 		}
@@ -1527,12 +1527,12 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	case jsonNumberType:
 		// The jsonNumberType exclusion, at schema inference: the Kind switch
 		// below would emit an Avro "string", the one type the codec is
-		// guaranteed to reject for this Go type — a build-accepts/
-		// encode-rejects deferred failure. Reject up front instead,
-		// matching the uuid/decimal/time strictness. (A registered CustomType
-		// for json.Number still works — the loop above runs first; a NAMED
-		// alias `type N json.Number` is a distinct reflect.Type that the
-		// codec treats as a plain string and is unaffected.)
+		// guaranteed to reject for this Go type, a build-accepts/encode-rejects
+		// deferred failure. Reject up front instead, matching the
+		// uuid/decimal/time strictness. A registered CustomType for json.Number
+		// still works, since the loop above runs first; a *named* alias
+		// `type N json.Number` is a distinct reflect.Type that the codec treats
+		// as a plain string and is unaffected.
 		return nil, fmt.Errorf("avro: json.Number has no single Avro type for SchemaFor; use a concrete Go numeric type (int32/int64/float64), string, or a CustomType")
 
 	case bigRatPtrType, bigRatValueType:
@@ -1550,20 +1550,20 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}, nil
 	}
 
-	// decimal logical type requires *big.Rat or big.Rat (handled above).
-	// Any other Go type carrying ",decimal(p,s)" produces a schema that
-	// wouldn't reflect the user's intent — the encoder for decimal-on-bytes
-	// expects *big.Rat input, not raw bytes / int / string — so reject at
-	// SchemaFor time rather than silently dropping the tag.
+	// decimal logical type requires *big.Rat or big.Rat (handled above). Any
+	// other Go type carrying ",decimal(p,s)" produces a schema that would not
+	// reflect your intent, the encoder for decimal-on-bytes expecting *big.Rat
+	// input rather than raw bytes / int / string, so reject at SchemaFor time
+	// rather than silently dropping the tag.
 	if logical == "decimal" {
 		return nil, fmt.Errorf("avro: decimal logical type requires *big.Rat or big.Rat; got %s", t)
 	}
 
-	// UUID: spec wire form is either string or fixed(16). Accept Go
-	// string kind and text-marshaler types as string; [16]byte goes
-	// through the Array case below for fixed(16). Reject other Go
-	// types — they would produce a schema that lies about the field's
-	// Go type and cause Encode to fail at runtime far from here.
+	// UUID: spec wire form is either string or fixed(16). Accept Go string
+	// kind and text-marshaler types as string; [16]byte goes through the Array
+	// case below for fixed(16). Reject other Go types: they would produce a
+	// schema that lies about the field's Go type and cause Encode to fail at
+	// runtime far from here.
 	if logical == "uuid" {
 		isArr16 := t.Kind() == reflect.Array && t.Elem().Kind() == reflect.Uint8 && t.Len() == 16
 		if !isArr16 {
@@ -1572,9 +1572,9 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 			byteSlice := t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8
 			switch {
 			case stringKind, byteSlice && (enc || dec), enc && dec:
-				// Round-trips as a uuid string: a string kind; a []byte slice
-				// carrying a text method; or any type implementing BOTH text
-				// directions. (The same round-trip rule as the plain string arm.)
+				// Round-trips as a uuid string: a string kind; a []byte
+				// slice carrying a text method; or any type implementing both
+				// text directions. Same round-trip rule as the plain string arm.
 				return map[string]any{"type": "string", "logicalType": "uuid"}, nil
 			case enc:
 				return nil, fmt.Errorf("avro: uuid logical type on %s: it implements TextMarshaler/AppendText but not TextUnmarshaler, so a uuid string schema could encode it but not decode into it — implement both text directions or use Go string / [16]byte", t)
@@ -1586,15 +1586,13 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}
 	}
 
-	// Integer-wire logical types (date / time-millis on int wire;
-	// time-micros / timestamp-* / local-timestamp-* on long wire)
-	// attached to a plain Go integer field. The user opted into the
-	// logical with the tag; honor it by emitting the wire+logical
-	// schema. The Go field must have a natural Avro wire type that
-	// matches the logical's required wire — otherwise the encoder
-	// would silently widen or narrow, hiding the user's intent and
-	// producing a schema whose annotation may be soft-dropped at
-	// Parse if the wire doesn't match.
+	// Integer-wire logical types (date / time-millis on int wire; time-micros
+	// / timestamp-* / local-timestamp-* on long wire) attached to a plain Go
+	// integer field. You opted into the logical with the tag, so honor it by
+	// emitting the wire+logical schema. The Go field must have a natural Avro
+	// wire type that matches the logical's required wire; otherwise the encoder
+	// would silently widen or narrow, hiding your intent and producing a schema
+	// whose annotation may be soft-dropped at Parse if the wire doesn't match.
 	if logical != "" {
 		wire := baseTypeForLogical(logical, "")
 		if wire != "" {
@@ -1618,24 +1616,25 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}
 	}
 
-	// A type implementing text interfaces is inferred as string — but only when
-	// a string schema ROUND-TRIPS for it. The codec encodes a string from
+	// A type implementing text interfaces is inferred as string, but only when
+	// a string schema round-trips for it. The codec encodes a string from
 	// TextMarshaler/AppendText (or a string / []byte kind) and decodes one via
-	// TextUnmarshaler (or a string / []byte kind). A string-kind or []byte-slice
-	// type round-trips regardless of which text methods it has (the kind itself
-	// covers the missing direction); any OTHER type round-trips only if it
-	// implements BOTH an encode-side method AND TextUnmarshaler. A non-string
-	// type implementing exactly one direction would yield a one-directional
-	// "string" schema whose unsupported direction fails at Encode/Decode far
-	// from here, and SchemaFor cannot reliably guess which direction the caller
-	// wants — so it refuses, the same strict-reject posture as the logical-type
-	// tags above (never emit a schema that lies about the Go type).
+	// TextUnmarshaler (or a string / []byte kind). A string-kind or
+	// []byte-slice type round-trips regardless of which text methods it has
+	// (the kind itself covers the missing direction); any other type
+	// round-trips only if it implements both an encode-side method and
+	// TextUnmarshaler. A non-string type implementing exactly one direction
+	// would yield a one-directional "string" schema whose unsupported direction
+	// fails at Encode/Decode far from here, and SchemaFor cannot reliably guess
+	// which direction you want, so it refuses: the same strict-reject posture
+	// as the logical-type tags above, never emitting a schema that lies about
+	// the Go type.
 	//
-	// EXCEPTION: a ,uuid-tagged [16]byte is a fixed(16) uuid handled by the
-	// Array case below — the codec trusts its raw bytes and never consults a
-	// text method for a uuid-on-fixed value (see [Schema.Decode]'s uuid-on-fixed
-	// contract); downgrading it to "string" would silently drop the fixed(16)
-	// shape and the uuid logical type.
+	// One exception: a ,uuid-tagged [16]byte is a fixed(16) uuid handled by the
+	// Array case below. The codec trusts its raw bytes and never consults a
+	// text method for a uuid-on-fixed value (see [Schema.Decode]'s
+	// uuid-on-fixed contract); downgrading it to "string" would silently drop
+	// the fixed(16) shape and the uuid logical type.
 	uuidArr16 := logical == "uuid" && t.Kind() == reflect.Array &&
 		t.Elem().Kind() == reflect.Uint8 && t.Len() == 16
 	if !uuidArr16 {
@@ -1693,16 +1692,16 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if t.Elem().Kind() == reflect.Uint8 {
 			// The Avro name a []byte array gets depends on the uuid tag:
 			// "uuid" (with the logical type) when ,uuid-tagged, otherwise
-			// t.Name() / "fixed_N". So the SAME Go type can legitimately
-			// appear under two different Avro names — e.g. used once
-			// ,uuid-tagged and once plain — which are distinct Avro types
-			// (they differ by logicalType). seen[t] records the name an
-			// earlier occurrence emitted; emit a name reference ONLY when
-			// this occurrence's name matches it. A different-named form of
-			// the same type emits its own full definition. The name-match
-			// guard keeps the same-form dedup (so a later field can
-			// reference an earlier definition that a type-alias= mutated)
-			// while letting the two forms each define their own fixed.
+			// t.Name() / "fixed_N". So one Go type can legitimately appear
+			// under two different Avro names, used once ,uuid-tagged and once
+			// plain, which are distinct Avro types (they differ by
+			// logicalType). seen[t] records the name an earlier occurrence
+			// emitted; emit a name reference only when this occurrence's name
+			// matches it. A different-named form of the same type emits its own
+			// full definition. The name-match guard keeps the same-form dedup
+			// (so a later field can reference an earlier definition that a
+			// type-alias= mutated) while letting the two forms each define their
+			// own fixed.
 			isUUIDForm := logical == "uuid" && t.Len() == 16
 			var name string
 			var def map[string]any
@@ -1725,12 +1724,12 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 					"size": t.Len(),
 				}
 			}
-			// Reference an earlier definition only for the SAME type in the SAME
-			// form (same Avro name AND same logical-vs-plain form). When the form
-			// differs but the name coincides (a [16]byte named exactly "uuid"
-			// used both ,uuid and plain), emit this form's own definition; the
-			// name collision is then caught uniformly by dedupNamedTypes, which
-			// rejects any Avro name claimed by two different definitions.
+			// Reference an earlier definition only for the same type in the same
+			// form (same Avro name and same logical-vs-plain form). When the form
+			// differs but the name coincides (a [16]byte named exactly "uuid" used
+			// both ,uuid and plain), emit this form's own definition;
+			// dedupNamedTypes then catches the name collision uniformly, rejecting
+			// any Avro name claimed by two different definitions.
 			if prev, ok := seen[t]; ok && prev.name == name && prev.uuidForm == isUUIDForm {
 				return name, nil
 			}

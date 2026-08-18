@@ -7,7 +7,7 @@ import (
 )
 
 // CheckCompatibility reports whether data written with the writer schema can
-// be read by the reader schema. It returns nil on success or a
+// be read by the reader schema. We return nil on success, or a
 // [*CompatibilityError] describing the first incompatibility.
 //
 // See [Resolve] for a note on argument order.
@@ -19,8 +19,6 @@ type nodePair struct {
 	r, w *schemaNode
 }
 
-// compatErr builds a *CompatibilityError, factoring the construction
-// shape repeated at every site in this file.
 func compatErr(path, readerType, writerType, detail string) error {
 	return &CompatibilityError{
 		Path:       pathOrRoot(path),
@@ -30,11 +28,11 @@ func compatErr(path, readerType, writerType, detail string) error {
 	}
 }
 
-// CompatibilityError.Detail strings for the writer-union incompatibility rule.
-// The rule is enforced from two entry points — the pre-check here
-// (CheckCompatibility) and the resolver (resolve.go, Resolve) — so the
-// user-visible detail must stay identical between them; sharing the literal
-// makes that structural rather than a comment-enforced lockstep.
+// CompatibilityError.Detail strings for the writer-union incompatibility
+// rule. Two entry points enforce it, the pre-check here (CheckCompatibility)
+// and the resolver (resolve.go, Resolve), and you must see the same detail
+// from both. Sharing the literal makes that structural rather than a lockstep
+// we have to remember.
 const (
 	detailWriterTypeNoReaderBranch   = "writer type matches no reader union branch"
 	detailWriterBranchNoReaderBranch = "writer union branch has no matching reader branch"
@@ -70,16 +68,16 @@ func checkCompat(r, w *schemaNode, path string, seen map[nodePair]bool) error {
 }
 
 // checkWriterUnion requires every writer branch to be compatible with the
-// reader, union or not; the first failure is an eager CompatibilityError.
+// reader, union or not. We return the first failure eagerly.
 //
 // Java and fastavro instead defer per-branch failures to decode time via
-// ErrorAction sentinels, so a writer that narrowed during evolution but never
-// emits the dropped branch stays readable there. This package fails fast, like
-// the rest of its resolution. The cost is that such a producer must update its
-// schema; the benefit is that schema problems surface before any data flows.
+// ErrorAction sentinels, so a writer that narrowed during evolution but
+// never emits the dropped branch stays readable there. We fail fast, like
+// the rest of our resolution: such a producer must update its schema, and in
+// exchange you see schema problems before any data flows.
 func checkWriterUnion(r, w *schemaNode, path string, seen map[nodePair]bool) error {
-	// Built once for the whole loop: this asks per WRITER branch, and the
-	// answer is a property of the READER union.
+	// Built once for the whole loop: this asks per writer branch, and the
+	// answer is a property of the reader union.
 	var readerBranches readerBranchLookup
 	if r.kind == "union" {
 		readerBranches = newReaderBranchLookup(r)
@@ -180,19 +178,19 @@ func checkRecordCompat(r, w *schemaNode, path string, seen map[nodePair]bool) er
 	return nil
 }
 
-// checkRecordFieldClaimsUnique reports two writer fields resolving to the same
-// reader-field index — one by canonical name and one by alias, or both by
+// checkRecordFieldClaimsUnique reports two writer fields resolving to one
+// reader-field index: one by canonical name and one by alias, or both by
 // aliases. The twin of resolveRecord's guard.
 func checkRecordFieldClaimsUnique(r, w *schemaNode, path string) error {
 	if len(r.fields) == 0 {
 		return nil
 	}
-	// Presence and identity are SEPARATE variables. A field name is not a
+	// Presence and identity are *separate* variables. A field name is not a
 	// usable presence sentinel: [WithLaxNames] admits the empty string, so a
 	// writer field named "" would claim a slot while leaving it
-	// indistinguishable from unclaimed, and a second field reaching it through
-	// an alias would go undetected. claimedBy exists only to name the collision
-	// in the error. resolveRecord splits them the same way.
+	// indistinguishable from unclaimed, and a second field reaching it
+	// through an alias would go undetected. claimedBy exists only to name the
+	// collision in the error. resolveRecord splits them the same way.
 	claimed := make([]bool, len(r.fields))
 	claimedBy := make([]string, len(r.fields))
 	readerByName := newReaderFieldLookup(r)
@@ -231,17 +229,18 @@ func checkEnumCompat(r, w *schemaNode, path string) error {
 }
 
 // namesMatch checks if two named types match by fully-qualified name,
-// unqualified name, or aliases. Per the Avro spec, named types in
-// different namespaces match if their unqualified names are the same
-// ("both schemas are records with the same (unqualified) name" — the same
-// wording for enum and fixed).
+// unqualified name, or aliases. Per the Avro spec, named types in different
+// namespaces match if their unqualified names are the same ("both schemas
+// are records with the same (unqualified) name", the same wording for enum
+// and fixed).
 //
-// Aliases carry their qualification. A reader alias matches the writer's exact
-// fullname, and an alias DECLARED without a dot also short-name-matches the
-// writer in any namespace — fastavro's raw-string tier (executed), the
-// permissive side of the two references. An explicitly-qualified alias never
-// short-matches: the spec ("Aliases") makes "x.y" a fully qualified name
-// denoting exactly x.y, and both references reject the cross-namespace match.
+// Aliases carry their qualification. A reader alias matches the writer's
+// exact fullname, and an alias declared *without* a dot also
+// short-name-matches the writer in any namespace: fastavro's raw-string tier
+// (executed), the permissive side of the two references. An
+// explicitly-qualified alias never short-matches, since the spec ("Aliases")
+// makes "x.y" a fully qualified name denoting exactly x.y, and both
+// references reject the cross-namespace match.
 func namesMatch(r, w *schemaNode) bool {
 	if r.name == w.name {
 		return true
@@ -255,7 +254,6 @@ func namesMatch(r, w *schemaNode) bool {
 	return slices.Contains(r.bareAliases, unqualified(w.name))
 }
 
-// unqualified returns the unqualified portion of a possibly dot-separated name.
 func unqualified(name string) string {
 	if i := strings.LastIndexByte(name, '.'); i >= 0 {
 		return name[i+1:]
@@ -263,8 +261,6 @@ func unqualified(name string) string {
 	return name
 }
 
-// namespaceOf returns the namespace portion of a fullname (everything before
-// the final dot), or "" when the name has no namespace.
 func namespaceOf(name string) string {
 	if i := strings.LastIndexByte(name, '.'); i >= 0 {
 		return name[:i]
@@ -272,8 +268,6 @@ func namespaceOf(name string) string {
 	return ""
 }
 
-// findWriterField finds the writer field matching a reader field by name or
-// reader field aliases.
 func findWriterField(rf fieldNode, writerFields map[string]*fieldNode) *fieldNode {
 	if wf, ok := writerFields[rf.name]; ok {
 		return wf
@@ -288,25 +282,25 @@ func findWriterField(rf fieldNode, writerFields map[string]*fieldNode) *fieldNod
 
 // readerBranchLookup answers "which reader branch does this writer node
 // select?" in constant time, for one reader union. The rule is
-// branchMatchTiers below, applied once ahead of the questions: both callers ask
-// once per WRITER branch, and scanning the reader's branches inside that loop
-// is quadratic in two author-chosen counts. A cost bound only — the verdict
-// must be what the scan gave.
+// branchMatchTiers below, and we apply it once ahead of the questions: both
+// callers ask once per writer branch, and scanning the reader's branches
+// inside that loop is quadratic in two counts the schema author picks. A cost
+// bound only: the verdict must be what the scan gave.
 type readerBranchLookup struct {
 	branches []*schemaNode
 	// byTier[i] holds branchMatchTiers[i]'s keys; first branch wins, which is
 	// the declaration-order tie-break.
 	byTier []map[branchMatchKey]int
 	// firstByKind is every reader branch kind's first index. The promotion
-	// tier is keyed by KIND alone, so it reads this instead of a tier map.
+	// tier is keyed by kind alone, so it reads this instead of a tier map.
 	firstByKind map[string]int
 }
 
 // branchMatchKey identifies what a reader branch answers to under one tier.
-// Kind, because every tier matches within a kind. SIZE, because the spec folds
-// a fixed's size into the MATCH predicate rather than checking it after
-// selection: a wrong-size same-name fixed must not match, and selection
-// continues to a later branch (NOT_BUGS #44).
+// Kind, because every tier matches within a kind. Size, because the spec
+// folds a fixed's size into the *match* predicate rather than checking it
+// after selection: a wrong-size same-name fixed must not match, and
+// selection continues to a later branch (NOT_BUGS #44).
 type branchMatchKey struct {
 	kind string
 	name string
@@ -314,9 +308,9 @@ type branchMatchKey struct {
 }
 
 // branchMatchTier is one rank of the match rule: the names a reader branch
-// ANSWERS TO, and the name a writer node ASKS WITH. The builder registers
-// readerNames and the query asks writerName from this one table, so the index
-// and the verdict cannot describe different rules.
+// answers to, and the name a writer node asks with. The builder registers
+// readerNames and the query asks writerName from this one table, so the
+// index and the verdict cannot describe different rules.
 type branchMatchTier struct {
 	name        string
 	readerNames func(r *schemaNode) []string
@@ -346,15 +340,15 @@ func branchSizeKey(n *schemaNode) int {
 // branchMatchTiers ranks union-branch selection: full name or alias, then
 // unqualified short name, then promotion.
 //
-// The unqualified tier applies to record, enum AND fixed, matching fastavro's
-// match_types. Java does the short-name match for records only; this package
-// follows fastavro's more uniform rule deliberately (NOT_BUGS #44). Exact match
-// must outrank it — the spec permits a union to hold several named types
-// sharing an unqualified name across namespaces.
+// The unqualified tier applies to record, enum *and* fixed, matching
+// fastavro's match_types. Java does the short-name match for records only;
+// we follow fastavro's more uniform rule deliberately (NOT_BUGS #44). Exact
+// match must outrank it, since the spec permits a union to hold several
+// named types sharing an unqualified name across namespaces.
 //
-// An UNNAMED kind answers to the empty name at the exact tier and to nothing at
-// the unqualified tier: same kind IS an exact match for it, and it has no name
-// to shorten.
+// An unnamed kind answers to the empty name at the exact tier and to nothing
+// at the unqualified tier: same kind is an exact match for it, and it has no
+// name to shorten.
 var branchMatchTiers = []branchMatchTier{
 	{
 		name: "full name or alias",
@@ -377,10 +371,10 @@ var branchMatchTiers = []branchMatchTier{
 			if !branchIsNamedKind(r) {
 				return nil
 			}
-			// Only an alias DECLARED without a dot short-matches across
-			// namespaces; an explicitly-qualified alias denotes exactly its
-			// fullname and is already handled by the exact tier. Same rule as
-			// namesMatch — see its alias-qualification comment.
+			// Only an alias declared *without* a dot short-matches across
+			// namespaces; an explicitly-qualified alias denotes exactly
+			// its fullname and the exact tier already handles it. Same
+			// rule as namesMatch; see its alias-qualification comment.
 			return append([]string{unqualified(r.name)}, r.bareAliases...)
 		},
 		writerName: func(w *schemaNode) (string, bool) {
@@ -392,10 +386,10 @@ var branchMatchTiers = []branchMatchTier{
 	},
 }
 
-// promotionTargetKinds maps a writer kind to every reader kind it promotes to.
-// DERIVED from the promotions table itself (promote.go) rather than listed, so
-// a promotion added there is honored here without an edit — the promotion tier
-// is keyed by kind alone, and this is that tier's vocabulary.
+// promotionTargetKinds maps a writer kind to every reader kind it promotes
+// to. Derived from the promotions table itself (promote.go) rather than
+// listed, so a promotion added there is honored here without an edit: the
+// promotion tier is keyed by kind alone, and this is that tier's vocabulary.
 var promotionTargetKinds = func() map[string][]string {
 	m := make(map[string][]string, len(promotions))
 	for key := range promotions {
@@ -437,8 +431,8 @@ func newReaderBranchLookup(r *schemaNode) readerBranchLookup {
 }
 
 // match returns the best reader branch for w, or nil. Tiers are consulted in
-// rank order and the first that answers wins, which is what the old best-tier
-// scan computed by ranking every branch.
+// rank order and the first that answers wins, which is the same verdict as
+// ranking every branch and taking the best tier.
 func (lk readerBranchLookup) match(w *schemaNode) *schemaNode {
 	for ti, t := range branchMatchTiers {
 		name, ok := t.writerName(w)
@@ -451,8 +445,8 @@ func (lk readerBranchLookup) match(w *schemaNode) *schemaNode {
 	}
 	// Promotion is the last tier and the only one that crosses kinds. A
 	// same-kind named branch that failed both tiers above does NOT reach it:
-	// nothing promotes into record, enum or fixed, so promotionTargetKinds has
-	// no entry that could match one.
+	// nothing promotes into record, enum or fixed, so promotionTargetKinds
+	// has no entry that could match one.
 	best := -1
 	for _, readerKind := range promotionTargetKinds[w.kind] {
 		if readerKind == w.kind {

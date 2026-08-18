@@ -7,9 +7,8 @@ import (
 	"unsafe"
 )
 
-// jsonScanner is a minimal zero-allocation JSON byte scanner.
-// It operates on a []byte input and exposes a cursor-style API
-// for the schema-guided decoder to extract tokens.
+// jsonScanner is a zero-allocation cursor over a []byte input. The
+// schema-guided decoder pulls tokens off it.
 type jsonScanner struct {
 	data []byte
 	pos  int
@@ -35,9 +34,8 @@ func (s *jsonScanner) peek() byte {
 	return s.data[s.pos]
 }
 
-// peekAt returns the byte `n` positions past the current
-// non-whitespace cursor, without consuming. Used to disambiguate
-// negative-number vs bare "-Infinity" at the start of a token.
+// peekAt returns the byte n past the non-whitespace cursor, without consuming.
+// We use it to tell a negative number from a bare "-Infinity".
 func (s *jsonScanner) peekAt(n int) byte {
 	s.skipWhitespace()
 	if s.pos+n >= len(s.data) {
@@ -67,12 +65,10 @@ func (s *jsonScanner) consumeNull() error {
 	return nil
 }
 
-// consumeBareSpecialFloat consumes a bare JSON token shaped like an
-// optional leading '-' followed by an alphabetic run. The token's
-// content is returned verbatim for parseSpecialFloat to validate, so
-// casing leniency (NaN/nan/NAN, Infinity/inf/Inf, etc.) is identical
-// between this bare path and the quoted-string path in decodeFloat/
-// decodeDouble — preventing a quoted-vs-bare casing-parity gap.
+// consumeBareSpecialFloat consumes an optional '-' plus an alphabetic run. We
+// hand the content to parseSpecialFloat verbatim, so casing leniency
+// (NaN/nan/NAN, Infinity/inf/Inf, and so on) is identical here and on the
+// quoted-string path in decodeFloat and decodeDouble.
 func (s *jsonScanner) consumeBareSpecialFloat() (string, error) {
 	s.skipWhitespace()
 	if s.pos >= len(s.data) {
@@ -111,10 +107,9 @@ func (s *jsonScanner) consumeBool() (bool, error) {
 	return false, fmt.Errorf("avro json: expected boolean at offset %d", s.pos)
 }
 
-// consumeStringRaw consumes a JSON string and returns the raw content
-// between the quotes (with escape sequences unresolved). Returns start
-// and end offsets into s.data. For strings without escapes (the common
-// case), the caller can use s.data[start:end] directly.
+// consumeStringRaw returns start and end offsets into s.data for the content
+// between the quotes, escapes unresolved. Without escapes, the common case,
+// you can use s.data[start:end] directly.
 func (s *jsonScanner) consumeStringRaw() (start, end int, hasEscapes bool, err error) {
 	s.skipWhitespace()
 	if s.pos >= len(s.data) || s.data[s.pos] != '"' {
@@ -136,16 +131,16 @@ func (s *jsonScanner) consumeStringRaw() (start, end int, hasEscapes bool, err e
 		if b == '"' {
 			end = s.pos
 			s.pos++ // skip closing quote
-			// RFC 8259: JSON text is UTF-8. Reject literal invalid byte
-			// sequences. Gated by sawHighByte so pure-ASCII content (the
-			// common case) skips the scan; \uXXXX escapes are ASCII here
-			// and resolve to valid runes during walkJSONEscapes.
+			// RFC 8259: JSON text is UTF-8, so we reject literal
+			// invalid byte sequences. sawHighByte gates the scan, so
+			// pure-ASCII content skips it; \uXXXX escapes are ASCII
+			// here and resolve to valid runes in walkJSONEscapes.
 			if sawHighByte && !utf8.Valid(s.data[start:end]) {
 				return 0, 0, false, fmt.Errorf("avro json: invalid UTF-8 in string at offset %d", start)
 			}
 			return start, end, hasEscapes, nil
 		}
-		// RFC 8259 §7: control characters U+0000–U+001F must be escaped.
+		// RFC 8259 §7: control characters U+0000 to U+001F must be escaped.
 		if b < 0x20 {
 			return 0, 0, false, fmt.Errorf("avro json: unescaped control character %#x in string at offset %d", b, s.pos)
 		}
@@ -157,10 +152,9 @@ func (s *jsonScanner) consumeStringRaw() (start, end int, hasEscapes bool, err e
 	return 0, 0, false, fmt.Errorf("avro json: unterminated string at offset %d", start-1)
 }
 
-// consumeStringZeroCopy consumes a JSON string and returns a zero-copy
-// string backed by the scanner's input data. The returned string is only
-// valid during the current DecodeJSON call — do NOT store it in output.
-// Falls back to a copying path for strings with escape sequences.
+// consumeStringZeroCopy returns a string backed by the scanner's input, valid
+// only during the current DecodeJSON call: you must *not* store it in output.
+// A string with escapes falls back to a copying path.
 func (s *jsonScanner) consumeStringZeroCopy() (string, error) {
 	start, end, hasEscapes, err := s.consumeStringRaw()
 	if err != nil {
@@ -172,7 +166,6 @@ func (s *jsonScanner) consumeStringZeroCopy() (string, error) {
 	return resolveJSONEscapes(s.data[start:end])
 }
 
-// consumeNumberBytes consumes a JSON number and returns the raw bytes.
 func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 	s.skipWhitespace()
 	start := s.pos
@@ -182,9 +175,9 @@ func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 	if s.pos >= len(s.data) || s.data[s.pos] < '0' || s.data[s.pos] > '9' {
 		return nil, fmt.Errorf("avro json: expected number at offset %d", start)
 	}
-	// Per RFC 8259: leading zeros are not permitted (except "0" itself
-	// or "0.xxx"). If the first digit is '0', the next must be '.' or
-	// end-of-number.
+	// Per RFC 8259, leading zeros are not permitted (except "0" itself or
+	// "0.xxx"). If the first digit is '0', the next must be '.' or the end
+	// of the number.
 	if s.data[s.pos] == '0' && s.pos+1 < len(s.data) {
 		next := s.data[s.pos+1]
 		if next >= '0' && next <= '9' {
@@ -202,35 +195,34 @@ func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 	return s.data[start:s.pos], nil
 }
 
-// skipValue skips an entire JSON value (for unknown record fields).
+// skipValue skips an entire JSON value, for unknown record fields.
 //
-// Accepts the same bare special-float tokens decodeJSONFloat does — NaN,
-// Infinity, -Infinity, INF, -INF, Inf, -Inf — so a fastavro-written record
+// We accept the same bare special-float tokens decodeJSONFloat does (NaN,
+// Infinity, -Infinity, INF, -INF, Inf, -Inf), so a fastavro-written record
 // (json.dumps with allow_nan=True emits them bare, observed) decodes against a
 // reader lacking that field. Java emits the quoted form, which the string arm
-// already skips. Dispatches on the value path's [isBareSpecialFloatStart] and
+// already skips. We dispatch on the value path's [isBareSpecialFloatStart] and
 // parseSpecialFloat's exact-match gate, so "Naive" and lowercase "nan" still
 // error and the two paths cannot drift.
 func (s *jsonScanner) skipValue() error {
 	return s.skipValueDepth(0)
 }
 
-// skipValueDepth skips one JSON value while VALIDATING its full grammar, not
-// merely delimiting it. Unknown record fields route here. The former
-// delimit-only skip was a SECOND, lax JSON parser that accepted malformed
-// input the value path (and Java/fastavro/encoding/json) reject: the number
-// arm took 1.2.3/1e/5., the string arm skipped escapes blindly so "\q" passed,
-// and skipCompound counted only bracket depth so [}] / {"a" 1} / [1,2,]
-// "balanced". depth bounds recursion so a pathologically deep skipped value
-// errors rather than overflowing the stack (the old skipCompound was
-// iterative; this validator is recursive).
+// skipValueDepth skips one JSON value while *validating* its full grammar, not
+// merely delimiting it. Unknown record fields route here. A delimit-only skip
+// would be a second, lax JSON parser taking input the value path (and Java,
+// fastavro, encoding/json) rejects: the number arm would take 1.2.3/1e/5., a
+// blind escape skip would pass "\q", and bracket-depth counting would call
+// [}] / {"a" 1} / [1,2,] balanced. We recurse where a delimiter could loop, so
+// depth bounds us and a pathologically deep skipped value errors rather than
+// overflowing the stack.
 func (s *jsonScanner) skipValueDepth(depth int) error {
-	// Use the value path's >= maxDepth (trips at the maxDepth-th level), not
-	// >, so the two recursion guards agree on the bound. depth restarts at 0
-	// per skipped value rather than threading the enclosing decode depth: a
+	// We use the value path's >= maxDepth (trips at the maxDepth-th level),
+	// not >, so the two recursion guards agree on the bound. depth restarts at
+	// 0 per skipped value rather than threading the enclosing decode depth: a
 	// skipped value is a self-contained sub-parse that discards its data, so a
-	// fresh maxDepth budget is fine (the worst case, a deep value with a deep
-	// skipped tail, is still ~2*maxDepth frames — bounded for stack/DoS).
+	// fresh maxDepth budget is fine. The worst case, a deep value with a deep
+	// skipped tail, is still ~2*maxDepth frames, bounded for stack and DoS.
 	if depth >= maxDepth {
 		return errTooDeep
 	}
@@ -270,9 +262,9 @@ func (s *jsonScanner) skipValueDepth(depth int) error {
 	}
 }
 
-// skipStringStrict consumes a JSON string and VALIDATES its escapes;
-// consumeStringRaw checks control bytes and UTF-8 but delimits escapes blindly,
-// so "\q"/"\x41" would otherwise pass.
+// skipStringStrict also *validates* the escapes. consumeStringRaw checks
+// control bytes and UTF-8 but delimits escapes blindly, so "\q"/"\x41" would
+// otherwise pass.
 func (s *jsonScanner) skipStringStrict() error {
 	start, end, hasEscapes, err := s.consumeStringRaw()
 	if err != nil {
@@ -284,11 +276,10 @@ func (s *jsonScanner) skipStringStrict() error {
 	return nil
 }
 
-// skipNumberStrict consumes a JSON number and validates the RFC 8259 grammar
-// through the SAME isJSONNumber gate the value path uses (parseJSONNumberAsFloat,
-// json.Number) — so the skip path and value path cannot disagree on what a
-// valid JSON number is. consumeNumberBytes only delimits a [0-9.eE+-] run, so
-// without this gate 1.2.3/1e/5. would pass.
+// skipNumberStrict validates the RFC 8259 grammar through the same isJSONNumber
+// gate the value path uses (parseJSONNumberAsFloat, json.Number), so the two
+// cannot disagree on what a valid JSON number is. consumeNumberBytes only
+// delimits a [0-9.eE+-] run, so without this gate 1.2.3/1e/5. would pass.
 func (s *jsonScanner) skipNumberStrict() error {
 	nb, err := s.consumeNumberBytes()
 	if err != nil {
@@ -366,8 +357,9 @@ func (s *jsonScanner) skipObjectStrict(depth int) error {
 	}
 }
 
-// parseJSONInt32 parses raw JSON number bytes directly as int32.
-// Rejects fractional/exponent notation and out-of-range values.
+// parseJSONInt32 parses raw JSON number bytes directly as int32. Fractional
+// and exponent notation is accepted for an integral value; a non-integral
+// value or one out of int32 range is not.
 func parseJSONInt32(b []byte) (int32, error) {
 	n, err := parseJSONInt64(b)
 	if err != nil {
@@ -379,8 +371,10 @@ func parseJSONInt32(b []byte) (int32, error) {
 	return int32(n), nil
 }
 
-// parseJSONInt64 parses raw JSON number bytes directly as int64.
-// Rejects fractional/exponent notation.
+// parseJSONInt64 parses raw JSON number bytes directly as int64. Fractional
+// and exponent notation is accepted when the value is integral; we hand those
+// to parseInt64Lenient so a value near the int64 boundary is not lost to
+// float64 rounding.
 func parseJSONInt64(b []byte) (int64, error) {
 	if len(b) == 0 {
 		return 0, fmt.Errorf("avro json: empty number")
@@ -394,16 +388,15 @@ func parseJSONInt64(b []byte) (int64, error) {
 	if i >= len(b) {
 		return 0, fmt.Errorf("avro json: invalid number %q", truncBytesForError(b))
 	}
-	// Per-digit pre-multiply guard. The naive "n*10+d wrapped if it
-	// went down" check has a gap once n ≈ 2^64/9: n*10+d can wrap
-	// mod 2^64 to a value still ≥ prev (e.g. parsing
-	// "20496382304121724020" lands at 2049638230412172404 with no
-	// post-multiply wrap visible). Java's JsonParser.getLongValue
-	// throws InputCoercionException; goavro uses strconv.ParseInt;
-	// twmb/avro now does an equivalent pre-multiply bound.
+	// Per-digit pre-multiply guard. The naive "n*10+d wrapped if it went
+	// down" check has a gap once n nears 2^64/9: n*10+d can wrap mod 2^64
+	// to a value still >= prev, e.g. "20496382304121724020" lands at
+	// 2049638230412172404 with no post-multiply wrap visible. Java's
+	// JsonParser.getLongValue throws InputCoercionException and goavro
+	// uses strconv.ParseInt; we bound before the multiply instead.
 	//
-	// MaxInt64 = 9223372036854775807 → cutoff 922337203685477580, last digit 7.
-	// |MinInt64| = 9223372036854775808 → same cutoff, last digit 8.
+	// MaxInt64 = 9223372036854775807: cutoff 922337203685477580, last digit 7.
+	// |MinInt64| = 9223372036854775808: same cutoff, last digit 8.
 	const cutoff = uint64(math.MaxInt64) / 10
 	maxDigit := uint64(7)
 	if neg {
@@ -413,7 +406,7 @@ func parseJSONInt64(b []byte) (int64, error) {
 	for ; i < len(b); i++ {
 		c := b[i]
 		if c == '.' || c == 'e' || c == 'E' {
-			// Fractional or exponent form: parse at arbitrary precision so
+			// Fractional or exponent form: we parse at arbitrary precision so
 			// values near the int64 boundary are not truncated or rejected by
 			// float64 rounding. "-9.2233720368547758e18" is the valid int64
 			// -9223372036854775800 that float64 rounds to int64.Min, and its
@@ -444,10 +437,9 @@ func parseJSONInt64(b []byte) (int64, error) {
 	return int64(n), nil
 }
 
-// walkJSONEscapes iterates raw JSON string content (between quotes),
-// decoding escape sequences and UTF-8 multi-byte sequences into runes,
-// then calling emit for each code point. Used by both resolveJSONEscapes
-// (Avro string) and scanAvroJSONBytes (Avro bytes/fixed).
+// walkJSONEscapes decodes escapes and UTF-8 multi-byte sequences in raw string
+// content into runes, calling emit for each code point. resolveJSONEscapes
+// (Avro string) and scanAvroJSONBytes (Avro bytes/fixed) share it.
 //
 // The UTF-8 decoding is required for spec parity: "each character represents
 // one byte", with code points 0-255 mapping to byte values, and both Java and
@@ -456,7 +448,7 @@ func parseJSONInt64(b []byte) (int64, error) {
 func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 	for i := 0; i < len(raw); {
 		if raw[i] != '\\' {
-			// Decode multi-byte UTF-8 as a single rune so the round trip
+			// We decode multi-byte UTF-8 as one rune so the round trip
 			// preserves the value. consumeStringRaw already rejected
 			// invalid UTF-8, so DecodeRune always advances a full rune.
 			r, size := utf8.DecodeRune(raw[i:])
@@ -506,10 +498,10 @@ func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 		default:
 			// Unrecognized escape sequence. JSON defines exactly eight
 			// (" \ / b f n r t) plus \uXXXX; anything else is malformed.
-			// Reject rather than silently dropping the backslash (which
-			// corrupts content — "C:\dir" would become "C:dir"). Matches
-			// Java's JsonDecoder (Jackson, "Unrecognized character
-			// escape") and fastavro (Python json, "Invalid \escape").
+			// We reject rather than silently drop the backslash, which
+			// corrupts content: "C:\dir" would become "C:dir". Java's
+			// JsonDecoder (Jackson, "Unrecognized character escape") and
+			// fastavro (Python json, "Invalid \escape") both reject too.
 			return fmt.Errorf("avro json: invalid escape sequence \\%c", raw[i])
 		}
 		if err := emit(r); err != nil {
@@ -520,8 +512,6 @@ func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 	return nil
 }
 
-// resolveJSONEscapes resolves JSON escape sequences in raw string content,
-// producing a UTF-8 Go string.
 func resolveJSONEscapes(raw []byte) (string, error) {
 	var buf []byte
 	err := walkJSONEscapes(raw, func(r rune) error {

@@ -6,12 +6,11 @@ import (
 )
 
 // The must* helpers below each run one library call and fail the test if it
-// errors. They exist so a cell that only needs the successful result reads as
-// one line instead of four; every one calls t.Helper(), so a failure is
-// reported at the caller's line, and every message names the operation. A site
-// whose own failure message says more than the operation name — which cell,
-// which input, which axis — keeps its own error handling and is not folded
-// into these.
+// errors. A cell that only needs the successful result then reads as one line
+// instead of four. Every one calls t.Helper(), so a failure is reported at
+// the caller's line, and every message names the operation. A site whose own
+// failure message says more than the operation name (which cell, which input,
+// which axis) keeps its own error handling and stays out of these.
 
 func mustParse(t testing.TB, schema string, opts ...SchemaOpt) *Schema {
 	t.Helper()

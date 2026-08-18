@@ -7,8 +7,8 @@ import (
 	"sync"
 )
 
-// skipfn advances past an encoded Avro value without storing it. It threads
-// the slab through purely to share the recursion-depth bound with deserfn
+// skipfn advances past an encoded Avro value without storing it. We thread the
+// slab through purely to share the recursion-depth bound with deserfn
 // (sl.depth); skips otherwise don't need it.
 type skipfn func(src []byte, sl *slab) ([]byte, error)
 
@@ -17,10 +17,11 @@ func skipNull(src []byte, _ *slab) ([]byte, error) {
 }
 
 // needLen reports a ShortBufferError when src is too short to read n bytes.
-// Single constructor of the fixed-size {Type + Need + Have} short-buffer
-// shape so every fixed-length read/skip agrees on it (skip paths via
-// skipBytesN; decode paths — deserFixed, deserDuration, deserFixedDecimal,
-// deserFixedUUIDReflect, udDuration, readFixedUUID — call it directly).
+// This is our sole constructor of the fixed-size {Type + Need + Have}
+// short-buffer shape, so every fixed-length read and skip agrees on it. Skip
+// paths reach it through skipBytesN; deserFixed, deserDuration,
+// deserFixedDecimal, deserFixedUUIDReflect, udDuration and readFixedUUID call
+// it directly.
 func needLen(src []byte, n int, typ string) error {
 	if len(src) < n {
 		return &ShortBufferError{Type: typ, Need: n, Have: len(src)}
@@ -28,9 +29,6 @@ func needLen(src []byte, n int, typ string) error {
 	return nil
 }
 
-// skipBytesN advances past n bytes (boolean/float/double/fixed). One
-// helper for every fixed-size skip so they agree on the ShortBufferError
-// shape (Type + Need + Have).
 func skipBytesN(src []byte, n int, typ string) ([]byte, error) {
 	if err := needLen(src, n, typ); err != nil {
 		return nil, err
@@ -80,13 +78,13 @@ func skipRecord(w *schemaNode, mbw *minBytesWalk) skipfn {
 		sl.depth++
 		defer func() { sl.depth-- }()
 		s.once.Do(func() {
-			// The OPERATION's walk, threaded down from Resolve — not a fresh
-			// one. A record is not a cost boundary: the schema chooses how many
-			// records a dropped subtree references, each reference compiles its
-			// own skipRecordFields, and a per-record walk therefore multiplied
-			// the per-walk allowance by a count the schema picks. Reaching each
-			// one costs O(1) wire bytes, so "the wire bounds how many compile"
-			// bounds the COUNT and not the WORK.
+			// We use the *operation's* walk, threaded down from Resolve,
+			// not a fresh one. A record is not a cost boundary. The schema
+			// chooses how many records a dropped subtree references, each
+			// reference compiles its own skipRecordFields, and a per-record
+			// walk would multiply the per-walk allowance by a count the
+			// schema picks. Reaching each one costs O(1) wire bytes, so "the
+			// wire bounds how many compile" bounds the count, not the work.
 			//
 			// This runs at decode time and the walk is shared, so minBytesOf
 			// locks; see minBytesWalk.mu for why that is uncontended and why a
@@ -106,15 +104,15 @@ func skipRecord(w *schemaNode, mbw *minBytesWalk) skipfn {
 	}
 }
 
-// skipBlocks iterates Avro block-framed data, invoking inner once per
-// item/entry. blockType labels readBlockHeader errors ("array" / "map",
-// the same labels the value-path block walkers pass, so the two paths
-// report identical text for identical corruption — readBlockHeader's
-// formats append their own "block"). When negative-count byte-size
-// framing is present the
-// block is fast-skipped via byteSize; otherwise totalGuard (when non-nil)
-// gates the per-block count, and inner is called for each item/entry.
-// Shared by skipArray and skipMap.
+// skipBlocks iterates Avro block-framed data, calling inner once per item or
+// entry. Shared by skipArray and skipMap.
+//
+// blockType labels readBlockHeader errors ("array" or "map"). The value-path
+// block walkers pass the same labels, so both paths report identical text for
+// identical corruption; readBlockHeader's formats append their own "block".
+// Negative-count byte-size framing fast-skips the whole block via byteSize.
+// Otherwise totalGuard (when non-nil) gates the per-block count, and inner
+// runs for each item or entry.
 func skipBlocks(src []byte, sl *slab, blockType string,
 	totalGuard func(count, total int64, srcLen int) error,
 	inner func(src []byte, sl *slab) ([]byte, error),
@@ -167,17 +165,17 @@ func skipArray(w *schemaNode, mbw *minBytesWalk) skipfn {
 
 func skipMap(w *schemaNode, mbw *minBytesWalk) skipfn {
 	valueSkip := buildSkip(w.values, mbw)
-	// minEntryBytes = 1 (key length varint, ≥1 byte for an empty key) +
-	// the value's minimum wire bytes — identical to deserMap.minEntryBytes.
+	// minEntryBytes = 1 (key length varint, ≥1 byte for an empty key) plus
+	// the value's minimum wire bytes, identical to deserMap.minEntryBytes.
 	minEntryBytes := mapEntryMinBytes(mbw.minBytesOf(w.values))
 	return func(src []byte, sl *slab) ([]byte, error) {
 		return skipBlocks(src, sl, "map",
-			// Bound the block count against the remaining buffer, matching
+			// We bound the block count against the remaining buffer, matching
 			// deserMap (deser.go) and skipArray's checkArrayBlockBounds.
-			// Without it, skipBlocks' `for range int(count)` loop truncates
-			// a count above 2^31 on a 32-bit build, mis-framing the skip of
-			// subsequent bytes; on 64-bit the loop is buffer-bounded already,
-			// but this keeps deserMap, skipArray, and skipMap on one rule.
+			// Without it, skipBlocks' `for range int(count)` loop truncates a
+			// count above 2^31 on a 32-bit build and mis-frames the skip of
+			// subsequent bytes. On 64-bit the loop is buffer-bounded already,
+			// but this keeps deserMap, skipArray and skipMap on one rule.
 			// minEntryBytes ≥ 1, so this is always the buffer-relative bound
 			// and never false-rejects a legitimate block (each entry occupies
 			// at least minEntryBytes wire bytes).
@@ -225,18 +223,18 @@ var primitiveSkips = map[string]skipfn{
 	"double":  skipDouble,
 	"bytes":   skipBytes,
 	// A string is a length-prefixed byte run on the wire, so skipping one
-	// IS skipping bytes — the shared reader already labels its
+	// *is* skipping bytes; the shared reader already labels its
 	// short-buffer error "bytes" for both.
 	"string": skipBytes,
 }
 
-// buildSkip compiles a skipper for writer node w. mbw is the ONE min-bytes walk
-// of the operation that reached here (resolveCtx.minBytes), and every arm passes
-// it down — including the record arm, whose compile is deferred to decode time
-// but still joins this walk rather than starting a fresh one. Nothing along the
-// way is a cost boundary: containers, union branches and records are all counted
-// by the schema, so any per-unit allowance is the per-walk bound multiplied by a
-// number the schema author picks.
+// buildSkip compiles a skipper for writer node w. mbw is the *one* min-bytes
+// walk of the operation that reached here (resolveCtx.minBytes), and every arm
+// passes it down. That includes the record arm, whose compile is deferred to
+// decode time but still joins this walk rather than starting a fresh one.
+// Nothing along the way is a cost boundary. The schema counts the containers,
+// union branches and records, so any per-unit allowance is the per-walk bound
+// multiplied by a number the schema author picks.
 func buildSkip(w *schemaNode, mbw *minBytesWalk) skipfn {
 	if f, ok := primitiveSkips[w.kind]; ok {
 		return f
@@ -268,7 +266,6 @@ func skipUnbuildable(_ []byte, _ *slab) ([]byte, error) {
 	return nil, errors.New("avro: internal: record field has no skipper")
 }
 
-// skipToDeser wraps a skipfn as a deserfn that ignores the reflect.Value.
 func skipToDeser(skip skipfn) deserfn {
 	return func(src []byte, _ reflect.Value, sl *slab) ([]byte, error) {
 		return skip(src, sl)

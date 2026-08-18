@@ -20,9 +20,9 @@ import (
 // The oracle: encoding/json, executed rather than restated.
 //
 // Every twin below is the code the corresponding production site ran before
-// one decoder replaced five hand-spelled ones. They are kept here, and only
-// here, so the matrix compares against a reference OUTSIDE this package
-// instead of against whatever the decoder currently happens to do.
+// one decoder replaced five hand-spelled ones. We keep them here, and only
+// here, so the matrix compares against a reference outside this package. The
+// alternative is comparing against whatever the decoder currently does.
 // ---------------------------------------------------------------------
 
 func oracleDecodeLenient(schema string) (any, error) {
@@ -30,9 +30,9 @@ func oracleDecodeLenient(schema string) (any, error) {
 	return v, err
 }
 
-// oracleDecodeLenientOffset also reports where the stdlib decoder stopped, so
-// the consumed count the shared decoder returns has an independent answer to
-// be checked against rather than only being self-consistent.
+// oracleDecodeLenientOffset also reports where the stdlib decoder stopped. That
+// gives the consumed count the shared decoder returns an independent answer to
+// check against, rather than leaving it merely self-consistent.
 func oracleDecodeLenientOffset(schema string) (any, int, error) {
 	dec := json.NewDecoder(strings.NewReader(schema))
 	dec.UseNumber()
@@ -95,17 +95,17 @@ func oracleCacheNormalize(schema string) string {
 
 // oracleTagDefault is the struct-tag default read, built on the stdlib decode.
 //
-// Unlike the other twins here it is NOT a copy of what the site used to do,
-// because this is the one site whose behavior changed: it used to ask
+// Unlike the other twins here it is NOT a copy of what the site used to do.
+// This is the one site whose behavior changed. It used to ask
 // json.Decoder.More whether anything followed, and More answers `c != ']' &&
 // c != '}'`, so it called `42]` a complete value and discarded the bracket.
-// A twin spelling that would asserts the behavior the change removed.
+// A twin copying that would assert the behavior the change removed.
 //
-// So the rule is stated independently on this side instead: decode one value,
-// then require the rest of the text to be whitespace, using the decoder's OWN
+// So we state the rule independently on this side: decode one value, then
+// require the rest of the text to be whitespace, using the decoder's own
 // offset accounting (InputOffset) rather than the consumed count the
-// implementation computes. That keeps the oracle answerable from stdlib alone
-// while also crossing the arithmetic the implementation uses to find the same
+// implementation computes. That keeps the oracle answerable from stdlib alone,
+// and it still crosses the arithmetic the implementation uses to find the same
 // boundary.
 func oracleTagDefault(raw string) any {
 	dec := json.NewDecoder(strings.NewReader(raw))
@@ -129,8 +129,8 @@ func oracleTagDefault(raw string) any {
 // ---------------------------------------------------------------------
 
 // decodeCell is one schema-text input plus the class it belongs to. The class
-// is what the liveness floor counts, so an axis that stops being generated
-// reds instead of quietly emptying.
+// is what the liveness floor counts. An axis that stops being generated reds
+// instead of quietly emptying.
 type decodeCell struct {
 	name  string
 	class string
@@ -139,11 +139,11 @@ type decodeCell struct {
 
 // decodeCorpus spans the input axis: every JSON shape a schema can be written
 // in, crossed with the boundaries where a decoder can silently differ from the
-// stdlib one it replaced. The number rows are the ones that matter most — see
-// [decodeSchemaAny] for the two silent failures a resolving decoder causes.
+// stdlib one it replaced. The number rows matter most; see [decodeSchemaAny]
+// for the two silent failures a resolving decoder causes.
 var decodeCorpus = func() []decodeCell {
 	cells := []decodeCell{
-		// Numbers: syntax forms whose LITERAL must survive the decode.
+		// Numbers: syntax forms whose literal must survive the decode.
 		{"int", "number", `{"type":"int","p":42}`},
 		{"negative-zero-integer", "number", `{"type":"int","p":-0}`},
 		{"negative-zero-float", "number", `{"type":"int","p":-0.0}`},
@@ -208,9 +208,9 @@ var decodeCorpus = func() []decodeCell {
 		{"bad-escape", "malformed", `{"type":"int","p":"\q"}`},
 		{"raw-control-char", "malformed", "{\"type\":\"int\",\"p\":\"a\x01b\"}"},
 	}
-	// Raw invalid UTF-8, which a decode repairs one replacement rune per
-	// BYTE rather than per run — a distinction no escape can express, so it
-	// is built here rather than written as a literal.
+	// Raw invalid UTF-8. A decode repairs it one replacement rune per byte
+	// rather than per run, a distinction no escape can express, so we build
+	// it here rather than writing it as a literal.
 	cells = append(cells,
 		decodeCell{"invalid-utf8-single", "string", "{\"type\":\"int\",\"p\":\"\xa8\"}"},
 		decodeCell{"invalid-utf8-run", "string", "{\"type\":\"int\",\"p\":\"\xa8\xa8\xa8\"}"},
@@ -220,11 +220,11 @@ var decodeCorpus = func() []decodeCell {
 	// The nesting boundary, which no mutation-driven corpus reaches: the
 	// decoder accepts exactly the depth the stdlib decoder accepted.
 	//
-	// The innermost value is an axis of its own, not a detail. An EMPTY
+	// The innermost value is an axis of its own, not a detail. An empty
 	// innermost container agrees with the stdlib decode whatever the bound is
-	// charged per — value or per container — because there is no leaf to spend
-	// the last unit on. Only a NON-EMPTY innermost separates the two, so a
-	// ladder of empty containers can be run at every depth and still measure
+	// charged per, value or container, because there is no leaf to spend the
+	// last unit on. Only a *non-empty* innermost separates the two, so a
+	// ladder of empty containers can run at every depth and still measure
 	// nothing about which rule the decoder implements.
 	for _, n := range []int{2, 9999, 10000, 10001, 10002} {
 		for _, inner := range []struct{ name, body string }{
@@ -255,10 +255,10 @@ var decodeCorpus = func() []decodeCell {
 
 // decodeSite is one production caller of the shared decoder, paired with the
 // stdlib twin of what that caller used to do. The site axis is what makes the
-// matrix a class net rather than a decoder net: the decoder's contract is
-// re-entered once per caller, and a caller with no cell is a route on which
-// nothing is proven. [TestCensus_SchemaJSONDecodeCallSites] is what keeps this
-// list equal to the set the source actually contains.
+// matrix a class net rather than a decoder net. Every caller re-enters the
+// decoder's contract, and a caller with no cell is a route on which we prove
+// nothing. [TestCensus_SchemaJSONDecodeCallSites] keeps this list equal to the
+// set the source actually contains.
 type decodeSite struct {
 	name string
 	// run returns a comparable rendering of the site's output, or an error.
@@ -287,8 +287,8 @@ var decodeSites = []decodeSite{
 	{
 		name: "unmarshalDefault",
 		// Never fails by contract: it re-reads bytes an earlier decode
-		// already accepted. Feeding it the whole corpus asks more of it
-		// than production does, which is the point — a decoder that
+		// already accepted. Feeding it the whole corpus asks more of
+		// it than production does, which is the point. A decoder that
 		// diverges on malformed input diverges on valid input too.
 		run:    func(in string) (any, error) { return unmarshalDefault(json.RawMessage(in)), nil },
 		oracle: func(in string) (any, error) { v, _ := oracleDecodeLenient(in); return v, nil },
@@ -306,14 +306,14 @@ var decodeSites = []decodeSite{
 }
 
 // TestMatrix_SchemaJSONDecodeCallSiteParity crosses every schema-text input
-// class with every caller of the shared decoder, and requires each caller to
-// land exactly where the stdlib decode it replaced landed — same value, same
-// accept/reject verdict.
+// class with every caller of the shared decoder. Each caller must land exactly
+// where the stdlib decode it replaced landed: same value, same accept/reject
+// verdict.
 //
 // The oracle is encoding/json, executed here rather than described, so no cell
-// can pass by agreeing with the decoder about something they are both wrong
-// about. The site axis is the one the mechanism turns on: a single decoder
-// serving six callers is proven on the callers, not on itself.
+// passes by agreeing with the decoder about something they are both wrong
+// about. The site axis is the one the mechanism turns on. We prove a single
+// decoder serving six callers on the callers, not on itself.
 func TestMatrix_SchemaJSONDecodeCallSiteParity(t *testing.T) {
 	classSeen := map[string]int{}
 	siteSeen := map[string]int{}
@@ -352,15 +352,15 @@ func TestMatrix_SchemaJSONDecodeCallSiteParity(t *testing.T) {
 }
 
 // TestInvariant_SchemaDecodeNumbersStayLiteral pins the property the parse path
-// depends on, answered FROM THE INPUT rather than from a sibling decoder: every
-// number the shared decoder emits is the author's literal, byte for byte.
+// depends on: every number the shared decoder emits is the author's literal,
+// byte for byte. Answered from the input rather than from a sibling decoder.
 //
 // The parity matrix would also red if a number were resolved here, but only for
-// as long as its twin stays stdlib. This states the rule without a second
+// as long as its twin stays stdlib. So we state the rule with no second
 // implementation to agree with, because the two failures it prevents are
-// silent: a re-marshal of a resolved "-0" loses the sign a float default
-// encodes, and a re-marshal of a resolved long literal is short enough to walk
-// past the length cap that refuses the literal. Both produce wrong bytes and no
+// silent. A re-marshal of a resolved "-0" loses the sign a float default
+// encodes. A re-marshal of a resolved long literal is short enough to walk past
+// the length cap that refuses the literal. Both produce wrong bytes and no
 // error, so the guard has to be one nothing can quietly co-edit.
 func TestInvariant_SchemaDecodeNumbersStayLiteral(t *testing.T) {
 	literals := []string{
@@ -404,10 +404,10 @@ var sharedDecoderEntryPoints = map[string]bool{
 }
 
 // schemaDecodeCallers is the call-site set the matrix claims to cover, keyed by
-// the enclosing function. Derived from source by
-// [TestCensus_SchemaJSONDecodeCallSites] rather than trusted from this list —
-// the list is what the derivation is compared AGAINST, so a site appearing or
-// disappearing is a decision made here rather than a silent change.
+// the enclosing function. [TestCensus_SchemaJSONDecodeCallSites] derives the
+// set from source rather than trusting this list, and we compare the derivation
+// against the list. A site appearing or disappearing is then a decision made
+// here rather than a silent change.
 var schemaDecodeCallers = map[string]string{
 	"parseSchemaTree":               "schema_parse.go",
 	"unmarshalAnyPreservePrecision": "schema.go",
@@ -418,14 +418,14 @@ var schemaDecodeCallers = map[string]string{
 }
 
 // TestCensus_SchemaJSONDecodeCallSites derives the shared decoder's callers
-// from the package source and requires them to be exactly the set the parity
-// matrix exercises. It reds in BOTH directions: a new caller that no cell
-// covers fails here, and a caller that disappears fails here too, so the guard
-// cannot go stale by watching code that is gone.
+// from the package source. They must be exactly the set the parity matrix
+// exercises. It reds in both directions: a new caller that no cell covers fails
+// here, and a caller that disappears fails here too, so the guard cannot go
+// stale by watching code that is gone.
 //
-// It also requires that no source file reconstruct the decode this replaced. A
-// json.Decoder put into UseNumber mode IS the old hand-spelled site — five of
-// them had already drifted into three different trailing-content rules — so a
+// We also require that no source file reconstruct the decode this replaced. A
+// json.Decoder put into UseNumber mode *is* the old hand-spelled site. Five of
+// them had already drifted into three different trailing-content rules, so a
 // sixth reappearing has to fail rather than quietly coexist.
 func TestCensus_SchemaJSONDecodeCallSites(t *testing.T) {
 	files := censusSourceFiles(t)
@@ -502,10 +502,10 @@ func TestCensus_SchemaJSONDecodeCallSites(t *testing.T) {
 // means the text held no value at all, [io.ErrUnexpectedEOF] means it ran out
 // part way through one, and a well-formed-but-wrong schema is neither.
 //
-// Two answers rather than one is the whole point — "you passed me nothing" and
-// "you passed me a truncated schema" are different mistakes — so a decoder that
-// collapsed them, or that reported its own error type for both, would take a
-// distinction away from callers without anything failing.
+// Two answers rather than one is the whole point. "Nothing was passed" and "a
+// truncated schema was passed" are different mistakes. A decoder that collapsed
+// them, or that reported its own error type for both, would take a distinction
+// away from callers without anything failing.
 func TestMatrix_ParseDecodeErrorSentinels(t *testing.T) {
 	for _, c := range []struct {
 		name      string
@@ -555,14 +555,14 @@ func TestMatrix_ParseDecodeErrorSentinels(t *testing.T) {
 }
 
 // TestInvariant_RootCannotFailToDecode pins why [Schema.Root] may panic on a
-// decode error: the text it decodes is the exact text a parse already accepted,
-// through the SAME decoder, so the panic is unreachable rather than merely
+// decode error. The text it decodes is the exact text a parse already accepted,
+// through the same decoder, so the panic is unreachable rather than merely
 // unlikely.
 //
-// It used to be unreachable for a weaker reason — Root's decode was the LENIENT
+// It used to be unreachable for a weaker reason. Root's decode was the lenient
 // one, accepting a superset of what the parse accepted, so the two agreeing was
-// a coincidence of two spellings. Now they are one function, and the property is
-// that a decoder is deterministic and carries no state between calls.
+// a coincidence of two spellings. Now they are one function, and the property
+// is that a decoder is deterministic and carries no state between calls.
 func TestInvariant_RootCannotFailToDecode(t *testing.T) {
 	// Every schema in the corpus that parses at all, plus the ownership
 	// shapes, re-decoded exactly as Root re-decodes them.
@@ -609,19 +609,19 @@ type tagDefaultCase struct {
 // TestMatrix_SchemaForTagDefaultAcceptSet fixes which `default=` tag bodies are
 // read as JSON and which fall back to the text verbatim.
 //
-// The accept set is CHOSEN, not inherited. This site used to ask
+// The accept set is chosen, not inherited. This site used to ask
 // json.Decoder.More whether anything followed the value, and More answers
-// `c != ']' && c != '}'` — so a body of `42]` reported nothing-follows, the
+// `c != ']' && c != '}'`, so a body of `42]` reported nothing-follows, the
 // bracket was silently discarded, and the field got the number 42. The two
 // sites that decode a whole schema asked a different question (a second decode
-// must reach EOF) and rejected the same text. That was a divergence between
-// two spellings of one rule, not a decision, and one of them threw away input
+// must reach EOF) and rejected the same text. That was a divergence between two
+// spellings of one rule, not a decision, and one of them threw away input
 // without saying so.
 //
-// Discarding is the worse answer, so all of them now reject: `42]` is not the
+// Discarding is the worse answer, so all of them now reject. `42]` is not the
 // number 42, it is a body that is not JSON, and it takes the same fallback as
 // `hello`. On a typed field that fallback then fails validation, which is the
-// point — the author gets an error instead of a silently different default.
+// point: we get an error instead of a silently different default.
 func TestMatrix_SchemaForTagDefaultAcceptSet(t *testing.T) {
 	cases := []tagDefaultCase{
 		{body: `42`, want: json.Number("42"), why: "a bare JSON value is the value"},
@@ -668,9 +668,9 @@ type tagPlainDefault struct {
 }
 
 // TestMatrix_SchemaForTagDefaultTrailingBracket carries the rule to the surface
-// an author actually types, because the fallback is only half the story: on a
-// typed field the verbatim string then has to survive Avro validation, and it
-// does not. A body of `42]` used to build a schema with the long default 42.
+// an author actually types. The fallback is only half the story: on a typed
+// field the verbatim string then has to survive Avro validation, and it does
+// not. A body of `42]` used to build a schema with the long default 42.
 func TestMatrix_SchemaForTagDefaultTrailingBracket(t *testing.T) {
 	if _, err := SchemaFor[tagTrailingBracket](); err == nil {
 		t.Fatal("a `default=42]` tag built a schema; the trailing bracket must not be discarded, and the string it falls back to is not a long")
@@ -751,9 +751,9 @@ func mutableContainers(n *SchemaNode, path string, out map[uintptr]string, seen 
 }
 
 // ownershipShapes puts a decoded container on each surface a caller can write
-// through, including the second-occurrence reference paths — a self-reference
-// and a diamond where one definition is reached twice — because a tree sharing
-// a container with ITSELF would share it across calls too.
+// through, including the second-occurrence reference paths (a self-reference,
+// and a diamond where one definition is reached twice), because a tree sharing
+// a container with itself would share it across calls too.
 var ownershipShapes = map[string]string{
 	"node props":     `{"type":"record","name":"R","meta":{"a":[1,2],"b":{"c":3}},"fields":[{"name":"x","type":"int"}]}`,
 	"field props":    `{"type":"record","name":"R","fields":[{"name":"x","type":"int","tags":{"t":[1]}}]}`,
@@ -770,16 +770,16 @@ var ownershipShapes = map[string]string{
 }
 
 // TestInvariant_RootTreesShareNoMutableState pins [Schema.Root]'s ownership
-// contract: the tree handed back is the caller's alone, so two calls share no
-// map and no slice either could write through, and neither shares one with the
-// schema's own internals — the props a [CustomType] callback reads while other
-// goroutines encode.
+// contract: the tree handed back is the caller's alone. Two calls share no map
+// and no slice either could write through. Neither shares one with the schema's
+// own internals, the props a [CustomType] callback reads while other goroutines
+// encode.
 //
-// The contract is not new, but what makes it true moved: the schema decoder
-// hands back SUBSTRINGS of the schema text where a reflect-driven decode
+// The contract is not new, but what makes it true moved. The schema decoder
+// hands back substrings of the schema text where a reflect-driven decode
 // allocated fresh strings, so what a returned tree shares with the text it came
 // from became a live question. A string cannot be written through, which is why
-// only the containers are counted.
+// we count only the containers.
 func TestInvariant_RootTreesShareNoMutableState(t *testing.T) {
 	names := make([]string, 0, len(ownershipShapes))
 	for name := range ownershipShapes {
@@ -825,7 +825,7 @@ func TestInvariant_RootTreesShareNoMutableState(t *testing.T) {
 }
 
 // collectNodeProps records the containers reachable from the compiled tree's
-// props — what a CustomType callback is handed.
+// props, which is what a CustomType callback is handed.
 func collectNodeProps(n *schemaNode, path string, out map[uintptr]string, seen map[*schemaNode]bool) {
 	if n == nil || seen[n] {
 		return
@@ -884,7 +884,7 @@ func FuzzSchemaDecodeParity(f *testing.F) {
 		if (wantErr == nil) != (gotErr == nil) {
 			t.Fatalf("lenient accept/reject differs: stdlib=%v shared=%v", wantErr, gotErr)
 		}
-		// The consumed count is an ANSWER, not bookkeeping: it is the whole
+		// The consumed count is an answer, not bookkeeping: it is the whole
 		// of what every strict caller decides on, so a decoder landing on
 		// the right value at the wrong offset would split the two callers
 		// that share this decode.
@@ -892,8 +892,8 @@ func FuzzSchemaDecodeParity(f *testing.F) {
 			t.Fatalf("consumed count differs: stdlib=%d shared=%d for %q", wantOff, gotOff, in)
 		}
 		// Parse echoes a decode error rather than replacing it, so these two
-		// sentinels are part of what a caller can ask about the failure —
-		// "you gave me nothing" against "you gave me a truncated schema".
+		// sentinels are part of what a caller can ask about the failure:
+		// "nothing was given" against "a truncated schema was given".
 		for _, sentinel := range []error{io.EOF, io.ErrUnexpectedEOF} {
 			if errors.Is(wantErr, sentinel) != errors.Is(gotErr, sentinel) {
 				t.Fatalf("errors.Is(%v) differs: stdlib err=%v shared err=%v", sentinel, wantErr, gotErr)
@@ -964,16 +964,16 @@ func FuzzSchemaParseEndToEnd(f *testing.F) {
 }
 
 // FuzzSchemaTagDefaultParity covers the struct-tag default on its own, because
-// it is the one caller whose contract is not "decode this": a value that is not
+// it is the one caller whose contract is not "decode this". A value that is not
 // exactly one JSON value stays a verbatim string, so its accept path and its
-// FALLBACK path are different answers the other sites never produce.
+// fallback path are different answers the other sites never produce.
 func FuzzSchemaTagDefaultParity(f *testing.F) {
 	addDecodeSeeds(f)
 	for _, s := range []string{
 		"note (a", "hello", "42 oops", "", "  ", "true", "[1,2]", "-0",
 		// A complete value followed by a closing bracket or brace. This is
 		// the shape the old rule called complete and this one calls
-		// trailing, and no other seed here ends that way — a corpus without
+		// trailing, and no other seed here ends that way; a corpus without
 		// it cannot tell the two rules apart.
 		"0}", "0]", "42]", `"s"}`, "[1,2]]", `{"a":1}}`, "true]", "null}",
 	} {
@@ -1069,7 +1069,7 @@ func TestExpandReferencesCyclesStayReferences(t *testing.T) {
 		}
 	})
 	t.Run("mutual", func(t *testing.T) {
-		// A and B name each other, so BOTH are on the cycle and neither
+		// A and B name each other, so both are on the cycle and neither
 		// expands anywhere. Expanding whichever copy is not yet on the path
 		// would give one B the recursive body and another the expanded one,
 		// and Schema reads two same-named bodies that differ as a conflict.
@@ -1084,7 +1084,7 @@ func TestExpandReferencesCyclesStayReferences(t *testing.T) {
 		if backA.Type != "A" || len(backA.Fields) != 0 {
 			t.Errorf("the cycle-closing reference to A expanded: %s", expandJSON(t, &backA))
 		}
-		// B does not close the cycle, so it expands — and every copy of it has
+		// B does not close the cycle, so it expands, and every copy of it has
 		// to come out identical, which is the whole reason the verdict is per
 		// name rather than per position.
 		atY := e.Fields[1].Type
@@ -1114,8 +1114,8 @@ func TestExpandReferencesDoesNotMutateReceiver(t *testing.T) {
 		t.Errorf("receiver changed:\n before %s\n after  %s", before, after)
 	}
 
-	// Writing through every container the result hands back must not reach the
-	// receiver either.
+	// We write through every container the result hands back; none of it may
+	// reach the receiver either.
 	if n := expandMutateAll(e, 0); n < 8 {
 		t.Fatalf("only %d containers to write through; the cell is not reaching the result's structure", n)
 	}
@@ -1125,7 +1125,7 @@ func TestExpandReferencesDoesNotMutateReceiver(t *testing.T) {
 }
 
 // expandMutateAll writes through every container in n's tree, returning how
-// many it wrote to. Written as a walk rather than a list of paths so it keeps
+// many it wrote to. Written as a walk rather than a list of paths, so it keeps
 // reaching the containers whatever the expansion produced.
 func expandMutateAll(n *SchemaNode, depth int) int {
 	if n == nil || depth > maxSchemaJSONDepth {
@@ -1165,7 +1165,7 @@ var expandRoundTripSchemas = []struct {
 	name   string
 	schema string
 	// fullDiffers marks the cases where the rebuilt text differs from the
-	// unexpanded rebuild in reference SPELLING alone: Schema re-spells a
+	// unexpanded rebuild in reference spelling alone: Schema re-spells a
 	// collapsed repeat by fullname, so a source reference written as an
 	// in-scope short name comes back qualified. The canonical comparison,
 	// which normalizes both to the fullname, still runs.
@@ -1202,13 +1202,11 @@ func TestExpandReferencesRoundTrips(t *testing.T) {
 			if string(got.Canonical()) != string(s.Canonical()) {
 				t.Errorf("canonical form changed:\n got  %s\n want %s", got.Canonical(), s.Canonical())
 			}
-			// The full form too: canonical drops docs, props and defaults, so
-			// on its own it would not notice an expansion that lost them.
-			// The full form too — canonical drops docs, props and defaults, so
-			// on its own it would not notice an expansion that lost them.
-			// Compared against the tree rebuilt WITHOUT expanding, so the
-			// difference measured is the expansion and not Schema's own
-			// re-emission of the source text.
+			// The full form too: canonical drops docs, props and defaults,
+			// so on its own it would not notice an expansion that lost
+			// them. We compare against the tree rebuilt *without*
+			// expanding, so the difference measured is the expansion
+			// and not Schema's own re-emission of the source text.
 			plain, err := s.Root().Schema()
 			if err != nil {
 				t.Fatalf("rebuilding the unexpanded tree: %v", err)
@@ -1235,8 +1233,8 @@ func expandDoublingSchema(levels int) string {
 
 // TestExpandReferencesIsBounded: a schema whose full expansion is over the
 // ceiling comes back copied but NOT expanded. Stopping partway is not an
-// option — a half-expanded copy of a name conflicts with the whole one and
-// Schema refuses the tree — so the verdict is all or nothing.
+// option. A half-expanded copy of a name conflicts with the whole one and
+// Schema refuses the tree, so the verdict is all or nothing.
 func TestExpandReferencesIsBounded(t *testing.T) {
 	// 2^20 expanded nodes against a 2^18 ceiling, from ~40 lines of text.
 	s := mustParse(t, expandDoublingSchema(20))
@@ -1253,7 +1251,7 @@ func TestExpandReferencesIsBounded(t *testing.T) {
 		t.Errorf("the unexpanded copy no longer rebuilds: %v", err)
 	}
 
-	// The same shape UNDER the ceiling expands in full, so the cell measures
+	// The same shape under the ceiling expands in full, so the cell measures
 	// the ceiling and not a blanket refusal to expand.
 	small := mustParse(t, expandDoublingSchema(10))
 	sr := small.Root()
@@ -1270,10 +1268,10 @@ func TestExpandReferencesIsBounded(t *testing.T) {
 	}
 }
 
-// TestExpandReferencesSizeSaturates: the ceiling is decided from a COUNT, and
-// that count saturates. A doubling chain reaches 2^40 in forty lines of text,
-// so a sum that kept adding would be judged on a number the walk cannot hold —
-// and nothing is built to find out.
+// TestExpandReferencesSizeSaturates: the ceiling is decided from a count, and
+// that count saturates. A doubling chain reaches 2^40 in forty lines of text.
+// A sum that kept adding would be judged on a number the walk cannot hold, and
+// nothing is built to find out.
 func TestExpandReferencesSizeSaturates(t *testing.T) {
 	r := mustParse(t, expandDoublingSchema(40)).Root()
 	x := &expander{
@@ -1334,8 +1332,8 @@ func TestExpandReferencesDeepTree(t *testing.T) {
 }
 
 // TestExpandReferencesExtractedSubtree: a subtree lifted out of a Root tree
-// carries the stamp Root left on its references, so it expands even though the
-// definition lives outside it — the same resolution Schema splices with.
+// carries the stamp Root left on its references. So it expands even though the
+// definition lives outside it, the same resolution Schema splices with.
 func TestExpandReferencesExtractedSubtree(t *testing.T) {
 	s := mustParse(t, `{"type":"record","name":"Top","namespace":"ns","fields":[
 		{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}},
