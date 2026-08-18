@@ -89,6 +89,9 @@ type slab struct {
 	taggedUnions    bool
 	tagLogicalTypes bool
 	skipUnknown     bool
+	// alias replaces carving with pointing: string and bytes return a view of
+	// the decode input instead of a copy of it. See [AliasInput].
+	alias bool
 	// customMatches counts CustomType decoders that MATCHED (returned a result
 	// rather than ErrSkipCustomType) during a decode. A custom-decoder wrapper
 	// saves it before probing and compares after: an unchanged count means no
@@ -121,7 +124,15 @@ func (s *slab) carve(n int) []byte {
 	return b
 }
 
+// aliases reports whether decoded strings and byte slices may point into the
+// decode input. Nil-safe for the arms that reach it off the slab-free path,
+// where no option was ever parsed. See [AliasInput].
+func (s *slab) aliases() bool { return s != nil && s.alias }
+
 func (s *slab) string(src []byte, n int) string {
+	if s.alias {
+		return unsafe.String(unsafe.SliceData(src), n)
+	}
 	b := s.carve(n)
 	copy(b, src[:n])
 	return unsafe.String(unsafe.SliceData(b), n)
@@ -129,9 +140,15 @@ func (s *slab) string(src []byte, n int) string {
 
 func (s *slab) bytes(src []byte, n int) []byte {
 	if s == nil || n == 0 {
+		// n == 0 ahead of the alias arm, and not only for the nil slab: empty
+		// wire bytes must surface NON-nil, and src[:0:0] over an exhausted
+		// input is nil.
 		b := make([]byte, n)
 		copy(b, src[:n])
 		return b
+	}
+	if s.alias {
+		return src[:n:n]
 	}
 	b := s.carve(n)
 	copy(b, src[:n])
@@ -171,6 +188,7 @@ func (sl *slab) put() {
 	sl.taggedUnions = false
 	sl.tagLogicalTypes = false
 	sl.skipUnknown = false
+	sl.alias = false
 	sl.customMatches = 0
 	sl.bypassCustom = false
 	slabPool.Put(sl)
@@ -234,6 +252,7 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 		sl.taggedUnions = cfg.tagged
 		sl.tagLogicalTypes = cfg.tagLogical
 		sl.skipUnknown = cfg.skipUnknown
+		sl.alias = cfg.alias
 	}
 	rest, err := s.deser(src, rv.Elem(), sl)
 	sl.put()
@@ -2093,9 +2112,13 @@ func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			return nil, err
 		}
 	case v.Type().Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8:
-		// Copy: SetBytes(src[:16]) would alias the caller's input buffer,
-		// so a later overwrite of src would silently corrupt the decoded
-		// value. The deserFixed slice path already does this; mirror it.
+		// Raw bytes, so the same rule as deserFixed's slice arm: alias only
+		// under AliasInput. Without it, SetBytes(src[:16]) would leave the
+		// decoded value at the mercy of a later overwrite of src.
+		if sl.aliases() {
+			v.SetBytes(sl.bytes(src, 16))
+			break
+		}
 		buf := make([]byte, 16)
 		copy(buf, src[:16])
 		v.SetBytes(buf)
@@ -2130,8 +2153,14 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		// Mirror serSize's reflect.String arm: encoder accepts a
 		// string of the right length and writes raw bytes; decoder
 		// reads raw bytes and materializes them as a string. Same
-		// shape as deserBytes's reflect.String arm.
-		if err := setStringTarget(v, string(src[:s.n]), "fixed"); err != nil {
+		// shape as deserBytes's reflect.String arm, alias branch included.
+		str := ""
+		if sl.aliases() {
+			str = sl.string(src, s.n)
+		} else {
+			str = string(src[:s.n])
+		}
+		if err := setStringTarget(v, str, "fixed"); err != nil {
 			return nil, err
 		}
 		return src[s.n:], nil
@@ -2332,6 +2361,12 @@ func setBytesValue(v reflect.Value, b []byte, avroType string, sl *slab) error {
 		}
 		copyBytesToArray(v, b)
 	case reflect.String:
+		// string(b) copies; the slab's string is the one that can alias. The
+		// branch keeps this arm off the slab entirely without AliasInput, which
+		// is what lets the bytes and fixed kinds decode with no slab at all.
+		if sl.aliases() {
+			return setStringTarget(v, sl.string(b, len(b)), avroType)
+		}
 		return setStringTarget(v, string(b), avroType)
 	default:
 		return &SemanticError{GoType: v.Type(), AvroType: avroType}

@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/twmb/avro/internal/optmark"
 )
 
 // ---------- deser_test.go ----------
@@ -18526,5 +18528,444 @@ func TestSkipUnknownAmbiguousStillErrors(t *testing.T) {
 	// would also "fail" if the wire then ran short.
 	if !strings.Contains(err.Error(), "duplicate field name") {
 		t.Errorf("got %v, want the duplicate-field-name error", err)
+	}
+}
+
+/////////////////
+// ALIAS INPUT //
+/////////////////
+
+// aliasOffset reports the offset of p within src, or -1 when p points
+// elsewhere. Go's collector does not move heap objects, so comparing the two as
+// addresses holds for the life of the call.
+func aliasOffset(p unsafe.Pointer, src []byte) int {
+	if p == nil || len(src) == 0 {
+		return -1
+	}
+	base := uintptr(unsafe.Pointer(unsafe.SliceData(src)))
+	q := uintptr(p)
+	if q < base || q >= base+uintptr(len(src)) {
+		return -1
+	}
+	return int(q - base)
+}
+
+func strPtr(s string) unsafe.Pointer  { return unsafe.Pointer(unsafe.StringData(s)) }
+func bytePtr(b []byte) unsafe.Pointer { return unsafe.Pointer(unsafe.SliceData(b)) }
+
+const aliasFixed3 = `{"type":"fixed","name":"F3","size":3}`
+const aliasFixedUUID = `{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`
+
+// aliasCases decode one value and hand back the address its payload lives at.
+// The wire is hand-built so the offset the payload MUST land on is known, which
+// is what makes "it aliased" distinguishable from "it happened to be equal".
+var aliasCases = []struct {
+	name   string
+	schema string
+	wire   []byte
+	want   int // offset of the payload within wire
+	decode func(t *testing.T, s *Schema, wire []byte, opts ...Opt) unsafe.Pointer
+}{
+	{"string/string", `"string"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v string
+			mustAliasDecode(t, s, w, &v, o...)
+			return strPtr(v)
+		}},
+	{"string/bytes", `"string"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v []byte
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v)
+		}},
+	{"string/any", `"string"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v any
+			mustAliasDecode(t, s, w, &v, o...)
+			return strPtr(v.(string))
+		}},
+	{"bytes/bytes", `"bytes"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v []byte
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v)
+		}},
+	{"bytes/string", `"bytes"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v string
+			mustAliasDecode(t, s, w, &v, o...)
+			return strPtr(v)
+		}},
+	{"bytes/any", `"bytes"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v any
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v.([]byte))
+		}},
+	{"fixed/bytes", aliasFixed3, []byte{'a', 'b', 'c'}, 0,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v []byte
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v)
+		}},
+	{"fixed/string", aliasFixed3, []byte{'a', 'b', 'c'}, 0,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v string
+			mustAliasDecode(t, s, w, &v, o...)
+			return strPtr(v)
+		}},
+	{"fixed/any", aliasFixed3, []byte{'a', 'b', 'c'}, 0,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v any
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v.([]byte))
+		}},
+	{"fixed-uuid/bytes", aliasFixedUUID, make([]byte, 16), 0,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v []byte
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v)
+		}},
+	// A struct field takes the compiled unsafe path, which shadows the reflect
+	// one; the two may not decide aliasing differently.
+	{"record-field/string", `{"type":"record","name":"R","fields":[{"name":"s","type":"string"}]}`,
+		[]byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v struct {
+				S string `avro:"s"`
+			}
+			mustAliasDecode(t, s, w, &v, o...)
+			return strPtr(v.S)
+		}},
+	{"record-field/bytes", `{"type":"record","name":"R","fields":[{"name":"b","type":"bytes"}]}`,
+		[]byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v struct {
+				B []byte `avro:"b"`
+			}
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v.B)
+		}},
+	{"array-item/string", `{"type":"array","items":"string"}`,
+		[]byte{2, 6, 'a', 'b', 'c', 0}, 2,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v []string
+			mustAliasDecode(t, s, w, &v, o...)
+			if len(v) != 1 {
+				t.Fatalf("got %d items, want 1", len(v))
+			}
+			return strPtr(v[0])
+		}},
+	{"map-key", `{"type":"map","values":"int"}`,
+		[]byte{2, 6, 'k', 'e', 'y', 2, 0}, 2,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v map[string]int32
+			mustAliasDecode(t, s, w, &v, o...)
+			if len(v) != 1 {
+				t.Fatalf("got %d entries, want 1", len(v))
+			}
+			for k := range v {
+				return strPtr(k)
+			}
+			return nil
+		}},
+}
+
+func mustAliasDecode(t *testing.T, s *Schema, wire []byte, v any, opts ...Opt) {
+	t.Helper()
+	if _, err := s.Decode(wire, v, opts...); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
+// TestAliasInputSharesBacking pins BOTH directions on every target the option
+// covers: with it, the decoded payload lives at its exact wire offset inside
+// src; without it, nowhere inside src at all.
+func TestAliasInputSharesBacking(t *testing.T) {
+	for _, c := range aliasCases {
+		t.Run(c.name, func(t *testing.T) {
+			s := MustParse(c.schema)
+
+			wire := append([]byte(nil), c.wire...)
+			if got := aliasOffset(c.decode(t, s, wire, AliasInput()), wire); got != c.want {
+				t.Errorf("AliasInput: payload at offset %d in src, want %d", got, c.want)
+			}
+			// A separate buffer: a copy that happened to be handed back from a
+			// pool cannot land inside a buffer allocated after it.
+			wire2 := append([]byte(nil), c.wire...)
+			if got := aliasOffset(c.decode(t, s, wire2), wire2); got != -1 {
+				t.Errorf("no option: payload at offset %d in src, want outside", got)
+			}
+		})
+	}
+}
+
+// TestAliasInputMutationIsVisible pins the contract rather than treating it as
+// a bug: the decoded values ARE src, so writing to src rewrites them —
+// including the strings, which Go otherwise guarantees are immutable.
+func TestAliasInputMutationIsVisible(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"s","type":"string"},
+		{"name":"b","type":"bytes"}]}`)
+	var got struct {
+		S string `avro:"s"`
+		B []byte `avro:"b"`
+	}
+	wire := []byte{6, 'a', 'b', 'c', 6, 'x', 'y', 'z'}
+	mustAliasDecode(t, s, wire, &got, AliasInput())
+	if got.S != "abc" || string(got.B) != "xyz" {
+		t.Fatalf("got %q / %q, want abc / xyz", got.S, got.B)
+	}
+	wire[1] = 'Z'
+	wire[5] = 'Q'
+	if got.S != "Zbc" {
+		t.Errorf("string did not follow src: %q, want Zbc", got.S)
+	}
+	if string(got.B) != "Qyz" {
+		t.Errorf("bytes did not follow src: %q, want Qyz", got.B)
+	}
+
+	// And the inverse, which is what every existing caller relies on.
+	var plain struct {
+		S string `avro:"s"`
+		B []byte `avro:"b"`
+	}
+	wire2 := []byte{6, 'a', 'b', 'c', 6, 'x', 'y', 'z'}
+	mustAliasDecode(t, s, wire2, &plain)
+	wire2[1] = 'Z'
+	wire2[5] = 'Q'
+	if plain.S != "abc" || string(plain.B) != "xyz" {
+		t.Errorf("no option: src mutation reached %q / %q", plain.S, plain.B)
+	}
+}
+
+type aliasTextTarget struct{ raw []byte }
+
+// UnmarshalText RETAINS b rather than copying it, so the test measures whether
+// the decoder handed over memory it owns.
+func (a *aliasTextTarget) UnmarshalText(b []byte) error { a.raw = b; return nil }
+
+// TestAliasInputCopiesWhereItMust: a target the decoder builds a NEW value for
+// keeps copying, option or not.
+func TestAliasInputCopiesWhereItMust(t *testing.T) {
+	t.Run("byte-array", func(t *testing.T) {
+		s := MustParse(aliasFixed3)
+		var v [3]byte
+		wire := []byte{'a', 'b', 'c'}
+		mustAliasDecode(t, s, wire, &v, AliasInput())
+		wire[0] = 'Z'
+		if v != [3]byte{'a', 'b', 'c'} {
+			t.Errorf("array followed src: %q", v)
+		}
+	})
+	t.Run("text-unmarshaler", func(t *testing.T) {
+		s := MustParse(`"string"`)
+		var v aliasTextTarget
+		wire := []byte{6, 'a', 'b', 'c'}
+		mustAliasDecode(t, s, wire, &v, AliasInput())
+		if string(v.raw) != "abc" {
+			t.Fatalf("got %q, want abc", v.raw)
+		}
+		if off := aliasOffset(bytePtr(v.raw), wire); off != -1 {
+			t.Errorf("UnmarshalText got wire memory at offset %d", off)
+		}
+		wire[1] = 'Z'
+		if string(v.raw) != "abc" {
+			t.Errorf("retained text followed src: %q", v.raw)
+		}
+	})
+	t.Run("bytes-decimal", func(t *testing.T) {
+		s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`)
+		var v *big.Rat
+		wire := []byte{4, 0x01, 0x2C} // 300 → 3.00
+		mustAliasDecode(t, s, wire, &v, AliasInput())
+		before := v.RatString()
+		wire[1] = 0xFF
+		if v.RatString() != before {
+			t.Errorf("decimal followed src: %s, was %s", v.RatString(), before)
+		}
+	})
+	t.Run("long-timestamp", func(t *testing.T) {
+		s := MustParse(`{"type":"long","logicalType":"timestamp-millis"}`)
+		var v time.Time
+		wire := []byte{2}
+		mustAliasDecode(t, s, wire, &v, AliasInput())
+		before := v
+		wire[0] = 4
+		if !v.Equal(before) {
+			t.Errorf("timestamp followed src: %v, was %v", v, before)
+		}
+	})
+	t.Run("fixed-uuid-string", func(t *testing.T) {
+		s := MustParse(aliasFixedUUID)
+		var v string
+		wire := make([]byte, 16)
+		mustAliasDecode(t, s, wire, &v, AliasInput())
+		if off := aliasOffset(strPtr(v), wire); off != -1 {
+			t.Errorf("uuid string aliased src at offset %d — it is a formatted value, not wire bytes", off)
+		}
+	})
+}
+
+// TestAliasInputEmptyStaysNonNil: an aliased empty run must not become a nil
+// slice. A nil is nil-equivalent on re-encode, so a nil-first union would flip
+// a decoded empty bytes onto the null branch.
+func TestAliasInputEmptyStaysNonNil(t *testing.T) {
+	for _, opts := range [][]Opt{nil, {AliasInput()}} {
+		label := fmt.Sprintf("opts=%d", len(opts))
+		for _, c := range []struct {
+			name   string
+			schema string
+			wire   []byte
+		}{
+			{"bytes", `"bytes"`, []byte{0}},
+			{"string", `"string"`, []byte{0}},
+			{"fixed0", `{"type":"fixed","name":"F0","size":0}`, nil},
+		} {
+			s := MustParse(c.schema)
+			var v []byte
+			mustAliasDecode(t, s, c.wire, &v, opts...)
+			if v == nil {
+				t.Errorf("%s/%s: decoded to a nil slice", label, c.name)
+			}
+			if len(v) != 0 {
+				t.Errorf("%s/%s: decoded to %v, want empty", label, c.name, v)
+			}
+			var a any
+			mustAliasDecode(t, s, c.wire, &a, opts...)
+			if b, ok := a.([]byte); c.name != "string" && (!ok || b == nil) {
+				t.Errorf("%s/%s: any decoded to %#v, want a non-nil []byte", label, c.name, a)
+			}
+		}
+		// The consequence the rule exists for: an empty bytes must re-encode
+		// onto the bytes branch, not the null one.
+		u := MustParse(`["null","bytes"]`)
+		var a any
+		mustAliasDecode(t, u, []byte{2, 0}, &a, opts...)
+		out, err := u.Encode(a)
+		if err != nil {
+			t.Fatalf("%s: re-encode: %v", label, err)
+		}
+		if len(out) == 0 || out[0] != 2 {
+			t.Errorf("%s: empty bytes re-encoded as %v, want the bytes branch (2, 0)", label, out)
+		}
+	}
+}
+
+// TestAliasInputDecodeJSONIgnoresIt: a JSON string carrying an escape cannot
+// alias, and aliasing only the ones that happen to have none would make the
+// guarantee vary field by field.
+func TestAliasInputDecodeJSONIgnoresIt(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"s","type":"string"},
+		{"name":"b","type":"bytes"}]}`)
+	// The writer carries a field the reader drops, so this is a real
+	// resolution and not the identity one, which hands back the reader itself
+	// and never reaches decodeJSONResolved.
+	w := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"s","type":"string"},
+		{"name":"b","type":"bytes"},
+		{"name":"gone","type":"int"}]}`)
+	for _, name := range []string{"plain", "resolved"} {
+		t.Run(name, func(t *testing.T) {
+			dec := s
+			src := []byte(`{"s":"abc","b":"xyz"}`)
+			if name == "resolved" {
+				var err error
+				if dec, err = Resolve(w, s); err != nil {
+					t.Fatal(err)
+				}
+				if dec.resolveWriter == nil {
+					t.Fatal("Resolve returned an identity schema; this subtest would not reach decodeJSONResolved")
+				}
+				src = []byte(`{"s":"abc","b":"xyz","gone":1}`)
+			}
+			var got struct {
+				S string `avro:"s"`
+				B []byte `avro:"b"`
+			}
+			if err := dec.DecodeJSON(src, &got, AliasInput()); err != nil {
+				t.Fatalf("DecodeJSON: %v", err)
+			}
+			if got.S != "abc" || string(got.B) != "xyz" {
+				t.Fatalf("got %q / %q", got.S, got.B)
+			}
+			if off := aliasOffset(strPtr(got.S), src); off != -1 {
+				t.Errorf("string aliased the JSON src at offset %d", off)
+			}
+			if off := aliasOffset(bytePtr(got.B), src); off != -1 {
+				t.Errorf("bytes aliased the JSON src at offset %d", off)
+			}
+			for i := range src {
+				src[i] = 'Z'
+			}
+			if got.S != "abc" || string(got.B) != "xyz" {
+				t.Errorf("JSON decode followed src: %q / %q", got.S, got.B)
+			}
+		})
+	}
+}
+
+func TestAliasInputSingleObject(t *testing.T) {
+	s := MustParse(`"string"`)
+	data, err := s.AppendSingleObject(nil, "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v string
+	if _, err := s.DecodeSingleObject(data, &v, AliasInput()); err != nil {
+		t.Fatal(err)
+	}
+	// 10-byte header, then the length varint.
+	if off := aliasOffset(strPtr(v), data); off != 11 {
+		t.Errorf("payload at offset %d, want 11", off)
+	}
+	data[11] = 'Z'
+	if v != "Zbc" {
+		t.Errorf("decoded string did not follow src: %q", v)
+	}
+}
+
+// TestAliasInputIsNotASchemaOpt is the structural half of "OCF never aliases
+// its block buffer": ocf.WithSchemaOpts is the one path that forwards caller
+// options into an OCF reader, and it takes SchemaOpts. AliasInput must stay out
+// of that set — the block buffer is replaced every block.
+func TestAliasInputIsNotASchemaOpt(t *testing.T) {
+	if _, ok := any(AliasInput()).(SchemaOpt); ok {
+		t.Error("AliasInput satisfies SchemaOpt; ocf.WithSchemaOpts would forward it into a reader whose block buffer is overwritten every block")
+	}
+	if _, ok := any(AliasInput()).(optmark.AliasesInput); !ok {
+		t.Error("AliasInput does not implement optmark.AliasesInput; a host that reuses its decode buffer cannot drop it")
+	}
+}
+
+// TestInvariant_ResolvedJSONDropsAliasingOpts reads decodeJSONResolved from
+// source. The composed resolved-JSON path decodes from a re-encoded
+// intermediate it allocates itself, so forwarding an aliasing option there
+// points the caller's values at a buffer they never handed over and pins it for
+// as long as one field is held. Nothing observable distinguishes it — the
+// intermediate is per-call and unreachable — so a source guard is the only
+// thing that can hold the forward honest.
+func TestInvariant_ResolvedJSONDropsAliasingOpts(t *testing.T) {
+	const decl = "func (s *Schema) decodeJSONResolved("
+	src := readFile(t, "json_codec.go")
+	i := strings.Index(src, decl)
+	if i < 0 {
+		t.Fatalf("%s not found in json_codec.go — this guard reads it from source, so a rename must update the guard, not silence it", decl)
+	}
+	body := src[i:]
+	if e := strings.Index(body, "\n}\n"); e >= 0 {
+		body = body[:e+2]
+	}
+	call := strings.Index(body, "s.Decode(")
+	if call < 0 {
+		t.Fatalf("decodeJSONResolved no longer calls s.Decode:\n\n%s", body)
+	}
+	line := body[call:]
+	if e := strings.IndexByte(line, '\n'); e >= 0 {
+		line = line[:e]
+	}
+	if !strings.Contains(line, "dropAliasingOpts(opts)") {
+		t.Errorf("decodeJSONResolved forwards the caller's options raw:\n    %s\nThe buffer it decodes is an intermediate this function allocated, not the caller's src.", strings.TrimSpace(line))
 	}
 }

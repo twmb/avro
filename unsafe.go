@@ -1349,11 +1349,18 @@ func udStringDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 
 // udBytesDeser writes the byte slice directly via typed pointer store.
 // *(*[]byte)(p) = b triggers GC write barriers automatically.
-// make+copy ensures the decoded slice owns its memory.
+// make+copy ensures the decoded slice owns its memory, unless the caller took
+// on [AliasInput]'s never-modify-src contract — the reflect path this shadows
+// (setBytesValue) makes the same choice, and a fast path may not decide it
+// differently.
 func udBytesDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	n, src, err := readLength(src, "bytes")
 	if err != nil {
 		return nil, err
+	}
+	if sl.aliases() {
+		*(*[]byte)(p) = sl.bytes(src, n)
+		return src[n:], nil
 	}
 	b := make([]byte, n)
 	copy(b, src[:n])

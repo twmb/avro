@@ -11,6 +11,8 @@ import (
 	"time"
 	"unicode/utf8"
 	"unsafe"
+
+	"github.com/twmb/avro/internal/optmark"
 )
 
 // Opt configures encoding and decoding behavior. See each option's
@@ -85,6 +87,40 @@ func (skipUnknown) opt() {}
 // still errors: the type does have fields for it, so there is nothing to skip.
 func SkipUnknown() Opt { return skipUnknown{} }
 
+type aliasInput struct{}
+
+func (aliasInput) opt() {}
+
+// AvroOptAliasesInput marks this option for [optmark.AliasesInput], so a host
+// decoding from a buffer it reuses can drop it without introspecting the type.
+func (aliasInput) AvroOptAliasesInput() {}
+
+// AliasInput makes decoded strings and byte slices point INTO src rather than
+// copying out of it. It applies to [Schema.Decode] and
+// [Schema.DecodeSingleObject]; [Schema.DecodeJSON] ignores it, because a JSON
+// string carrying an escape cannot alias and aliasing only the unescaped ones
+// would make the guarantee vary field by field.
+//
+// CONTRACT: src must not be modified after the decode. Every aliased value
+// changes with it, including strings, which Go otherwise guarantees are
+// immutable. Lifetime is not the concern — the reference keeps src alive —
+// MUTATION is. The retention is the other cost: one aliased field, however
+// small, pins the whole src buffer for as long as it is held. Decode from a
+// buffer you are about to reuse, or hold one field of a large message for a
+// long time, and this option is the wrong one.
+//
+// Aliased: string and []byte targets of the string, bytes and fixed kinds,
+// including inside an any and including those kinds under a uuid logical type.
+// Copied, as always: [N]byte (an array is a value), [encoding.TextUnmarshaler]
+// (it parses the bytes), and every logical type that builds a new Go value —
+// decimal, the timestamps, and the hex-dash uuid string form.
+//
+// It is an [Opt] and deliberately NOT a [SchemaOpt]: ocf.WithSchemaOpts
+// forwards SchemaOpts into an OCF reader, whose block buffer is overwritten
+// every block, so an option reaching there would hand out memory that changes
+// under the caller.
+func AliasInput() Opt { return aliasInput{} }
+
 type linkedinFloats struct{}
 
 func (linkedinFloats) opt() {}
@@ -110,6 +146,7 @@ type optConfig struct {
 	tagLogical  bool
 	linkedin    bool
 	skipUnknown bool
+	alias       bool
 }
 
 func parseOpts(opts []Opt) optConfig {
@@ -124,6 +161,8 @@ func parseOpts(opts []Opt) optConfig {
 			cfg.linkedin = true
 		case skipUnknown:
 			cfg.skipUnknown = true
+		case aliasInput:
+			cfg.alias = true
 		}
 	}
 	return cfg
@@ -257,8 +296,31 @@ func (s *Schema) decodeJSONResolved(src []byte, rv reflect.Value, opts ...Opt) e
 	if err != nil {
 		return fmt.Errorf("avro: re-encoding resolved JSON intermediate: %w", err)
 	}
-	_, err = s.Decode(wb, rv.Interface(), opts...)
+	_, err = s.Decode(wb, rv.Interface(), dropAliasingOpts(opts)...)
 	return err
+}
+
+// dropAliasingOpts returns opts without any that would make decoded values
+// reference the decode input. The buffer this hands Decode is a re-encoded
+// intermediate, not the caller's src, so honoring one here would point the
+// result at memory the caller never gave and DecodeJSON never promised.
+// Returns opts untouched when there is nothing to drop, so the common call
+// allocates nothing.
+func dropAliasingOpts(opts []Opt) []Opt {
+	for i, o := range opts {
+		if _, ok := o.(optmark.AliasesInput); !ok {
+			continue
+		}
+		kept := make([]Opt, i, len(opts)-1)
+		copy(kept, opts[:i])
+		for _, o := range opts[i+1:] {
+			if _, ok := o.(optmark.AliasesInput); !ok {
+				kept = append(kept, o)
+			}
+		}
+		return kept
+	}
+	return opts
 }
 
 // appendAvroJSON is the single-pass Avro JSON encoder. It walks
