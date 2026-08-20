@@ -72,17 +72,15 @@ type skipUnknown struct{}
 
 func (skipUnknown) opt() {}
 
-// SkipUnknown lets a struct that maps only some of a record's fields decode: we
-// skip a record field your struct lacks instead of erroring, which is the
-// default. Nested records skip on the same rule.
+// SkipUnknown decodes into a struct that maps only some of a record's fields,
+// skipping any field your struct lacks rather than erroring as we do by
+// default. Nested records skip on the same rule. This applies to
+// [Schema.Decode], [Schema.DecodeJSON] and [Schema.DecodeSingleObject], and to
+// decoding only: encoding from a struct that does not cover the record still
+// errors, since the missing fields would go out as zero values.
 //
-// It applies to [Schema.Decode], [Schema.DecodeJSON] and
-// [Schema.DecodeSingleObject], and it is decode-only. Encoding from a struct
-// that does not cover the record still errors either way, since the missing
-// fields would silently go out as zero values.
-//
-// A field name your type maps ambiguously, two same-depth fields claiming it,
-// still errors: the type does have fields for it, so there is nothing to skip.
+// A name your type maps ambiguously still errors. The type does have fields
+// for it, so there is nothing to skip.
 func SkipUnknown() Opt { return skipUnknown{} }
 
 type aliasInput struct{}
@@ -94,38 +92,27 @@ func (aliasInput) opt() {}
 func (aliasInput) AvroOptAliasesInput() {}
 
 // AliasInput makes decoded strings and byte slices point into the bytes they
-// were read from rather than copying out of them, overriding the default of
-// copying every one. It applies to [Schema.Decode] and
-// [Schema.DecodeSingleObject]. [Schema.DecodeJSON] ignores it: a JSON string
-// carrying an escape cannot alias, and aliasing only the unescaped ones would
-// make the guarantee vary field by field.
+// were read from, rather than copying as we do by default. This applies to
+// [Schema.Decode] and [Schema.DecodeSingleObject]; [Schema.DecodeJSON] ignores
+// it, because a JSON string carrying an escape cannot alias.
 //
-// You must not modify anything the decode returns. An aliased value is the
-// memory it was read from, so writing to one rewrites that memory, including
-// through a string, which Go otherwise guarantees is immutable. Lifetime is
-// not the concern; the reference keeps that memory alive.
+// You must not modify anything the decode returns. An aliased value IS the
+// memory it was read from, and that includes writing through a string, which
+// Go otherwise guarantees is immutable. Usually that memory is your src, but a
+// field filled from a schema default aliases the parsed [Schema], which every
+// decode of that schema shares.
 //
-// That memory is usually src, where a stray write costs you only your own
-// buffer. It is not always src: a field filled from the schema's default
-// aliases the parsed [Schema], which every decode of that schema shares, so a
-// write there reaches every later decode on every goroutine. You never have to
-// tell the two apart, because the rule is the same for both.
+// One aliased field pins the whole buffer it points into for as long as you
+// hold it. If you reuse the buffer, or keep one field of a large message, do
+// not use this.
 //
-// Retention is the other cost. One aliased field, however small, pins the whole
-// buffer it points into for as long as you hold it. If you decode from a buffer
-// you are about to reuse, or keep one field of a large message for a long time,
-// this is the wrong option.
+// We alias string and []byte targets of the string, bytes and fixed kinds,
+// inside an any, under a uuid logical, and map keys. We still copy for
+// [N]byte, [encoding.TextUnmarshaler], and any logical that builds a new Go
+// value: decimal, the timestamps, and the hex-dash uuid form.
 //
-// Aliased: string and []byte targets of the string, bytes and fixed kinds,
-// inside an any as well, under a uuid logical type as well, and map keys.
-// Copied, as always: [N]byte (an array is a value), [encoding.TextUnmarshaler]
-// (it parses the bytes), and every logical type that builds a new Go value,
-// meaning decimal, the timestamps, and the hex-dash uuid string form.
-//
-// This is an [Opt] and deliberately not a [SchemaOpt]. ocf.WithSchemaOpts
-// forwards SchemaOpts into an OCF reader, whose block buffer is overwritten
-// every block, so an option reaching there would hand out memory that changes
-// under you.
+// This is an [Opt] and not a [SchemaOpt]: ocf.WithSchemaOpts forwards
+// SchemaOpts into an OCF reader, whose block buffer we overwrite every block.
 func AliasInput() Opt { return aliasInput{} }
 
 type linkedinFloats struct{}

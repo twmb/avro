@@ -364,21 +364,14 @@ func WithMaxDecompressedBlockBytes(n int64) ReaderOpt { return optMaxDecompresse
 func WithSchemaOpts(opts ...avro.SchemaOpt) Opt { return optSchemaOpts(opts) }
 
 // WithDecodeOpts passes [avro.Opt] values to the [avro.Schema.Decode] behind
-// every [Reader.Decode], overriding the default of passing none at all.
-// Without it you cannot reach [avro.TaggedUnions] or [avro.TagLogicalTypes],
-// which change what a union decodes to in an *any target, from an OCF reader.
-// We silently ignore options that do not apply to binary decode, per
-// [avro.Opt].
+// every [Reader.Decode], where we pass none by default. Without it you cannot
+// reach [avro.TaggedUnions] or [avro.TagLogicalTypes], which change what a
+// union decodes to in an *any target. Repeated calls are cumulative, and
+// [NewWriter] and [NewAppendWriter] ignore it.
 //
-// Repeated calls are cumulative. [NewWriter] and [NewAppendWriter] ignore it:
-// nothing on the write side decodes.
-//
-// We drop rather than forward an option that would make decoded values
-// *reference* the decode input, such as [avro.AliasInput]. We decode out of a
-// block buffer we replace on every block, so the values we handed you would
-// point into memory the next read overwrites. We drop by the marker such
-// options carry, not by a list of names, so an option added later is dropped
-// here without anyone editing this reader.
+// We drop any option that would make decoded values reference the decode
+// input, such as [avro.AliasInput]: we replace our block buffer on every read,
+// so those values would point into memory that changes under you.
 func WithDecodeOpts(opts ...avro.Opt) ReaderOpt {
 	kept := make(optDecodeOpts, 0, len(opts))
 	for _, o := range opts {

@@ -220,44 +220,21 @@ func (n *SchemaNode) Schema(opts ...SchemaOpt) (*Schema, error) {
 
 // ExpandReferences returns a copy of n's tree with every name reference
 // replaced by the definition it names, so each occurrence of a repeated named
-// type carries the full body rather than only the first.
+// type carries the full body rather than only the first. n is not modified.
 //
-// A reference resolves the way [SchemaNode.Schema] resolves it: against the
-// definitions in n's own tree first, then against the definition [Schema.Root]
-// stamped it with. A subtree extracted from a Root tree therefore expands even
-// when the definition lives outside it. We leave a reference carrying usage-site
-// attributes of its own ({"type":"Inner","doc":"x"}) as written. A definition
-// cannot hold a second doc or namespace, and Schema would collapse the expanded
-// copy back to a reference and lose them again.
-//
-// Two rules leave a reference in place, and we decide both once for the whole
-// tree, per name. That is what makes every copy of a name identical, which
-// [SchemaNode.Schema] requires: it reads two same-named definitions with
-// different bodies as a conflict and refuses the tree.
-//
-//   - A name that *closes* a reference cycle never expands, since expanding a
-//     recursive definition does not terminate. One name per cycle is enough,
-//     and we choose it once for the whole tree, mutual recursion included.
-//     Deciding per occurrence instead, expanding whichever copy is not yet on
-//     the current path, gives one copy the recursive body and another the
-//     expanded one.
-//   - Nothing expands when the fully expanded tree would exceed an internal
-//     ceiling. Each reference expands to a copy of its definition, so a chain
-//     of definitions each naming the previous twice doubles per level. A few
-//     hundred bytes of schema would otherwise demand a tree no machine holds.
-//     Stopping partway is not an option, for the same reason as above: it is
-//     the half-expanded copy that conflicts with the whole one.
-//
-// n is not modified. The copy is deep through the schema structure and through
-// the Aliases, Symbols, Fields, Branches and Props containers; the values
-// inside Props and [SchemaField.Default] are shared, since neither tree writes
-// them.
+// A reference resolves the way [SchemaNode.Schema] resolves it, so a subtree
+// extracted from a [Schema.Root] tree expands even when the definition lives
+// outside it. Two things stay as references: a name that closes a cycle, since
+// expanding a recursive definition does not terminate, and everything at all if
+// the expanded tree would exceed an internal ceiling, since each reference
+// copies its definition and a chain naming the previous twice doubles per
+// level. A reference carrying attributes of its own ({"type":"Inner","doc":"x"})
+// also stays, because a definition cannot hold a second doc.
 //
 // [SchemaNode.Schema] collapses repeats back to references on emit, so
 // n.ExpandReferences().Schema() and n.Schema() produce the same schema. It
-// re-spells a collapsed repeat by fullname, so a reference you wrote as an
-// in-scope short name comes back qualified: the same type, named the way the
-// canonical form names it.
+// spells a collapsed repeat by fullname, so a reference you wrote as an
+// in-scope short name comes back qualified.
 func (n *SchemaNode) ExpandReferences() *SchemaNode {
 	if n == nil {
 		return nil
