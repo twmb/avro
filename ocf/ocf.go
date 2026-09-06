@@ -61,11 +61,9 @@
 // and decode time on untrusted input. We do not cap the writer, matching
 // Java's DataFileWriter and fastavro: we write whatever blocks you give us.
 //
-// A single Avro datum cannot be split across blocks. A value larger than the
-// reader default, say an 80 MiB blob, is written as one block that a default
-// reader then refuses, with an error naming the option to raise. The caps are
-// a reader-side defense, so they live on the reader. To read a file whose
-// blocks exceed the default, raise the matching cap there:
+// A single Avro datum cannot be split across blocks, so a value larger than
+// the reader's default cap (say an 80 MiB blob) is written as one block that
+// a default reader refuses. The error names the option to raise:
 //
 //	r, err := ocf.NewReader(f, ocf.WithMaxDecompressedBlockBytes(128<<20))
 //
@@ -115,19 +113,19 @@ type Codec interface {
 	Close() error
 }
 
-// BoundedDecompressor is an optional capability a [Codec] may implement. If
-// yours does, we hand DecompressBounded our per-block cap (from
-// [WithMaxDecompressedBlockBytes]) rather than calling [Codec.Decompress], so
-// you can refuse early or stream-limit *before* allocating the block. That is
-// the only effective defense against a decompression bomb. Checking the size
-// afterward is false comfort: the allocation already happened. A Codec
-// without this decompresses unbounded, so for untrusted data supply one that
-// bounds itself. All built-in codecs do.
+// BoundedDecompressor is an optional interface a [Codec] can implement. If
+// yours does, we call DecompressBounded with our per-block cap (from
+// [WithMaxDecompressedBlockBytes]) rather than [Codec.Decompress], so you can
+// refuse an oversized block *before* allocating it. That is the only real
+// defense against a decompression bomb, since checking the size afterward
+// means the allocation already happened. A Codec without this method
+// decompresses unbounded, so for untrusted data supply one that bounds
+// itself. All built-in codecs do.
 //
-// A wrapper that embeds [Codec], such as a [NopCloser] result, does *not*
-// inherit the capability: embedding an interface promotes only that
-// interface's methods. Your wrapper must forward DecompressBounded itself, or
-// it silently disables bounding for the codec it wraps.
+// Note that a wrapper embedding [Codec] does not inherit this method, because
+// embedding an interface promotes only that interface's methods. Your wrapper
+// must forward DecompressBounded itself, or it silently disables bounding for
+// the codec it wraps. [NopCloser] forwards it.
 //
 // max <= 0 means no limit. max is constant across all calls for a given
 // [Reader], so a codec that caches a configured decoder (say a zstd decoder
@@ -136,15 +134,13 @@ type BoundedDecompressor interface {
 	DecompressBounded(src []byte, max int64) ([]byte, error)
 }
 
-// NopCloser returns a Codec that wraps c with a no-op Close, so that a
-// [Writer.Close], a [Reader.Close], or a constructor that fails and releases
-// the codec it was handed does not release resources you share with another
-// writer or reader. You close the underlying codec yourself once you are done
-// with it.
+// NopCloser returns a Codec that wraps c with a no-op Close, so that closing
+// a [Writer] or [Reader] (or a constructor failing and releasing the codec it
+// was handed) does not close a codec you share with another writer or reader.
+// You close the underlying codec yourself once you are done with it.
 //
 // If c implements [BoundedDecompressor], so does the result: we forward the
-// reader's decompression bound to c. Wrapping a built-in codec for sharing
-// does not silently drop its bounding.
+// reader's decompression bound to c.
 func NopCloser(c Codec) Codec { return nopCloser{c} }
 
 type nopCloser struct{ Codec }
@@ -219,38 +215,34 @@ func (optDecodeOpts) readerOpt() {}
 // to register the four built-in codecs (null, deflate, snappy, zstandard) to
 // read them. A custom codec whose name matches a built-in overrides it.
 //
-// Passing a codec hands it to us, and we close it exactly once whatever
-// happens: in [Writer.Close] or [Reader.Close] when the constructor returns a
-// usable one, in the constructor when it fails, and in the constructor when
-// it succeeds without ever using the codec. That last case is easy to reach
-// and gives no sign. [NewReader] and [NewAppendWriter] take a codec only when
-// its Name matches the header's avro.codec, and NewWriter takes only the last
-// WithCodec you wrote, so we release a declined offer rather than drop it.
+// We take ownership of the codec you pass and close it exactly once: in
+// [Writer.Close] or [Reader.Close] when the constructor succeeds, or in the
+// constructor itself when it fails or does not use the codec. Note that the
+// last case is easy to hit: [NewReader] and [NewAppendWriter] only use a
+// codec whose Name matches the header's avro.codec, NewWriter only uses the
+// last WithCodec you pass, and we close every codec we do not use.
 //
-// So if you share one codec across several writers, readers, or files, give
-// it a Close that returns nil, or wrap it in [NopCloser]. The rule holds
-// whether or not we took the offer.
+// If you share one codec across several writers, readers, or files, give it
+// a Close that returns nil, or wrap it in [NopCloser].
 //
-// We ignore a nil codec, on every constructor, in both spellings: a nil
-// Codec, and a non-nil Codec holding a nil pointer. We never name, adopt, or
-// close such an offer; the constructor behaves as though you had not written
-// it. It is still a mistake. If it is the *only* offer for a codec the file
-// names, the constructor reports an unknown codec rather than silently
-// reading nothing.
+// We ignore a nil codec, whether a nil Codec or a non-nil Codec holding a nil
+// pointer, on every constructor: we never name, adopt, or close it, and the
+// constructor behaves as though you had not passed it. If it is the only
+// codec supplied for a name the file uses, the constructor reports an
+// unknown codec.
 //
-// For reader-side decompression bounding, see
-// [WithMaxDecompressedBlockBytes]. It reaches any codec you supply that
-// implements [BoundedDecompressor], which every built-in does, including one
-// wrapped by [NopCloser]. A codec that does not implement it decompresses
-// unbounded, so supply one that bounds itself for untrusted data.
+// For reader-side decompression bounding, see [WithMaxDecompressedBlockBytes].
+// It applies to any codec you supply that implements [BoundedDecompressor],
+// which every built-in does, including one wrapped by [NopCloser].
 func WithCodec(c Codec) Opt { return optCodec{c} }
 
-// WithBlockCount caps items per block, overriding the default of 0
-// (unlimited). Whichever of it and [WithBlockBytes] fires first flushes.
+// WithBlockCount caps the number of items per block, overriding the default
+// of 0 (unlimited). We flush a block when either this or [WithBlockBytes] is
+// reached.
 func WithBlockCount(n int) WriterOpt { return optBlockCount{n} }
 
 // WithBlockBytes caps a block's uncompressed bytes, overriding the default of
-// 64 KiB. Whichever of it and [WithBlockCount] fires first flushes.
+// 64 KiB. We flush a block when either this or [WithBlockCount] is reached.
 func WithBlockBytes(n int) WriterOpt { return optBlockBytes{n} }
 
 // WithMetadata adds custom metadata to the file header. The spec reserves
@@ -264,9 +256,9 @@ func WithSyncMarker(sync [16]byte) WriterOpt { return optSyncMarker{sync} }
 // WithSchema sets the schema JSON we write to the file header, overriding the
 // default of [avro.Schema.String]: the original JSON you passed to
 // [avro.Parse], with logicalType, precision, scale, doc, aliases, and default
-// all preserved, matching Java's DataFileWriter and fastavro. Use this only
-// when you want deliberately different header text, say the Parsing Canonical
-// Form via [avro.Schema.Canonical] for strict-PCF consumers.
+// all preserved, matching Java's DataFileWriter and fastavro. Use this if you
+// want different header text, say the Parsing Canonical Form from
+// [avro.Schema.Canonical].
 func WithSchema(schema string) WriterOpt { return optSchema{schema} }
 
 // WithReaderSchema gives us a reader schema to resolve the file's writer
@@ -332,27 +324,23 @@ const defaultMaxBlockBytes = 1 << 26
 // allocation up to the raised cap. See readBlock.
 const ocfEagerBlockAllocLimit = defaultMaxBlockBytes
 
-// WithMaxDecompressedBlockBytes sets the maximum *decompressed* size in bytes
+// WithMaxDecompressedBlockBytes sets the maximum decompressed size in bytes
 // of a single block we accept when reading, overriding the default of 64 MiB.
 // [WithMaxBlockBytes] bounds the compressed size we read off the wire; this
-// bounds what that block inflates to. It guards against
-// decompression-amplification ("zip bomb") inputs, where a tiny compressed
-// block declares or expands to a huge output. A block's record count is
-// bounded by its decompressed length, so this also bounds the per-block
-// decode loop. Raise it if you legitimately write blocks (via
-// [WithBlockBytes]) that decompress beyond the default.
+// bounds what that block inflates to, guarding against "zip bomb" inputs
+// where a tiny compressed block expands to a huge output. A block's record
+// count is bounded by its decompressed length, so this also bounds the
+// per-block decode loop. Raise it if you write blocks (via [WithBlockBytes])
+// that decompress beyond the default.
 //
-// We apply the limit up front, preventing the over-cap allocation rather than
-// catching it afterward, by passing it to the codec's
-// [BoundedDecompressor.DecompressBounded] at decode time. It therefore
-// reaches every codec implementing that capability uniformly: one we resolve
-// by name from the file header (the common case), and one you supply via
-// [WithCodec], including one wrapped by [NopCloser]. All four built-in codecs
-// (null, deflate, snappy, zstandard) implement it. A codec that does *not*
-// implement [BoundedDecompressor] decompresses unbounded, and this limit does
-// not apply to it. There is no post-decompression backstop, which is false
-// comfort once the allocation has happened, so supply a self-bounding codec
-// for untrusted data.
+// We pass the limit to the codec's [BoundedDecompressor.DecompressBounded],
+// which refuses an over-cap block before allocating it. This applies to every
+// codec implementing that interface: one we resolve by name from the file
+// header, and one you supply via [WithCodec], including one wrapped by
+// [NopCloser]. All four built-in codecs implement it. A codec that does not
+// decompresses unbounded, and there is no post-decompression check, since the
+// allocation would already have happened. Supply a self-bounding codec for
+// untrusted data.
 func WithMaxDecompressedBlockBytes(n int64) ReaderOpt { return optMaxDecompressedBytes{n} }
 
 // WithSchemaOpts passes [avro.SchemaOpt] values, such as [avro.CustomType] or
@@ -364,14 +352,14 @@ func WithMaxDecompressedBlockBytes(n int64) ReaderOpt { return optMaxDecompresse
 func WithSchemaOpts(opts ...avro.SchemaOpt) Opt { return optSchemaOpts(opts) }
 
 // WithDecodeOpts passes [avro.Opt] values to the [avro.Schema.Decode] behind
-// every [Reader.Decode], where we pass none by default. Without it you cannot
-// reach [avro.TaggedUnions] or [avro.TagLogicalTypes], which change what a
-// union decodes to in an *any target. Repeated calls are cumulative, and
+// every [Reader.Decode], overriding the default of no options. Without it you
+// cannot use [avro.TaggedUnions] or [avro.TagLogicalTypes], which change what
+// a union decodes to in an *any target. Repeated calls are cumulative.
 // [NewWriter] and [NewAppendWriter] ignore it.
 //
-// We drop any option that would make decoded values reference the decode
-// input, such as [avro.AliasInput]: we replace our block buffer on every read,
-// so those values would point into memory that changes under you.
+// We drop any option that would make decoded values point into the decode
+// input, such as [avro.AliasInput]. A Reader decodes out of a block buffer it
+// owns, and we do not promise that buffer outlives the next read.
 func WithDecodeOpts(opts ...avro.Opt) ReaderOpt {
 	kept := make(optDecodeOpts, 0, len(opts))
 	for _, o := range opts {
@@ -397,16 +385,13 @@ func SnappyCodec() Codec { return snappyCodec{} }
 // override. You can share one ZstdCodec across readers and writers via
 // [NopCloser].
 //
-// ZstdCodec implements [BoundedDecompressor], so a reader applies its
-// [WithMaxDecompressedBlockBytes] cap to a ZstdCodec you supply exactly as to
-// a name-resolved one: we build the decoder lazily on first read with
-// [zstd.WithDecoderMaxMemory] set from the cap. We then cache that decoder,
-// so a ZstdCodec shared across readers with different caps honors the first
-// reader's cap. Set [zstd.WithDecoderMaxMemory] in dopts to pin a bound
+// ZstdCodec implements [BoundedDecompressor]: we build the decoder lazily on
+// first read with [zstd.WithDecoderMaxMemory] set from the reader's
+// [WithMaxDecompressedBlockBytes] cap, and then cache that decoder. Note that
+// a ZstdCodec shared across readers with different caps therefore honors the
+// first reader's cap; set [zstd.WithDecoderMaxMemory] in dopts to pin a bound
 // regardless of reader. We raise a cap below [zstd.MinWindowSize] (1 KiB) up
-// to it, the smallest window the decoder accepts: a smaller limit would
-// reject every frame, since each frame's window is at least MinWindowSize. At
-// or above that bound a sub-MiB cap is honored exactly.
+// to it, since a smaller limit would reject every frame.
 func ZstdCodec(eopts []zstd.EOption, dopts []zstd.DOption) (Codec, error) {
 	eopts = append([]zstd.EOption{zstd.WithEncoderConcurrency(1)}, eopts...)
 	enc, err := zstd.NewWriter(nil, eopts...)
@@ -640,10 +625,9 @@ func (w *Writer) writeHeader() error {
 // reaches the Reader's per-block bound, so a file of zero-byte datums
 // ("null", all-null records, size-0 fixed) always reads back.
 //
-// A value error, where v does not fit the schema, discards the failed datum
-// and leaves the Writer usable. We only ever appended that datum to the
-// in-memory block buffer, never the file, so datums we already accepted are
-// intact and still flush.
+// If v does not fit the schema, we discard that datum and the Writer remains
+// usable: we had only appended it to the in-memory block, never the file, so
+// datums we already accepted are intact and still flush.
 //
 // After an I/O or compression error, where we cannot know the sink's state,
 // we poison the Writer: every subsequent call returns the same error.
@@ -707,9 +691,7 @@ func (w *Writer) Flush() error {
 
 // Close flushes any remaining items and closes the codec. We close the codec
 // even when the writer is poisoned, because zstd and similar codecs hold
-// goroutines and buffers whose lifetime must be bounded. (Deliberately more
-// careful than Java: DataFileWriter.close is a plain flush-then-close with no
-// finally, so a failing flush skips its close, DataFileWriter.java:483-489.)
+// goroutines and buffers that must be released.
 //
 // Close is idempotent: later calls return nil without re-closing the codec.
 // After Close, Encode, Write, Flush, and Reset all return an error rather
@@ -757,15 +739,14 @@ func (w *Writer) flush() error {
 // Reset flushes buffered items to the current destination, then starts a new
 // OCF on dst with the original schema, codec, and options. If the Writer is in
 // an error state we skip the flush and clear the error. Reset errors if you
-// already closed the Writer: its codec is no longer usable.
+// already closed the Writer, since its codec is no longer usable.
 //
-// If Reset fails after repointing to dst, on either a sync-marker generation
+// If Reset fails after switching to dst, on either a sync-marker generation
 // error or a header write error, we poison the Writer exactly as a failed
-// [Writer.Encode] or [Writer.Flush] does. Every subsequent Encode/Flush/Close
-// returns the sticky error until a later successful Reset clears it. (The
-// flush of the *old* destination, which runs before the repoint, also poisons
-// on failure.) Without this, ignoring Reset's error and writing on would emit
-// a silent headerless byte stream onto dst.
+// [Writer.Encode] or [Writer.Flush] does: every subsequent Encode, Flush, and
+// Close returns the error until a later successful Reset clears it. (A failed
+// flush of the old destination also poisons.) Otherwise, ignoring Reset's
+// error and writing on would emit a headerless byte stream onto dst.
 func (w *Writer) Reset(dst io.Writer) error {
 	if w.closed {
 		return errClosed
@@ -802,15 +783,14 @@ func (w *Writer) Reset(dst io.Writer) error {
 //
 // We honor [WithBlockCount] and [WithBlockBytes]. [WithCodec] supplies an
 // implementation for a non-built-in codec, matched by name against the
-// header. [WithSchemaOpts] reaches the header-schema parse, which you need
+// header. [WithSchemaOpts] applies to the header-schema parse, which you need
 // whenever that schema requires an option to parse at all (say
 // [avro.WithLaxNames] for a file written with a lax-named schema). We ignore
 // [WithSchema], [WithSyncMarker], and [WithMetadata]: the header is already
 // on disk and we never rewrite it, so the schema, sync marker, and metadata
-// always come from the existing file. (Reference implementations behave the
-// same on append: neither Java's DataFileWriter.appendTo nor fastavro's
-// append mode lands new metadata in the file.) We likewise ignore any
-// remaining option.
+// always come from the existing file. Java's DataFileWriter.appendTo and
+// fastavro's append mode behave the same. We likewise ignore any other
+// option.
 func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error) {
 	var schemaOpts []avro.SchemaOpt
 	var customCodecs []Codec
@@ -944,7 +924,7 @@ type Reader struct {
 	maxDecompressed int64
 	closed          bool
 	// decodeOpts are the caller's [WithDecodeOpts], already stripped of
-	// anything that would alias block, which we replace on every block.
+	// anything that would alias block.
 	decodeOpts []avro.Opt
 }
 

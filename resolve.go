@@ -17,13 +17,13 @@ import (
 // removal (skip), renaming (aliases), reordering, and type promotion.
 // Encoding with it uses the reader's format.
 //
-// We run [CheckCompatibility] first and hand back any incompatibility as a
-// [*CompatibilityError]. If it passes and the canonical forms are identical,
-// you get reader back as-is. The check must precede that fast path: the
+// We run [CheckCompatibility] first and return any incompatibility as a
+// [*CompatibilityError]. If the check passes and the two canonical forms are
+// identical, you get reader back as-is. The check runs first because the
 // parsing canonical form strips logicalType, precision and scale, so two
-// schemas with equal canonical forms can still be logically incompatible, a
-// decimal precision/scale mismatch most of all. Such a pair would otherwise
-// take the fast path and silently rescale the decoded value.
+// schemas with equal canonical forms can still be incompatible (a decimal
+// precision/scale mismatch, for example), and such a pair would otherwise
+// silently rescale the decoded value.
 //
 // Note that the argument order is (writer, reader), matching the
 // source-then-destination convention and Java's GenericDatumReader. This

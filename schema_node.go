@@ -44,9 +44,9 @@ type SchemaNode struct {
 
 	Name string // name for record, enum, fixed
 
-	// Namespace is the named type's resolved namespace: [Schema.Root] fills it
-	// for every named type, a child inheriting its enclosing namespace
-	// surfaces that namespace here, and "" always means the null namespace,
+	// Namespace is the named type's resolved namespace. [Schema.Root] fills it
+	// for every named type, a child that inherits its enclosing namespace
+	// shows that namespace here, and "" always means the null namespace,
 	// never "inherit". [SchemaNode.Schema] emits a "namespace":"" escape when
 	// a null-namespace type sits inside a namespaced scope, so the distinction
 	// survives the round trip. A dotted Name takes precedence over this field.
@@ -65,22 +65,22 @@ type SchemaNode struct {
 	EnumDefault    string // default symbol for enum schema evolution
 	HasEnumDefault bool   // true if an enum default is defined
 
-	// Precision and Scale are the decimal logical type's parameters, set and
-	// validated exactly when LogicalType is "decimal" on a bytes or fixed
-	// carrier. Anywhere else (no logical type, an unknown or non-decimal one,
-	// or a decimal on a carrier it soft-drops from) the attributes are inert
-	// metadata surfaced in Props, matching the field level.
+	// Precision and Scale are the decimal logical type's parameters. We set
+	// and validate them only when LogicalType is "decimal" on a bytes or
+	// fixed type. Anywhere else (no logical type, an unknown or non-decimal
+	// one, or a decimal on a type that does not support it) the attributes
+	// are plain metadata and appear in Props, as at the field level.
 	Precision int // decimal precision
 	Scale     int // decimal scale
 
 	// Props holds custom (non-reserved) schema attributes: anything in the
 	// schema JSON that is not a standard Avro field (e.g. "com.example.tag").
-	// It is also the *only* surface for a reserved structural key on a kind
-	// that does not bind it, when the body does not parse as that key's schema
-	// shape (a stray "items":3 on an "int"). The matching structural field
-	// stays zero. A schema-shaped stray body instead surfaces as-written on
-	// Items / Values / Fields. A non-string logicalType is likewise inert and
-	// appears here verbatim, since nothing but a string can name a logical.
+	// A reserved structural key on a kind that does not use it ("items" on
+	// an "int") also appears here when its body does not parse as a schema
+	// (a stray "items":3), and the matching structural field stays zero. A
+	// schema-shaped stray body instead appears as written on Items, Values,
+	// or Fields. A non-string logicalType likewise appears here verbatim,
+	// since only a string can name a logical type.
 	//
 	// Values use the natural Go types from JSON: string, bool, nil, []any,
 	// map[string]any, int64 for whole numbers, float64 for fractional. A
@@ -143,8 +143,9 @@ type SchemaField struct {
 	//     out-of-range defaults at parse.
 	//   - float schemas give float32, double float64. Overflows narrow to
 	//     ±Inf; NaN, ±Inf, and a float-syntax "-0.0" round-trip. An
-	//     integer-syntax "-0" is the sign-less integer 0 and surfaces as +0.0
-	//     (matching Java/fastavro), though the wire encoder writes -0.0 for it.
+	//     integer-syntax "-0" is the sign-less integer 0 and reads as +0.0
+	//     (matching Java and fastavro), though the wire encoder writes -0.0
+	//     for it.
 	//   - string and enum schemas give string.
 	//   - bytes and fixed give []byte, already decoded from the JSON spec's
 	//     codepoint-per-byte form.
@@ -169,13 +170,12 @@ type SchemaField struct {
 	// field for why the state is hidden.
 	docSet bool
 
-	// Props holds custom (non-reserved) field properties; numbers decode as in
-	// [SchemaNode.Props]. Field-level "logicalType", "precision", and "scale"
-	// appear here as written: the wire-side lift is a codec concession that
-	// never removes them from this surface. An unconsumed precision/scale is an
-	// ordinary property whatever its JSON shape, meaning no field logicalType, a
-	// non-decimal one, or a decimal whose lift target is not a bytes/fixed
-	// carrier. Only a consumed placement shape-validates the pair at parse.
+	// Props holds custom (non-reserved) field properties; numbers decode as
+	// in [SchemaNode.Props]. A field-level "logicalType", "precision", and
+	// "scale" appear here as written even when we lift them onto the
+	// field's type for encoding and decoding. An unused precision or scale
+	// is an ordinary property whatever its JSON shape; we only validate the
+	// pair when a decimal logicalType on a bytes or fixed field uses it.
 	Props map[string]any
 }
 
@@ -192,11 +192,11 @@ type SchemaField struct {
 // parse, or the enclosing type itself for a recursive schema. Those resolve
 // automatically. We emit the definition at the reference's first occurrence,
 // so the result needs neither the enclosing schema nor any cache. A name the
-// tree defines itself wins over the enclosing schema's definition, and custom
-// properties on a wrapped reference ride onto the emitted definition (reserved
-// usage-site attributes do not survive, matching the SchemaCache splice).
-// Hand-built nodes carry no enclosing schema, so there a reference the tree
-// does not define is an error.
+// tree defines itself wins over the enclosing schema's definition. Custom
+// properties on a wrapped reference move onto the emitted definition, while
+// reserved usage-site attributes (doc, namespace) do not survive. Hand-built
+// nodes have no enclosing schema, so there a reference the tree does not
+// define is an error.
 //
 // opts pass through to the internal [Parse]. If you parsed the original schema
 // with [SchemaOpt]s that change what Parse accepts or wires ([WithLaxNames],
@@ -224,12 +224,15 @@ func (n *SchemaNode) Schema(opts ...SchemaOpt) (*Schema, error) {
 //
 // A reference resolves the way [SchemaNode.Schema] resolves it, so a subtree
 // extracted from a [Schema.Root] tree expands even when the definition lives
-// outside it. Two things stay as references: a name that closes a cycle, since
-// expanding a recursive definition does not terminate, and everything at all if
-// the expanded tree would exceed an internal ceiling, since each reference
-// copies its definition and a chain naming the previous twice doubles per
-// level. A reference carrying attributes of its own ({"type":"Inner","doc":"x"})
-// also stays, because a definition cannot hold a second doc.
+// outside it.
+//
+// Some references stay as they are. A name that closes a cycle never expands,
+// since expanding a recursive definition does not terminate. A reference that
+// carries attributes of its own ({"type":"Inner","doc":"x"}) stays, because a
+// definition cannot hold a second doc. And if the fully expanded tree would
+// exceed an internal ceiling, nothing expands at all, since a chain of
+// definitions each naming the previous twice doubles per level; we return an
+// unexpanded copy rather than a partial one.
 //
 // [SchemaNode.Schema] collapses repeats back to references on emit, so
 // n.ExpandReferences().Schema() and n.Schema() produce the same schema. It
@@ -468,13 +471,13 @@ type deduper struct {
 // spelling of a structural key is a case variant ("ITEMS" on an array) fails
 // Parse, because the structural attribute is absent.
 //
-// We describe a field in the flat (goavro-style) format post-lift, exactly as
-// it parses. That format is a bare-string complex-kind type with the kind's
-// defining key (symbols, items, values, fields, size) alongside the field's
-// own keys. The field's type is the lifted nested definition (named after the
-// field for record/error/enum/fixed), and the keys the lift routed into the
-// type appear on the type node rather than in [SchemaField.Props].
-// [SchemaNode.Schema] rebuilds the nested form, which parses identically.
+// A field written in the flat goavro-style format (a bare complex type name
+// with the kind's defining key, such as "symbols" or "items", alongside the
+// field's own keys) appears as it parses: the field's type is the nested
+// definition we lifted out (named after the field for record, error, enum,
+// and fixed), and the keys we moved into the type appear on the type node
+// rather than in [SchemaField.Props]. [SchemaNode.Schema] rebuilds the nested
+// form, which parses identically.
 //
 // Every node converts back to a usable [*Schema] via [SchemaNode.Schema],
 // name-reference nodes included: the tree carries the schema's named-type

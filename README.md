@@ -83,33 +83,35 @@ All types can decode into `any`.
 |-----------|--------|--------|
 | null      | anything nillable | zeroes the target |
 | boolean   | `bool` | `bool` |
-| int, long, float, double | `numeric` † | `numeric` † |
+| int, long, float, double | `numeric` | `numeric` |
 | string    | `string []byte TextAppender TextMarshaler` | `string []byte TextUnmarshaler` |
-| bytes     | `bytes-like` | `bytes-like` ‡ |
+| bytes     | `bytes-like` | `bytes-like` |
 | enum      | `string integer TextAppender TextMarshaler` | `string integer TextUnmarshaler` |
-| fixed     | `bytes-like` ‡ | `bytes-like` ‡ |
-| array     | slice or `[N]array` | slice or `[N]array` ‡ |
+| fixed     | `bytes-like` | `bytes-like` |
+| array     | slice or `[N]array` | slice or `[N]array` |
 | map       | `map[string]T` | `map[string]T` |
 | union     | `*T`, tagged-union map, or the matched branch | `*T` or the matched branch |
 | record    | struct or `map[string]any` | struct or `map[string]any` |
 
 Shorthands used above:
-`numeric` = `int int8–int64 uint uint8–uint64 float32 float64 json.Number`.
-`integer` = `int int8–int64 uint uint8–uint64`.
+`numeric` = `int int8-int64 uint uint8-uint64 float32 float64 json.Number`.
+`integer` = `int int8-int64 uint uint8-uint64`.
 `bytes-like` = `[]byte [N]byte string`.
 `TextAppender` / `TextMarshaler` / `TextUnmarshaler` are the standard `encoding` interfaces.
 
-† Numeric types accept any `numeric` Go type, but coercion has precision rules —
-  whole-number/range checks into integers, silent IEEE rounding into floats. See
-  [Encode/decode behavior contract](#encodedecode-behavior-contract).
-‡ Length must match: decoding bytes into `[N]byte`, or encoding/decoding any value
-  as fixed, requires the byte length to equal N; `[N]array` requires exactly N elements.
+Numeric types accept any `numeric` Go type, but coercion has precision rules:
+integers require a whole number in range, and floats round silently. See
+[Encode/decode behavior contract](#encodedecode-behavior-contract). Lengths
+must match: decoding bytes into `[N]byte`, or encoding or decoding any value
+as fixed, requires the byte length to equal N, and `[N]array` requires
+exactly N elements.
 
-Decoding into `any` yields the natural Go type — `int32`/`int64` for int/long,
-`float32`/`float64` for float/double, `[]any` for arrays, `map[string]any` for maps
-and records; logical types use the Go types in [Logical Types](#logical-types). A
-null (e.g. a union's null branch) decodes to the target's zero value, replacing any
-prior contents — use `*T` to tell null from zero.
+Decoding into `any` yields the natural Go type: `int32` and `int64` for int
+and long, `float32` and `float64` for float and double, `[]any` for arrays,
+and `map[string]any` for maps and records. Logical types use the Go types in
+[Logical Types](#logical-types). A null (e.g. a union's null branch) decodes
+to the target's zero value, replacing any prior contents. Use `*T` if you
+need to tell null from zero.
 
 ## Struct Tags
 
@@ -141,18 +143,19 @@ Supported options:
   they were declared directly on the parent. The field must be a struct or
   pointer to struct. This works like anonymous (embedded) struct fields, but
   for named fields. When using inline, the name portion of the tag must be
-  empty and no other tag options are allowed — the flattened embed has no
-  field of its own for `default=`, `alias=`, logical-type tags, etc. to
-  apply to. Put those options on the embed's child fields directly.
+  empty and no other tag options are allowed, since the flattened struct has
+  no field of its own for `default=`, `alias=`, or a logical-type tag to apply
+  to. Put those options on the inlined struct's fields directly.
 
 - **omitzero**: when encoding, a zero value (or a field whose `IsZero() bool`
   method returns true) is encoded as if its key were omitted from a
-  `map[string]any` — the field's schema default is used. A nullable field with
-  no default encodes `null`; a non-nullable field with no default keeps its zero
-  value (there is nothing to fill with). Useful for optional fields in
-  `["null", T]` / `["T", "null"]` unions or fields with explicit defaults.
+  `map[string]any`: the field's schema default is used. A nullable field with
+  no default encodes `null`; a non-nullable field with no default keeps its
+  zero value, since there is nothing to fill with. This is useful for optional
+  fields in `["null", T]` / `["T", "null"]` unions or fields with explicit
+  defaults.
 
-Embedded (anonymous) struct fields are automatically inlined — their fields are
+Embedded (anonymous) struct fields are automatically inlined: their fields are
 promoted into the parent as if declared directly. To prevent inlining an
 embedded struct, give it an explicit name tag:
 
@@ -165,12 +168,16 @@ type Parent struct {
 
 When multiple fields resolve to the same Avro field name, a tagged field wins
 over an untagged one at any depth; among fields with the same tagged status,
-the shallowest field wins. Two fields that resolve to the same name at the same depth
-with the same tagged status are an ambiguous collision (Go itself makes such a
-field reference a compile error). twmb errors rather than silently selecting
-one: `SchemaFor` rejects the type, while encode and decode reject only when the
-schema actually resolves a field to the ambiguous name — a coincidental
-collision on a name the schema never references does not break the type.
+the shallowest field wins. Two fields that resolve to the same name at the same
+depth with the same tagged status are ambiguous (Go itself makes such a field
+reference a compile error). We error rather than silently selecting one:
+`SchemaFor` rejects the type, while encode and decode reject only when the
+schema actually has a field with the ambiguous name.
+
+By default, decoding into a struct that has no field for some record field is
+an error. Pass `SkipUnknown()` to skip the fields your struct does not map
+instead. This is decode only; encoding a partial struct still errors, because
+the missing fields would go out as zero values.
 
 ## Schema Inference
 
@@ -215,16 +222,16 @@ Additional tag options for schema inference:
 |-----|---------|-------------|
 | `default=` | `avro:",default=0"` | Default value (must be last; scalars only) |
 | `alias=` | `avro:",alias=old"` | Field alias for schema evolution (repeatable, or `alias=[a,b]`) |
-| `type-alias=` | `avro:",type-alias=old"` | Alias for the field's named type — record, enum, or fixed (repeatable, or `type-alias=[a,b]`) |
+| `type-alias=` | `avro:",type-alias=old"` | Alias for the field's named type (record, enum, or fixed; repeatable, or `type-alias=[a,b]`) |
 | `timestamp-micros` | `avro:",timestamp-micros"` | Override logical type |
 | `decimal(p,s)` | `avro:",decimal(10,2)"` | Decimal logical type (requires `*big.Rat` or `big.Rat`) |
 | `uuid` | `avro:",uuid"` | UUID logical type (requires Go string, `[16]byte`, or a text marshaler type) |
 | `date` | `avro:",date"` | Date logical type (requires `time.Time`, `time.Duration`, or an int8/16/32/uint8/uint16) |
 
 `alias` and `type-alias` serve different purposes in schema evolution. `alias`
-adds an alias to the **field** — it lets a writer field with a different name
+adds an alias to the **field**, letting a writer field with a different name
 match this reader field. `type-alias` adds an alias to the **named type**
-(record, enum, or fixed) that the field references — it lets a writer type with
+(record, enum, or fixed) that the field references, letting a writer type with
 a different name match the reader type. The alias is applied to the innermost
 named type, walking through pointers, slices, and maps:
 
@@ -248,9 +255,8 @@ Options:
 
 ## Schema Introspection
 
-`Schema.Root()` returns a `SchemaNode` representing the parsed schema. This
-provides read access to all schema metadata including field types, logical
-types, doc strings, and custom properties:
+`Schema.Root()` returns a `SchemaNode` tree describing the parsed schema,
+including field types, logical types, doc strings, and custom properties:
 
 ```go
 schema, _ := avro.Parse(schemaJSON)
@@ -263,6 +269,12 @@ for _, f := range root.Fields {
     }
 }
 ```
+
+A named type that appears more than once is a full definition the first time
+and a bare name reference afterward. `SchemaNode.ExpandReferences()` returns a
+copy of the tree with every reference replaced by its definition, so you can
+walk the tree without resolving names yourself. Recursive types stay as
+references.
 
 `SchemaNode` can also be used to build schemas programmatically:
 
@@ -282,13 +294,12 @@ Reserved attribute names (`type`, `name`, `items`, ...) match only their
 exact lowercase spelling, as in the Java, Python (fastavro), and goavro
 implementations. A key differing from a reserved name only by letter case
 (`"ITEMS"`, `"Namespace"`) is an ordinary custom property, preserved in
-`Props`. One migration note: hamba/avro matches these keys
-case-insensitively, so a schema that parsed there but fails here has a
-miscased reserved key. A miscased *structural* key fails loudly at parse
-time — `{"type":"array","Items":"int"}` errors with "array is missing
-items schema"; fix the casing — while a miscased non-structural key
-(`"Doc"`, `"Aliases"`) simply becomes a harmless custom property instead
-of binding the attribute.
+`Props`. Note that hamba/avro matches these keys case-insensitively, so a
+schema that parsed there but fails here has a miscased reserved key. A
+miscased *structural* key fails at parse time: `{"type":"array","Items":"int"}`
+errors with "array is missing items schema", so fix the casing. A miscased
+non-structural key (`"Doc"`, `"Aliases"`) simply becomes a custom property
+instead of binding the attribute.
 
 ## Logical Types
 
@@ -297,8 +308,8 @@ Logical types decode to their natural Go equivalents:
 | Logical Type | Avro Type | Encode | Decode |
 |---|---|---|---|
 | date | int | time.Time, RFC 3339 or YYYY-MM-DD string, or int | time.Time (UTC) |
-| time-millis | int | time.Duration, time.Time (lossy †), or int | time.Duration or time.Time (lossy †) |
-| time-micros | long | time.Duration, time.Time (lossy †), or int | time.Duration or time.Time (lossy †) |
+| time-millis | int | time.Duration, time.Time (lossy), or int | time.Duration or time.Time (lossy) |
+| time-micros | long | time.Duration, time.Time (lossy), or int | time.Duration or time.Time (lossy) |
 | timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
 | timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
 | timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
@@ -312,49 +323,46 @@ Logical types decode to their natural Go equivalents:
 | duration | fixed(12) | avro.Duration or underlying type | avro.Duration or underlying type |
 
 When encoding, timestamp and date fields accept RFC 3339 strings, and decimal
-fields accept float64 and numeric strings (e.g. "3.14"). Values that don't
+fields accept float64 and numeric strings (e.g. "3.14"). Values that do not
 match the expected format fall through to the underlying type's encoder, which
-will return an error.
+returns an error.
 
-† **time-millis / time-micros with `time.Time`** is a convenience escape hatch
-for users whose Go data already lives in `time.Time`. Avro's `time-millis` and
-`time-micros` logical types are time-of-day only — the wire bytes physically
-cannot represent a date or zone. On encode, only the wall-clock fields
-(hour/minute/second/nanosecond) are written; year/month/day/location are
-silently discarded. On decode into a `time.Time` target, the wire value is
-materialized at the Unix epoch (`1970-01-01 UTC`) plus the time-of-day. A
-round-trip through `time.Time` therefore preserves the time-of-day but
-resets the date and zone: `2024-01-15 12:34:56 PST` → wire → `1970-01-01
-12:34:56 UTC`. If round-trip date fidelity matters, use `timestamp-millis` /
-`timestamp-micros` (which preserve the full instant) or convert to and from
-`time.Duration` explicitly. `time.Duration` round-trips exactly when its
-nanosecond component is a whole multiple of the schema's resolution unit
-(millisecond for `time-millis`, microsecond for `time-micros`); sub-resolution
-nanoseconds are silently truncated toward zero on encode (integer division
-by the resolution unit, dropping the remainder).
+Encoding a `time.Time` as `time-millis` or `time-micros` is lossy. These
+logical types are time-of-day only, so the wire bytes cannot carry a date or
+zone. On encode, only the wall-clock fields (hour, minute, second, nanosecond)
+are written, and the year, month, day, and location are dropped. On decode
+into a `time.Time`, the wire value is placed at the Unix epoch (`1970-01-01
+UTC`) plus the time-of-day. A round-trip through `time.Time` therefore keeps
+the time-of-day but resets the date and zone: `2024-01-15 12:34:56 PST` comes
+back as `1970-01-01 12:34:56 UTC`. If you need the date, use
+`timestamp-millis` or `timestamp-micros`, or convert to and from
+`time.Duration` yourself. A `time.Duration` round-trips exactly when its
+nanoseconds are a whole multiple of the schema's resolution (a millisecond for
+`time-millis`, a microsecond for `time-micros`); anything finer is truncated
+toward zero on encode.
 
 big-decimal carries no schema-level precision or scale; scale is derived
 per value, and rationals with no finite decimal expansion (e.g.
 `big.NewRat(1, 3)`) return an error.
 
-Unknown logical types are silently ignored per the Avro spec, and the
-underlying type is used as-is.
+Unknown logical types are ignored per the Avro spec, and the underlying type
+is used as-is.
 
 ## Schema Evolution
 
-Avro data is always written with a specific schema — the **writer schema**.
-When you read that data later, your application may expect a different schema —
-the **reader schema**. You may have added a field, removed one, or widened a
-type from int to long.
+Avro data is always written with a specific schema, the **writer schema**.
+When you read that data later, your application may expect a different
+schema, the **reader schema**. You may have added a field, removed one, or
+widened a type from int to long.
 
-`Resolve` bridges this gap. Given the writer and reader schemas, it returns a
-new schema that decodes data in the old wire format and produces values in the
-reader's layout:
+`Resolve` takes the writer and reader schemas and returns a new schema that
+decodes data in the old wire format and produces values in the reader's
+layout:
 
 - Fields in the reader but not the writer are filled from **defaults**.
 - Fields in the writer but not the reader are **skipped**.
 - Fields that exist in both are matched by **name** (or **alias**) and decoded,
-  with type promotion applied where needed (e.g. int → long).
+  with type promotion applied where needed (e.g. int to long).
 
 ### Example
 
@@ -398,12 +406,13 @@ _, err = resolved.Decode(v1Data, &u)
 
 The following type promotions are supported:
 
-| Writer → Reader |
-|---|
-| int → long, float, double |
-| long → float, double |
-| float → double |
-| string ↔ bytes |
+| Writer | Reader |
+|---|---|
+| int | long, float, double |
+| long | float, double |
+| float | double |
+| string | bytes |
+| bytes | string |
 
 `CheckCompatibility` checks whether two schemas are compatible without
 building a resolved schema. The direction you check depends on the guarantee
@@ -430,7 +439,7 @@ calls so they can be resolved:
 ```go
 var cache avro.SchemaCache
 
-// Parse referenced schema first — order matters.
+// Parse the referenced schema first; order matters.
 _, err := cache.Parse(`{
     "type": "record",
     "name": "Address",
@@ -448,8 +457,8 @@ schema, err := cache.Parse(`{
 }`)
 ```
 
-Parsing the same schema string multiple times returns the cached result,
-handling diamond dependencies without caller-side deduplication. The returned
+Parsing the same schema string multiple times returns the cached result, so
+diamond dependencies need no deduplication on your side. The returned
 `*Schema` is independent of the cache and safe to use concurrently.
 
 ## Custom Types
@@ -472,7 +481,7 @@ moneyType := avro.NewCustomType[Money, int64]("money",
 
 schema := avro.MustParse(moneySchema, moneyType)
 
-// Encode and decode — Money fields are automatically converted.
+// Encode and decode: Money fields are converted automatically.
 data, _ := schema.Encode(&order)
 var out Order
 schema.Decode(data, &out) // out.Price is Money{Cents: 500, ...}
@@ -494,8 +503,8 @@ schema := avro.MustParse(raw, avro.CustomType{
 })
 ```
 
-For property-based dispatch (e.g., Kafka Connect / Debezium types), use
-an empty matching criteria with `ErrSkipCustomType`:
+For property-based dispatch (e.g. Kafka Connect / Debezium types), use
+empty matching criteria with `ErrSkipCustomType`:
 
 ```go
 avro.CustomType{
@@ -514,7 +523,7 @@ avro.CustomType{
 ## Type name constants
 
 The `atype` sub-package exports constants for Avro primitive type names,
-complex type names, logical type names, and field sort orders — the string
+complex type names, logical type names, and field sort orders: the string
 values used in `SchemaNode`, `SchemaField`, and `CustomType`:
 
 ```go
@@ -532,12 +541,12 @@ ct := avro.CustomType{LogicalType: atype.Decimal}
 ```
 
 They are untyped string constants and can be used anywhere a string is
-expected. Helps catch typos (`atype.TimestampMicros` vs
+expected, and they catch typos (`atype.TimestampMicros` vs
 `"timestam-micros"`) at compile time.
 
 ## Object Container Files
 
-The `ocf` sub-package reads and writes [Avro Object Container Files](https://avro.apache.org/docs/current/specification/#object-container-files) —
+The `ocf` sub-package reads and writes [Avro Object Container Files](https://avro.apache.org/docs/current/specification/#object-container-files),
 self-describing binary files that embed the schema in the header and store
 data in compressed blocks.
 
@@ -587,7 +596,9 @@ for {
 ```
 
 The reader's `Schema()` method returns the schema parsed from the file header,
-which you can pass as the writer schema to `Resolve`.
+which you can pass as the writer schema to `Resolve`. Alternatively, pass
+`WithReaderSchema` and the reader resolves for you. `WithDecodeOpts` passes
+decode options such as `TaggedUnions()` through to each `Decode`.
 
 ### Codecs
 
@@ -595,16 +606,16 @@ Built-in codecs: **null** (default, no compression), **deflate**
 (`DeflateCodec`), **snappy** (`SnappyCodec`), and **zstandard** (`ZstdCodec`).
 Custom codecs can be provided via the `Codec` interface.
 
-**Memory bounds.** `WithMaxBlockBytes` (default 64 MiB) caps the *compressed*
-block size, not the *decompressed* size — snappy, deflate, and zstd all
-allocate the declared decompressed length before validating the payload, so
-a malicious block can drive a larger allocation than the cap allows. For
-OCF read from untrusted sources, bound memory at the transport or process
-layer (request size cap, cgroup limit).
+**Memory bounds.** The reader caps both the compressed block size it reads off
+the wire (`WithMaxBlockBytes`) and the size a block decompresses to
+(`WithMaxDecompressedBlockBytes`), each 64 MiB by default. The decompressed
+cap is applied before allocating, through the `BoundedDecompressor` interface,
+which all built-in codecs implement. A custom codec that does not implement it
+decompresses unbounded, so for untrusted input supply one that bounds itself.
 
 ### Appending
 
-`NewAppendWriter` opens an existing OCF for appending — it reads the header to
+`NewAppendWriter` opens an existing OCF for appending. It reads the header to
 recover the schema, codec, and sync marker, then seeks to the end.
 
 ## JSON Encoding
@@ -622,8 +633,8 @@ jsonBytes, err = schema.EncodeJSON(&user, avro.TaggedUnions())
 // {"name":"Alice","email":{"string":"a@b.com"}}
 ```
 
-The tagged form is the Avro JSON spec's representation and what Java and other Avro
-tools require; the bare default is plainer JSON for non-Avro consumers.
+The tagged form is the Avro JSON spec's representation and what Java and other
+Avro tools require; the bare default is plainer JSON for non-Avro consumers.
 
 `DecodeJSON` accepts both formats (tagged and bare unions) and all NaN/Infinity
 conventions:
@@ -675,17 +686,17 @@ _, err = schema.Decode(payload, &user)
 ## Fingerprinting
 
 `Canonical` returns the [Parsing Canonical Form](https://avro.apache.org/docs/current/specification/#parsing-canonical-form-for-schemas)
-of a schema — a deterministic JSON representation stripped of doc, aliases,
+of a schema: a deterministic JSON representation stripped of doc, aliases,
 defaults, and other non-essential attributes. Use it for schema comparison and
 fingerprinting.
 
 ```go
 canonical := schema.Canonical() // []byte
 
-// CRC-64-AVRO (Rabin) — the Avro-standard fingerprint
+// CRC-64-AVRO (Rabin), the Avro-standard fingerprint
 fp := schema.Fingerprint(avro.NewRabin())
 
-// SHA-256 — common for cross-language registries
+// SHA-256, common for cross-language registries
 fp256 := schema.Fingerprint(sha256.New())
 ```
 
@@ -706,48 +717,54 @@ Struct field access uses `unsafe` pointer arithmetic (similar to
 All schemas, type mappings, and codec state are cached after first use so
 repeated operations pay no extra allocation cost.
 
+Decoded strings and byte slices are copied out of the input by default. Pass
+`AliasInput()` to `Decode` to have them point into the input instead, which
+skips the copy entirely. You must not modify the input or the decoded values
+afterward, and one aliased field keeps the whole input alive, so only use it
+when you own the buffer and do not reuse it.
+
 ## Encode/decode behavior contract
 
 The encoder and decoder are mostly symmetric: any Go shape the encoder accepts
-as input is a Go shape the decoder accepts as a target, and an encode→decode
-round-trip through the same Go type yields the same value. The cases below are
-deliberate exceptions.
+as input is a Go shape the decoder accepts as a target, and an encode then
+decode round-trip through the same Go type yields the same value. The cases
+below are deliberate exceptions.
 
 ### Round-trips that lose data
 
-- **`time.Time` → `time-millis` / `time-micros`** keeps only the time-of-day;
+- **`time.Time` as `time-millis` / `time-micros`** keeps only the time-of-day;
   date and zone are dropped. The decoded `time.Time` sits at the Unix epoch with
   the original time-of-day. Use `timestamp-*` to keep the full instant.
-- **`time.Time` → `date`** keeps only the UTC date; time-of-day and zone are dropped.
-- **`big-decimal` trailing-zero scale** isn't preserved — scale is derived per
-  value, and `big.Rat` can't carry the distinction.
+- **`time.Time` as `date`** keeps only the UTC date; time-of-day and zone are dropped.
+- **`big-decimal` trailing-zero scale** is not preserved: scale is derived per
+  value, and `big.Rat` cannot carry the distinction.
 
 ### Numbers
 
 - **Precision follows the reader schema.** A `float`/`double` schema rounds
   silently into a Go float (overflowing to ±Inf on encode), but decoding one into
   a Go *integer* still requires a whole number in range. An `int`/`long` schema
-  never loses precision silently — decoding into a Go type that can't hold the
+  never loses precision silently: decoding into a Go type that cannot hold the
   value exactly errors. For exact large-integer round-trips keep the schema `long`
   with an `int64` target; evolving to `double` opts into rounding.
 - **Union branch is chosen by the Go type, not the value.** A Go `int` always
-  selects a union's `long` branch, never `int`, even when the value would fit —
-  dispatch keys off the static type, keeping wire size deterministic. Force the
-  `int` branch with an `int32` value or `map[string]any{"int": v}`.
+  selects a union's `long` branch, never `int`, even when the value would fit,
+  because dispatch keys off the static type, keeping wire size deterministic.
+  Force the `int` branch with an `int32` value or `map[string]any{"int": v}`.
 - **Encoding a `json.Number` into an `int`/`long` works even in fractional or
-  exponent form, as long as the value is whole** — `json.Number("9.5e17")`
-  succeeds (it's exactly 950000000000000000). Caveat: the same literal as a schema
-  *default* (`"default":9.5e17`) won't load in Java; use the plain integer form if
-  you publish schemas to Java consumers.
+  exponent form, as long as the value is whole.** `json.Number("9.5e17")`
+  succeeds (it is exactly 950000000000000000). Note that the same literal as a
+  schema *default* (`"default":9.5e17`) does not load in Java; use the plain
+  integer form if you publish schemas to Java consumers.
 
 ## Why
 
 I had efficient encode-side code lying around for two years. I'd written it one
 way, started rewriting it another, got most of the way through, and decided it
-wasn't worth the effort — hamba/avro was around by then and really good, so I
+wasn't worth the effort. hamba/avro was around by then and really good, so I
 stopped.
 
 When I started using LLMs in January 2026, I figured I'd touch up all the old
-projects I had lying around. Did it for this one — and coincidentally, hamba/avro
-got archived right around then. I wanted one library that did it all: hamba/avro
-missed things linkedin/goavro had, and vice versa. Here we are.
+projects I had lying around. I did it for this one, and coincidentally,
+hamba/avro got archived right around then. I wanted one library that did it
+all: hamba/avro missed things linkedin/goavro had, and vice versa. Here we are.
