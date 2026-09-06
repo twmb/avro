@@ -9,13 +9,13 @@ import (
 )
 
 // SchemaCache accumulates named types across multiple [SchemaCache.Parse]
-// calls, letting schemas reference types defined in previously parsed
-// schemas: the shape a Schema Registry's inter-schema references take.
+// calls, so that a schema can reference types defined in previously parsed
+// schemas. This is how a schema registry's inter-schema references work.
 //
-// Parse schemas in dependency order; a referenced type must be parsed
-// before the schemas that reference it.
+// Parse schemas in dependency order: a referenced type must be parsed before
+// the schemas that reference it.
 //
-// You can parse the same schema string more than once; we hand back the
+// You can parse the same schema string more than once; we return the
 // previously parsed result, so diamond dependencies (A->B->D, A->C->D) need
 // no tracking on your side. Options that change what the string compiles to,
 // custom types or [WithLaxNames], skip this deduplication and re-parse, since
@@ -29,11 +29,11 @@ import (
 // via [SchemaNode.Schema] with every cross-parse reference resolved, so you
 // never need the cache again once Parse returns.
 //
-// [WithLaxNames] is sticky: if a type is defined with it, pass it to every
-// later Parse that references that type. A schema containing a lax name is
-// not parseable without it, cache or no cache, so the referencing Parse's
-// [Schema.String] and [Schema.Canonical] output also needs WithLaxNames to
-// re-parse. [Schema.Encode] and [Schema.Decode] are unaffected either way.
+// Note that [WithLaxNames] is sticky: if a type is defined with it, pass it
+// to every later Parse that references that type. A schema containing a lax
+// name is not parseable without it, cache or no cache, so re-parsing the
+// referencing schema's [Schema.String] or [Schema.Canonical] output also
+// needs WithLaxNames. [Schema.Encode] and [Schema.Decode] are unaffected.
 //
 // The zero value is ready to use. A SchemaCache is safe for concurrent use.
 type SchemaCache struct {

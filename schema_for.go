@@ -68,15 +68,11 @@ func WithName(name string) SchemaOpt { return withName(name) }
 //   - map[string]T -> map
 //   - struct -> record (recursive)
 //   - time.Time -> long with timestamp-millis (override with tag)
-//   - time.Duration -> int with time-millis (override with tag; a Duration
-//     is a span of time, so it is only meaningful with the
-//     time-millis/time-micros logicals: overriding it onto date or a
-//     timestamp-* logical maps a duration onto a point in time, and a large
-//     Duration overflows the narrower wire type)
-//   - avro.Duration -> fixed(12) with the duration logical type (the
-//     dedicated Go type for the Avro duration logical: little-endian
-//     months/days/milliseconds, recognized by type, takes no tag and does
-//     not accept one)
+//   - time.Duration -> int with time-millis (override with time-micros; a
+//     Duration is a span of time, so date and timestamp-* make no sense for
+//     it, and a large Duration overflows the narrower wire type)
+//   - avro.Duration -> fixed(12) with the duration logical type (recognized
+//     by type; it takes no tag and does not accept one)
 //   - *big.Rat -> requires explicit decimal(p,s) tag
 //   - [16]byte with uuid tag -> fixed(16) with uuid logical type
 //   - string (or text marshaler type) with uuid tag -> string with uuid
@@ -512,7 +508,7 @@ func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any,
 					if string(cur) != prev {
 						return nil, fmt.Errorf("avro: SchemaFor: the Avro name %q is produced by two different "+
 							"definitions (two Go types, or a logical and a plain form of one type, mapping to one "+
-							"fixed/record/enum fullname); each Avro named type must be unique — rename a Go type so the "+
+							"fixed/record/enum fullname); each Avro named type must be unique; rename a Go type so the "+
 							"names are distinct", full)
 					}
 					// Identical, so emit a reference. A dotted fullname
@@ -1414,7 +1410,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 			// avro.Duration and uuid/decimal wrong-kind arms), so reject
 			// with the remedy: the logical type belongs on the CustomType.
 			if logical != "" {
-				return nil, fmt.Errorf("avro: a CustomType is registered for %s and supplies the schema; the field's logical-type tag %q has no effect — remove the tag, or set LogicalType/Schema on the CustomType", t, logical)
+				return nil, fmt.Errorf("avro: a CustomType is registered for %s and supplies the schema; the field's logical-type tag %q has no effect; remove the tag, or set LogicalType/Schema on the CustomType", t, logical)
 			}
 			if ct.Schema != nil {
 				tree, err := renderCustomSchemaTree(ct.Schema)
@@ -1515,7 +1511,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		// present: dedupNamedTypes rejects any Avro name claimed by two different
 		// definitions.
 		if logical != "" {
-			return nil, fmt.Errorf("avro: avro.Duration maps to the duration logical type (a fixed(12)); it does not support logical type %q — remove the tag", logical)
+			return nil, fmt.Errorf("avro: avro.Duration maps to the duration logical type (a fixed(12)); it does not support logical type %q; remove the tag", logical)
 		}
 		return map[string]any{
 			"type":        "fixed",
@@ -1577,9 +1573,9 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 				// text directions. Same round-trip rule as the plain string arm.
 				return map[string]any{"type": "string", "logicalType": "uuid"}, nil
 			case enc:
-				return nil, fmt.Errorf("avro: uuid logical type on %s: it implements TextMarshaler/AppendText but not TextUnmarshaler, so a uuid string schema could encode it but not decode into it — implement both text directions or use Go string / [16]byte", t)
+				return nil, fmt.Errorf("avro: uuid logical type on %s: it implements TextMarshaler/AppendText but not TextUnmarshaler, so a uuid string schema could encode it but not decode into it; implement both text directions or use Go string / [16]byte", t)
 			case dec:
-				return nil, fmt.Errorf("avro: uuid logical type on %s: it implements TextUnmarshaler but not TextMarshaler/AppendText, so a uuid string schema could decode into it but not encode it — implement both text directions or use Go string / [16]byte", t)
+				return nil, fmt.Errorf("avro: uuid logical type on %s: it implements TextUnmarshaler but not TextMarshaler/AppendText, so a uuid string schema could decode into it but not encode it; implement both text directions or use Go string / [16]byte", t)
 			default:
 				return nil, fmt.Errorf("avro: uuid logical type requires Go string, [16]byte, or a text marshaler type; got %s", t)
 			}
@@ -1646,9 +1642,9 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 			case kindFallback || (enc && dec):
 				return "string", nil
 			case enc:
-				return nil, fmt.Errorf("avro: type %s implements TextMarshaler/AppendText but not TextUnmarshaler: a string schema could encode it but not decode into it — implement TextUnmarshaler too, use a string/[]byte-based Go type, or define the schema explicitly", t)
+				return nil, fmt.Errorf("avro: type %s implements TextMarshaler/AppendText but not TextUnmarshaler: a string schema could encode it but not decode into it; implement TextUnmarshaler too, use a string/[]byte-based Go type, or define the schema explicitly", t)
 			default:
-				return nil, fmt.Errorf("avro: type %s implements TextUnmarshaler but not TextMarshaler/AppendText: a string schema could decode into it but not encode it — implement an encode-side text method (TextMarshaler/AppendText) too, use a string/[]byte-based Go type, or define the schema explicitly", t)
+				return nil, fmt.Errorf("avro: type %s implements TextUnmarshaler but not TextMarshaler/AppendText: a string schema could decode into it but not encode it; implement an encode-side text method (TextMarshaler/AppendText) too, use a string/[]byte-based Go type, or define the schema explicitly", t)
 			}
 		}
 	}

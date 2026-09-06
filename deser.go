@@ -2782,15 +2782,14 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	return src, nil
 }
 
-// RatFromBytes converts Avro decimal bytes (big-endian two's complement) to
+// RatFromBytes converts Avro decimal bytes (big-endian two's complement) to a
 // *big.Rat with the given scale. This is the conversion you would otherwise
 // write yourself in a [CustomType] Decode callback that overrides our built-in
 // decimal handling, since such a callback receives the raw []byte.
 //
-// We read a negative scale as `unscaled * 10^|scale|`, matching Java/avro-rs
-// big-decimal semantics. We bound |scale| by decimalScaleLimit and the
-// unscaled byte length by maxDecimalUnscaledBytes; input past either bound
-// yields a zero *big.Rat rather than allocating and base-converting unbounded.
+// We read a negative scale as unscaled * 10^|scale|, matching Java and
+// avro-rs. We bound |scale| and the unscaled byte length; input past either
+// bound returns a zero *big.Rat rather than allocating unbounded.
 func RatFromBytes(b []byte, scale int) *big.Rat {
 	return bytesToRat(b, scale)
 }

@@ -11,16 +11,15 @@ import (
 // through to the next matching custom type, or to built-in behavior.
 var ErrSkipCustomType = errors.New("avro: skip custom type")
 
-// CustomType defines a custom conversion between a Go type and an Avro
-// type. [NewCustomType] covers the primitive-backing-type case, with the
-// wiring we infer from its type parameters. This struct is the general form,
-// and the only one that reaches records, fixed types, and property-based
-// dispatch.
+// CustomType defines a custom conversion between a Go type and an Avro type.
+// [NewCustomType] is the simpler form for types backed by a primitive Avro
+// type; this struct is the general form, and the only way to handle records,
+// fixed types, and property-based dispatch.
 //
-// Pass to [Parse] or [SchemaFor] as a [SchemaOpt].
+// Pass a CustomType to [Parse] or [SchemaFor] as a [SchemaOpt].
 //
-// Matching at parse time: we check LogicalType and AvroType against schema
-// nodes. All non-empty criteria must match.
+// At parse time we match LogicalType and AvroType against schema nodes. All
+// non-empty criteria must match:
 //   - LogicalType only: matches any schema node with that logicalType
 //   - LogicalType + AvroType: matches that logicalType on that Avro type
 //   - AvroType only: matches all nodes of that Avro type
@@ -33,10 +32,10 @@ var ErrSkipCustomType = errors.New("avro: skip custom type")
 // custom-typed long field).
 //
 // A matching CustomType replaces our built-in logical type deserializer.
-// Among your registrations, first match wins.
+// Among your registrations, the first match wins.
 //
-// Backed by a complex Avro type, your Encode function returns
-// map[string]any, []any, and so on.
+// If the Avro type is complex, your Encode function returns map[string]any,
+// []any, and so on.
 type CustomType struct {
 	// LogicalType narrows matching to schema nodes with this logicalType.
 	LogicalType string
@@ -70,26 +69,22 @@ type CustomType struct {
 	// We preserve every fullname the schema declares: a namespaced type
 	// keeps its namespace, and a null-namespace type embedded under
 	// [WithNamespace] keeps its null namespace (the emitted definition
-	// carries the "namespace":"" inheritance escape). One combination is
-	// unrepresentable and errors: a null-namespace type used on two or
-	// more fields under WithNamespace, because Avro has no reference
-	// spelling that reaches the null namespace from inside another
+	// carries a "namespace":"" escape). Note that a null-namespace type
+	// used on two or more fields under WithNamespace is an error, because
+	// Avro has no way to reference the null namespace from inside another
 	// namespace.
 	//
-	// We compose a private copy of the rendered schema, so a build never
-	// mutates your SchemaNode or anything reachable from it (Props
-	// container values included). A schema over the schema-tree budgets,
-	// or holding an unnamed pointer cycle, fails the build with the
-	// walk's named error.
+	// We work on a private copy, so SchemaFor never mutates your
+	// SchemaNode or anything reachable from it. A schema over the
+	// schema-tree budgets, or one holding an unnamed pointer cycle, fails
+	// the build with an error.
 	//
-	// A union branch's type may be written in either spelling Avro
-	// admits, the bare name ("null") or the wrapped object
-	// ({"type":"null"}), and composition treats the two as the one type
-	// they are. A null branch is recognized in both spellings, and in the
-	// wrapped form regardless of any properties or logicalType it carries
-	// (Avro defines no null logical type, so both are inert): a nullable
-	// union collapses through a pointer field and receives its null
-	// default identically either way.
+	// A union branch may be written either as a bare name ("null") or as
+	// a wrapped object ({"type":"null"}); we treat the two as the same
+	// type. A null branch is recognized in both spellings, whatever
+	// properties or logicalType the wrapped form carries (Avro defines no
+	// null logical type), so a nullable union collapses through a pointer
+	// field and receives its null default the same way either way.
 	Schema *SchemaNode
 
 	// Encode converts your Go value to an Avro-native value. We call it
@@ -133,11 +128,10 @@ type CustomType struct {
 	// The schema argument is shared across concurrent callback invocations;
 	// see [CustomType.Encode] for the read-only contract.
 	//
-	// A []byte v is not always yours to write to either. Under [AliasInput] it
-	// points into the decode input, and for a field filled from its schema
-	// default that input is the parsed [Schema], which every decode of that
-	// schema shares. Read it or copy from it, but do not write through it.
-	// Returning it is fine; that is what the option is for.
+	// Under [AliasInput], a []byte v points into the decode input, and a
+	// field filled from its schema default points into the parsed
+	// [Schema], which every decode of that schema shares. Read it or copy
+	// from it, but do not write through it. Returning it is fine.
 	Decode func(v any, schema *SchemaNode) (any, error)
 
 	// Set by NewCustomType; if true and AvroType is "", Parse returns

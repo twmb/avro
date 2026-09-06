@@ -57,8 +57,8 @@ func validateSOEHeader(data []byte) error {
 // verifying the magic and fingerprint match this schema.
 //
 // For a schema returned by [Resolve], we also accept the writer's
-// fingerprint: wire bytes carry the writer's fingerprint per the SOE spec,
-// and a resolved schema is the right place to decode them.
+// fingerprint, since single-object bytes carry the fingerprint of the schema
+// that produced them.
 func (s *Schema) DecodeSingleObject(data []byte, v any, opts ...Opt) ([]byte, error) {
 	if err := validateSOEHeader(data); err != nil {
 		return nil, err
