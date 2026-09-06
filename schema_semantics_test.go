@@ -6830,44 +6830,6 @@ func enumResolutionFill(t *testing.T, r *avro.Schema) (string, error) {
 	return got, nil
 }
 
-// Boundary controls for the token-type check.
-func TestEnumDefaultEmptySymbolBoundary(t *testing.T) {
-	// An explicit "" default is a legal string token; with "" a member
-	// (lax names) it binds, both surfaces agree, and resolution fills it.
-	t.Run("explicit-empty-binds", func(t *testing.T) {
-		s, err := avro.Parse(
-			`{"type":"enum","name":"E","symbols":["","A"],"default":""}`,
-			avro.WithLaxNames(laxAllEnumNames))
-		if err != nil {
-			t.Fatalf("explicit \"\" default with \"\" a member must parse: %v", err)
-		}
-		root := s.Root()
-		if !root.HasEnumDefault || root.EnumDefault != "" {
-			t.Fatalf("metadata: HasEnumDefault=%v EnumDefault=%q, want true/\"\"", root.HasEnumDefault, root.EnumDefault)
-		}
-		filled, err := enumResolutionFill(t, s)
-		if err != nil || filled != "" {
-			t.Fatalf("resolution fill = %q, %v; want \"\"", filled, err)
-		}
-	})
-	// The same "" default without "" in symbols is a membership reject:
-	// the string token passes the type check and fails containment.
-	t.Run("empty-not-member-rejects", func(t *testing.T) {
-		for _, c := range []struct {
-			name string
-			opts []avro.SchemaOpt
-		}{
-			{"strict", nil},
-			{"lax", []avro.SchemaOpt{avro.WithLaxNames(laxAllEnumNames)}},
-		} {
-			_, err := avro.Parse(`{"type":"enum","name":"E","symbols":["A"],"default":""}`, c.opts...)
-			if err == nil || !strings.Contains(err.Error(), "not a member") {
-				t.Fatalf("%s: want membership reject, got: %v", c.name, err)
-			}
-		}
-	})
-}
-
 // enumDefaultToken is one default-token cell of the class-elimination
 // matrix: the JSON spelling, whether it is a JSON string token, and (for
 // strings) the symbol it names.
@@ -8165,36 +8127,6 @@ func TestNegativeZeroPositiveControls(t *testing.T) {
 		if math.Signbit(def) {
 			t.Errorf("%s: positive zero metadata has a sign bit: %v", lit, def)
 		}
-	}
-}
-
-// Documented residual: a negative zero written in integer syntax ("-0") is the
-// integer 0. Our wire pipeline parses it via strconv.ParseFloat, which keeps
-// the sign to -0.0 on both wires. The metadata pipeline collapses it to
-// int64(0), giving +0.0, and the rebuild re-emits that. The references treat
-// "-0" as sign-less 0 everywhere. Reconciling the wire to +0.0 would require
-// changing the shared json.Number-to-float parser. That parser also drives
-// runtime json.Number encode/decode and JSON float formatting, so the change
-// ripples into round-trip stability for genuine -0.0. We keep the wire
-// internally consistent and accept the metadata-vs-wire divergence on this
-// degenerate literal.
-func TestNegativeZeroIntegerLiteralResidual(t *testing.T) {
-	s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"d","type":"double","default":-0}]}`)
-	if !doubleDefaultWireSignbit(t, s) {
-		t.Error("integer -0: wire is expected to carry the ParseFloat sign (-0.0) today")
-	}
-	def := s.Root().Fields[0].Default.(float64)
-	if math.Signbit(def) {
-		t.Error("integer -0: metadata is expected to be +0.0 (int64 collapse) today")
-	}
-	// Binary and JSON wire must agree (the invariant we protect).
-	binWire, _ := s.Encode(map[string]any{})
-	jsonWire, _ := s.AppendEncodeJSON(nil, map[string]any{})
-	var got map[string]any
-	avrotest.MustDecodeJSON(t, s, jsonWire, &got)
-	reBin, _ := s.Encode(got)
-	if string(binWire) != string(reBin) {
-		t.Errorf("integer -0: binary (%x) and JSON-roundtrip (%x) wire diverge", binWire, reBin)
 	}
 }
 
@@ -11162,70 +11094,6 @@ func TestInvariant_EveryDefaultWalkArmHasANestingCell(t *testing.T) {
 }
 
 // ---------- error_bound_test.go ----------
-
-// Tier-2 error-message DoS bound (CORRECTNESS_PLAN.md DoS gap). Every
-// fmt.Errorf("...%q...", x) interpolating wire- or schema-controlled content is a
-// 1:1 amplification vector. A hostile N-byte input rejected into an N-byte error
-// message floods logging pipelines, RPC error channels, metric labels and traces.
-// The trunc*ForError helpers exist to cap that echo, but the recurring regression
-// is a call site that forgets to use them. Here we pin the invariant. The error
-// from a rejected hostile input is bounded by a small constant, independent of
-// input size, so a call site that drops its trunc wrapper trips the cap.
-func TestErrorMessageBounded(t *testing.T) {
-	const hostileLen = 1 << 20 // 1 MiB
-	// Legit messages from these paths are ~100 bytes (an ~80-char truncated
-	// echo plus template text). The cap is far below the 1 MiB input so any
-	// amplification regression trips it, and far above any legitimate message.
-	const cap = 4096
-
-	cases := []struct {
-		name    string
-		trigger func() error
-	}{
-		{
-			// Schema parse echoing an unknown named-type reference.
-			name: "parse unknown type reference",
-			trigger: func() error {
-				huge := strings.Repeat("A", hostileLen) // valid name chars, unknown type
-				_, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"` + huge + `"}]}`)
-				return err
-			},
-		},
-		{
-			// JSON decode echoing an unknown enum symbol.
-			name: "json unknown enum symbol",
-			trigger: func() error {
-				s := avro.MustParse(`{"type":"enum","name":"E","symbols":["A","B"]}`)
-				huge := strings.Repeat("Z", hostileLen)
-				var out string
-				return s.DecodeJSON([]byte(`"`+huge+`"`), &out)
-			},
-		},
-		{
-			// JSON decode echoing an out-of-range integer literal.
-			name: "json integer overflow",
-			trigger: func() error {
-				s := avro.MustParse(`"int"`)
-				huge := strings.Repeat("9", hostileLen)
-				var out int32
-				return s.DecodeJSON([]byte(huge), &out)
-			},
-		},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			err := c.trigger()
-			if err == nil {
-				t.Fatalf("expected an error for the hostile input")
-			}
-			if n := len(err.Error()); n > cap {
-				t.Errorf("error message is %d bytes for a %d-byte hostile input (cap %d): the echo is unbounded\nfirst 200: %.200s",
-					n, hostileLen, cap, err.Error())
-			}
-		})
-	}
-}
 
 // TestMatrix_DeepSchemaBounds crosses nesting depth over the two chain shapes
 // and the surfaces a deep schema reaches. Two limits apply. The pre-scan

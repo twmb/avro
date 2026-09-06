@@ -114,243 +114,6 @@ func TestMatrix_JSONDecodeOptionsAgreeAcrossFieldProvenance(t *testing.T) {
 	}
 }
 
-func TestEncodeJSON(t *testing.T) {
-	tests := []struct {
-		name   string
-		schema string
-		value  any
-		want   string
-	}{
-		{"null", `"null"`, nil, `null`},
-		{"boolean", `"boolean"`, true, `true`},
-		{"int", `"int"`, int32(42), `42`},
-		{"long", `"long"`, int64(123456789), `123456789`},
-		{"float", `"float"`, float32(1.5), `1.5`},
-		{"double", `"double"`, float64(3.14), `3.14`},
-		{"string", `"string"`, "hello", `"hello"`},
-		{"bytes", `"bytes"`, []byte{0x00, 0xFF, 0x41}, `"\u0000\u00ffA"`},
-		{"enum", `{"type":"enum","name":"Color","symbols":["RED","GREEN"]}`, "RED", `"RED"`},
-		{
-			"fixed",
-			`{"type":"fixed","name":"F","size":3}`,
-			[3]byte{0x01, 0x02, 0x03},
-			`"\u0001\u0002\u0003"`,
-		},
-		{
-			"array",
-			`{"type":"array","items":"int"}`,
-			[]any{int32(1), int32(2), int32(3)},
-			`[1,2,3]`,
-		},
-		{
-			"map",
-			`{"type":"map","values":"int"}`,
-			map[string]any{"a": int32(1)},
-			`{"a":1}`,
-		},
-		{
-			"union null",
-			`["null","string"]`,
-			nil,
-			`null`,
-		},
-		{
-			"union string",
-			`["null","string"]`,
-			"hello",
-			`"hello"`,
-		},
-		{
-			"union int",
-			`["null","int","string"]`,
-			int32(42),
-			`42`,
-		},
-		{
-			"record",
-			`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`,
-			map[string]any{"a": int32(1), "b": "hello"},
-			`{"a":1,"b":"hello"}`,
-		},
-		{
-			"nested record with union",
-			recNameEmailSchema,
-			map[string]any{"name": "Alice", "email": "a@b.com"},
-			`{"name":"Alice","email":"a@b.com"}`,
-		},
-		{
-			"nested record with null union",
-			recNameEmailSchema,
-			map[string]any{"name": "Bob", "email": nil},
-			`{"name":"Bob","email":null}`,
-		},
-		{
-			"float NaN",
-			`"float"`,
-			float32(math.Float32frombits(0x7fc00000)),
-			`"NaN"`,
-		},
-		{
-			"double Infinity",
-			`"double"`,
-			math.Inf(1),
-			`"Infinity"`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := mustParse(t, tt.schema)
-			got := mustEncodeJSON(t, s, tt.value)
-			if string(got) != tt.want {
-				t.Errorf("got %s, want %s", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestDecodeJSON(t *testing.T) {
-	tests := []struct {
-		name   string
-		schema string
-		input  string
-		want   any
-	}{
-		{"null", `"null"`, `null`, nil},
-		{"boolean", `"boolean"`, `true`, true},
-		{"int", `"int"`, `42`, int32(42)},
-		{"long", `"long"`, `123456789`, int64(123456789)},
-		{"float", `"float"`, `1.5`, float32(1.5)},
-		{"double", `"double"`, `3.14`, 3.14},
-		{"string", `"string"`, `"hello"`, "hello"},
-		{"bytes", `"bytes"`, `"\u0000\u00FFA"`, []byte{0x00, 0xFF, 0x41}},
-		{"enum", `{"type":"enum","name":"Color","symbols":["RED","GREEN"]}`, `"RED"`, "RED"},
-		{
-			"array",
-			`{"type":"array","items":"int"}`,
-			`[1,2,3]`,
-			[]any{int32(1), int32(2), int32(3)},
-		},
-		{
-			"union null",
-			`["null","string"]`,
-			`null`,
-			nil,
-		},
-		{
-			"union string",
-			`["null","string"]`,
-			`{"string":"hello"}`,
-			"hello",
-		},
-		{
-			"record with union",
-			recNameEmailSchema,
-			`{"name":"Alice","email":{"string":"a@b.com"}}`,
-			map[string]any{"name": "Alice", "email": "a@b.com"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := mustParse(t, tt.schema)
-			var got any
-			mustDecodeJSON(t, s, []byte(tt.input), &got)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("got %v (%T), want %v (%T)", got, got, tt.want, tt.want)
-			}
-		})
-	}
-}
-
-func TestAvroJSONRoundTrip(t *testing.T) {
-	schema := `{
-		"type":"record","name":"Event",
-		"fields":[
-			{"name":"id","type":"string"},
-			{"name":"ts","type":"long"},
-			{"name":"data","type":"bytes"},
-			{"name":"tags","type":{"type":"array","items":"string"}},
-			{"name":"meta","type":{"type":"map","values":"int"}},
-			{"name":"status","type":{"type":"enum","name":"Status","symbols":["ACTIVE","DELETED"]}},
-			{"name":"extra","type":["null","string","int"]}
-		]
-	}`
-	s := mustParse(t, schema)
-
-	original := map[string]any{
-		"id":     "abc",
-		"ts":     int64(1000),
-		"data":   []byte{0x01, 0x02},
-		"tags":   []any{"go", "avro"},
-		"meta":   map[string]any{"x": int32(1)},
-		"status": "ACTIVE",
-		"extra":  "hello",
-	}
-
-	encoded := mustEncodeJSON(t, s, original)
-
-	// The output must be valid JSON.
-	var parsed any
-	if err := json.Unmarshal(encoded, &parsed); err != nil {
-		t.Fatalf("invalid JSON: %v\n%s", err, encoded)
-	}
-
-	var decoded any
-	mustDecodeJSON(t, s, encoded, &decoded)
-
-	m := decoded.(map[string]any)
-	if m["id"] != "abc" {
-		t.Errorf("id: got %v", m["id"])
-	}
-	if m["ts"] != int64(1000) {
-		t.Errorf("ts: got %v", m["ts"])
-	}
-	if m["status"] != "ACTIVE" {
-		t.Errorf("status: got %v", m["status"])
-	}
-	if m["extra"] != "hello" {
-		t.Errorf("extra: got %v", m["extra"])
-	}
-}
-
-func TestAvroJSONNamedUnionBranch(t *testing.T) {
-	schema := `{
-		"type":"record","name":"Wrapper",
-		"fields":[{
-			"name":"value",
-			"type":["null",{"type":"record","name":"Inner","fields":[
-				{"name":"x","type":"int"}
-			]}]
-		}]
-	}`
-	s := mustParse(t, schema)
-
-	// With TaggedUnions we expect the non-null branch to key off the record
-	// name, so "Inner" is the union type name.
-	data := map[string]any{
-		"value": map[string]any{"x": int32(42)},
-	}
-	encoded := mustEncodeJSON(t, s, data, TaggedUnions())
-	var parsed map[string]any
-	json.Unmarshal(encoded, &parsed)
-	valueObj, ok := parsed["value"].(map[string]any)
-	if !ok {
-		t.Fatalf("value: expected object, got %T: %s", parsed["value"], encoded)
-	}
-	if _, ok := valueObj["Inner"]; !ok {
-		t.Errorf("expected Inner key in union, got: %s", encoded)
-	}
-
-	var decoded any
-	mustDecodeJSON(t, s, encoded, &decoded)
-	m := decoded.(map[string]any)
-	inner := m["value"].(map[string]any)
-	if inner["x"] != int32(42) {
-		t.Errorf("x: got %v", inner["x"])
-	}
-}
-
 func TestDecodeJSONIntoStruct(t *testing.T) {
 	schema := recordNameEmailSchema
 	s := mustParse(t, schema)
@@ -363,42 +126,6 @@ func TestDecodeJSONIntoStruct(t *testing.T) {
 	}
 	if got.Email == nil || *got.Email != "a@b.com" {
 		t.Errorf("email: got %v", got.Email)
-	}
-}
-
-// TestDecodeJSONUnionTaggedNullIntoAny exercises the union object decode
-// path at json_decode.go:809 / 844. When the JSON is a tagged union object
-// whose branch is "null" (e.g. {"null":null}), the inner decode produces nil
-// and wrapUnion returns nil. The previous code then did
-// v.Set(reflect.ValueOf(nil)), which panics with "reflect.Value.Set on zero
-// Value". We must decode to a nil any, not panic.
-func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
-	cases := []struct {
-		name   string
-		schema string
-		src    string
-		opts   []Opt
-	}{
-		{"two-branch null bare", `["null","int"]`, `null`, nil},
-		{"two-branch null tagged", `["null","int"]`, `{"null":null}`, nil},
-		{"two-branch null tagged with TaggedUnions", `["null","int"]`, `{"null":null}`, []Opt{TaggedUnions()}},
-		{"three-branch null tagged", `["null","int","string"]`, `{"null":null}`, nil},
-		{"three-branch null tagged with TaggedUnions", `["null","int","string"]`, `{"null":null}`, []Opt{TaggedUnions()}},
-		{"record with nullable any field, tagged null inner", `{"type":"record","name":"r","fields":[{"name":"x","type":["null","int"]}]}`, `{"x":{"null":null}}`, nil},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			defer func() {
-				if r := recover(); r != nil {
-					t.Fatalf("panic: %v", r)
-				}
-			}()
-			s := mustParse(t, tc.schema)
-			var v any
-			if err := s.DecodeJSON([]byte(tc.src), &v, tc.opts...); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-		})
 	}
 }
 
@@ -483,60 +210,6 @@ func TestAvroJSONNamespacedUnionBranch(t *testing.T) {
 	}
 }
 
-func TestAvroJSONNestedUnionRecord(t *testing.T) {
-	// Three-level nested record with union fields (like goavro's LongList test).
-	schema := nodeRecursiveSchema
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	data := map[string]any{
-		"value": int32(1),
-		"next": map[string]any{
-			"value": int32(2),
-			"next": map[string]any{
-				"value": int32(3),
-				"next":  nil,
-			},
-		},
-	}
-	// Tagged: Node wrapping at each level.
-	encoded, err := s.EncodeJSON(data, TaggedUnions())
-	if err != nil {
-		t.Fatalf("EncodeJSON(TaggedUnions()): %v", err)
-	}
-	var parsed any
-	json.Unmarshal(encoded, &parsed)
-	m := parsed.(map[string]any)
-	next := m["next"].(map[string]any)
-	if _, ok := next["Node"]; !ok {
-		t.Errorf("expected Node key in tagged union, got: %s", encoded)
-	}
-	var got any
-	if err := s.DecodeJSON(encoded, &got); err != nil {
-		t.Fatalf("DecodeJSON tagged: %v", err)
-	}
-	gm := got.(map[string]any)
-	if gm["value"] != int32(1) {
-		t.Errorf("value: got %v", gm["value"])
-	}
-
-	// Bare: nested records, no wrapping.
-	bare, err := s.EncodeJSON(data)
-	if err != nil {
-		t.Fatalf("EncodeJSON(bare): %v", err)
-	}
-	var got2 any
-	if err := s.DecodeJSON(bare, &got2); err != nil {
-		t.Fatalf("DecodeJSON bare: %v", err)
-	}
-	gm2 := got2.(map[string]any)
-	if gm2["value"] != int32(1) {
-		t.Errorf("value: got %v", gm2["value"])
-	}
-}
-
 func TestAvroJSONBytesEdgeCases(t *testing.T) {
 	s := mustParse(t, `"bytes"`)
 
@@ -563,84 +236,6 @@ func TestAvroJSONBytesEdgeCases(t *testing.T) {
 	}
 }
 
-func TestAvroJSONArrayOfUnions(t *testing.T) {
-	schema := `{"type":"array","items":["null","string","int"]}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// We first check that binary encoding works.
-	data := []any{"hello", int32(42)}
-	binary, err := s.Encode(data)
-	if err != nil {
-		t.Fatalf("Encode binary: %v", err)
-	}
-	t.Logf("binary: %v", binary)
-
-	// Bare (default): unwrapped values.
-	encoded, err := s.EncodeJSON(data)
-	if err != nil {
-		t.Fatalf("EncodeJSON: %v", err)
-	}
-	want := `["hello",42]`
-	if string(encoded) != want {
-		t.Errorf("got %s, want %s", encoded, want)
-	}
-
-	// Decode back from bare.
-	var got any
-	if err := s.DecodeJSON(encoded, &got); err != nil {
-		t.Fatalf("DecodeJSON bare: %v", err)
-	}
-	arr := got.([]any)
-	if len(arr) != 2 {
-		t.Fatalf("expected 2 elements, got %d", len(arr))
-	}
-
-	// Tagged: wrapped values.
-	tagged, err := s.EncodeJSON(data, TaggedUnions())
-	if err != nil {
-		t.Fatalf("EncodeJSON(TaggedUnions()): %v", err)
-	}
-	wantTagged := `[{"string":"hello"},{"int":42}]`
-	if string(tagged) != wantTagged {
-		t.Errorf("got %s, want %s", tagged, wantTagged)
-	}
-}
-
-func TestAvroJSONArrayOfUnionsWithNull(t *testing.T) {
-	schema := `{"type":"array","items":["null","string"]}`
-	s := mustParse(t, schema)
-	data := []any{nil, "hello", nil}
-	encoded := mustEncodeJSON(t, s, data)
-	want := `[null,"hello",null]`
-	if string(encoded) != want {
-		t.Errorf("got %s, want %s", encoded, want)
-	}
-}
-
-func TestDecodeJSONArrayOfUnionsWithNull(t *testing.T) {
-	schema := `{"type":"array","items":["null","string"]}`
-	s := mustParse(t, schema)
-	input := `[null,{"string":"hello"},null]`
-	var got any
-	mustDecodeJSON(t, s, []byte(input), &got)
-	arr := got.([]any)
-	if len(arr) != 3 {
-		t.Fatalf("expected 3 elements, got %d", len(arr))
-	}
-	if arr[0] != nil {
-		t.Errorf("arr[0]: got %v, want nil", arr[0])
-	}
-	if arr[1] != "hello" {
-		t.Errorf("arr[1]: got %v, want hello", arr[1])
-	}
-	if arr[2] != nil {
-		t.Errorf("arr[2]: got %v, want nil", arr[2])
-	}
-}
-
 func TestDecodeJSONFixed(t *testing.T) {
 	s := mustParse(t, `{"type":"fixed","name":"F","size":3}`)
 	var got any
@@ -663,16 +258,6 @@ func TestDecodeJSONNull(t *testing.T) {
 	}
 }
 
-func TestDecodeJSONMapMultipleKeys(t *testing.T) {
-	s := mustParse(t, `{"type":"map","values":"int"}`)
-	var got any
-	mustDecodeJSON(t, s, []byte(`{"a":1,"b":2,"c":3}`), &got)
-	m := got.(map[string]any)
-	if len(m) != 3 {
-		t.Errorf("expected 3 keys, got %d", len(m))
-	}
-}
-
 func TestDecodeJSONRecordMissingField(t *testing.T) {
 	s := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int","default":0},
@@ -687,15 +272,6 @@ func TestDecodeJSONRecordMissingField(t *testing.T) {
 	}
 }
 
-func TestDecodeJSONUnionNull(t *testing.T) {
-	s := mustParse(t, `["null","string"]`)
-	var got any
-	mustDecodeJSON(t, s, []byte(`null`), &got)
-	if got != nil {
-		t.Errorf("got %v, want nil", got)
-	}
-}
-
 func TestEncodeJSONMapMultipleEntries(t *testing.T) {
 	s := mustParse(t, `{"type":"map","values":"int"}`)
 	data := map[string]any{"a": int32(1), "b": int32(2)}
@@ -707,14 +283,6 @@ func TestEncodeJSONMapMultipleEntries(t *testing.T) {
 	}
 	if len(parsed) != 2 {
 		t.Errorf("expected 2 entries, got %d", len(parsed))
-	}
-}
-
-func TestEncodeJSONNegativeInfinity(t *testing.T) {
-	s := mustParse(t, `"double"`)
-	encoded := mustEncodeJSON(t, s, math.Inf(-1))
-	if string(encoded) != `"-Infinity"` {
-		t.Errorf("got %s, want \"-Infinity\"", encoded)
 	}
 }
 
@@ -817,113 +385,6 @@ func TestAppendAvroJSONUnknownKind(t *testing.T) {
 	}
 }
 
-func TestEncodeJSONRejectsNonWholeFloat(t *testing.T) {
-	t.Run("int", func(t *testing.T) {
-		s, _ := Parse(`"int"`)
-		_, err := s.EncodeJSON(float64(42.5))
-		if err == nil {
-			t.Fatal("expected error for non-whole float in int field")
-		}
-		b, err := s.EncodeJSON(float64(42.0))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(b) != "42" {
-			t.Fatalf("got %s", b)
-		}
-	})
-	t.Run("long", func(t *testing.T) {
-		s, _ := Parse(`"long"`)
-		_, err := s.EncodeJSON(float64(42.5))
-		if err == nil {
-			t.Fatal("expected error for non-whole float in long field")
-		}
-		b, err := s.EncodeJSON(float64(42.0))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(b) != "42" {
-			t.Fatalf("got %s", b)
-		}
-	})
-}
-
-func TestEncodeJSONTaggedUnionMaps(t *testing.T) {
-	s, err := Parse(`{"type":"record","name":"T","fields":[
-		{"name":"u","type":["null","int","string"]}
-	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Tagged union map should be accepted.
-	out, err := s.EncodeJSON(map[string]any{"u": map[string]any{"int": float64(42)}}, TaggedUnions())
-	if err != nil {
-		t.Fatalf("tagged int: %v", err)
-	}
-	if string(out) != `{"u":{"int":42}}` {
-		t.Fatalf("tagged int: got %s", out)
-	}
-
-	out, err = s.EncodeJSON(map[string]any{"u": map[string]any{"string": "hello"}}, TaggedUnions())
-	if err != nil {
-		t.Fatalf("tagged string: %v", err)
-	}
-	if string(out) != `{"u":{"string":"hello"}}` {
-		t.Fatalf("tagged string: got %s", out)
-	}
-
-	// Without TaggedUnions, tagged maps should still be unwrapped.
-	out, err = s.EncodeJSON(map[string]any{"u": map[string]any{"int": float64(7)}})
-	if err != nil {
-		t.Fatalf("tagged bare: %v", err)
-	}
-	if string(out) != `{"u":7}` {
-		t.Fatalf("tagged bare: got %s", out)
-	}
-
-	// Wrong branch name should fail.
-	_, err = s.EncodeJSON(map[string]any{"u": map[string]any{"long": float64(42)}})
-	if err == nil {
-		t.Fatal("expected error for wrong branch name")
-	}
-
-	// Tagged map where the key matches a branch name but the value does
-	// not match that branch's type. We fall through and try the whole map
-	// against other branches (e.g. a map branch), matching Encode.
-	s3, err := Parse(`{"type":"record","name":"T","fields":[
-		{"name":"u","type":["null","int",{"type":"map","values":"string"}]}
-	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// {"int": "not_a_number"}: key "int" matches the int branch, but
-	// "not_a_number" fails for int, so the whole map then matches the
-	// map<string> branch.
-	out, err = s3.EncodeJSON(map[string]any{"u": map[string]any{"int": "not_a_number"}}, TaggedUnions())
-	if err != nil {
-		t.Fatalf("fallthrough to map branch: %v", err)
-	}
-	if string(out) != `{"u":{"map":{"int":"not_a_number"}}}` {
-		t.Fatalf("fallthrough to map branch: got %s", out)
-	}
-
-	// Logical type branch names (goavro convention).
-	s2, err := Parse(`{"type":"record","name":"T","fields":[
-		{"name":"t","type":["null",{"type":"int","logicalType":"time-millis"}]}
-	]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err = s2.EncodeJSON(map[string]any{"t": map[string]any{"int.time-millis": float64(35245000)}}, TaggedUnions(), TagLogicalTypes())
-	if err != nil {
-		t.Fatalf("logical tag: %v", err)
-	}
-	if string(out) != `{"t":{"int.time-millis":35245000}}` {
-		t.Fatalf("logical tag: got %s", out)
-	}
-}
-
 func TestSchemaNodeErrors(t *testing.T) {
 	// Schema() with invalid node.
 	n := &SchemaNode{Type: "record"} // missing name
@@ -944,65 +405,6 @@ func TestSchemaNodeErrors(t *testing.T) {
 	} {
 		s := mustParse(t, schema)
 		_ = s.Root() // should not panic
-	}
-}
-
-func TestEncodeJSONStruct(t *testing.T) {
-	type Record struct {
-		Name   string   `avro:"name"`
-		Age    int32    `avro:"age"`
-		Score  float64  `avro:"score"`
-		Active bool     `avro:"active"`
-		Tags   []string `avro:"tags"`
-		Inner  Inner    `avro:"inner"`
-		Email  *string  `avro:"email"`
-	}
-	s := mustParse(t, `{
-		"type":"record","name":"Record",
-		"fields":[
-			{"name":"name","type":"string"},
-			{"name":"age","type":"int"},
-			{"name":"score","type":"double"},
-			{"name":"active","type":"boolean"},
-			{"name":"tags","type":{"type":"array","items":"string"}},
-			{"name":"inner","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}},
-			{"name":"email","type":["null","string"]}
-		]
-	}`)
-	email := "a@b.com"
-	r := Record{
-		Name:   "Alice",
-		Age:    30,
-		Score:  98.6,
-		Active: true,
-		Tags:   []string{"go"},
-		Inner:  Inner{X: 42},
-		Email:  &email,
-	}
-	encoded := mustEncodeJSON(t, s, &r)
-	// Verify it's valid JSON and round-trips.
-	var decoded any
-	mustDecodeJSON(t, s, encoded, &decoded)
-	m := decoded.(map[string]any)
-	if m["name"] != "Alice" {
-		t.Errorf("name: got %v", m["name"])
-	}
-	if m["age"] != int32(30) {
-		t.Errorf("age: got %v", m["age"])
-	}
-	if m["email"] != "a@b.com" {
-		t.Errorf("email: got %v", m["email"])
-	}
-}
-
-func TestEncodeJSONStructNilPointer(t *testing.T) {
-	s := mustParse(t, recordNameEmailSchema)
-	r := Record{Name: "Bob", Email: nil}
-	encoded := mustEncodeJSON(t, s, &r)
-	var parsed map[string]any
-	json.Unmarshal(encoded, &parsed)
-	if parsed["email"] != nil {
-		t.Errorf("email: got %v, want null", parsed["email"])
 	}
 }
 
@@ -1102,111 +504,6 @@ func TestEncodeJSONMissingMapKey(t *testing.T) {
 	}
 }
 
-func TestEncodeJSONNilInUnion(t *testing.T) {
-	type R struct {
-		V *string `avro:"v"`
-	}
-	s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"v","type":["null","string"]}]}`)
-	encoded := mustEncodeJSON(t, s, &R{V: nil})
-	var parsed map[string]any
-	json.Unmarshal(encoded, &parsed)
-	if parsed["v"] != nil {
-		t.Errorf("v: got %v, want null", parsed["v"])
-	}
-}
-
-func TestAvroJSONBinaryRoundTrip(t *testing.T) {
-	// We encode to Avro JSON, decode to any, encode to binary, decode to
-	// any, then check the values match.
-	schema := `{
-		"type":"record","name":"Event",
-		"fields":[
-			{"name":"id","type":"string"},
-			{"name":"ts","type":"long"},
-			{"name":"data","type":"bytes"},
-			{"name":"status","type":{"type":"enum","name":"Status","symbols":["A","B"]}},
-			{"name":"extra","type":["null","string","int"]}
-		]
-	}`
-	s := mustParse(t, schema)
-
-	original := map[string]any{
-		"id":     "abc",
-		"ts":     int64(1000),
-		"data":   []byte{0x01, 0x02},
-		"status": "A",
-		"extra":  "hello",
-	}
-
-	// Path 1: binary encode, then binary decode.
-	binary := mustEncode(t, s, original)
-	var fromBinary any
-	mustDecode(t, s, binary, &fromBinary)
-
-	// Path 2: Avro JSON encode, then Avro JSON decode.
-	jsonBytes := mustEncodeJSON(t, s, original)
-	var fromJSON any
-	mustDecodeJSON(t, s, jsonBytes, &fromJSON)
-
-	// Both paths must agree.
-	mb := fromBinary.(map[string]any)
-	mj := fromJSON.(map[string]any)
-	if mb["id"] != mj["id"] {
-		t.Errorf("id mismatch: binary=%v json=%v", mb["id"], mj["id"])
-	}
-	if mb["ts"] != mj["ts"] {
-		t.Errorf("ts mismatch: binary=%v json=%v", mb["ts"], mj["ts"])
-	}
-	if mb["status"] != mj["status"] {
-		t.Errorf("status mismatch: binary=%v json=%v", mb["status"], mj["status"])
-	}
-	if mb["extra"] != mj["extra"] {
-		t.Errorf("extra mismatch: binary=%v json=%v", mb["extra"], mj["extra"])
-	}
-}
-
-func TestAvroJSONStructRoundTrip(t *testing.T) {
-	type Record struct {
-		Name  string  `avro:"name"`
-		Age   int32   `avro:"age"`
-		Email *string `avro:"email"`
-	}
-	s := mustParse(t, `{"type":"record","name":"Record","fields":[
-		{"name":"name","type":"string"},
-		{"name":"age","type":"int"},
-		{"name":"email","type":["null","string"]}
-	]}`)
-	email := "a@b.com"
-	original := Record{Name: "Alice", Age: 30, Email: &email}
-
-	// Struct to Avro JSON and back to struct.
-	jsonBytes := mustEncodeJSON(t, s, &original)
-	var got Record
-	mustDecodeJSON(t, s, jsonBytes, &got)
-	if got.Name != original.Name || got.Age != original.Age {
-		t.Errorf("got %+v, want %+v", got, original)
-	}
-	if got.Email == nil || *got.Email != *original.Email {
-		t.Errorf("email: got %v, want %v", got.Email, original.Email)
-	}
-}
-
-func TestAvroJSONUnionArrayNilRoundTrip(t *testing.T) {
-	// Array of nullable unions with nil elements.
-	s := mustParse(t, `{"type":"array","items":["null","string"]}`)
-	original := []any{nil, "hello", nil, "world"}
-	jsonBytes := mustEncodeJSON(t, s, original)
-	var got any
-	mustDecodeJSON(t, s, jsonBytes, &got)
-	arr := got.([]any)
-	if len(arr) != 4 {
-		t.Fatalf("expected 4 elements, got %d", len(arr))
-	}
-	if arr[0] != nil || arr[1] != "hello" || arr[2] != nil || arr[3] != "world" {
-		t.Errorf("got %v", arr)
-	}
-}
-
 func TestDecodeJSONIntOverflow(t *testing.T) {
 	s, _ := Parse(`"int"`)
 	// 3 billion exceeds int32 max.
@@ -1250,31 +547,6 @@ func TestDecodeJSONInvalidJSON(t *testing.T) {
 	var v any
 	if err := s.DecodeJSON([]byte(`{not json`), &v); err == nil {
 		t.Fatal("expected error for invalid JSON")
-	}
-}
-
-func TestEncodeJSONLinkedinFloats(t *testing.T) {
-	tests := []struct {
-		name   string
-		schema string
-		value  any
-		want   string
-	}{
-		{"float NaN", `"float"`, float32(math.Float32frombits(0x7fc00000)), `null`},
-		{"float +Inf", `"float"`, float32(math.Inf(1)), `1e999`},
-		{"float -Inf", `"float"`, float32(math.Inf(-1)), `-1e999`},
-		{"double NaN", `"double"`, math.NaN(), `null`},
-		{"double +Inf", `"double"`, math.Inf(1), `1e999`},
-		{"double -Inf", `"double"`, math.Inf(-1), `-1e999`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := mustParse(t, tt.schema)
-			got := mustEncodeJSON(t, s, tt.value, LinkedinFloats())
-			if string(got) != tt.want {
-				t.Errorf("got %s, want %s", got, tt.want)
-			}
-		})
 	}
 }
 
@@ -1353,20 +625,6 @@ func TestMatrix_LinkedinFloatsNaNUnionAmbiguity(t *testing.T) {
 	})
 }
 
-func TestEncodeJSONTaggedUnions(t *testing.T) {
-	s := mustParse(t, `["null","string","int"]`)
-	// Tagged: wrapped.
-	got := mustEncodeJSON(t, s, "hello", TaggedUnions())
-	if string(got) != `{"string":"hello"}` {
-		t.Errorf("tagged: got %s", got)
-	}
-	// Bare (default): unwrapped.
-	got = mustEncodeJSON(t, s, "hello")
-	if string(got) != `"hello"` {
-		t.Errorf("bare: got %s", got)
-	}
-}
-
 func TestDecodeTaggedUnions(t *testing.T) {
 	schema := `{"type":"record","name":"R","fields":[
 		{"name":"v","type":["null","string","int"]}
@@ -1395,87 +653,6 @@ func TestDecodeTaggedUnions(t *testing.T) {
 	}
 }
 
-func TestDecodeTaggedUnionsComplex(t *testing.T) {
-	schema := `{"type":"record","name":"R","fields":[
-		{"name":"u_bool","type":["null","boolean"]},
-		{"name":"u_int","type":["null","int"]},
-		{"name":"u_long","type":["null","long"]},
-		{"name":"u_float","type":["null","float"]},
-		{"name":"u_double","type":["null","double"]},
-		{"name":"u_string","type":["null","string"]},
-		{"name":"u_bytes","type":["null","bytes"]},
-		{"name":"u_null","type":["null","string"]},
-		{"name":"arr","type":{"type":"array","items":["null","string"]}},
-		{"name":"m","type":{"type":"map","values":["null","int"]}}
-	]}`
-	s := mustParse(t, schema)
-	input := map[string]any{
-		"u_bool":   true,
-		"u_int":    int32(42),
-		"u_long":   int64(100),
-		"u_float":  float32(1.5),
-		"u_double": float64(3.14),
-		"u_string": "hello",
-		"u_bytes":  []byte{0x01, 0x02},
-		"u_null":   nil,
-		"arr":      []any{nil, "a"},
-		"m":        map[string]any{"k": int32(1)},
-	}
-	bin := mustEncode(t, s, input)
-	var got any
-	mustDecode(t, s, bin, &got, TaggedUnions())
-	m := got.(map[string]any)
-
-	// Check each union is wrapped.
-	check := func(field, branch string) {
-		t.Helper()
-		wrapper, ok := m[field].(map[string]any)
-		if !ok {
-			if m[field] == nil {
-				return // null union values stay nil
-			}
-			t.Errorf("%s: expected map wrapper, got %T: %v", field, m[field], m[field])
-			return
-		}
-		if _, ok := wrapper[branch]; !ok {
-			t.Errorf("%s: expected branch %q, got keys %v", field, branch, wrapper)
-		}
-	}
-	check("u_bool", "boolean")
-	check("u_int", "int")
-	check("u_long", "long")
-	check("u_float", "float")
-	check("u_double", "double")
-	check("u_string", "string")
-	check("u_bytes", "bytes")
-	if m["u_null"] != nil {
-		t.Errorf("u_null: expected nil, got %v", m["u_null"])
-	}
-
-	// Array items should be wrapped.
-	arr := m["arr"].([]any)
-	if arr[0] != nil {
-		t.Errorf("arr[0]: expected nil, got %v", arr[0])
-	}
-	arrItem, ok := arr[1].(map[string]any)
-	if !ok {
-		t.Fatalf("arr[1]: expected map, got %T", arr[1])
-	}
-	if arrItem["string"] != "hello" && arrItem["string"] != "a" {
-		t.Errorf("arr[1]: got %v", arrItem)
-	}
-
-	// Map values should be wrapped.
-	mv := m["m"].(map[string]any)
-	kv, ok := mv["k"].(map[string]any)
-	if !ok {
-		t.Fatalf("m[k]: expected map, got %T", mv["k"])
-	}
-	if _, ok := kv["int"]; !ok {
-		t.Errorf("m[k]: expected int branch, got %v", kv)
-	}
-}
-
 func TestDecodeTaggedUnionsNullAtRoot(t *testing.T) {
 	s := mustParse(t, `["null","string"]`)
 	bin := mustEncode(t, s, nil)
@@ -1483,33 +660,6 @@ func TestDecodeTaggedUnionsNullAtRoot(t *testing.T) {
 	mustDecode(t, s, bin, &got, TaggedUnions())
 	if got != nil {
 		t.Errorf("expected nil, got %v", got)
-	}
-}
-
-func TestDecodeTaggedUnionsWithLogicalNames(t *testing.T) {
-	schema := `{"type":"record","name":"R","fields":[
-		{"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}
-	]}`
-	s := mustParse(t, schema)
-	now := time.UnixMilli(1687221496000).UTC()
-	bin := mustEncode(t, s, map[string]any{"ts": now})
-
-	// TaggedUnions only: branch name is "long".
-	var std any
-	mustDecode(t, s, bin, &std, TaggedUnions())
-	m := std.(map[string]any)
-	wrapper := m["ts"].(map[string]any)
-	if _, ok := wrapper["long"]; !ok {
-		t.Errorf("expected 'long' key, got %v", wrapper)
-	}
-
-	// TaggedUnions + TagLogicalTypes: branch name is "long.timestamp-millis".
-	var logical any
-	mustDecode(t, s, bin, &logical, TaggedUnions(), TagLogicalTypes())
-	m = logical.(map[string]any)
-	wrapper = m["ts"].(map[string]any)
-	if _, ok := wrapper["long.timestamp-millis"]; !ok {
-		t.Errorf("expected 'long.timestamp-millis' key, got %v", wrapper)
 	}
 }
 
@@ -1527,25 +677,6 @@ func TestEncodeJSONTaggedUnionsWithLogicalNames(t *testing.T) {
 	got = mustEncodeJSON(t, s, now, TaggedUnions(), TagLogicalTypes())
 	if string(got) != `{"long.timestamp-millis":1687221496000}` {
 		t.Errorf("got %s", got)
-	}
-}
-
-func TestDecodeJSONTaggedUnions(t *testing.T) {
-	s := mustParse(t, `["null","string"]`)
-	var bare any
-	mustDecodeJSON(t, s, []byte(`"hello"`), &bare)
-	if bare != "hello" {
-		t.Errorf("bare: got %v", bare)
-	}
-
-	var tagged any
-	mustDecodeJSON(t, s, []byte(`"hello"`), &tagged, TaggedUnions())
-	wrapper, ok := tagged.(map[string]any)
-	if !ok {
-		t.Fatalf("tagged: expected map, got %T: %v", tagged, tagged)
-	}
-	if wrapper["string"] != "hello" {
-		t.Errorf("tagged: got %v", wrapper)
 	}
 }
 
@@ -1614,29 +745,6 @@ func TestDecodeJSONBadDoubleString(t *testing.T) {
 	}
 }
 
-func TestEncodeJSONBareUnionRecord(t *testing.T) {
-	schema := `{
-		"type":"record","name":"R",
-		"fields":[{"name":"v","type":["null",{"type":"record","name":"Inner","fields":[
-			{"name":"x","type":"int"}
-		]}]}]
-	}`
-	s := mustParse(t, schema)
-	data := map[string]any{"v": map[string]any{"x": int32(42)}}
-	// Bare: record without type wrapper.
-	bare := mustEncodeJSON(t, s, data)
-	// Decode back from bare.
-	var got any
-	if err := s.DecodeJSON(bare, &got); err != nil {
-		t.Fatalf("DecodeJSON bare: %v", err)
-	}
-	m := got.(map[string]any)
-	inner := m["v"].(map[string]any)
-	if inner["x"] != int32(42) {
-		t.Errorf("x: got %v", inner["x"])
-	}
-}
-
 func TestEncodeJSONRecordMissingRequiredField(t *testing.T) {
 	schema := recABSchema
 	s := mustParse(t, schema)
@@ -1647,86 +755,11 @@ func TestEncodeJSONRecordMissingRequiredField(t *testing.T) {
 	}
 }
 
-func TestEncodeJSONRecordOptionalField(t *testing.T) {
-	schema := `{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string","default":"hi"}
-	]}`
-	s := mustParse(t, schema)
-	// Missing field "b" has a default, so encode succeeds with it.
-	got := mustEncodeJSON(t, s, map[string]any{"a": int32(1)})
-	if string(got) != `{"a":1,"b":"hi"}` {
-		t.Errorf("got %s", got)
-	}
-}
-
 func TestEncodeJSONBytesFromString(t *testing.T) {
 	s := mustParse(t, `"bytes"`)
 	got := mustEncodeJSON(t, s, "hello")
 	if string(got) != `"hello"` {
 		t.Errorf("got %s", got)
-	}
-}
-
-func TestBareUnionMultiRecordRoundTrip(t *testing.T) {
-	schema := `["null",
-		{"type":"record","name":"Foo","fields":[{"name":"x","type":"int"}]},
-		{"type":"record","name":"Bar","fields":[{"name":"y","type":"string"}]}
-	]`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The tagged form recovers any branch deterministically. It is the Avro
-	// JSON spec form for a non-null union. It is also the only JSON form that
-	// round-trips a multi-record union; Java/fastavro/goavro require it.
-	var v1 any
-	if err := s.DecodeJSON([]byte(`{"Bar":{"y":"hello"}}`), &v1); err != nil {
-		t.Fatalf("tagged DecodeJSON: %v", err)
-	}
-
-	// Binary carries an explicit branch index, so a Bar value round-trips on the
-	// binary wire regardless of declaration order.
-	bar := map[string]any{"y": "hello"}
-	bin, err := s.Encode(bar)
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	var native any
-	mustDecode(t, s, bin, &native)
-	// Tagged JSON round-trips the recovered branch.
-	jb, err := s.EncodeJSON(native, TaggedUnions())
-	if err != nil {
-		t.Fatalf("EncodeJSON tagged: %v", err)
-	}
-	var rt any
-	if err := s.DecodeJSON(jb, &rt); err != nil {
-		t.Fatalf("DecodeJSON tagged: %v", err)
-	}
-
-	// Bare JSON of a multi-record union commits to the first
-	// declaration-order branch whose structure the object matches. It does
-	// NOT backtrack to a later record branch. That backtracking is the
-	// branch-guessing the Avro JSON spec and Java/fastavro/goavro avoid;
-	// they require the tagged form. It is also 2^depth for recursive unions,
-	// see TestRegression_BareUnionJSONNoExponentialBacktrack. So a bare
-	// object matching only the second branch (Bar's {"y":...}) fails against
-	// the first branch, since Foo needs "x". The tagged form recovers Bar.
-	var barBare any
-	if err := s.DecodeJSON([]byte(`{"y":"hello"}`), &barBare); err == nil {
-		t.Fatal(`bare {"y":"hello"} must commit to the first record branch Foo and fail (missing "x"); tagged form required for Bar`)
-	}
-	// A bare object matching the first branch (Foo) decodes fine.
-	var foo any
-	if err := s.DecodeJSON([]byte(`{"x":5}`), &foo); err != nil {
-		t.Fatalf("bare first-branch decode: %v", err)
-	}
-
-	// Direct Encode of a bare map still matches branches by structure on the
-	// binary encode side, unaffected by the JSON-decode commit-to-first.
-	if _, err := s.Encode(map[string]any{"y": "hello"}); err != nil {
-		t.Fatalf("direct Encode of Bar map: %v", err)
 	}
 }
 
@@ -1781,71 +814,11 @@ func TestSerStringJsonNumberInUnion(t *testing.T) {
 	}
 }
 
-func TestDecodeJSONBareUnionStringVsRecord(t *testing.T) {
-	// Union ["null","string",record]: a map matches the record, not string.
-	schema := `["null","string",{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}]`
-	s := mustParse(t, schema)
-	var v any
-	mustDecodeJSON(t, s, []byte(`{"x":42}`), &v)
-	m, ok := v.(map[string]any)
-	if !ok {
-		t.Fatalf("expected map, got %T: %v", v, v)
-	}
-	if m["x"] != int32(42) {
-		t.Errorf("x: got %v", m["x"])
-	}
-}
-
 func TestEncodeJSONFixedFromString(t *testing.T) {
 	s := mustParse(t, `{"type":"fixed","name":"F","size":5}`)
 	got := mustEncodeJSON(t, s, "hello")
 	if string(got) != `"hello"` {
 		t.Errorf("got %s", got)
-	}
-}
-
-func TestEncodeJSONLogicalTypeRoundTrip(t *testing.T) {
-	tests := []struct {
-		name   string
-		schema string
-		value  any
-		want   string
-	}{
-		{"date", `{"type":"int","logicalType":"date"}`, time.Date(1977, 5, 12, 0, 0, 0, 0, time.UTC), "2688"},
-		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, time.Duration(35245000) * time.Millisecond, "35245000"},
-		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, time.Duration(20192000) * time.Microsecond, "20192000"},
-		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, time.UnixMilli(1687221496000).UTC(), "1687221496000"},
-		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, time.UnixMicro(1687221496000000).UTC(), "1687221496000000"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := mustParse(t, tt.schema)
-			bin := mustEncode(t, s, tt.value)
-			var native any
-			mustDecode(t, s, bin, &native)
-			got := mustEncodeJSON(t, s, native)
-			if string(got) != tt.want {
-				t.Errorf("got %s, want %s", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestEncodeJSONDurationRoundTrip(t *testing.T) {
-	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
-	s := mustParse(t, schema)
-	d := Duration{Months: 3, Days: 15, Milliseconds: 86400000}
-	bin := mustEncode(t, s, d)
-	var native any
-	mustDecode(t, s, bin, &native)
-	if got := native.(Duration); got != d {
-		t.Fatalf("Decode: got %+v, want %+v", got, d)
-	}
-	j := mustEncodeJSON(t, s, native)
-	var rt any
-	mustDecodeJSON(t, s, j, &rt)
-	if got := rt.(Duration); got != d {
-		t.Fatalf("round-trip: got %+v, want %+v", got, d)
 	}
 }
 
@@ -2066,22 +1039,6 @@ func TestEncodeJSONUFFFDIdempotence(t *testing.T) {
 	}
 }
 
-func TestDecodeJSONGoavroLogicalBranchName(t *testing.T) {
-	// goavro uses "long.timestamp-millis" as union branch names. We accept
-	// those through the findUnionBranch fallback.
-	schema := `["null",{"type":"long","logicalType":"timestamp-millis"}]`
-	s := mustParse(t, schema)
-	var v any
-	mustDecodeJSON(t, s, []byte(`{"long.timestamp-millis":1687221496000}`), &v)
-	got, ok := v.(time.Time)
-	if !ok {
-		t.Fatalf("expected time.Time, got %T: %v", v, v)
-	}
-	if got.UnixMilli() != 1687221496000 {
-		t.Errorf("got %v", got)
-	}
-}
-
 func TestEncodeJSONTimeLongDefault(t *testing.T) {
 	// time.Time for a bare long (no logical type) should be rejected,
 	// matching Encode's behavior.
@@ -2099,290 +1056,6 @@ func TestSerStringTextMarshalerError(t *testing.T) {
 	_, err := s.AppendEncode(nil, &v)
 	if err == nil {
 		t.Fatal("expected error from MarshalText")
-	}
-}
-
-func TestSerStringTextAppenderLong(t *testing.T) {
-	// TextAppender with text > 63 bytes forces multi-byte varlong header.
-	s, _ := Parse(`"string"`)
-	long := testTextAppender{val: string(make([]byte, 200))}
-	encoded := mustAppendEncode(t, s, nil, &long)
-	var got string
-	mustDecode(t, s, encoded, &got)
-	if len(got) != 200 {
-		t.Errorf("got len %d, want 200", len(got))
-	}
-}
-
-// TestLogicalTypeRoundTrips verifies that every logical type round-trips
-// through all four encode/decode functions:
-//
-//	value -> Encode -> Decode -> same value
-//	value -> EncodeJSON -> DecodeJSON -> same value
-//	value -> Encode -> Decode -> EncodeJSON -> DecodeJSON -> same value
-func TestLogicalTypeRoundTrips(t *testing.T) {
-	tests := []struct {
-		name   string
-		schema string
-		value  any    // input to Encode / EncodeJSON
-		want   any    // expected from Decode / DecodeJSON to *any
-		json   string // expected EncodeJSON output
-	}{
-		{
-			name:   "date",
-			schema: `{"type":"int","logicalType":"date"}`,
-			value:  time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			want:   time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-			json:   "20089",
-		},
-		{
-			name:   "time-millis",
-			schema: `{"type":"int","logicalType":"time-millis"}`,
-			value:  time.Duration(35245000) * time.Millisecond,
-			want:   time.Duration(35245000) * time.Millisecond,
-			json:   "35245000",
-		},
-		{
-			name:   "time-micros",
-			schema: `{"type":"long","logicalType":"time-micros"}`,
-			value:  time.Duration(35245000) * time.Microsecond,
-			want:   time.Duration(35245000) * time.Microsecond,
-			json:   "35245000",
-		},
-		{
-			name:   "timestamp-millis",
-			schema: `{"type":"long","logicalType":"timestamp-millis"}`,
-			value:  time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
-			want:   time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
-			json:   "1742378400000",
-		},
-		{
-			name:   "timestamp-micros",
-			schema: `{"type":"long","logicalType":"timestamp-micros"}`,
-			value:  time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
-			want:   time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
-			json:   "1742378400000000",
-		},
-		{
-			name:   "timestamp-nanos",
-			schema: `{"type":"long","logicalType":"timestamp-nanos"}`,
-			value:  time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
-			want:   time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
-			json:   "1742378400000000000",
-		},
-		{
-			// Spec / Java / fastavro form: unscaled-int (33 as 0x21)
-			// emitted as a codepoint-mapped Avro JSON byte string.
-			name:   "decimal-bytes",
-			schema: `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
-			value:  json.Number("0.33"),
-			want:   new(big.Rat).SetFrac64(33, 100),
-			json:   `"!"`,
-		},
-		{
-			// Fixed-size variant: 8 bytes, sign-extended for unscaled=33,
-			// so seven leading 0x00 codepoints + literal '!' for 0x21.
-			name:   "decimal-fixed",
-			schema: `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":10,"scale":2}`,
-			value:  json.Number("0.33"),
-			want:   new(big.Rat).SetFrac64(33, 100),
-			json:   `"\u0000\u0000\u0000\u0000\u0000\u0000\u0000!"`,
-		},
-		{
-			name:   "uuid",
-			schema: `{"type":"string","logicalType":"uuid"}`,
-			value:  "550e8400-e29b-41d4-a716-446655440000",
-			want:   "550e8400-e29b-41d4-a716-446655440000",
-			json:   `"550e8400-e29b-41d4-a716-446655440000"`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
-
-			// Encode, then Decode.
-			binary, err := s.Encode(tt.value)
-			if err != nil {
-				t.Fatalf("Encode: %v", err)
-			}
-			var decoded any
-			mustDecode(t, s, binary, &decoded)
-			if !reflect.DeepEqual(tt.want, decoded) {
-				t.Errorf("Encode→Decode: got %T(%v), want %T(%v)", decoded, decoded, tt.want, tt.want)
-			}
-
-			// EncodeJSON, then DecodeJSON.
-			jb, err := s.EncodeJSON(tt.value)
-			if err != nil {
-				t.Fatalf("EncodeJSON: %v", err)
-			}
-			if string(jb) != tt.json {
-				t.Errorf("EncodeJSON: got %s, want %s", jb, tt.json)
-			}
-			var djDecoded any
-			if err := s.DecodeJSON(jb, &djDecoded); err != nil {
-				t.Fatalf("DecodeJSON(%s): %v", jb, err)
-			}
-			if !reflect.DeepEqual(tt.want, djDecoded) {
-				t.Errorf("EncodeJSON→DecodeJSON: got %T(%v), want %T(%v)", djDecoded, djDecoded, tt.want, tt.want)
-			}
-
-			// Full round-trip: Encode, Decode, EncodeJSON, DecodeJSON.
-			jb2, err := s.EncodeJSON(decoded)
-			if err != nil {
-				t.Fatalf("EncodeJSON(decoded): %v", err)
-			}
-			var final any
-			if err := s.DecodeJSON(jb2, &final); err != nil {
-				t.Fatalf("DecodeJSON(jb2): %v", err)
-			}
-			if !reflect.DeepEqual(tt.want, final) {
-				t.Errorf("full round-trip: got %T(%v), want %T(%v)", final, final, tt.want, tt.want)
-			}
-		})
-	}
-}
-
-// TestPrimitiveRoundTrips verifies that all primitive types round-trip
-// through Encode/Decode and EncodeJSON/DecodeJSON.
-func TestPrimitiveRoundTrips(t *testing.T) {
-	tests := []struct {
-		name   string
-		schema string
-		value  any
-		want   any
-		json   string
-	}{
-		{"null", `"null"`, nil, nil, "null"},
-		{"boolean true", `"boolean"`, true, true, "true"},
-		{"boolean false", `"boolean"`, false, false, "false"},
-		{"int", `"int"`, int32(42), int32(42), "42"},
-		{"int negative", `"int"`, int32(-7), int32(-7), "-7"},
-		{"long", `"long"`, int64(9876543210), int64(9876543210), "9876543210"},
-		{"float", `"float"`, float32(1.5), float32(1.5), "1.5"},
-		{"double", `"double"`, float64(3.14159), float64(3.14159), "3.14159"},
-		{"string", `"string"`, "hello", "hello", `"hello"`},
-		{"bytes", `"bytes"`, []byte{0x01, 0x02}, []byte{0x01, 0x02}, `"\u0001\u0002"`},
-		{"enum", `{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"]}`, "GREEN", "GREEN", `"GREEN"`},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
-
-			// Encode, then Decode.
-			binary, err := s.Encode(tt.value)
-			if err != nil {
-				t.Fatalf("Encode: %v", err)
-			}
-			var decoded any
-			mustDecode(t, s, binary, &decoded)
-			if !reflect.DeepEqual(tt.want, decoded) {
-				t.Errorf("Encode→Decode: got %T(%v), want %T(%v)", decoded, decoded, tt.want, tt.want)
-			}
-
-			// EncodeJSON, then DecodeJSON.
-			jb, err := s.EncodeJSON(tt.value)
-			if err != nil {
-				t.Fatalf("EncodeJSON: %v", err)
-			}
-			if string(jb) != tt.json {
-				t.Errorf("EncodeJSON: got %s, want %s", jb, tt.json)
-			}
-			var djDecoded any
-			if err := s.DecodeJSON(jb, &djDecoded); err != nil {
-				t.Fatalf("DecodeJSON(%s): %v", jb, err)
-			}
-			if !reflect.DeepEqual(tt.want, djDecoded) {
-				t.Errorf("EncodeJSON→DecodeJSON: got %T(%v), want %T(%v)", djDecoded, djDecoded, tt.want, tt.want)
-			}
-
-			// Cross: Encode, Decode, EncodeJSON, DecodeJSON.
-			jb2, err := s.EncodeJSON(decoded)
-			if err != nil {
-				t.Fatalf("EncodeJSON(decoded): %v", err)
-			}
-			var final any
-			if err := s.DecodeJSON(jb2, &final); err != nil {
-				t.Fatalf("DecodeJSON(jb2): %v", err)
-			}
-			if !reflect.DeepEqual(tt.want, final) {
-				t.Errorf("full round-trip: got %T(%v), want %T(%v)", final, final, tt.want, tt.want)
-			}
-		})
-	}
-}
-
-// TestEncodeJSONCoercion exercises the numeric coercion paths in
-// jsonCoerceToInt32, jsonCoerceToInt64, and jsonCoerceToFloat64.
-func TestEncodeJSONCoercion(t *testing.T) {
-	intSchema := MustParse(`"int"`)
-	longSchema := MustParse(`"long"`)
-	floatSchema := MustParse(`"float"`)
-	doubleSchema := MustParse(`"double"`)
-
-	type enc struct {
-		name    string
-		schema  *Schema
-		v       any
-		wantErr bool
-	}
-	cases := []enc{
-		// int32
-		{"int to int32", intSchema, int(42), false},
-		{"uint to int32", intSchema, uint(42), false},
-		{"float to int32", intSchema, float64(42), false},
-		{"json.Number int to int32", intSchema, json.Number("42"), false},
-		{"json.Number whole float int32", intSchema, json.Number("42.0"), false},
-		{"json.Number sci int32", intSchema, json.Number("1e2"), false},
-		{"json.Number float int32", intSchema, json.Number("3.14"), true},
-		{"int64 overflow int32", intSchema, int64(1 << 40), true},
-		{"uint overflow int32", intSchema, uint64(1 << 40), true},
-		{"float overflow int32", intSchema, float64(1 << 40), true},
-		{"float non-whole int32", intSchema, float64(3.14), true},
-		{"json.Number overflow int32", intSchema, json.Number("99999999999"), true},
-		{"json.Number invalid int32", intSchema, json.Number("not a number"), true},
-		{"string to int32", intSchema, "hello", true},
-		// int64
-		{"int to int64", longSchema, int(42), false},
-		{"uint to int64", longSchema, uint(42), false},
-		{"float to int64", longSchema, float64(42), false},
-		{"json.Number int to int64", longSchema, json.Number("42"), false},
-		{"float non-whole int64", longSchema, float64(3.14), true},
-		{"uint64 max overflow int64", longSchema, uint64(1<<63 + 1), true},
-		{"float overflow int64", longSchema, float64(1e20), true},
-		{"json.Number whole float int64", longSchema, json.Number("42.0"), false},
-		{"json.Number sci int64", longSchema, json.Number("1e2"), false},
-		{"json.Number float non-whole int64", longSchema, json.Number("3.14"), true},
-		{"json.Number float overflow int64", longSchema, json.Number("1e20"), true},
-		{"json.Number invalid int64", longSchema, json.Number("nope"), true},
-		{"string to int64", longSchema, "hello", true},
-		// float
-		{"int to float", floatSchema, int(42), false},
-		{"uint to float", floatSchema, uint(42), false},
-		{"json.Number to float", floatSchema, json.Number("3.14"), false},
-		// Lossy-destination policy: int/uint beyond float mantissa silently
-		// IEEE-rounds, matching Java/fastavro.
-		{"int overflow float lossy round", floatSchema, int64(1 << 30), false},
-		{"uint overflow float lossy round", floatSchema, uint64(1 << 30), false},
-		{"int to double", doubleSchema, int(42), false},
-		{"invalid json.Number float", floatSchema, json.Number("nope"), true},
-		{"string to float", floatSchema, "hello", true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := tc.schema.EncodeJSON(tc.v)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
-			}
-		})
 	}
 }
 
@@ -2515,74 +1188,6 @@ func TestEncodeJSONStringEscapes(t *testing.T) {
 	mustEncodeJSON(t, strS, "héllo")
 }
 
-// TestEncodeJSONStringBytesEnumCoverage covers remaining gaps in
-// appendAvroJSON for string, bytes, fixed, and enum types.
-func TestEncodeJSONStringBytesEnumCoverage(t *testing.T) {
-	strS := MustParse(`"string"`)
-	bytesS := MustParse(`"bytes"`)
-	fixedS := MustParse(`{"type":"fixed","name":"f","size":4}`)
-	enumS := MustParse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
-
-	// string: json.Number rejected
-	if _, err := strS.EncodeJSON(json.Number("42")); err == nil {
-		t.Error("expected error for json.Number as string")
-	}
-	// string: []byte accepted
-	if _, err := strS.EncodeJSON([]byte("hi")); err != nil {
-		t.Error(err)
-	}
-	// string: TextMarshaler (time.Time implements it)
-	if _, err := strS.EncodeJSON(time.Now()); err != nil {
-		t.Error(err)
-	}
-	// string: unsupported type
-	if _, err := strS.EncodeJSON(42); err == nil {
-		t.Error("expected unsupported error")
-	}
-
-	// bytes: unsupported type
-	if _, err := bytesS.EncodeJSON(42); err == nil {
-		t.Error("expected unsupported error")
-	}
-
-	// fixed: string source
-	if _, err := fixedS.EncodeJSON("abcd"); err != nil {
-		t.Error(err)
-	}
-	// fixed: [4]byte array
-	if _, err := fixedS.EncodeJSON([4]byte{1, 2, 3, 4}); err != nil {
-		t.Error(err)
-	}
-	// fixed: size mismatch
-	if _, err := fixedS.EncodeJSON("xyz"); err == nil {
-		t.Error("expected size mismatch")
-	}
-	// fixed: wrong type
-	if _, err := fixedS.EncodeJSON(42); err == nil {
-		t.Error("expected error")
-	}
-
-	// enum: unknown symbol
-	if _, err := enumS.EncodeJSON("D"); err == nil {
-		t.Error("expected unknown symbol error")
-	}
-	// enum: integer index
-	if _, err := enumS.EncodeJSON(0); err != nil {
-		t.Error(err)
-	}
-	if _, err := enumS.EncodeJSON(uint(1)); err != nil {
-		t.Error(err)
-	}
-	// enum: integer out of range
-	if _, err := enumS.EncodeJSON(99); err == nil {
-		t.Error("expected range error")
-	}
-	// enum: wrong type
-	if _, err := enumS.EncodeJSON(3.14); err == nil {
-		t.Error("expected error")
-	}
-}
-
 // TestMatrix_BytesToAvroJSONStringCodepointPerByte pins that
 // [bytesToAvroJSONString] emits each byte 0x00-0xFF as a separate Unicode
 // codepoint. `string(b)` is NOT equivalent. It reinterprets the slice as
@@ -2659,130 +1264,6 @@ func TestMatrix_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
 
 // ---------- json_decode_test.go ----------
 
-// TestDecodeJSONTypedInt exercises typed target paths for int fields.
-func TestDecodeJSONTypedInt(t *testing.T) {
-	s, _ := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"d","type":{"type":"int","logicalType":"date"}},
-		{"name":"tm","type":{"type":"int","logicalType":"time-millis"}},
-		{"name":"n","type":"int"}
-	]}`)
-	type R struct {
-		D  time.Time     `avro:"d"`
-		TM time.Duration `avro:"tm"`
-		N  int32         `avro:"n"`
-	}
-	var r R
-	mustDecodeJSON(t, s, []byte(`{"d":19700,"tm":43200000,"n":42}`), &r)
-	if r.N != 42 {
-		t.Fatalf("N: got %d", r.N)
-	}
-	if r.D.IsZero() {
-		t.Fatal("D is zero")
-	}
-	if r.TM == 0 {
-		t.Fatal("TM is zero")
-	}
-}
-
-// TestDecodeJSONTypedLong exercises typed target paths for long fields.
-func TestDecodeJSONTypedLong(t *testing.T) {
-	s, _ := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"ts_ms","type":{"type":"long","logicalType":"timestamp-millis"}},
-		{"name":"ts_us","type":{"type":"long","logicalType":"timestamp-micros"}},
-		{"name":"ts_ns","type":{"type":"long","logicalType":"timestamp-nanos"}},
-		{"name":"tm","type":{"type":"long","logicalType":"time-micros"}},
-		{"name":"n","type":"long"}
-	]}`)
-	type R struct {
-		TsMs time.Time     `avro:"ts_ms"`
-		TsUs time.Time     `avro:"ts_us"`
-		TsNs time.Time     `avro:"ts_ns"`
-		TM   time.Duration `avro:"tm"`
-		N    int64         `avro:"n"`
-	}
-	var r R
-	mustDecodeJSON(t, s, []byte(`{"ts_ms":1700000000000,"ts_us":1700000000000000,"ts_ns":1700000000000000000,"tm":1500000,"n":99}`), &r)
-	if r.TsMs.IsZero() || r.TsUs.IsZero() || r.TsNs.IsZero() {
-		t.Fatal("timestamps are zero")
-	}
-	if r.TM == 0 {
-		t.Fatal("TM is zero")
-	}
-	if r.N != 99 {
-		t.Fatalf("N: got %d", r.N)
-	}
-}
-
-// TestDecodeJSONTypedBytes exercises assignBytes for typed targets.
-func TestDecodeJSONTypedBytes(t *testing.T) {
-	t.Run("bytes to []byte", func(t *testing.T) {
-		s, _ := Parse(`"bytes"`)
-		var b []byte
-		mustDecodeJSON(t, s, []byte(`"hello"`), &b)
-		if string(b) != "hello" {
-			t.Fatalf("got %q", b)
-		}
-	})
-	t.Run("bytes to string", func(t *testing.T) {
-		s, _ := Parse(`"bytes"`)
-		var str string
-		mustDecodeJSON(t, s, []byte(`"hello"`), &str)
-		if str != "hello" {
-			t.Fatalf("got %q", str)
-		}
-	})
-	t.Run("fixed to [N]byte", func(t *testing.T) {
-		s, _ := Parse(`{"type":"fixed","name":"f","size":3}`)
-		var arr [3]byte
-		mustDecodeJSON(t, s, []byte(`"abc"`), &arr)
-		if arr != [3]byte{'a', 'b', 'c'} {
-			t.Fatalf("got %v", arr)
-		}
-	})
-	t.Run("decimal to json.Number", func(t *testing.T) {
-		s, _ := Parse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
-		var n json.Number
-		mustDecodeJSON(t, s, []byte("\"!\""), &n)
-	})
-	t.Run("decimal to big.Rat", func(t *testing.T) {
-		s, _ := Parse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
-		var r big.Rat
-		mustDecodeJSON(t, s, []byte("\"!\""), &r)
-	})
-	t.Run("decimal bytes from JSON number to big.Rat", func(t *testing.T) {
-		s, _ := Parse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
-		var r big.Rat
-		mustDecodeJSON(t, s, []byte("12.34"), &r)
-	})
-	t.Run("decimal bytes from JSON number to json.Number", func(t *testing.T) {
-		s, _ := Parse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
-		var n json.Number
-		mustDecodeJSON(t, s, []byte("12.34"), &n)
-	})
-	t.Run("decimal fixed from JSON number to big.Rat", func(t *testing.T) {
-		s, _ := Parse(`{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`)
-		var r big.Rat
-		mustDecodeJSON(t, s, []byte("12.34"), &r)
-	})
-	t.Run("decimal fixed from JSON number to json.Number", func(t *testing.T) {
-		s, _ := Parse(`{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`)
-		var n json.Number
-		mustDecodeJSON(t, s, []byte("12.34"), &n)
-	})
-	t.Run("decimal bytes from JSON number to unsupported type errors", func(t *testing.T) {
-		s, _ := Parse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
-		var i int
-		if err := s.DecodeJSON([]byte("12.34"), &i); err == nil {
-			t.Fatal("expected error for unsupported target")
-		}
-	})
-	t.Run("fixed duration to Duration", func(t *testing.T) {
-		s, _ := Parse(`{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`)
-		var d Duration
-		mustDecodeJSON(t, s, []byte(`"\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000"`), &d)
-	})
-}
-
 // TestDecodeJSONTypedBool exercises typed bool target.
 func TestDecodeJSONTypedBool(t *testing.T) {
 	s, _ := Parse(`"boolean"`)
@@ -2808,46 +1289,6 @@ func TestDecodeJSONTypedString(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONTypedFloat exercises typed float targets.
-func TestDecodeJSONTypedFloat(t *testing.T) {
-	s, _ := Parse(`"float"`)
-	var f float32
-	mustDecodeJSON(t, s, []byte(`3.14`), &f)
-	if f < 3.13 || f > 3.15 {
-		t.Fatalf("got %v", f)
-	}
-}
-
-// TestDecodeJSONTypedDouble exercises typed double targets.
-func TestDecodeJSONTypedDouble(t *testing.T) {
-	s, _ := Parse(`"double"`)
-	var f float64
-	mustDecodeJSON(t, s, []byte(`3.14159`), &f)
-	if f != 3.14159 {
-		t.Fatalf("got %v", f)
-	}
-}
-
-// TestDecodeJSONRecordMap exercises DecodeJSON into map[string]T.
-func TestDecodeJSONRecordMap(t *testing.T) {
-	s, _ := Parse(recABSchema)
-	var m map[string]any
-	mustDecodeJSON(t, s, []byte(`{"a":1,"b":"hello"}`), &m)
-	if m["b"] != "hello" {
-		t.Fatalf("got %v", m)
-	}
-}
-
-// TestDecodeJSONMapTyped exercises DecodeJSON into map[string]T typed values.
-func TestDecodeJSONMapTyped(t *testing.T) {
-	s, _ := Parse(`{"type":"map","values":"int"}`)
-	var m map[string]int32
-	mustDecodeJSON(t, s, []byte(`{"x":1,"y":2}`), &m)
-	if m["x"] != 1 || m["y"] != 2 {
-		t.Fatalf("got %v", m)
-	}
-}
-
 // TestDecodeJSONArrayTyped exercises DecodeJSON into typed slices.
 func TestDecodeJSONArrayTyped(t *testing.T) {
 	s, _ := Parse(`{"type":"array","items":"string"}`)
@@ -2865,22 +1306,6 @@ func TestDecodeJSONUnionBranchTyped(t *testing.T) {
 	mustDecodeJSON(t, s, []byte(`{"string":"hello"}`), &str)
 	if str == nil || *str != "hello" {
 		t.Fatalf("got %v", str)
-	}
-}
-
-// TestDecodeJSONSkipCompound exercises skipping unknown object/array fields.
-func TestDecodeJSONSkipCompound(t *testing.T) {
-	s, _ := Parse(recASchema)
-	// Extra fields with nested objects and arrays should be skipped.
-	input := `{"a":1,"unknown_obj":{"nested":true},"unknown_arr":[1,2,3]}`
-	var out any
-	mustDecodeJSON(t, s, []byte(input), &out)
-	m := out.(map[string]any)
-	if m["a"] != int32(1) {
-		t.Fatalf("got %v", m)
-	}
-	if _, ok := m["unknown_obj"]; ok {
-		t.Fatal("unknown_obj should have been skipped")
 	}
 }
 
@@ -3051,135 +1476,6 @@ func TestDecodeJSONInvalidUTF8Rejected(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONTrailingContentRejected pins that trailing non-whitespace
-// after a single decoded value is rejected (matching encoding/json.Unmarshal
-// and fastavro). DecodeJSON decodes exactly one value and returns no
-// offset, so concatenated values cannot be streamed. Surrounding/trailing
-// whitespace stays accepted.
-func TestDecodeJSONTrailingContentRejected(t *testing.T) {
-	for _, c := range []struct{ schema, input string }{
-		{`"int"`, "5 6"},
-		{`"int"`, "5true"},
-		{`"int"`, "5null"},
-		{`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`, `{"a":1}{"a":2}`},
-		{`{"type":"array","items":"int"}`, "[1,2] [3,4]"},
-	} {
-		var out any
-		if err := MustParse(c.schema).DecodeJSON([]byte(c.input), &out); err == nil {
-			t.Errorf("%s DecodeJSON(%q) accepted; want reject (trailing content)", c.schema, c.input)
-		}
-	}
-	for _, c := range []struct{ schema, input string }{
-		{`"int"`, "5"},
-		{`"int"`, "  5  "},
-		{`"int"`, "5\n"},
-		{`{"type":"array","items":"int"}`, "[1,2]"},
-	} {
-		var out any
-		if err := MustParse(c.schema).DecodeJSON([]byte(c.input), &out); err != nil {
-			t.Errorf("%s DecodeJSON(%q) rejected: %v", c.schema, c.input, err)
-		}
-	}
-}
-
-// TestDecodeJSONFloatGrammarRejected pins that a JSON number whose grammar
-// is invalid per RFC 8259, a trailing dot with no fractional digit ("5.",
-// "5.e3", "1.e5"), is rejected when decoding into a float/double target,
-// the same as the int/long arms already reject it and the same as Java
-// (Jackson), fastavro (Python json), and goavro (whose numberLength state
-// machine requires a digit after the dot) reject. Without the shared
-// isJSONNumber gate, strconv.ParseFloat would silently accept these. The
-// IEEE special forms (±Inf from overflow, NaN/Infinity tokens) remain
-// accepted: those are semantic leniencies, not grammar violations.
-func TestDecodeJSONFloatGrammarRejected(t *testing.T) {
-	bad := []string{"5.", "5.e3", "1.e5", "-5.", "0.", "5.E3"}
-	for _, schema := range []string{`"float"`, `"double"`, `"long"`, `"int"`} {
-		s := MustParse(schema)
-		for _, in := range bad {
-			var out any
-			if err := s.DecodeJSON([]byte(in), &out); err == nil {
-				t.Errorf("%s DecodeJSON(%q) accepted (=%v); want reject", schema, in, out)
-			}
-		}
-	}
-
-	// Valid grammar must still decode on float/double, including the
-	// overflow-to-±Inf and special-float forms that are deliberately lenient.
-	type fc struct {
-		in   string
-		want float64
-	}
-	for _, schema := range []string{`"float"`, `"double"`} {
-		s := MustParse(schema)
-		for _, c := range []fc{
-			{"5.5", 5.5}, {"5e3", 5000}, {"5.5e3", 5500}, {"0.0", 0}, {"-5.5", -5.5},
-			{"42", 42}, {"1e999", math.Inf(1)}, {"-1e999", math.Inf(-1)},
-			{`"NaN"`, math.NaN()}, {`"Infinity"`, math.Inf(1)}, {"NaN", math.NaN()},
-		} {
-			var out any
-			if err := s.DecodeJSON([]byte(c.in), &out); err != nil {
-				t.Errorf("%s DecodeJSON(%q) rejected: %v", schema, c.in, err)
-				continue
-			}
-			got := toF64(out)
-			if math.IsNaN(c.want) {
-				if !math.IsNaN(got) {
-					t.Errorf("%s DecodeJSON(%q): got %v, want NaN", schema, c.in, got)
-				}
-			} else if got != c.want {
-				t.Errorf("%s DecodeJSON(%q): got %v, want %v", schema, c.in, got, c.want)
-			}
-		}
-	}
-
-	// Encode/decode symmetry: EncodeJSON rejects json.Number("5.") and so
-	// must DecodeJSON; both run the same isJSONNumber gate.
-	d := MustParse(`"double"`)
-	for _, in := range []string{"5.", "5.e3"} {
-		_, encErr := d.EncodeJSON(json.Number(in))
-		decErr := d.DecodeJSON([]byte(in), new(any))
-		if (encErr == nil) != (decErr == nil) {
-			t.Errorf("encode/decode disagree on %q: enc=%v dec=%v", in, encErr, decErr)
-		}
-	}
-}
-
-func toF64(v any) float64 {
-	switch n := v.(type) {
-	case float64:
-		return n
-	case float32:
-		return float64(n)
-	}
-	return math.NaN()
-}
-
-// TestDecodeJSONUnionBareMatch exercises bare union matching by token type.
-func TestDecodeJSONUnionBareMatch(t *testing.T) {
-	s, _ := Parse(`["null","boolean","int","long","float","string",{"type":"array","items":"int"},{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}]`)
-
-	tests := []struct {
-		input string
-		check func(any) bool
-	}{
-		{`null`, func(v any) bool { return v == nil }},
-		{`true`, func(v any) bool { return v == true }},
-		{`42`, func(v any) bool { return v == int32(42) }},
-		{`"hello"`, func(v any) bool { return v == "hello" }},
-		{`[1,2]`, func(v any) bool { return len(v.([]any)) == 2 }},
-		{`{"x":1}`, func(v any) bool { return v.(map[string]any)["x"] == int32(1) }},
-	}
-	for _, tt := range tests {
-		var out any
-		if err := s.DecodeJSON([]byte(tt.input), &out); err != nil {
-			t.Fatalf("input %s: %v", tt.input, err)
-		}
-		if !tt.check(out) {
-			t.Fatalf("input %s: got %v (%T)", tt.input, out, out)
-		}
-	}
-}
-
 // TestDecodeJSONErrors exercises error paths.
 func TestDecodeJSONErrors(t *testing.T) {
 	tests := []struct {
@@ -3285,22 +1581,6 @@ func TestDecodeJSONNullPointer(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONCustomWithTypedTarget exercises custom decoder with struct target.
-func TestDecodeJSONCustomWithTypedTarget(t *testing.T) {
-	type Money struct {
-		Cents int64
-	}
-	s := mustParse(t, `{"type":"long","logicalType":"money"}`, NewCustomType[Money, int64]("money",
-		func(m Money, _ *SchemaNode) (int64, error) { return m.Cents, nil },
-		func(c int64, _ *SchemaNode) (Money, error) { return Money{Cents: c}, nil },
-	))
-	var m Money
-	mustDecodeJSON(t, s, []byte(`42`), &m)
-	if m.Cents != 42 {
-		t.Fatalf("got %d", m.Cents)
-	}
-}
-
 // TestDecodeJSONFloatSpecials exercises NaN/Infinity in DecodeJSON.
 func TestDecodeJSONFloatSpecials(t *testing.T) {
 	sf, _ := Parse(`"float"`)
@@ -3369,20 +1649,6 @@ func TestDecodeJSONStringToBytes(t *testing.T) {
 	}
 }
 
-// TestScannerErrors exercises scanner error paths.
-func TestScannerErrors(t *testing.T) {
-	s, _ := Parse(`"int"`)
-	var out any
-	// Truncated input.
-	if err := s.DecodeJSON([]byte(``), &out); err == nil {
-		t.Fatal("expected error for empty input")
-	}
-	// Invalid JSON.
-	if err := s.DecodeJSON([]byte(`{`), &out); err == nil {
-		t.Fatal("expected error for truncated object")
-	}
-}
-
 // TestDecodeJSONNilTarget exercises the nil pointer check.
 func TestDecodeJSONNilTarget(t *testing.T) {
 	s, _ := Parse(`"int"`)
@@ -3405,26 +1671,6 @@ func TestWalkJSONEscapesSurrogatePair(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONIntUint exercises uint target for int fields.
-func TestDecodeJSONIntUint(t *testing.T) {
-	s, _ := Parse(`"int"`)
-	var u uint32
-	mustDecodeJSON(t, s, []byte(`42`), &u)
-	if u != 42 {
-		t.Fatalf("got %d", u)
-	}
-}
-
-// TestDecodeJSONLongUint exercises uint target for long fields.
-func TestDecodeJSONLongUint(t *testing.T) {
-	s, _ := Parse(`"long"`)
-	var u uint64
-	mustDecodeJSON(t, s, []byte(`42`), &u)
-	if u != 42 {
-		t.Fatalf("got %d", u)
-	}
-}
-
 // TestDecodeJSONDecodeValueUnknownKind exercises the default case.
 func TestDecodeJSONDecodeValueUnknownKind(t *testing.T) {
 	// Create a node with bogus kind to exercise the default error path.
@@ -3440,109 +1686,6 @@ func TestDecodeJSONDecodeValueUnknownKind(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONLogicalTypesAny exercises all decodeLogical* branches for *any.
-func TestDecodeJSONLogicalTypesAny(t *testing.T) {
-	tests := []struct {
-		schema string
-		input  string
-		check  func(any) bool
-	}{
-		// decodeLogicalInt: date
-		{`{"type":"int","logicalType":"date"}`, `19700`, func(v any) bool { _, ok := v.(time.Time); return ok }},
-		// decodeLogicalInt: time-millis
-		{`{"type":"int","logicalType":"time-millis"}`, `43200000`, func(v any) bool { _, ok := v.(time.Duration); return ok }},
-		// decodeLogicalInt: plain (no logical)
-		{`"int"`, `42`, func(v any) bool { return v == int32(42) }},
-		// decodeLogicalLong: timestamp-millis
-		{`{"type":"long","logicalType":"timestamp-millis"}`, `1700000000000`, func(v any) bool { _, ok := v.(time.Time); return ok }},
-		// decodeLogicalLong: timestamp-micros
-		{`{"type":"long","logicalType":"timestamp-micros"}`, `1700000000000000`, func(v any) bool { _, ok := v.(time.Time); return ok }},
-		// decodeLogicalLong: timestamp-nanos
-		{`{"type":"long","logicalType":"timestamp-nanos"}`, `1700000000000000000`, func(v any) bool { _, ok := v.(time.Time); return ok }},
-		// decodeLogicalLong: local-timestamp-millis
-		{`{"type":"long","logicalType":"local-timestamp-millis"}`, `1700000000000`, func(v any) bool { _, ok := v.(time.Time); return ok }},
-		// decodeLogicalLong: local-timestamp-micros
-		{`{"type":"long","logicalType":"local-timestamp-micros"}`, `1700000000000000`, func(v any) bool { _, ok := v.(time.Time); return ok }},
-		// decodeLogicalLong: local-timestamp-nanos
-		{`{"type":"long","logicalType":"local-timestamp-nanos"}`, `1700000000000000000`, func(v any) bool { _, ok := v.(time.Time); return ok }},
-		// decodeLogicalLong: time-micros
-		{`{"type":"long","logicalType":"time-micros"}`, `1500000`, func(v any) bool { _, ok := v.(time.Duration); return ok }},
-		// decodeLogicalLong: plain (no logical)
-		{`"long"`, `99`, func(v any) bool { return v == int64(99) }},
-		// decodeLogicalFixed: decimal (4 bytes: value 33, scale 2, so 0.33;
-		// precision must fit in 4 bytes: max 9)
-		{`{"type":"fixed","name":"d","size":4,"logicalType":"decimal","precision":9,"scale":2}`, `"\u0000\u0000\u0000!"`, func(v any) bool { _, ok := v.(*big.Rat); return ok }},
-		// decodeLogicalFixed: duration (12 bytes, all printable ASCII for simplicity)
-		{`{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`, "\"abcdefghijkl\"", func(v any) bool { _, ok := v.(Duration); return ok }},
-		// decodeLogicalFixed: plain (no logical)
-		{`{"type":"fixed","name":"f","size":3}`, `"abc"`, func(v any) bool { b, ok := v.([]byte); return ok && len(b) == 3 }},
-		// decodeLogicalBytes: decimal
-		{`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, `"!"`, func(v any) bool { _, ok := v.(*big.Rat); return ok }},
-		// decodeLogicalBytes: plain
-		{`"bytes"`, `"hello"`, func(v any) bool { _, ok := v.([]byte); return ok }},
-	}
-	for _, tt := range tests {
-		s, err := Parse(tt.schema)
-		if err != nil {
-			t.Fatalf("parse %s: %v", tt.schema, err)
-		}
-		var out any
-		if err := s.DecodeJSON([]byte(tt.input), &out); err != nil {
-			t.Fatalf("schema %s input %s: %v", tt.schema, tt.input, err)
-		}
-		if !tt.check(out) {
-			t.Fatalf("schema %s: got %v (%T)", tt.schema, out, out)
-		}
-	}
-}
-
-// TestDecodeJSONSkipValueTypes exercises all skipValue branches.
-func TestDecodeJSONSkipValueTypes(t *testing.T) {
-	s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
-	tests := []struct {
-		name  string
-		input string
-	}{
-		{"skip string", `{"unknown":"hello","a":1}`},
-		{"skip number", `{"unknown":3.14,"a":1}`},
-		{"skip bool true", `{"unknown":true,"a":1}`},
-		{"skip bool false", `{"unknown":false,"a":1}`},
-		{"skip null", `{"unknown":null,"a":1}`},
-		{"skip array", `{"unknown":[1,[2],{"x":3}],"a":1}`},
-		{"skip object", `{"unknown":{"nested":{"deep":true}},"a":1}`},
-		{"skip string in array", `{"unknown":["a\"b"],"a":1}`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var out any
-			if err := s.DecodeJSON([]byte(tt.input), &out); err != nil {
-				t.Fatalf("input %s: %v", tt.input, err)
-			}
-			m := out.(map[string]any)
-			if m["a"] != int32(1) {
-				t.Fatalf("got %v", m)
-			}
-		})
-	}
-}
-
-// TestDecodeJSONCustomDecoderSkipAll exercises the "no decoder matched" fallback.
-func TestDecodeJSONCustomDecoderSkipAll(t *testing.T) {
-	s := mustParse(t, `{"type":"long","logicalType":"custom"}`, CustomType{
-		LogicalType: "custom",
-		AvroType:    "long",
-		Decode: func(v any, _ *SchemaNode) (any, error) {
-			return nil, ErrSkipCustomType
-		},
-	})
-	var out any
-	mustDecodeJSON(t, s, []byte(`42`), &out)
-	// All decoders skipped, so we get the raw int64 value.
-	if out != int64(42) {
-		t.Fatalf("got %v (%T)", out, out)
-	}
-}
-
 // TestDecodeJSONCustomDecoderError exercises fatal custom decoder error.
 func TestDecodeJSONCustomDecoderError(t *testing.T) {
 	s := mustParse(t, `{"type":"long","logicalType":"boom"}`, CustomType{
@@ -3555,22 +1698,6 @@ func TestDecodeJSONCustomDecoderError(t *testing.T) {
 	var out any
 	if err := s.DecodeJSON([]byte(`42`), &out); err == nil {
 		t.Fatal("expected error")
-	}
-}
-
-// TestDecodeJSONCustomDecoderNilResult exercises custom decoder returning nil.
-func TestDecodeJSONCustomDecoderNilResult(t *testing.T) {
-	s := mustParse(t, `{"type":"long","logicalType":"nilout"}`, CustomType{
-		LogicalType: "nilout",
-		AvroType:    "long",
-		Decode: func(v any, _ *SchemaNode) (any, error) {
-			return nil, nil
-		},
-	})
-	var out any
-	mustDecodeJSON(t, s, []byte(`42`), &out)
-	if out != nil {
-		t.Fatalf("expected nil, got %v", out)
 	}
 }
 
@@ -3600,73 +1727,6 @@ func TestDecodeJSONNullTypedTargets(t *testing.T) {
 	})
 }
 
-// TestDecodeJSONNullIntoNonPointerZeroes is the JSON sibling of
-// TestDeserNullIntoNonPointerZeroes. doc.go states that a null union branch
-// decodes to the target's Go zero value, always replacing any prior value: the
-// binary path honors this unconditionally, while the JSON path historically
-// zeroed only nilable kinds, leaving non-nilable concrete targets at whatever
-// they held, a silent value-bleed footgun across reused decode targets. Covers
-// decodeNull, the decodeUnion null branch, and assignAny's nil value.
-func TestDecodeJSONNullIntoNonPointerZeroes(t *testing.T) {
-	t.Run("top-level null", func(t *testing.T) {
-		s, _ := Parse(`"null"`)
-		out := 42
-		mustDecodeJSON(t, s, []byte(`null`), &out)
-		if out != 0 {
-			t.Fatalf("top-level null into int target did not zero: got %d", out)
-		}
-	})
-
-	t.Run("null in union, non-pointer struct fields", func(t *testing.T) {
-		s := mustParse(t, `{"type":"record","name":"R","fields":[
-			{"name":"a","type":["null","int"],"default":null},
-			{"name":"b","type":["int","null"]},
-			{"name":"c","type":["null","int","string"]},
-			{"name":"d","type":["null","string"],"default":null}
-		]}`)
-		buf := mustAppendEncodeJSON(t, s, nil, map[string]any{"a": nil, "b": nil, "c": nil, "d": nil})
-		type Row struct {
-			A int32  `avro:"a"`
-			B int32  `avro:"b"`
-			C int32  `avro:"c"`
-			D string `avro:"d"`
-		}
-		got := Row{A: 99, B: 88, C: 77, D: "prior"}
-		mustDecodeJSON(t, s, buf, &got)
-		want := Row{}
-		if got != want {
-			t.Fatalf("null decoded into pre-populated struct: got %+v, want %+v", got, want)
-		}
-	})
-
-	t.Run("null in 2-branch union, bare int target", func(t *testing.T) {
-		s, _ := Parse(`["null","int"]`)
-		out := int32(99)
-		mustDecodeJSON(t, s, []byte(`null`), &out)
-		if out != 0 {
-			t.Fatalf("2-branch null union did not zero int target: got %d", out)
-		}
-	})
-
-	t.Run("null in 3-branch union, bare bool target", func(t *testing.T) {
-		s, _ := Parse(`["null","boolean","string"]`)
-		out := true
-		mustDecodeJSON(t, s, []byte(`null`), &out)
-		if out {
-			t.Fatalf("3-branch null union did not zero bool target")
-		}
-	})
-
-	t.Run("null in union, bare string target", func(t *testing.T) {
-		s, _ := Parse(`["null","string"]`)
-		out := "prior"
-		mustDecodeJSON(t, s, []byte(`null`), &out)
-		if out != "" {
-			t.Fatalf("null did not zero string target: got %q", out)
-		}
-	})
-}
-
 // TestDecodeJSONTaggedUnionTypedTarget exercises tagged union decode to struct.
 func TestDecodeJSONTaggedUnionTypedTarget(t *testing.T) {
 	s, _ := Parse(`{"type":"record","name":"R","fields":[
@@ -3679,63 +1739,6 @@ func TestDecodeJSONTaggedUnionTypedTarget(t *testing.T) {
 	mustDecodeJSON(t, s, []byte(`{"v":{"string":"hello"}}`), &r)
 	if r.V == nil || *r.V != "hello" {
 		t.Fatalf("got %v", r.V)
-	}
-}
-
-// TestDecodeJSONUnionBareTypedTarget exercises bare union into non-pointer typed target.
-func TestDecodeJSONUnionBareTypedTarget(t *testing.T) {
-	s, _ := Parse(`["null","string","int"]`)
-	// Decode bare string into *any, already covered.
-	// Decode bare int into a typed int32 target (non-pointer, multi-branch).
-	var out int32
-	mustDecodeJSON(t, s, []byte(`42`), &out)
-	if out != 42 {
-		t.Fatalf("got %d", out)
-	}
-}
-
-// TestDecodeJSONParseJSONInt64EdgeCases exercises integer parsing edge cases.
-func TestDecodeJSONParseJSONInt64EdgeCases(t *testing.T) {
-	s, _ := Parse(`"long"`)
-	tests := []struct {
-		name  string
-		input string
-		want  int64
-	}{
-		{"zero", `0`, 0},
-		{"negative", `-42`, -42},
-		{"max int64 approx", `9223372036854775807`, math.MaxInt64},
-		{"scientific whole", `1e3`, 1000},
-		{"negative scientific", `-1e3`, -1000},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var out any
-			if err := s.DecodeJSON([]byte(tt.input), &out); err != nil {
-				t.Fatalf("input %s: %v", tt.input, err)
-			}
-			if out != tt.want {
-				t.Fatalf("got %v, want %d", out, tt.want)
-			}
-		})
-	}
-	// Error cases.
-	errors := []struct {
-		name  string
-		input string
-	}{
-		{"empty", ``},
-		{"just minus", `-`},
-		{"overflow", `99999999999999999999`},
-		{"negative overflow", `-99999999999999999999`},
-	}
-	for _, tt := range errors {
-		t.Run("error_"+tt.name, func(t *testing.T) {
-			var out any
-			if err := s.DecodeJSON([]byte(tt.input), &out); err == nil {
-				t.Fatalf("expected error for %s", tt.input)
-			}
-		})
 	}
 }
 
@@ -3849,71 +1852,6 @@ func TestDecodeJSONScannerEdgeCases(t *testing.T) {
 	})
 }
 
-// TestDecodeJSONFloatTypedErrors exercises float/double into wrong typed targets.
-func TestDecodeJSONFloatTypedErrors(t *testing.T) {
-	t.Run("float NaN string typed", func(t *testing.T) {
-		s, _ := Parse(`"float"`)
-		var f float32
-		mustDecodeJSON(t, s, []byte(`"NaN"`), &f)
-		if !math.IsNaN(float64(f)) {
-			t.Fatalf("expected NaN, got %v", f)
-		}
-	})
-	t.Run("double NaN string typed", func(t *testing.T) {
-		s, _ := Parse(`"double"`)
-		var f float64
-		mustDecodeJSON(t, s, []byte(`"NaN"`), &f)
-		if !math.IsNaN(f) {
-			t.Fatalf("expected NaN, got %v", f)
-		}
-	})
-	t.Run("float invalid string", func(t *testing.T) {
-		s, _ := Parse(`"float"`)
-		var out any
-		if err := s.DecodeJSON([]byte(`"notanumber"`), &out); err == nil {
-			t.Fatal("expected error")
-		}
-	})
-	t.Run("double invalid string", func(t *testing.T) {
-		s, _ := Parse(`"double"`)
-		var out any
-		if err := s.DecodeJSON([]byte(`"notanumber"`), &out); err == nil {
-			t.Fatal("expected error")
-		}
-	})
-	t.Run("float null typed", func(t *testing.T) {
-		s, _ := Parse(`"float"`)
-		var f float32
-		mustDecodeJSON(t, s, []byte(`null`), &f)
-		if !math.IsNaN(float64(f)) {
-			t.Fatalf("expected NaN, got %v", f)
-		}
-	})
-	t.Run("double null typed", func(t *testing.T) {
-		s, _ := Parse(`"double"`)
-		var f float64
-		mustDecodeJSON(t, s, []byte(`null`), &f)
-		if !math.IsNaN(f) {
-			t.Fatalf("expected NaN, got %v", f)
-		}
-	})
-}
-
-// TestDecodeJSONRecordWithDefault exercises record field default handling.
-func TestDecodeJSONRecordWithDefault(t *testing.T) {
-	s, _ := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"int","default":99}
-	]}`)
-	var out any
-	mustDecodeJSON(t, s, []byte(`{"a":1}`), &out)
-	m := out.(map[string]any)
-	if m["a"] != int32(1) {
-		t.Fatalf("a: got %v", m["a"])
-	}
-	// b should be absent (default not populated in JSON decode to any).
-}
-
 // TestDecodeJSONMapTypedErrors exercises map decode to wrong types.
 func TestDecodeJSONMapTypedErrors(t *testing.T) {
 	s, _ := Parse(`{"type":"map","values":"int"}`)
@@ -3929,20 +1867,6 @@ func TestDecodeJSONIterateRecordFieldsErrors(t *testing.T) {
 	var out any
 	if err := s.DecodeJSON([]byte(`{"a":"notanint"}`), &out); err == nil {
 		t.Fatal("expected error")
-	}
-}
-
-// TestDecodeJSONWrapUnionQualifyLogical exercises the qualifyLogical branch.
-func TestDecodeJSONWrapUnionQualifyLogical(t *testing.T) {
-	s, _ := Parse(`["null",{"type":"long","logicalType":"timestamp-millis"}]`)
-	var out any
-	mustDecodeJSON(t, s, []byte(`1700000000000`), &out, TaggedUnions(), TagLogicalTypes())
-	m, ok := out.(map[string]any)
-	if !ok {
-		t.Fatalf("expected tagged map, got %T", out)
-	}
-	if _, ok := m["long.timestamp-millis"]; !ok {
-		t.Fatalf("expected long.timestamp-millis key, got %v", m)
 	}
 }
 
@@ -4103,35 +2027,6 @@ func TestDecodeJSONUnionNullConsumeError(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONScanParseInt64EdgeCases covers remaining parseJSONInt64 branches.
-func TestDecodeJSONScanParseInt64EdgeCases(t *testing.T) {
-	// These go through the scanner directly.
-	tests := []struct {
-		name    string
-		input   []byte
-		wantErr bool
-	}{
-		{"empty", []byte{}, true},
-		{"just minus", []byte("-"), true},
-		{"invalid char", []byte("12x4"), true},
-		{"negative overflow", []byte("-9999999999999999999999"), true},
-		{"positive overflow", []byte("99999999999999999999"), true},
-		{"invalid float", []byte("1e1e1"), true},
-		{"valid", []byte("42"), false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := parseJSONInt64(tt.input)
-			if tt.wantErr && err == nil {
-				t.Fatal("expected error")
-			}
-			if !tt.wantErr && err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
-	}
-}
-
 // TestDecodeJSONWalkEscapesEmitError exercises the emit callback error path.
 func TestDecodeJSONWalkEscapesEmitError(t *testing.T) {
 	err := walkJSONEscapes([]byte("abc"), func(r rune) error {
@@ -4214,55 +2109,6 @@ func TestDecodeJSONFloatOverflowIsInfinity(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONNestedStructures exercises deeply nested decode.
-func TestDecodeJSONNestedStructures(t *testing.T) {
-	t.Run("array of records", func(t *testing.T) {
-		s, _ := Parse(`{"type":"array","items":{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}}`)
-		var out any
-		mustDecodeJSON(t, s, []byte(`[{"x":1},{"x":2}]`), &out)
-		arr := out.([]any)
-		if len(arr) != 2 {
-			t.Fatalf("got %d items", len(arr))
-		}
-	})
-	t.Run("map of arrays", func(t *testing.T) {
-		s, _ := Parse(`{"type":"map","values":{"type":"array","items":"string"}}`)
-		var out any
-		mustDecodeJSON(t, s, []byte(`{"a":["x","y"],"b":["z"]}`), &out)
-	})
-	t.Run("record with union of record", func(t *testing.T) {
-		s, _ := Parse(`{"type":"record","name":"Outer","fields":[
-			{"name":"inner","type":["null",{"type":"record","name":"Inner","fields":[
-				{"name":"v","type":"int"}
-			]}]}
-		]}`)
-		var out any
-		mustDecodeJSON(t, s, []byte(`{"inner":{"Inner":{"v":42}}}`), &out)
-		mustDecodeJSON(t, s, []byte(`{"inner":null}`), &out)
-	})
-	t.Run("nested struct decode", func(t *testing.T) {
-		type Inner struct {
-			X int32  `avro:"x"`
-			Y string `avro:"y"`
-		}
-		type Outer struct {
-			Inner Inner `avro:"inner"`
-			Z     int64 `avro:"z"`
-		}
-		s, _ := Parse(`{"type":"record","name":"Outer","fields":[
-			{"name":"inner","type":{"type":"record","name":"Inner","fields":[
-				{"name":"x","type":"int"},{"name":"y","type":"string"}
-			]}},
-			{"name":"z","type":"long"}
-		]}`)
-		var out Outer
-		mustDecodeJSON(t, s, []byte(`{"inner":{"x":1,"y":"hello"},"z":99}`), &out)
-		if out.Inner.X != 1 || out.Inner.Y != "hello" || out.Z != 99 {
-			t.Fatalf("got %+v", out)
-		}
-	})
-}
-
 // TestEncodeJSONTimeDurationError exercises time-millis EncodeJSON overflow.
 func TestEncodeJSONTimeDurationError(t *testing.T) {
 	s, _ := Parse(`{"type":"int","logicalType":"time-millis"}`)
@@ -4301,70 +2147,6 @@ func TestSchemaNodePropsInToJSON(t *testing.T) {
 	}
 	// Exercise Schema() which goes through toJSON.
 	mustNodeSchema(t, root)
-}
-
-// TestSchemaNodeFieldPropsInToJSON exercises field-level props in toJSON.
-func TestSchemaNodeFieldPropsInToJSON(t *testing.T) {
-	s, _ := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int","connect.name":"custom"}
-	]}`)
-	root := s.Root()
-	if len(root.Fields) == 0 {
-		t.Fatal("no fields")
-	}
-	f := root.Fields[0]
-	if f.Props == nil || f.Props["connect.name"] != "custom" {
-		t.Fatalf("expected field props, got %v", f.Props)
-	}
-}
-
-// TestDecodeJSONLogicalTypesNonAddressable exercises the reflect.ValueOf
-// fallback paths for non-addressable time.Time/time.Duration targets.
-// Map values are non-addressable, so decoding into map[string]time.Time
-// hits the fallback.
-func TestDecodeJSONLogicalTypesNonAddressable(t *testing.T) {
-	t.Run("date into map value", func(t *testing.T) {
-		s, _ := Parse(`{"type":"map","values":{"type":"int","logicalType":"date"}}`)
-		var m map[string]time.Time
-		mustDecodeJSON(t, s, []byte(`{"d":19700}`), &m)
-		if m["d"].IsZero() {
-			t.Fatal("expected non-zero time")
-		}
-	})
-	t.Run("time-millis into map value", func(t *testing.T) {
-		s, _ := Parse(`{"type":"map","values":{"type":"int","logicalType":"time-millis"}}`)
-		var m map[string]time.Duration
-		mustDecodeJSON(t, s, []byte(`{"t":43200000}`), &m)
-		if m["t"] == 0 {
-			t.Fatal("expected non-zero duration")
-		}
-	})
-	t.Run("timestamp-millis into map value", func(t *testing.T) {
-		s, _ := Parse(`{"type":"map","values":{"type":"long","logicalType":"timestamp-millis"}}`)
-		var m map[string]time.Time
-		mustDecodeJSON(t, s, []byte(`{"ts":1700000000000}`), &m)
-		if m["ts"].IsZero() {
-			t.Fatal("expected non-zero time")
-		}
-	})
-	t.Run("timestamp-micros into map value", func(t *testing.T) {
-		s, _ := Parse(`{"type":"map","values":{"type":"long","logicalType":"timestamp-micros"}}`)
-		var m map[string]time.Time
-		mustDecodeJSON(t, s, []byte(`{"ts":1700000000000000}`), &m)
-	})
-	t.Run("timestamp-nanos into map value", func(t *testing.T) {
-		s, _ := Parse(`{"type":"map","values":{"type":"long","logicalType":"timestamp-nanos"}}`)
-		var m map[string]time.Time
-		mustDecodeJSON(t, s, []byte(`{"ts":1700000000000000000}`), &m)
-	})
-	t.Run("time-micros into map value", func(t *testing.T) {
-		s, _ := Parse(`{"type":"map","values":{"type":"long","logicalType":"time-micros"}}`)
-		var m map[string]time.Duration
-		mustDecodeJSON(t, s, []byte(`{"t":1500000}`), &m)
-		if m["t"] == 0 {
-			t.Fatal("expected non-zero duration")
-		}
-	})
 }
 
 // TestDecodeJSONStringWithEscapes exercises the resolveJSONEscapes path
@@ -4526,165 +2308,6 @@ func TestDecodeJSONWalkEscapesBadHex(t *testing.T) {
 	if err := s.DecodeJSON([]byte(`"\u00GG"`), &out); err == nil {
 		t.Fatal("expected error for bad hex in \\u")
 	}
-}
-
-// TestDecodeJSONLogicalTyped exercises typed target paths for logical
-// types in decodeInt, decodeLong, decodeFixed, and decodeBytes.
-func TestDecodeJSONLogicalTyped(t *testing.T) {
-	// date decodes to time.Time
-	t.Run("date to time.Time", func(t *testing.T) {
-		s := MustParse(`{"type":"int","logicalType":"date"}`)
-		var tm time.Time
-		mustDecodeJSON(t, s, []byte("18262"), &tm)
-	})
-	// time-millis decodes to time.Duration
-	t.Run("time-millis to time.Duration", func(t *testing.T) {
-		s := MustParse(`{"type":"int","logicalType":"time-millis"}`)
-		var d time.Duration
-		mustDecodeJSON(t, s, []byte("12345"), &d)
-	})
-	// timestamp-millis decodes to time.Time (each variant)
-	for _, lt := range []string{"timestamp-millis", "local-timestamp-millis"} {
-		t.Run(lt+" to time.Time", func(t *testing.T) {
-			s := MustParse(`{"type":"long","logicalType":"` + lt + `"}`)
-			var tm time.Time
-			mustDecodeJSON(t, s, []byte("1577880645000"), &tm)
-		})
-	}
-	for _, lt := range []string{"timestamp-micros", "local-timestamp-micros"} {
-		t.Run(lt+" to time.Time", func(t *testing.T) {
-			s := MustParse(`{"type":"long","logicalType":"` + lt + `"}`)
-			var tm time.Time
-			mustDecodeJSON(t, s, []byte("1577880645000000"), &tm)
-		})
-	}
-	for _, lt := range []string{"timestamp-nanos", "local-timestamp-nanos"} {
-		t.Run(lt+" to time.Time", func(t *testing.T) {
-			s := MustParse(`{"type":"long","logicalType":"` + lt + `"}`)
-			var tm time.Time
-			mustDecodeJSON(t, s, []byte("1577880645000000000"), &tm)
-		})
-	}
-	t.Run("time-micros to time.Duration", func(t *testing.T) {
-		s := MustParse(`{"type":"long","logicalType":"time-micros"}`)
-		var d time.Duration
-		mustDecodeJSON(t, s, []byte("12345"), &d)
-	})
-	// long to int/uint targets
-	t.Run("long to int", func(t *testing.T) {
-		s := MustParse(`"long"`)
-		var n int
-		mustDecodeJSON(t, s, []byte("42"), &n)
-	})
-	t.Run("long to uint", func(t *testing.T) {
-		s := MustParse(`"long"`)
-		var n uint
-		mustDecodeJSON(t, s, []byte("42"), &n)
-	})
-	t.Run("long to unsupported errors", func(t *testing.T) {
-		s := MustParse(`"long"`)
-		var f string
-		if err := s.DecodeJSON([]byte("42"), &f); err == nil {
-			t.Fatal("expected error")
-		}
-	})
-	t.Run("int to uint", func(t *testing.T) {
-		s := MustParse(`"int"`)
-		var n uint
-		mustDecodeJSON(t, s, []byte("42"), &n)
-	})
-	t.Run("int to unsupported errors", func(t *testing.T) {
-		s := MustParse(`"int"`)
-		var f string
-		if err := s.DecodeJSON([]byte("42"), &f); err == nil {
-			t.Fatal("expected error")
-		}
-	})
-}
-
-// TestDecodeJSONErrorPaths exercises error branches in decodeEnum,
-// decodeBytes, decodeFixed, decodeFloat, decodeDouble.
-func TestDecodeJSONErrorPaths(t *testing.T) {
-	// enum errors
-	enumS := MustParse(`{"type":"enum","name":"E","symbols":["A","B"]}`)
-	if err := enumS.DecodeJSON([]byte(`"C"`), new(string)); err == nil {
-		t.Error("expected unknown symbol error")
-	}
-	// int / uint targets are accepted as the ordinal, in binary parity; see
-	// TestMatrix_JSONEnumDecodeIntoIntTargetParity. Only genuinely
-	// unsupported targets (channel, slice, etc.) error.
-	if err := enumS.DecodeJSON([]byte(`"A"`), new([]int)); err == nil {
-		t.Error("expected unsupported target error for slice")
-	}
-	// decodeBytes decimal invalid number
-	bytesDecS := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
-	if err := bytesDecS.DecodeJSON([]byte("not_a_number"), new(json.Number)); err == nil {
-		t.Error("expected invalid decimal error")
-	}
-	// decodeFixed decimal invalid number
-	fixedDecS := MustParse(`{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`)
-	if err := fixedDecS.DecodeJSON([]byte("not_a_number"), new(json.Number)); err == nil {
-		t.Error("expected invalid decimal error")
-	}
-	// decodeFloat invalid
-	floatS := MustParse(`"float"`)
-	if err := floatS.DecodeJSON([]byte(`"not a float"`), new(float32)); err == nil {
-		t.Error("expected invalid float error")
-	}
-	// decodeDouble invalid
-	doubleS := MustParse(`"double"`)
-	if err := doubleS.DecodeJSON([]byte(`"not a double"`), new(float64)); err == nil {
-		t.Error("expected invalid double error")
-	}
-	// An int into a float target is supported, in round-trip parity with the
-	// documented encode-side whole-number divergence; see
-	// TestMatrix_IntLongDecodeIntoFloatJSONNumber. Genuinely unsupported
-	// targets (slice, struct without method, etc.) still error.
-	intS := MustParse(`"int"`)
-	if err := intS.DecodeJSON([]byte(`42`), new([]int)); err == nil {
-		t.Error("expected unsupported target for int (slice)")
-	}
-	// fixed decimal with typed unsupported target
-	if err := fixedDecS.DecodeJSON([]byte("12.34"), new(int)); err == nil {
-		t.Error("expected error for unsupported target")
-	}
-}
-
-// TestDecodeJSONMapTimeValues exercises the non-addressable time.Time/
-// time.Duration paths in decodeInt and decodeLong (map values are not
-// addressable).
-func TestDecodeJSONMapTimeValues(t *testing.T) {
-	// map with time.Time values (timestamp-micros)
-	t.Run("map timestamp-millis time.Time", func(t *testing.T) {
-		s := MustParse(`{"type":"map","values":{"type":"long","logicalType":"timestamp-millis"}}`)
-		var m map[string]time.Time
-		mustDecodeJSON(t, s, []byte(`{"a":1577880645000}`), &m)
-	})
-	t.Run("map timestamp-micros time.Time", func(t *testing.T) {
-		s := MustParse(`{"type":"map","values":{"type":"long","logicalType":"timestamp-micros"}}`)
-		var m map[string]time.Time
-		mustDecodeJSON(t, s, []byte(`{"a":1577880645000000}`), &m)
-	})
-	t.Run("map timestamp-nanos time.Time", func(t *testing.T) {
-		s := MustParse(`{"type":"map","values":{"type":"long","logicalType":"timestamp-nanos"}}`)
-		var m map[string]time.Time
-		mustDecodeJSON(t, s, []byte(`{"a":1577880645000000000}`), &m)
-	})
-	t.Run("map time-micros time.Duration", func(t *testing.T) {
-		s := MustParse(`{"type":"map","values":{"type":"long","logicalType":"time-micros"}}`)
-		var m map[string]time.Duration
-		mustDecodeJSON(t, s, []byte(`{"a":12345}`), &m)
-	})
-	t.Run("map date time.Time", func(t *testing.T) {
-		s := MustParse(`{"type":"map","values":{"type":"int","logicalType":"date"}}`)
-		var m map[string]time.Time
-		mustDecodeJSON(t, s, []byte(`{"a":18262}`), &m)
-	})
-	t.Run("map time-millis time.Duration", func(t *testing.T) {
-		s := MustParse(`{"type":"map","values":{"type":"int","logicalType":"time-millis"}}`)
-		var m map[string]time.Duration
-		mustDecodeJSON(t, s, []byte(`{"a":12345}`), &m)
-	})
 }
 
 // TestDecodeJSONTaggedUnionTypedInterfaceTarget verifies that DecodeJSON

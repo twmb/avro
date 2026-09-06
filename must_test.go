@@ -118,15 +118,6 @@ func mustAppendSingleObject(t testing.TB, s *Schema, dst []byte, v any, opts ...
 	return b
 }
 
-func mustDecodeSingleObject(t testing.TB, s *Schema, src []byte, v any, opts ...Opt) []byte {
-	t.Helper()
-	rest, err := s.DecodeSingleObject(src, v, opts...)
-	if err != nil {
-		t.Fatalf("DecodeSingleObject: %v", err)
-	}
-	return rest
-}
-
 func mustMarshal(t testing.TB, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)

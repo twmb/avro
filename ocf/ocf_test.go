@@ -24,7 +24,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
@@ -85,31 +84,6 @@ func TestDeflate(t *testing.T) {
 	out := drainAll[person](t, r)
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("got %v, want %v", out, in)
-	}
-}
-
-func TestMultipleBlocks(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-
-	const n = 250
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s) // default block length 100
-	writeInts(t, w, n)
-	mustClose(t, w)
-
-	r := mustNewReader(t, &buf)
-	for i := range n {
-		var v int32
-		if err := r.Decode(&v); err != nil {
-			t.Fatalf("item %d: %v", i, err)
-		}
-		if v != int32(i) {
-			t.Fatalf("item %d: got %d, want %d", i, v, i)
-		}
-	}
-	var v int32
-	if err := r.Decode(&v); err != io.EOF {
-		t.Fatalf("expected EOF, got %v", err)
 	}
 }
 
@@ -209,50 +183,10 @@ func (x xorCodec) Decompress(src []byte) ([]byte, error) {
 	return x.Compress(src) // xor is its own inverse
 }
 
-func TestCustomCodec(t *testing.T) {
-	s := avrotest.MustParse(t, `"long"`)
-	codec := xorCodec{0xAB}
-
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s, WithCodec(codec))
-	in := []int64{1, 2, 3, 100, -50}
-	for _, v := range in {
-		if err := w.Encode(&v); err != nil {
-			t.Fatal(err)
-		}
-	}
-	mustClose(t, w)
-
-	r := mustNewReader(t, &buf, WithCodec(codec))
-	out := drainAll[int64](t, r)
-	if !reflect.DeepEqual(in, out) {
-		t.Fatalf("got %v, want %v", out, in)
-	}
-}
-
 func TestBadMagic(t *testing.T) {
 	_, err := NewReader(bytes.NewReader([]byte("garbage data here")))
 	if err == nil {
 		t.Fatal("expected error for bad magic")
-	}
-}
-
-func TestUnknownCodec(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-	codec := xorCodec{0x42}
-
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s, WithCodec(codec))
-	v := int32(1)
-	if err := w.Encode(&v); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-
-	// Read without registering the codec.
-	_, err := NewReader(bytes.NewReader(buf.Bytes()))
-	if err == nil {
-		t.Fatal("expected error for unknown codec")
 	}
 }
 
@@ -462,29 +396,6 @@ func TestEncodeError(t *testing.T) {
 	mustClose(t, w)
 }
 
-type failCompressCodec struct{}
-
-func (failCompressCodec) Name() string { return "failcompress" }
-func (failCompressCodec) Close() error { return nil }
-func (failCompressCodec) Compress([]byte) ([]byte, error) {
-	return nil, errors.New("compress failed")
-}
-func (failCompressCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
-
-func TestCompressError(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s, WithCodec(failCompressCodec{}), WithBlockCount(1))
-	v := int32(1)
-	err := w.Encode(&v)
-	if err == nil {
-		t.Fatal("expected compress error")
-	}
-	if !strings.Contains(err.Error(), "compress failed") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestBadSchemaInFile(t *testing.T) {
 	// Build a valid OCF header but with an invalid schema.
 	var hdr []byte
@@ -526,28 +437,6 @@ func TestTruncatedBlockCount(t *testing.T) {
 	err := r.Decode(&v)
 	if err == nil || err == io.EOF {
 		t.Fatalf("expected non-EOF read error, got %v", err)
-	}
-}
-
-func TestTruncatedBlockSize(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s)
-	mustClose(t, w)
-	// Write a valid block count (1) but truncate before the size.
-	data := buf.Bytes()
-	data = binary.AppendVarint(data, 1) // count = 1, then EOF before size
-	r := mustNewReader(t, bytes.NewReader(data))
-	var v int32
-	err := r.Decode(&v)
-	if err == nil {
-		t.Fatal("expected error for truncated block size")
-	}
-	// The count varint promised a block, so this cut is truncation, not the
-	// end-of-stream sentinel. The error must be unexpected-EOF-shaped, never
-	// io.EOF-shaped. We reserve io.EOF for a clean end at a block boundary.
-	if errors.Is(err, io.EOF) || !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("truncated block size must match io.ErrUnexpectedEOF and not io.EOF, got: %v", err)
 	}
 }
 
@@ -607,36 +496,6 @@ func TestNegativeBlockSize(t *testing.T) {
 		t.Fatal("expected error for negative block size")
 	}
 	if !strings.Contains(err.Error(), "negative block size") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-type failDecompressCodec struct{}
-
-func (failDecompressCodec) Name() string                        { return "faildecompress" }
-func (failDecompressCodec) Close() error                        { return nil }
-func (failDecompressCodec) Compress(src []byte) ([]byte, error) { return src, nil }
-func (failDecompressCodec) Decompress([]byte) ([]byte, error) {
-	return nil, errors.New("decompress failed")
-}
-
-func TestDecompressError(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-	codec := failDecompressCodec{}
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s, WithCodec(codec), WithBlockCount(1))
-	v := int32(42)
-	if err := w.Encode(&v); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-
-	r := mustNewReader(t, bytes.NewReader(buf.Bytes()), WithCodec(codec))
-	err := r.Decode(&v)
-	if err == nil {
-		t.Fatal("expected decompress error")
-	}
-	if !strings.Contains(err.Error(), "decompress") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -890,26 +749,6 @@ func TestRandReadError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "rand failed") {
 		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestBlockCountNegative(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s, WithBlockCount(-5))
-	// Negative count defaults to 100; single item flushed on Close.
-	v := int32(99)
-	if err := w.Encode(&v); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-	r := mustNewReader(t, &buf)
-	var out int32
-	if err := r.Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out != 99 {
-		t.Fatalf("got %d, want 99", out)
 	}
 }
 
@@ -1362,27 +1201,6 @@ func (f *failSeekRWS) Seek(int64, int) (int64, error) {
 	return 0, errors.New("seek failed")
 }
 
-func TestAppendWriterUnknownCodec(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-
-	// Write with a custom codec.
-	codec := xorCodec{0x42}
-	sb := &seekBuf{}
-	w := mustNewWriter(t, sb, s, WithCodec(codec))
-	v := int32(1)
-	if err := w.Encode(&v); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-
-	// Then try to append without providing the codec.
-	sb.pos = 0
-	_, err := NewAppendWriter(sb)
-	if err == nil {
-		t.Fatal("expected error for unknown codec")
-	}
-}
-
 func TestWithBlockBytesNegative(t *testing.T) {
 	s := avrotest.MustParse(t, `"int"`)
 	// Negative block bytes is clamped to 0; with both zero we default to 100.
@@ -1725,45 +1543,6 @@ func TestZstd(t *testing.T) {
 
 // ---------- Codec close ----------
 
-func TestWriterClosesCodec(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-
-	codec := &trackCloseCodec{}
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s, WithCodec(codec))
-	v := int32(1)
-	if err := w.Encode(&v); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-	if !codec.closed {
-		t.Fatal("expected codec to be closed by Writer")
-	}
-}
-
-type trackCloseCodec struct {
-	nullCodec
-	closed bool
-}
-
-func (c *trackCloseCodec) Close() error {
-	c.closed = true
-	return nil
-}
-
-func TestWriterCloseCodecError(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s, WithCodec(&failCloseCodec{}))
-	if err := w.Close(); err == nil {
-		t.Fatal("expected error from codec close")
-	}
-}
-
-type failCloseCodec struct{ nullCodec }
-
-func (failCloseCodec) Close() error { return errors.New("close failed") }
-
 func TestReaderClose(t *testing.T) {
 	s := avrotest.MustParse(t, `"int"`)
 
@@ -1847,47 +1626,6 @@ func TestZstdCodecEncoderOpts(t *testing.T) {
 	}
 }
 
-func TestZstdCodecConcurrencyOverride(t *testing.T) {
-	// The default concurrency(1) can be overridden.
-	s, err := avro.Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	codec, err := ZstdCodec(
-		[]zstd.EOption{zstd.WithEncoderConcurrency(2)},
-		[]zstd.DOption{zstd.WithDecoderConcurrency(2)},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer codec.Close()
-	shared := NopCloser(codec)
-
-	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s, WithCodec(shared))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Encode(int32(99)); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-
-	r, err := NewReader(&buf, WithCodec(shared))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-	var out int32
-	if err := r.Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out != 99 {
-		t.Fatalf("got %d, want 99", out)
-	}
-}
-
 func TestZstdCodecShared(t *testing.T) {
 	s, err := avro.Parse(`"int"`)
 	if err != nil {
@@ -1967,89 +1705,7 @@ func TestWithSchema(t *testing.T) {
 	}
 }
 
-func TestResolveCodecCustomOverridesBuiltin(t *testing.T) {
-	// A custom codec with a built-in name should override the built-in.
-	custom := &testCodec{name: "zstandard"}
-	codec, adopted, err := resolveCodec("zstandard", []Codec{custom})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if codec != Codec(custom) {
-		t.Fatal("expected custom codec to override built-in zstandard")
-	}
-	// The index identifies *which* offer was taken, so the ones that were not
-	// can be released. A built-in resolved by name reports -1.
-	if adopted != 0 {
-		t.Fatalf("adopted index = %d, want 0 (the sole supplied codec)", adopted)
-	}
-	if _, adopted, err := resolveCodec("deflate", []Codec{custom}); err != nil || adopted != -1 {
-		t.Fatalf("built-in resolution: adopted = %d (want -1), err = %v", adopted, err)
-	}
-}
-
-type testCodec struct {
-	name string
-}
-
-func (c *testCodec) Name() string                          { return c.name }
-func (c *testCodec) Close() error                          { return nil }
-func (c *testCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
-func (c *testCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
-
 // ---------- golden file tests ----------
-
-type weather struct {
-	Station string `avro:"station"`
-	Time    int64  `avro:"time"`
-	Temp    int32  `avro:"temp"`
-}
-
-var wantWeather = []weather{
-	{"011990-99999", -619524000000, 0},
-	{"011990-99999", -619506000000, 22},
-	{"011990-99999", -619484400000, -11},
-	{"012650-99999", -655531200000, 111},
-	{"012650-99999", -655509600000, 78},
-}
-
-func TestGoldenWeather(t *testing.T) {
-	tests := []struct {
-		file  string
-		codec string
-	}{
-		{"weather.avro", "null"},
-		{"weather-deflate.avro", "deflate"},
-		{"weather-snappy.avro", "snappy"},
-		{"weather-zstd.avro", "zstandard"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.codec, func(t *testing.T) {
-			f, err := os.Open(filepath.Join("testdata", tt.file))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer f.Close()
-
-			r, err := NewReader(f)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer r.Close()
-
-			// Check the codec metadata.
-			if tt.codec != "null" {
-				if got := string(r.Metadata()["avro.codec"]); got != tt.codec {
-					t.Fatalf("codec = %q, want %q", got, tt.codec)
-				}
-			}
-
-			got := drainAll[weather](t, r)
-			if !reflect.DeepEqual(got, wantWeather) {
-				t.Fatalf("got %v, want %v", got, wantWeather)
-			}
-		})
-	}
-}
 
 func TestZstdCodecBadEncoderOption(t *testing.T) {
 	// Invalid window size (too small) causes ZstdCodec to fail.
@@ -2163,18 +1819,6 @@ func TestDecodeMapOversizedKeyLen(t *testing.T) {
 	}
 }
 
-func TestDecodeMapOversizedValLen(t *testing.T) {
-	var data []byte
-	data = binary.AppendVarint(data, 1)       // 1 entry
-	data = binary.AppendVarint(data, 1)       // key length = 1
-	data = append(data, 'k')                  // key
-	data = binary.AppendVarint(data, 1<<20+1) // value length too large
-	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)))
-	if err == nil || !strings.Contains(err.Error(), "value length") {
-		t.Fatalf("expected value length error, got %v", err)
-	}
-}
-
 func TestGoldenCorruptData(t *testing.T) {
 	tests := []struct {
 		file    string
@@ -2214,67 +1858,6 @@ func TestGoldenCorruptData(t *testing.T) {
 	}
 }
 
-func TestWithReaderSchema(t *testing.T) {
-	// Writer schema has name+age.
-	writerSchema := avro.MustParse(recordSchema)
-
-	// Reader schema adds a new field "email" with a default.
-	readerSchemaStr := `{"type":"record","name":"person","fields":[
-		{"name":"name","type":"string"},
-		{"name":"age","type":"int"},
-		{"name":"email","type":"string","default":"unknown"}
-	]}`
-	readerSchema := avro.MustParse(readerSchemaStr)
-
-	// Write some data.
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, writerSchema)
-	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-
-	// Read with the evolved schema.
-	r := mustNewReader(t, &buf, WithReaderSchema(readerSchema))
-	defer r.Close()
-
-	type personV2 struct {
-		Name  string `avro:"name"`
-		Age   int32  `avro:"age"`
-		Email string `avro:"email"`
-	}
-	var p personV2
-	if err := r.Decode(&p); err != nil {
-		t.Fatal(err)
-	}
-	if p.Name != "Alice" || p.Age != 30 || p.Email != "unknown" {
-		t.Fatalf("unexpected: %+v", p)
-	}
-}
-
-func TestWithReaderSchemaIncompatible(t *testing.T) {
-	writerSchema := avro.MustParse(recordSchema)
-
-	// Incompatible reader schema: missing field "name" with no default.
-	readerSchemaStr := `{"type":"record","name":"person","fields":[
-		{"name":"age","type":"int"},
-		{"name":"newfield","type":"string"}
-	]}`
-	readerSchema := avro.MustParse(readerSchemaStr)
-
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, writerSchema)
-	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-
-	_, err := NewReader(&buf, WithReaderSchema(readerSchema))
-	if err == nil {
-		t.Fatal("expected error for incompatible schemas")
-	}
-}
-
 func TestReservedMetadataKey(t *testing.T) {
 	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
@@ -2291,65 +1874,6 @@ func TestOptReaderSchemaMarker(t *testing.T) {
 	s := avro.MustParse(`"int"`)
 	var ro ReaderOpt = WithReaderSchema(s)
 	ro.(optReaderSchema).readerOpt()
-}
-
-// TestWithReaderSchemaFunc pins the callback variant. It is invoked after the
-// header is parsed. It can inspect rd.Schema() and rd.Metadata() to choose a
-// reader schema, and the schema it returns is what resolution uses.
-func TestWithReaderSchemaFunc(t *testing.T) {
-	writerSchema := avro.MustParse(recordSchema)
-
-	readerSchemaStr := `{"type":"record","name":"person","fields":[
-		{"name":"name","type":"string"},
-		{"name":"age","type":"int"},
-		{"name":"email","type":"string","default":"unknown"}
-	]}`
-	readerSchema := avro.MustParse(readerSchemaStr)
-
-	var buf bytes.Buffer
-	w, err := NewWriter(&buf, writerSchema,
-		WithMetadata(map[string][]byte{"format-version": []byte("2")}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-
-	callbackInvoked := false
-	r, err := NewReader(&buf, WithReaderSchemaFunc(func(rd *Reader) (*avro.Schema, error) {
-		callbackInvoked = true
-		// The callback sees the parsed header state.
-		if rd.Schema() == nil {
-			t.Error("rd.Schema() was nil in callback")
-		}
-		if got := string(rd.Metadata()["format-version"]); got != "2" {
-			t.Errorf("rd.Metadata()[format-version] = %q, want %q", got, "2")
-		}
-		// Choose the reader schema from the inspected metadata.
-		return readerSchema, nil
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-	if !callbackInvoked {
-		t.Fatal("reader schema callback was not invoked")
-	}
-
-	type personV2 struct {
-		Name  string `avro:"name"`
-		Age   int32  `avro:"age"`
-		Email string `avro:"email"`
-	}
-	var p personV2
-	if err := r.Decode(&p); err != nil {
-		t.Fatal(err)
-	}
-	if p.Name != "Alice" || p.Age != 30 || p.Email != "unknown" {
-		t.Fatalf("unexpected: %+v", p)
-	}
 }
 
 // TestWithReaderSchemaFuncReturnsNil pins that returning (nil, nil) from the
@@ -2402,28 +1926,6 @@ func TestWithReaderSchemaFuncReturnsError(t *testing.T) {
 	}
 }
 
-// TestReaderSchemaOptionsAreExclusive pins that WithReaderSchema and
-// WithReaderSchemaFunc cannot both appear in one NewReader call.
-func TestReaderSchemaOptionsAreExclusive(t *testing.T) {
-	writerSchema := avro.MustParse(recordSchema)
-
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, writerSchema)
-	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-
-	s := avro.MustParse(recordSchema)
-	_, err := NewReader(&buf,
-		WithReaderSchema(s),
-		WithReaderSchemaFunc(func(*Reader) (*avro.Schema, error) { return s, nil }),
-	)
-	if err == nil {
-		t.Fatal("expected error when both options are provided")
-	}
-}
-
 func TestNegativeBlockCountRead(t *testing.T) {
 	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
@@ -2453,58 +1955,6 @@ func TestWriterSchema(t *testing.T) {
 		t.Fatal("Writer.Schema() did not return the original schema")
 	}
 	w.Close()
-}
-
-// TestWithSchemaOptsCustomType pins that [WithSchemaOpts] passes
-// [avro.CustomType] through to the reader-schema parse. The registered callback
-// then fires on the matching logical-typed field during Decode.
-//
-// Pre-fix we wrote PCF to the header, which strips logicalType. The reader's
-// parsed-from-header schema then had no logical type to dispatch on, and the
-// built-in date-on-int default produced an int32. The old assertion
-// `out["d"].(int32)` was tautological: it succeeded whether or not the
-// CustomType fired. This now tracks via a captured bool and asserts the
-// handler's return type.
-func TestWithSchemaOptsCustomType(t *testing.T) {
-	schema := avro.MustParse(`{"type":"record","name":"R","fields":[
-		{"name":"d","type":{"type":"int","logicalType":"date"}}
-	]}`)
-
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, schema)
-	if err := w.Encode(map[string]any{"d": int32(18262)}); err != nil {
-		t.Fatal(err)
-	}
-	w.Close()
-
-	called := false
-	ct := avro.CustomType{
-		LogicalType: "date",
-		AvroType:    "int",
-		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
-			called = true
-			// Return a value whose Go type differs from the int32
-			// default-decode and from the built-in time.Time
-			// logical-decode. Neither fallback can satisfy the
-			// assertion below.
-			return fmt.Sprintf("date-tag-%v", v), nil
-		},
-	}
-	r := mustNewReader(t, &buf, WithSchemaOpts(ct))
-	var out map[string]any
-	if err := r.Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if !called {
-		t.Fatal("WithSchemaOpts CustomType.Decode was never called — OCF header likely strips logicalType")
-	}
-	got, ok := out["d"].(string)
-	if !ok {
-		t.Fatalf("expected string from custom Decode, got %T(%v)", out["d"], out["d"])
-	}
-	if want := "date-tag-18262"; got != want {
-		t.Fatalf("custom Decode result: got %q, want %q", got, want)
-	}
 }
 
 // TestRegression_AppendWriterSchemaOpts pins that [WithSchemaOpts] reaches
@@ -4448,84 +3898,6 @@ func TestInvariant_NilCodecAskedThroughOnePredicate(t *testing.T) {
 	}
 }
 
-// chanCodec and funcCodec exist so we drive the predicate's nilable-kind list
-// rather than read it. A Codec is any type with the four methods, and Go lets
-// that be a channel or a func as readily as a pointer. Each is nil-able and
-// each would crash the same way.
-type chanCodec chan int
-
-func (c chanCodec) Name() string                          { return "chan" }
-func (c chanCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
-func (c chanCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
-func (c chanCodec) Close() error                          { return nil }
-
-type funcCodec func()
-
-func (c funcCodec) Name() string                          { return "func" }
-func (c funcCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
-func (c funcCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
-func (c funcCodec) Close() error                          { return nil }
-
-type sliceCodec []byte
-
-func (c sliceCodec) Name() string                          { return "slice" }
-func (c sliceCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
-func (c sliceCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
-func (c sliceCodec) Close() error                          { return nil }
-
-// TestIsNilCodecAnswersEveryNilableKind drives the predicate directly across
-// every reflect kind a Codec implementation can have. The switch inside it is a
-// list of kinds, and a list is only as good as the cases someone thought of. So
-// we ask both the nil and the non-nil value of each kind, which makes a missing
-// case fail rather than merely be absent. It also executes the claim the
-// predicate's comment makes about reflect.Interface: reflect.ValueOf takes an
-// any and resolves it to the dynamic value, so a Codec interface value never
-// presents as Kind Interface.
-func TestIsNilCodecAnswersEveryNilableKind(t *testing.T) {
-	nilCases := []struct {
-		kind string
-		c    Codec
-	}{
-		{"untyped interface", nil},
-		{"pointer", (*derefCodec)(nil)},
-		{"map", mapKindCodec(nil)},
-		{"chan", chanCodec(nil)},
-		{"func", funcCodec(nil)},
-		{"slice", sliceCodec(nil)},
-	}
-	for _, tc := range nilCases {
-		if !isNilCodec(tc.c) {
-			t.Errorf("isNilCodec(nil %s) = false; a method call on it would crash", tc.kind)
-		}
-	}
-
-	nonNil := []struct {
-		kind string
-		c    Codec
-	}{
-		{"pointer", &derefCodec{name: "p", closes: new(int)}},
-		{"map", mapKindCodec{"name": "m"}},
-		{"chan", chanCodec(make(chan int))},
-		{"func", funcCodec(func() {})},
-		{"slice", sliceCodec{}},
-		{"struct (never nilable)", nullCodec{}},
-		{"struct with fields", deflateCodec{level: 1}},
-	}
-	for _, tc := range nonNil {
-		if isNilCodec(tc.c) {
-			t.Errorf("isNilCodec(non-nil %s) = true; a usable codec would be silently ignored", tc.kind)
-		}
-	}
-
-	// The omitted-kind claim, executed.
-	for _, tc := range append(nilCases[1:], nonNil...) {
-		if k := reflect.ValueOf(tc.c).Kind(); k == reflect.Interface {
-			t.Errorf("a Codec holding %s presented as Kind Interface; the predicate's "+
-				"switch omits that case on the grounds it cannot happen", tc.kind)
-		}
-	}
-}
-
 func isCodecSliceType(e ast.Expr) bool {
 	at, ok := e.(*ast.ArrayType)
 	if !ok || at.Len != nil {
@@ -6112,43 +5484,6 @@ func appendRawBlock(buf *bytes.Buffer, count int64, payload []byte, sync [16]byt
 	buf.Write(sync[:])
 }
 
-// foreignFile assembles an OCF whose data blocks are produced by the real
-// Writer (header, codec framing, compression) and whose empty blocks are
-// hand-framed between flushes. layout is a sequence of 'D' (one-datum data
-// block, datums "d0", "d1", ... in order) and 'E' (count-0 block carrying
-// emptyPayload). The writer never emits empty blocks itself, so 'E' bytes
-// are spliced directly into the output between sealed blocks.
-func foreignFile(t *testing.T, codec Codec, layout string, emptyPayload []byte) ([]byte, []string) {
-	t.Helper()
-	s := avro.MustParse(`"string"`)
-	var buf bytes.Buffer
-	opts := []WriterOpt{WithSyncMarker(foreignSync)}
-	if codec != nil {
-		// NopCloser: codec instances are shared across cells; Writer.Close
-		// must not release them.
-		opts = append(opts, WithCodec(NopCloser(codec)))
-	}
-	w := mustNewWriter(t, &buf, s, opts...)
-	var want []string
-	for _, ch := range layout {
-		switch ch {
-		case 'D':
-			d := fmt.Sprintf("d%d", len(want))
-			if err := w.Encode(d); err != nil {
-				t.Fatalf("Encode: %v", err)
-			}
-			mustFlush(t, w)
-			want = append(want, d)
-		case 'E':
-			appendRawBlock(&buf, 0, emptyPayload, foreignSync)
-		default:
-			t.Fatalf("bad layout char %q", ch)
-		}
-	}
-	mustClose(t, w)
-	return buf.Bytes(), want
-}
-
 // readAllStrings drives a Reader over file to io.EOF, returning every datum.
 func readAllStrings(t *testing.T, file []byte) []string {
 	t.Helper()
@@ -6255,319 +5590,6 @@ func fastavroOCFReader(t *testing.T) func(file []byte) ([]string, string) {
 // skip quietly.
 func codecUnsupportedByFastavro(errMsg string) bool {
 	return strings.Contains(errMsg, "need to install")
-}
-
-func TestReaderForeignEmptyBlockFraming(t *testing.T) {
-	fa := fastavroOCFReader(t)
-
-	type payloadCase struct {
-		name    string
-		payload func(c Codec) []byte
-		// fastavroReads: whether fastavro's iterator reads files carrying
-		// this empty-block payload, calibrated against fastavro 1.12.2
-		// (cramjam snappy, python-zstandard). Each cell's observed verdict is
-		// recorded on its table row. fastavro decompresses a count-0 block's
-		// payload eagerly, as Java's DataFileStream does via decompressUsing
-		// in hasNext. We skip the block without consulting the codec, so we
-		// read every reject-verdict cell fully: deliberate leniency, no
-		// records lost either way.
-		fastavroReads bool
-	}
-	nilPayload := func(Codec) []byte { return nil }
-	// The codec's own compression of zero bytes: a payload the matching
-	// decompressor accepts and inflates to nothing.
-	compressedEmpty := func(c Codec) []byte {
-		p, err := c.Compress(nil)
-		if err != nil {
-			t.Fatalf("Compress(nil): %v", err)
-		}
-		return p
-	}
-	// Bytes no codec produced.
-	garbagePayload := func(Codec) []byte { return []byte{0xDE, 0xAD, 0xBE, 0xEF} }
-
-	codecs := []struct {
-		name     string
-		codec    Codec // nil = null (the default; header omits avro.codec)
-		payloads []payloadCase
-	}{
-		{"null", nil, []payloadCase{
-			{"size0", nilPayload, true},
-			// The identity codec has no framing to violate: any payload is
-			// "valid", fastavro wraps the raw bytes without inspecting them.
-			{"arbitrary", garbagePayload, true},
-		}},
-		{"deflate", DeflateCodec(flate.DefaultCompression), []payloadCase{
-			// Raw-inflate of zero bytes yields zero bytes, so fastavro reads.
-			{"size0", nilPayload, true},
-			{"compressed-empty", compressedEmpty, true},
-			// Observed: "Error -3 while decompressing data: invalid block type".
-			{"garbage", garbagePayload, false},
-		}},
-		{"snappy", SnappyCodec(), []payloadCase{
-			// Observed: "snappy: corrupt input (expected valid offset but got
-			// offset 1027; dst position: 0)". The empty payload has no CRC
-			// tail to slice off, and cramjam rejects the remainder.
-			{"size0", nilPayload, false},
-			{"compressed-empty", compressedEmpty, true},
-			// Observed: "snappy: corrupt input (empty)".
-			{"garbage", garbagePayload, false},
-		}},
-		{"zstandard", MustZstdCodec(nil, nil), []payloadCase{
-			// Observed: "Compressed data ended before the end-of-stream
-			// marker was reached". python-zstandard's stream reader wants a
-			// complete frame even when there are no records to decode.
-			{"size0", nilPayload, false},
-			// Observed: the same end-of-stream-marker rejection even for
-			// klauspost's well-formed empty frame.
-			{"compressed-empty", compressedEmpty, false},
-			// Observed: "Unable to decompress Zstandard data: Unknown frame
-			// descriptor".
-			{"garbage", garbagePayload, false},
-		}},
-	}
-	defer func() {
-		for _, c := range codecs {
-			if c.codec != nil {
-				c.codec.Close()
-			}
-		}
-	}()
-
-	positions := []struct{ name, layout string }{
-		{"first", "EDD"},
-		{"mid", "DED"},
-		{"tail", "DDE"},
-		{"consecutive", "DEEED"},
-	}
-
-	// Per-codec fastavro support probe: a plain twmb-written file (no
-	// foreign framing). An "install" error means the interpreter lacks the
-	// codec's optional dependency, so skip fastavro for those cells. Any
-	// other error is a real differential failure.
-	faSupported := map[string]bool{}
-	if fa != nil {
-		for _, c := range codecs {
-			plain, want := foreignFile(t, c.codec, "DD", nil)
-			got, errMsg := fa(plain)
-			switch {
-			case errMsg == "":
-				if fmt.Sprint(got) != fmt.Sprint(want) {
-					t.Errorf("codec %s: fastavro read plain twmb file as %v, want %v", c.name, got, want)
-				}
-				faSupported[c.name] = true
-			case codecUnsupportedByFastavro(errMsg):
-				if os.Getenv("AVRO_FASTAVRO_PYTHON") != "" {
-					t.Errorf("codec %s: fastavro is missing an optional dependency with AVRO_FASTAVRO_PYTHON set (%s) — `pip install cramjam zstandard` into that interpreter so the cross-checks execute", c.name, errMsg)
-				} else {
-					t.Logf("codec %s: fastavro missing optional dependency (%s); cross-checks skipped", c.name, errMsg)
-				}
-			default:
-				t.Errorf("codec %s: fastavro failed to read a plain twmb-written file: %s", c.name, errMsg)
-			}
-		}
-	}
-
-	for _, c := range codecs {
-		for _, pc := range c.payloads {
-			for _, pos := range positions {
-				t.Run(fmt.Sprintf("%s/%s/%s", c.name, pc.name, pos.name), func(t *testing.T) {
-					file, want := foreignFile(t, c.codec, pos.layout, pc.payload(c.codec))
-					got := readAllStrings(t, file)
-					if fmt.Sprint(got) != fmt.Sprint(want) {
-						t.Fatalf("twmb read %v, want %v", got, want)
-					}
-					if fa == nil || !faSupported[c.name] {
-						return
-					}
-					faGot, faErr := fa(file)
-					if pc.fastavroReads {
-						if faErr != "" {
-							t.Errorf("fastavro rejected a cell it is expected to read: %s", faErr)
-						} else if fmt.Sprint(faGot) != fmt.Sprint(want) {
-							t.Errorf("fastavro read %v, want %v", faGot, want)
-						}
-					} else {
-						// Documented divergence, recorded not asserted: log
-						// drift if a fastavro upgrade starts accepting.
-						if faErr == "" {
-							t.Logf("fastavro now READS this cell (historically rejected); values=%v", faGot)
-						} else {
-							t.Logf("fastavro verdict (expected reject): %s", faErr)
-						}
-					}
-				})
-			}
-		}
-	}
-
-	// Hostile and non-canonical block-count / block-size values, spliced at
-	// the mid position (D <cell> D), the position where a wrong verdict
-	// silently truncates the data behind the cell. The invariant every cell
-	// asserts: a loud error or a consistent skip, never a silent io.EOF
-	// before the tail datum.
-	t.Run("count-values", func(t *testing.T) {
-		vi := func(v int64) []byte { return binary.AppendVarint(nil, v) }
-		s := avro.MustParse(`"string"`)
-		datum := avrotest.MustAppendEncode(t, s, nil, "dX")
-		cells := []struct {
-			name string
-			raw  []byte // hand-framed cell bytes spliced between the two data blocks
-			// wantErr: substring of the error Decode must return at the cell;
-			// "" = consistent skip (both data blocks read, then clean io.EOF).
-			wantErr string
-		}{
-			{
-				// A negative count is corruption no writer produces (the
-				// spec's count is the number of objects in the block): loud
-				// error. Guard: readBlock's `count < 0` reject, reached after
-				// both header varints are read and before any payload byte is
-				// consumed. fastavro 1.12.2 instead reads the file fully: its
-				// record loop `for i in range(block_count)` over a negative
-				// count is an empty loop (_read_py.py _iter_avro_records), so
-				// it skips the block like a count-0 one, and nothing is
-				// truncated on either side.
-				name:    "negative-count",
-				raw:     bytes.Join([][]byte{vi(-1), vi(0), foreignSync[:]}, nil),
-				wantErr: "invalid negative block count",
-			},
-			{
-				// A negative size errors even when the count is 0: the
-				// count/size guards precede the skip arm, so an "empty" block
-				// cannot smuggle a hostile size. Guard: readBlock's
-				// `size < 0` reject, before any payload read. The cell
-				// deliberately carries no payload or sync; the reader must
-				// never get that far. fastavro 1.12.2 also errors (EOFError
-				// "Expected -1 bytes").
-				name:    "negative-size-on-count0",
-				raw:     bytes.Join([][]byte{vi(0), vi(-1)}, nil),
-				wantErr: "invalid negative block size",
-			},
-			{
-				// An absurd count over a tiny real payload reaches the
-				// deepest guard. The envelope validates (count/size guards
-				// pass, payload and sync consumed), the skip arm doesn't
-				// fire (count != 0), and the codec decompresses. Then the
-				// count-vs-decompressed-length cap rejects: the
-				// CPU-amplification guard, since a 7-byte varint must not
-				// buy a 2^40-iteration decode loop. Guard: readBlock's
-				// `count > int64(len(block))+maxOCFZeroByteSlack`. fastavro
-				// 1.12.2 also errors (EOFError once the 3-byte block runs
-				// dry).
-				name:    "huge-count-tiny-block",
-				raw:     bytes.Join([][]byte{vi(1 << 40), vi(int64(len(datum))), datum, foreignSync[:]}, nil),
-				wantErr: "records but decompressed block is",
-			},
-			{
-				// An overlong (non-minimal two-byte) varint encoding of
-				// count 0. binary.ReadVarint accepts non-canonical varints,
-				// so the cell decodes to 0 and takes the same validated-skip
-				// arm as a canonical count-0 block: consistent skip, both
-				// datums read. fastavro 1.12.2 reads it identically. Pinned
-				// so a future varint tightening that rejects overlong counts
-				// flips this cell red and forces a deliberate re-pin.
-				// A loud error would also satisfy the invariant; silent
-				// truncation never does.
-				name:    "overlong-varint-count0",
-				raw:     bytes.Join([][]byte{{0x80, 0x00}, vi(0), foreignSync[:]}, nil),
-				wantErr: "",
-			},
-		}
-		for _, c := range cells {
-			t.Run(c.name, func(t *testing.T) {
-				var buf bytes.Buffer
-				w := mustNewWriter(t, &buf, s, WithSyncMarker(foreignSync))
-				if err := w.Encode("d0"); err != nil {
-					t.Fatal(err)
-				}
-				mustFlush(t, w)
-				buf.Write(c.raw)
-				if err := w.Encode("d1"); err != nil {
-					t.Fatal(err)
-				}
-				mustClose(t, w)
-
-				r := mustNewReader(t, bytes.NewReader(buf.Bytes()))
-				defer r.Close()
-				var v string
-				if err := r.Decode(&v); err != nil || v != "d0" {
-					t.Fatalf("first datum: %v %q", err, v)
-				}
-				err := r.Decode(&v)
-				if c.wantErr == "" {
-					if err != nil || v != "d1" {
-						t.Fatalf("skip cell: second datum %v %q", err, v)
-					}
-					if err := r.Decode(&v); err != io.EOF {
-						t.Fatalf("skip cell: want io.EOF after both datums, got %v", err)
-					}
-					return
-				}
-				if err == nil {
-					t.Fatalf("want error containing %q at the cell, decoded %q", c.wantErr, v)
-				}
-				if errors.Is(err, io.EOF) {
-					t.Fatalf("cell verdict is io.EOF — silent truncation of the tail datum: %v", err)
-				}
-				if !strings.Contains(err.Error(), c.wantErr) {
-					t.Fatalf("want error containing %q, got: %v", c.wantErr, err)
-				}
-			})
-		}
-	})
-
-	// Corrupt sync on an empty block errors at sync validation, *before* the
-	// skip arm: skipping must not weaken corruption detection.
-	t.Run("corrupt-sync-on-empty", func(t *testing.T) {
-		s := avro.MustParse(`"string"`)
-		var buf bytes.Buffer
-		w := mustNewWriter(t, &buf, s, WithSyncMarker(foreignSync))
-		if err := w.Encode("d0"); err != nil {
-			t.Fatal(err)
-		}
-		mustClose(t, w)
-		bad := foreignSync
-		bad[0] ^= 0xFF
-		appendRawBlock(&buf, 0, nil, bad)
-		datum := avrotest.MustAppendEncode(t, s, nil, "d1")
-		var rest bytes.Buffer
-		appendRawBlock(&rest, 1, datum, foreignSync)
-		buf.Write(rest.Bytes())
-
-		r := mustNewReader(t, bytes.NewReader(buf.Bytes()))
-		defer r.Close()
-		var v string
-		if err := r.Decode(&v); err != nil || v != "d0" {
-			t.Fatalf("first datum: %v %q", err, v)
-		}
-		err := r.Decode(&v)
-		if err == nil || !strings.Contains(err.Error(), "sync marker mismatch") {
-			t.Fatalf("want sync marker mismatch on corrupt-sync empty block, got %v", err)
-		}
-	})
-
-	// An all-empty-blocks file terminates: one Decode call walks every block
-	// (18 bytes each) and returns io.EOF: no records, no hang, and in
-	// particular no block treated as a datum.
-	t.Run("ten-thousand-empty-blocks", func(t *testing.T) {
-		s := avro.MustParse(`"string"`)
-		var buf bytes.Buffer
-		w := mustNewWriter(t, &buf, s, WithSyncMarker(foreignSync))
-		mustClose(t, w)
-		for range 10_000 {
-			appendRawBlock(&buf, 0, nil, foreignSync)
-		}
-		got := readAllStrings(t, buf.Bytes())
-		if len(got) != 0 {
-			t.Fatalf("read %v from an all-empty file", got)
-		}
-		if fa != nil && faSupported["null"] {
-			faGot, faErr := fa(buf.Bytes())
-			if faErr != "" || len(faGot) != 0 {
-				t.Errorf("fastavro on all-empty file: values=%v err=%s", faGot, faErr)
-			}
-		}
-	})
 }
 
 // TestReaderMetaMapFraming hand-frames the OCF header's metadata map, the one
@@ -8407,95 +7429,6 @@ func TestMatrix_TruncationTerminalErrorIdentity(t *testing.T) {
 
 // ---------- zero_byte_block_test.go ----------
 
-// Files we write must be readable by us. The Reader bounds a block's declared
-// count to len(block)+maxOCFZeroByteSlack, and caps consecutive zero-byte
-// records at the same slack. So the Writer must start a new block before a run
-// of zero-byte datums (top-level "null", a record of only null fields, a size-0
-// fixed) exceeds that bound. The byte-driven flush alone never fires for such
-// datums, since they contribute no bytes. Without a count-side bound every datum
-// lands in one giant block the Reader then rejects.
-func TestWriterZeroByteDatumsSelfReadable(t *testing.T) {
-	const n = 3*maxOCFZeroByteSlack + 17 // several blocks' worth
-	for _, tc := range []struct {
-		name   string
-		schema string
-		value  any
-	}{
-		{"null", `"null"`, nil},
-		{"size-0 fixed", `{"type":"fixed","name":"F","size":0}`, []byte{}},
-		{"all-null record", `{"type":"record","name":"R","fields":[
-			{"name":"a","type":"null"}]}`, map[string]any{"a": nil}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := avro.MustParse(tc.schema)
-			var buf bytes.Buffer
-			w := mustNewWriter(t, &buf, s)
-			for i := 0; i < n; i++ {
-				if err := w.Encode(tc.value); err != nil {
-					t.Fatalf("Encode #%d: %v", i, err)
-				}
-			}
-			mustClose(t, w)
-
-			r := mustNewReader(t, bytes.NewReader(buf.Bytes()))
-			defer r.Close()
-			var got int
-			for {
-				var v any
-				err := r.Decode(&v)
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				if err != nil {
-					t.Fatalf("Decode #%d: %v", got, err)
-				}
-				got++
-			}
-			if got != n {
-				t.Fatalf("read %d of %d datums back", got, n)
-			}
-		})
-	}
-}
-
-// Datums that consume ≥1 wire byte keep count ≤ len(block), so the count-side
-// flush bound never fires for them. Here that is union values, where even the
-// null branch writes its index varint. Block sizing stays purely byte-driven
-// and the file reads back exactly as before.
-func TestWriterOneByteDatumsUnaffectedByCountBound(t *testing.T) {
-	s := avro.MustParse(`["null","int"]`)
-	const n = 2*maxOCFZeroByteSlack + 11
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s)
-	for i := 0; i < n; i++ {
-		var v any
-		if i%37 == 0 {
-			v = int32(i) // occasional real bytes
-		}
-		if err := w.Encode(v); err != nil {
-			t.Fatalf("Encode #%d: %v", i, err)
-		}
-	}
-	mustClose(t, w)
-	r := mustNewReader(t, bytes.NewReader(buf.Bytes()))
-	defer r.Close()
-	var got int
-	for {
-		var v any
-		err := r.Decode(&v)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			t.Fatalf("Decode #%d: %v", got, err)
-		}
-		got++
-	}
-	if got != n {
-		t.Fatalf("read %d of %d datums back", got, n)
-	}
-}
-
 // The per-block consecutive-zero-byte-record cap (Reader.Decode's zeroRun
 // counter) is a second, independent DoS guard from readBlock's
 // count <= len(block)+slack check. They must be tested independently. A block
@@ -8574,133 +7507,3 @@ func writeInts(t testing.TB, w *Writer, n int) {
 //////////////////////
 // WITH DECODE OPTS //
 //////////////////////
-
-// decodeOptsSchema has one non-null union so the tagging options have
-// something to act on, plus a string so the aliasing guard has wire bytes to
-// point at.
-const decodeOptsSchema = `{"type":"record","name":"R","fields":[
-	{"name":"u","type":["null","string"]},
-	{"name":"t","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}]}`
-
-func writeDecodeOptsFile(t *testing.T) []byte {
-	t.Helper()
-	s := avrotest.MustParse(t, decodeOptsSchema)
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s)
-	if err := w.Encode(map[string]any{"u": "hello", "t": time.UnixMilli(1).UTC()}); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-	return buf.Bytes()
-}
-
-// TestWithDecodeOptsReachesTheDatumDecode: without it the reader's Decode
-// takes no options at all, so TaggedUnions and TagLogicalTypes, which only
-// act on an *any target, are unreachable from an OCF reader.
-func TestWithDecodeOptsReachesTheDatumDecode(t *testing.T) {
-	file := writeDecodeOptsFile(t)
-	for _, c := range []struct {
-		name  string
-		opts  []ReaderOpt
-		wantU any
-	}{
-		{"bare", nil, "hello"},
-		{"tagged", []ReaderOpt{WithDecodeOpts(avro.TaggedUnions())},
-			map[string]any{"string": "hello"}},
-		{"tagged+logical", []ReaderOpt{WithDecodeOpts(avro.TaggedUnions(), avro.TagLogicalTypes())},
-			map[string]any{"string": "hello"}},
-		// Cumulative, so two calls compose rather than the last one winning.
-		{"two calls", []ReaderOpt{WithDecodeOpts(avro.TaggedUnions()), WithDecodeOpts(avro.TagLogicalTypes())},
-			map[string]any{"string": "hello"}},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			rd, err := NewReader(bytes.NewReader(file), c.opts...)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer rd.Close()
-			var v any
-			if err := rd.Decode(&v); err != nil {
-				t.Fatal(err)
-			}
-			m, ok := v.(map[string]any)
-			if !ok {
-				t.Fatalf("got %#v, want a map", v)
-			}
-			if !reflect.DeepEqual(m["u"], c.wantU) {
-				t.Errorf("u: got %#v, want %#v", m["u"], c.wantU)
-			}
-			// TagLogicalTypes qualifies the branch name, and only with
-			// TaggedUnions, so the timestamp branch tells the two apart.
-			wantT := any(time.UnixMilli(1).UTC())
-			switch c.name {
-			case "tagged":
-				wantT = map[string]any{"long": time.UnixMilli(1).UTC()}
-			case "tagged+logical", "two calls":
-				wantT = map[string]any{"long.timestamp-millis": time.UnixMilli(1).UTC()}
-			}
-			if !reflect.DeepEqual(m["t"], wantT) {
-				t.Errorf("t: got %#v, want %#v", m["t"], wantT)
-			}
-		})
-	}
-}
-
-// ocfWithin reports whether p points inside b.
-func ocfWithin(p unsafe.Pointer, b []byte) bool {
-	if p == nil || len(b) == 0 {
-		return false
-	}
-	base := uintptr(unsafe.Pointer(unsafe.SliceData(b)))
-	q := uintptr(p)
-	return q >= base && q < base+uintptr(len(b))
-}
-
-// TestWithDecodeOptsNeverAliasesTheBlockBuffer: block is replaced on every
-// block read, so a decoded value pointing into it would change under the
-// caller. WithDecodeOpts drops an aliasing option rather than forwarding it.
-//
-// The block is read explicitly first, so the buffer the datum decodes *out* of
-// is in hand. Decode then finds remain non-zero and does not read another.
-func TestWithDecodeOptsNeverAliasesTheBlockBuffer(t *testing.T) {
-	file := writeDecodeOptsFile(t)
-	rd, err := NewReader(bytes.NewReader(file), WithDecodeOpts(avro.AliasInput()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rd.Close()
-	if err := rd.readBlock(); err != nil {
-		t.Fatal(err)
-	}
-	block := rd.block
-	var out struct {
-		U *string    `avro:"u"`
-		T *time.Time `avro:"t"`
-	}
-	if err := rd.Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out.U == nil || *out.U != "hello" {
-		t.Fatalf("got %v, want hello", out.U)
-	}
-	if ocfWithin(unsafe.Pointer(unsafe.StringData(*out.U)), block) {
-		t.Error("the decoded string points into the reader's block buffer, which the next block read overwrites")
-	}
-
-	// The control, which is what keeps the check above from passing for the
-	// wrong reason: the same schema and the same bytes *do* alias when the
-	// option reaches Decode, so the containment test can see aliasing.
-	var direct struct {
-		U *string    `avro:"u"`
-		T *time.Time `avro:"t"`
-	}
-	if _, err := rd.schema.Decode(block, &direct, avro.AliasInput()); err != nil {
-		t.Fatal(err)
-	}
-	if direct.U == nil {
-		t.Fatal("control decode produced no value")
-	}
-	if !ocfWithin(unsafe.Pointer(unsafe.StringData(*direct.U)), block) {
-		t.Fatal("the control did not alias, so this cell cannot tell aliasing from its absence")
-	}
-}

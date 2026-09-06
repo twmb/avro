@@ -10,16 +10,6 @@ const arrayOfIntSchema = `{
 			"fields": [{"name": "vals", "type": {"type": "array", "items": "int"}}]
 		}`
 
-// Outer{items: array of [null, Inner{p:int}]}.
-const arrayOfNullableInnerSchema = `{
-			"type": "record",
-			"name": "Outer",
-			"fields": [{"name": "items", "type": {"type": "array", "items": ["null", {
-				"type": "record", "name": "Inner",
-				"fields": [{"name": "p", "type": "int"}]
-			}]}}]
-		}`
-
 // Outer{items: array of Inner{p:int}}.
 const arrayOfPtrInnerSchema = `{
 			"type": "record",
@@ -40,19 +30,6 @@ const arrayOfPtrRecSchema = `{
 			}}}]
 		}`
 
-// Wrapper{color: enum Color[RED,GREEN,BLUE]}.
-const enumColorSchema = `{
-		"type": "record",
-		"name": "Wrapper",
-		"fields": [
-			{"name": "color", "type": {
-				"type": "enum",
-				"name": "Color",
-				"symbols": ["RED", "GREEN", "BLUE"]
-			}}
-		]
-	}`
-
 // iface{s: Foobar{f:int}}, a record field holding a record.
 const ifaceFoobarSchema = `{
 		"type": "record",
@@ -67,16 +44,6 @@ const ifaceFoobarSchema = `{
 					]
 				}
 			}
-		]
-	}`
-
-// Item{name:string, color: Color}. Color by reference, defined elsewhere.
-const itemColorRefSchema = `{
-		"type": "record",
-		"name": "Item",
-		"fields": [
-			{"name": "name", "type": "string"},
-			{"name": "color", "type": "Color"}
 		]
 	}`
 
@@ -117,19 +84,6 @@ const nodeRecursiveSchema = `{"type":"record","name":"Node","fields":[
 		{"name":"next","type":["null","Node"]}
 	]}`
 
-// Outer{item: [null, Inner{x:int, y:string}]}.
-const nullableInnerSchema = `{
-		"type": "record",
-		"name": "Outer",
-		"fields": [{"name": "item", "type": ["null", {
-			"type": "record", "name": "Inner",
-			"fields": [
-				{"name": "x", "type": "int"},
-				{"name": "y", "type": "string"}
-			]
-		}]}]
-	}`
-
 // Wrapper{value: [null, int]}.
 const nullableIntSchema = `{
 		"type": "record",
@@ -144,11 +98,6 @@ const orderIDPriceSchema = `{
 			{"name":"price","type":{"type":"long","logicalType":"money"}}
 		]
 	}`
-
-// Order{price: long with logicalType money}.
-const orderPriceSchema = `{"type":"record","name":"Order","fields":[
-			{"name":"price","type":{"type":"long","logicalType":"money"}}
-		]}`
 
 // prims: one field per primitive type.
 const primsSchema = `{
@@ -174,12 +123,6 @@ const recASchema = `{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"}
 	]}`
 
-// R{b:string, a:int}. Reader-side field order flipped from recABSchema.
-const recBASchema = `{"type":"record","name":"R","fields":[
-		{"name":"b","type":"string"},
-		{"name":"a","type":"int"}
-	]}`
-
 // r{a:int, b:string}. Lowercase record name.
 const recIntBSchema = `{"type":"record","name":"r","fields":[
 		{"name":"a","type":"int"},
@@ -191,12 +134,6 @@ const recLongBSchema = `{"type":"record","name":"r","fields":[
 		{"name":"a","type":"long"},
 		{"name":"b","type":"string"}
 	]}`
-
-// R{name:string, email:[null,string]}.
-const recNameEmailSchema = `{"type":"record","name":"R","fields":[
-				{"name":"name","type":"string"},
-				{"name":"email","type":["null","string"]}
-			]}`
 
 // R{ts: long with logicalType timestamp-millis}.
 const recTimestampMillisSchema = `{"type":"record","name":"R","fields":[
@@ -261,13 +198,3 @@ const superheroUnionSchema = `
 	}}
 ]
 }]`
-
-// Telephone{number:int, label:string}.
-const telephoneSchema = `{
-		"type": "record",
-		"name": "Telephone",
-		"fields": [
-			{"name": "number", "type": "int"},
-			{"name": "label", "type": "string"}
-		]
-	}`

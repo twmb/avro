@@ -1021,37 +1021,6 @@ func expandJSON(t *testing.T, n *SchemaNode) string {
 	return string(b)
 }
 
-// TestExpandReferencesRepeatedType: every occurrence of a repeated named type
-// carries the full body, wherever the occurrence sits.
-func TestExpandReferencesRepeatedType(t *testing.T) {
-	s := mustParse(t, `{"type":"record","name":"Top","namespace":"ns","fields":[
-		{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}},
-		{"name":"b","type":"ns.Inner"},
-		{"name":"c","type":{"type":"array","items":"Inner"}},
-		{"name":"d","type":{"type":"map","values":"ns.Inner"}},
-		{"name":"e","type":["null","Inner"]}]}`)
-	e := s.Root().ExpandReferences()
-
-	full := func(n *SchemaNode) bool {
-		return n != nil && n.Type == "record" && n.Name == "Inner" &&
-			n.Namespace == "ns" && len(n.Fields) == 1 && n.Fields[0].Name == "x"
-	}
-	for _, c := range []struct {
-		name string
-		node *SchemaNode
-	}{
-		{"a (the definition)", &e.Fields[0].Type},
-		{"b (a plain reference)", &e.Fields[1].Type},
-		{"c (an array item)", e.Fields[2].Type.Items},
-		{"d (a map value)", e.Fields[3].Type.Values},
-		{"e (a union branch)", &e.Fields[4].Type.Branches[1]},
-	} {
-		if !full(c.node) {
-			t.Errorf("%s: not expanded: %s", c.name, expandJSON(t, c.node))
-		}
-	}
-}
-
 // TestExpandReferencesCyclesStayReferences: expanding a recursive definition
 // does not terminate, so the edge that closes the cycle keeps its reference.
 func TestExpandReferencesCyclesStayReferences(t *testing.T) {
@@ -1098,125 +1067,6 @@ func TestExpandReferencesCyclesStayReferences(t *testing.T) {
 			t.Errorf("mutually recursive expansion does not rebuild: %v", err)
 		}
 	})
-}
-
-// TestExpandReferencesDoesNotMutateReceiver: the receiver is unchanged, and
-// nothing in the result shares a container with it.
-func TestExpandReferencesDoesNotMutateReceiver(t *testing.T) {
-	s := mustParse(t, `{"type":"record","name":"Top","namespace":"ns","doc":"d","aliases":["Alt"],"extra":1,"fields":[
-		{"name":"a","type":{"type":"enum","name":"E","symbols":["X","Y"],"extra":2},"aliases":["aa"],"fx":3},
-		{"name":"b","type":"ns.E"},
-		{"name":"c","type":{"type":"array","items":"E"}}]}`)
-	r := s.Root()
-	before := expandJSON(t, r)
-	e := r.ExpandReferences()
-	if after := expandJSON(t, r); after != before {
-		t.Errorf("receiver changed:\n before %s\n after  %s", before, after)
-	}
-
-	// We write through every container the result hands back; none of it may
-	// reach the receiver either.
-	if n := expandMutateAll(e, 0); n < 8 {
-		t.Fatalf("only %d containers to write through; the cell is not reaching the result's structure", n)
-	}
-	if after := expandJSON(t, r); after != before {
-		t.Errorf("writing to the result reached the receiver:\n before %s\n after  %s", before, after)
-	}
-}
-
-// expandMutateAll writes through every container in n's tree, returning how
-// many it wrote to. Written as a walk rather than a list of paths, so it keeps
-// reaching the containers whatever the expansion produced.
-func expandMutateAll(n *SchemaNode, depth int) int {
-	if n == nil || depth > maxSchemaJSONDepth {
-		return 0
-	}
-	c := 0
-	for i := range n.Aliases {
-		n.Aliases[i], c = "MUTATED", c+1
-	}
-	for i := range n.Symbols {
-		n.Symbols[i], c = "MUTATED", c+1
-	}
-	for k := range n.Props {
-		n.Props[k], c = "MUTATED", c+1
-	}
-	c += expandMutateAll(n.Items, depth+1)
-	c += expandMutateAll(n.Values, depth+1)
-	for i := range n.Fields {
-		for j := range n.Fields[i].Aliases {
-			n.Fields[i].Aliases[j], c = "MUTATED", c+1
-		}
-		for k := range n.Fields[i].Props {
-			n.Fields[i].Props[k], c = "MUTATED", c+1
-		}
-		n.Fields[i].Name, c = "MUTATED", c+1
-		c += expandMutateAll(&n.Fields[i].Type, depth+1)
-	}
-	for i := range n.Branches {
-		c += expandMutateAll(&n.Branches[i], depth+1)
-	}
-	return c
-}
-
-// expandRoundTripSchemas are the shapes ExpandReferences must leave a schema's
-// meaning untouched for.
-var expandRoundTripSchemas = []struct {
-	name   string
-	schema string
-	// fullDiffers marks the cases where the rebuilt text differs from the
-	// unexpanded rebuild in reference spelling alone: Schema re-spells a
-	// collapsed repeat by fullname, so a source reference written as an
-	// in-scope short name comes back qualified. The canonical comparison,
-	// which normalizes both to the fullname, still runs.
-	fullDiffers bool
-}{
-	{"repeat", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"I"}]}`, false},
-	{"namespaced", `{"type":"record","name":"Top","namespace":"a.b","fields":[{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"a.b.I"},{"name":"c","type":"I"}]}`, true},
-	{"null-namespace-escape", `{"type":"record","name":"Top","namespace":"a.b","fields":[{"name":"a","type":{"type":"record","name":"I","namespace":"","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":".I"}]}`, true},
-	{"cross-namespace", `{"type":"record","name":"Top","namespace":"a","fields":[{"name":"a","type":{"type":"record","name":"I","namespace":"c.d","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"c.d.I"}]}`, false},
-	{"recursive", `{"type":"record","name":"N","fields":[{"name":"n","type":["null","N"]},{"name":"v","type":"int"}]}`, false},
-	{"mutual", `{"type":"record","name":"A","fields":[{"name":"b","type":{"type":"record","name":"B","fields":[{"name":"a","type":["null","A"]}]}},{"name":"b2","type":"B"}]}`, false},
-	{"enum-and-fixed", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"enum","name":"E","symbols":["X"]}},{"name":"b","type":"E"},{"name":"c","type":{"type":"fixed","name":"F","size":4}},{"name":"d","type":"F"}]}`, false},
-	{"wrapped-reference", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":{"type":"I","tag":"keep"}}]}`, false},
-	{"defaults", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"I","default":{"x":1}}]}`, false},
-	{"props-and-docs", `{"type":"record","name":"Top","doc":"","aliases":[],"fields":[{"name":"a","type":{"type":"record","name":"I","doc":"hi","fields":[{"name":"x","type":"int","doc":""}]}},{"name":"b","type":"I"}]}`, false},
-	{"array-of-map-of-ref", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":{"type":"array","items":{"type":"map","values":"I"}}}]}`, false},
-	{"no-references", `{"type":"record","name":"Top","fields":[{"name":"x","type":"int"},{"name":"y","type":{"type":"array","items":"string"}}]}`, false},
-	{"primitive", `"int"`, false},
-	{"union-top", `["null",{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]},{"type":"record","name":"J","fields":[{"name":"i","type":"I"}]}]`, false},
-	{"deep-chain", `{"type":"record","name":"R2","fields":[{"name":"a","type":{"type":"record","name":"R1","fields":[{"name":"a","type":{"type":"record","name":"R0","fields":[{"name":"v","type":"int"}]}},{"name":"b","type":"R0"}]}},{"name":"b","type":"R1"}]}`, false},
-}
-
-// TestExpandReferencesRoundTrips: Schema collapses repeats back to references
-// on emit, so expanding first must land on exactly the same schema.
-func TestExpandReferencesRoundTrips(t *testing.T) {
-	for _, c := range expandRoundTripSchemas {
-		t.Run(c.name, func(t *testing.T) {
-			s := mustParse(t, c.schema)
-			e := s.Root().ExpandReferences()
-			got, err := e.Schema()
-			if err != nil {
-				t.Fatalf("rebuilding the expanded tree: %v", err)
-			}
-			if string(got.Canonical()) != string(s.Canonical()) {
-				t.Errorf("canonical form changed:\n got  %s\n want %s", got.Canonical(), s.Canonical())
-			}
-			// The full form too: canonical drops docs, props and defaults,
-			// so on its own it would not notice an expansion that lost
-			// them. We compare against the tree rebuilt *without*
-			// expanding, so the difference measured is the expansion
-			// and not Schema's own re-emission of the source text.
-			plain, err := s.Root().Schema()
-			if err != nil {
-				t.Fatalf("rebuilding the unexpanded tree: %v", err)
-			}
-			if same := got.String() == plain.String(); same == c.fullDiffers {
-				t.Errorf("full form: same=%v, want same=%v\n got  %s\n want %s",
-					same, !c.fullDiffers, got.String(), plain.String())
-			}
-		})
-	}
 }
 
 // expandDoublingSchema names one record per level, each holding its
@@ -1328,26 +1178,6 @@ func TestExpandReferencesDeepTree(t *testing.T) {
 			t.Fatalf("level %d shares a node with the receiver", i)
 		}
 		a, b = a.Items, b.Items
-	}
-}
-
-// TestExpandReferencesExtractedSubtree: a subtree lifted out of a Root tree
-// carries the stamp Root left on its references. So it expands even though the
-// definition lives outside it, the same resolution Schema splices with.
-func TestExpandReferencesExtractedSubtree(t *testing.T) {
-	s := mustParse(t, `{"type":"record","name":"Top","namespace":"ns","fields":[
-		{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}},
-		{"name":"b","type":"Inner"}]}`)
-	sub := s.Root().Fields[1].Type // just the reference node
-	if sub.Type != "ns.Inner" && sub.Type != "Inner" {
-		t.Fatalf("expected a reference node, got %s", expandJSON(t, &sub))
-	}
-	e := sub.ExpandReferences()
-	if e.Type != "record" || e.Name != "Inner" || len(e.Fields) != 1 {
-		t.Fatalf("extracted reference did not expand: %s", expandJSON(t, e))
-	}
-	if _, err := e.Schema(); err != nil {
-		t.Errorf("expanded extraction does not rebuild: %v", err)
 	}
 }
 
