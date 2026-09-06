@@ -53,13 +53,11 @@ type nodeChildVisitor struct {
 	// inside a stray "fields": a bound record build rejects a nil field type.
 	fieldNoType func(i int, fo map[string]any)
 
-	// strayKeys also fires the container callbacks on kinds that do not *bind*
-	// the key, for bodies parsing as the key's schema shape. The default is
-	// bound-only, and must stay so for any walker that registers names. A
-	// definition-shaped value inside a stray key would take its fullname in a
-	// first-wins store and shadow the real definition everywhere that store
-	// feeds. The metadata walker alone sets it, since surfacing stray keys
-	// as-written is read-only.
+	// strayKeys also fires the container callbacks on kinds that do not bind
+	// the key, for bodies that parse as the key's schema shape. Only the
+	// read-only metadata walker sets it. A walker that registers names must
+	// not: a definition-shaped value under a stray key would take its
+	// fullname in a first-wins store and shadow the real definition.
 	strayKeys bool
 
 	// strayShapeMemo memoizes the stray-body shape checks by subtree pointer,

@@ -28,11 +28,8 @@ func compatErr(path, readerType, writerType, detail string) error {
 	}
 }
 
-// CompatibilityError.Detail strings for the writer-union incompatibility
-// rule. Two entry points enforce it, the pre-check here (CheckCompatibility)
-// and the resolver (resolve.go, Resolve), and you must see the same detail
-// from both. Sharing the literal makes that structural rather than a lockstep
-// we have to remember.
+// Detail strings for the writer-union rule, shared by CheckCompatibility and
+// Resolve so both report the same text.
 const (
 	detailWriterTypeNoReaderBranch   = "writer type matches no reader union branch"
 	detailWriterBranchNoReaderBranch = "writer union branch has no matching reader branch"
@@ -185,12 +182,9 @@ func checkRecordFieldClaimsUnique(r, w *schemaNode, path string) error {
 	if len(r.fields) == 0 {
 		return nil
 	}
-	// Presence and identity are *separate* variables. A field name is not a
-	// usable presence sentinel: [WithLaxNames] admits the empty string, so a
-	// writer field named "" would claim a slot while leaving it
-	// indistinguishable from unclaimed, and a second field reaching it
-	// through an alias would go undetected. claimedBy exists only to name the
-	// collision in the error. resolveRecord splits them the same way.
+	// Presence and identity are separate: WithLaxNames admits the empty
+	// field name, so a name is no presence sentinel. claimedBy only names
+	// the collision in the error. resolveRecord splits them the same way.
 	claimed := make([]bool, len(r.fields))
 	claimedBy := make([]string, len(r.fields))
 	readerByName := newReaderFieldLookup(r)
@@ -235,12 +229,11 @@ func checkEnumCompat(r, w *schemaNode, path string) error {
 // and fixed).
 //
 // Aliases carry their qualification. A reader alias matches the writer's
-// exact fullname, and an alias declared *without* a dot also
-// short-name-matches the writer in any namespace: fastavro's raw-string tier
-// (executed), the permissive side of the two references. An
-// explicitly-qualified alias never short-matches, since the spec ("Aliases")
-// makes "x.y" a fully qualified name denoting exactly x.y, and both
-// references reject the cross-namespace match.
+// exact fullname, and an alias declared without a dot also short-name-matches
+// the writer in any namespace, which is fastavro's raw-string tier and the
+// permissive side of the two references. An explicitly qualified alias never
+// short-matches: the spec makes "x.y" a fully qualified name denoting exactly
+// x.y, and both references reject the cross-namespace match.
 func namesMatch(r, w *schemaNode) bool {
 	if r.name == w.name {
 		return true
@@ -281,11 +274,11 @@ func findWriterField(rf fieldNode, writerFields map[string]*fieldNode) *fieldNod
 }
 
 // readerBranchLookup answers "which reader branch does this writer node
-// select?" in constant time, for one reader union. The rule is
-// branchMatchTiers below, and we apply it once ahead of the questions: both
-// callers ask once per writer branch, and scanning the reader's branches
-// inside that loop is quadratic in two counts the schema author picks. A cost
-// bound only: the verdict must be what the scan gave.
+// select?" in constant time for one reader union. The rule is
+// branchMatchTiers; we index it once ahead of the questions, since both
+// callers ask once per writer branch and a scan inside that loop is quadratic
+// in two counts the schema author picks. The verdict must be what the scan
+// would give.
 type readerBranchLookup struct {
 	branches []*schemaNode
 	// byTier[i] holds branchMatchTiers[i]'s keys; first branch wins, which is
@@ -296,11 +289,10 @@ type readerBranchLookup struct {
 	firstByKind map[string]int
 }
 
-// branchMatchKey identifies what a reader branch answers to under one tier.
-// Kind, because every tier matches within a kind. Size, because the spec
-// folds a fixed's size into the *match* predicate rather than checking it
-// after selection: a wrong-size same-name fixed must not match, and
-// selection continues to a later branch (NOT_BUGS #44).
+// branchMatchKey identifies what a reader branch answers to under one tier:
+// kind, because every tier matches within a kind, and size, because the spec
+// folds a fixed's size into the match itself, so a wrong-size same-name fixed
+// does not match and selection continues to a later branch.
 type branchMatchKey struct {
 	kind string
 	name string
@@ -308,9 +300,9 @@ type branchMatchKey struct {
 }
 
 // branchMatchTier is one rank of the match rule: the names a reader branch
-// answers to, and the name a writer node asks with. The builder registers
-// readerNames and the query asks writerName from this one table, so the
-// index and the verdict cannot describe different rules.
+// answers to, and the name a writer node asks with. The index is built from
+// readerNames and queried with writerName, so the two cannot describe
+// different rules.
 type branchMatchTier struct {
 	name        string
 	readerNames func(r *schemaNode) []string
@@ -329,7 +321,7 @@ func branchIsNamedKind(n *schemaNode) bool {
 }
 
 // branchSizeKey is the size a fixed matches on, and zero for every other kind,
-// so the key carries the constraint exactly where the rule puts it.
+// so the key carries the constraint where the rule puts it.
 func branchSizeKey(n *schemaNode) int {
 	if n.kind == "fixed" {
 		return n.size
@@ -340,11 +332,11 @@ func branchSizeKey(n *schemaNode) int {
 // branchMatchTiers ranks union-branch selection: full name or alias, then
 // unqualified short name, then promotion.
 //
-// The unqualified tier applies to record, enum *and* fixed, matching
-// fastavro's match_types. Java does the short-name match for records only;
-// we follow fastavro's more uniform rule deliberately (NOT_BUGS #44). Exact
-// match must outrank it, since the spec permits a union to hold several
-// named types sharing an unqualified name across namespaces.
+// The unqualified tier applies to record, enum and fixed, matching fastavro's
+// match_types; Java does the short-name match for records only, and we
+// follow fastavro's more uniform rule. Exact match must outrank it, since the
+// spec permits a union to hold several named types sharing an unqualified
+// name across namespaces.
 //
 // An unnamed kind answers to the empty name at the exact tier and to nothing
 // at the unqualified tier: same kind is an exact match for it, and it has no
@@ -387,9 +379,8 @@ var branchMatchTiers = []branchMatchTier{
 }
 
 // promotionTargetKinds maps a writer kind to every reader kind it promotes
-// to. Derived from the promotions table itself (promote.go) rather than
-// listed, so a promotion added there is honored here without an edit: the
-// promotion tier is keyed by kind alone, and this is that tier's vocabulary.
+// to, derived from the promotions table so a promotion added there is honored
+// here without an edit.
 var promotionTargetKinds = func() map[string][]string {
 	m := make(map[string][]string, len(promotions))
 	for key := range promotions {
@@ -444,9 +435,8 @@ func (lk readerBranchLookup) match(w *schemaNode) *schemaNode {
 		}
 	}
 	// Promotion is the last tier and the only one that crosses kinds. A
-	// same-kind named branch that failed both tiers above does NOT reach it:
-	// nothing promotes into record, enum or fixed, so promotionTargetKinds
-	// has no entry that could match one.
+	// same-kind named branch that failed both tiers above cannot match here,
+	// since nothing promotes into record, enum or fixed.
 	best := -1
 	for _, readerKind := range promotionTargetKinds[w.kind] {
 		if readerKind == w.kind {

@@ -19,23 +19,11 @@ func appendCompactJSON(dst, raw []byte) []byte {
 	return append(dst, buf.Bytes()...)
 }
 
-// canonicalBytes serializes the (already first-occurrence-rewritten and
-// strip/order-canonicalized) schema tree to its Parsing Canonical Form bytes,
-// appending to one buffer in a single O(n) pass.
-//
-// We used to encode through nested aobject/aschema MarshalJSON methods, each
-// returning its full subtree bytes for the parent to copy into its own buffer:
-// O(depth*size), i.e. O(n^2) over a nested schema. That path also produced
-// HTML escapes (< etc.) and U+2028/U+2029 escapes that an outer
-// bytes.ReplaceAll then tried to undo. The undo was unsound for a string
-// containing a literal backslash: the 6-byte \uXXXX target appears inside the
-// \\uXXXX escape of such a string, so ReplaceAll collapsed it to invalid JSON
-// and a corrupt fingerprint.
-//
-// We now emit strings as raw UTF-8 per the PCF [STRINGS] rule. Only the
-// mandatory JSON escapes (quote, backslash, controls) are escaped; <, >, &,
-// U+2028, U+2029 and every other code point go out verbatim. This matches
-// Java's SchemaNormalization and drops the un-escape round trip.
+// canonicalBytes serializes the first-occurrence-rewritten, stripped schema
+// tree to its Parsing Canonical Form bytes in one O(n) pass. Strings go out
+// as raw UTF-8 per the PCF [STRINGS] rule: only the mandatory JSON escapes
+// (quote, backslash, controls) are escaped, and <, >, &, U+2028 and U+2029 go
+// out verbatim, matching Java's SchemaNormalization.
 func canonicalBytes(root aschema) []byte {
 	dst := make([]byte, 0, 256)
 	return appendCanonSchema(dst, &root)
@@ -84,12 +72,10 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 		return append(dst, ':')
 	}
 
-	// A named kind always emits its name, including the empty fullname a user
-	// WithLaxNames fn can accept ("name":""). That matches fastavro's PCF
-	// (executed, 1.12.2), the only other implementation known to parse the
-	// shape; omitting it emitted a missing-name spelling instead. The
-	// Name != "" arm keeps emission for hand-built objects carrying a name on
-	// a non-named kind.
+	// A named kind always emits its name, including the empty fullname a
+	// WithLaxNames fn can accept ("name":""), as fastavro's PCF does. The
+	// Name != "" arm keeps emission for a hand-built object carrying a name
+	// on a non-named kind.
 	if o.Name != "" || isNamedKind(o.Type) {
 		dst = key(dst, "name")
 		dst = appendCanonString(dst, o.Name)
@@ -97,12 +83,10 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 	dst = key(dst, "type")
 	dst = appendCanonString(dst, o.Type)
 
-	// One rule per required array. The kind that requires the key always emits
-	// it, even empty (a record with no "fields" or an enum with no "symbols" is
-	// unparseable). Any other kind emits it only when it carries one. One
-	// condition covers both, because both halves emit identically; the metadata
-	// emitter states its "fields" rule the same way (toJSONWalk,
-	// schema_node.go).
+	// A kind that requires the key always emits it, even empty (a record
+	// with no "fields" or an enum with no "symbols" is unparseable); any
+	// other kind emits it only when it carries one. toJSONWalk states its
+	// "fields" rule the same way.
 	if isRecordKind(o.Type) || len(o.Fields) > 0 {
 		dst = key(dst, "fields")
 		dst = append(dst, '[')
