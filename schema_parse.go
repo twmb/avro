@@ -466,15 +466,19 @@ func intPtrFrom(m map[string]any, key string) (*int, error) {
 // route unconsumed precision/scale already take. Only the exact lowercase
 // spelling is a reserved key: a case-variant spelling is an ordinary custom
 // property with no routing of its own.
-var strayRoutedKeys = [...]string{
-	"items", "values", "fields", "symbols", "size", "name", "namespace", "aliases",
-}
+var strayRoutedKeys = func() []string {
+	var keys []string
+	for i := range presenceBits {
+		if presenceBits[i].stray {
+			keys = append(keys, presenceBits[i].key)
+		}
+	}
+	return keys
+}()
 
 func canonicalStrayKey(k string) string {
-	for _, key := range strayRoutedKeys {
-		if k == key {
-			return key
-		}
+	if _, stray := strayKeyBit(k); stray {
+		return k
 	}
 	return ""
 }
@@ -610,30 +614,6 @@ func strayBodyShapeOKMemo(memo strayShapeMemo, key string, v any) bool {
 	default:
 		return strayBodyShapeOK(key, v)
 	}
-}
-
-// strayKeyBit returns the presence bit a stray-routed key's decoding arm
-// records, and false for any other key.
-func strayKeyBit(k string) (presenceSet, bool) {
-	switch k {
-	case "items":
-		return presItems, true
-	case "values":
-		return presValues, true
-	case "fields":
-		return presFields, true
-	case "symbols":
-		return presSymbols, true
-	case "size":
-		return presSize, true
-	case "name":
-		return presName, true
-	case "namespace":
-		return presNamespace, true
-	case "aliases":
-		return presAliases, true
-	}
-	return 0, false
 }
 
 // strayPresence returns the presence bit for a stray-routed key whose body

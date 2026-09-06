@@ -1892,30 +1892,45 @@ func (p *presenceSet) setIf(cond bool, b presenceSet) {
 	}
 }
 
-// presenceBitFor maps an exported SchemaNode field name to its bit, so the
-// emptiness walk, the emitter and the guards all key on one vocabulary.
+// presenceBits is the one table behind the presence vocabulary: each bit's
+// JSON key, the exported SchemaNode field it lands on, and whether the key
+// is stray-routed (carried as written on a kind that does not bind it, when
+// its body has the key's shape). The emptiness walk, the emitter, the
+// guards, and the Props routing all key on it.
+var presenceBits = [...]struct {
+	key, field string
+	bit        presenceSet
+	stray      bool
+}{
+	{"doc", "Doc", presDoc, false},
+	{"logicalType", "LogicalType", presLogicalType, false},
+	{"name", "Name", presName, true},
+	{"namespace", "Namespace", presNamespace, true},
+	{"aliases", "Aliases", presAliases, true},
+	{"symbols", "Symbols", presSymbols, true},
+	{"size", "Size", presSize, true},
+	{"fields", "Fields", presFields, true},
+	{"items", "Items", presItems, true},
+	{"values", "Values", presValues, true},
+}
+
+// presenceBitFor maps an exported SchemaNode field name to its bit.
 func presenceBitFor(field string) (presenceSet, bool) {
-	switch field {
-	case "Doc":
-		return presDoc, true
-	case "LogicalType":
-		return presLogicalType, true
-	case "Name":
-		return presName, true
-	case "Namespace":
-		return presNamespace, true
-	case "Aliases":
-		return presAliases, true
-	case "Symbols":
-		return presSymbols, true
-	case "Size":
-		return presSize, true
-	case "Fields":
-		return presFields, true
-	case "Items":
-		return presItems, true
-	case "Values":
-		return presValues, true
+	for i := range presenceBits {
+		if presenceBits[i].field == field {
+			return presenceBits[i].bit, true
+		}
+	}
+	return 0, false
+}
+
+// strayKeyBit returns the presence bit a stray-routed key's decoding arm
+// records, and false for any other key.
+func strayKeyBit(k string) (presenceSet, bool) {
+	for i := range presenceBits {
+		if presenceBits[i].stray && presenceBits[i].key == k {
+			return presenceBits[i].bit, true
+		}
 	}
 	return 0, false
 }
