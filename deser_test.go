@@ -14549,8 +14549,8 @@ func TestRegression_MapStructValueMatchesStandaloneRecord(t *testing.T) {
 // drift is the scan itself, stated independently and asked the same questions.
 
 // matchTierOracle ranks how strongly a reader branch matches a writer node.
-// This is the rule written out longhand, from the spec clauses and NOT_BUGS
-// #44's ruling, rather than read off branchMatchTiers. It is an independent
+// This is the rule written out longhand from the spec clauses, rather than
+// read off branchMatchTiers. It is an independent
 // statement of what the index is supposed to encode. A disagreement means the
 // index changed a verdict rather than only its cost.
 type matchTierOracle int

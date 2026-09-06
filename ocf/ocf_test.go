@@ -3050,8 +3050,8 @@ func TestRegression_OCFBigDecimalJavaInterop(t *testing.T) {
 // TestRegression_OCFCodecMatrix pins round-trip behavior for every supported
 // codec (null, deflate, snappy, zstd) at writer and reader sides. Snappy uses a
 // trailing CRC32 that we verify, as Java's SnappyCodec does. fastavro reads the
-// 4 CRC bytes but never compares them (_read_py.py snappy_read_block, see
-// NOT_BUGS.md #20). The matrix asserts a CRC mismatch is detected.
+// 4 CRC bytes but never compares them (_read_py.py snappy_read_block).
+// The matrix asserts a CRC mismatch is detected.
 func TestRegression_OCFCodecMatrix(t *testing.T) {
 	schema := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`)
 	records := []map[string]any{
@@ -8667,7 +8667,7 @@ func (s *toggleSink) Write(p []byte) (int, error) {
 	return s.buf.Write(p)
 }
 
-// Class invariant (NOT_BUGS #28): every fallible I/O step in every Writer
+// Class invariant: every fallible I/O step in every Writer
 // method must poison the Writer. Once a sink write or the sync-marker source
 // fails, no later Encode/Flush silently succeeds and no further bytes land that
 // a reader would accept. TestMatrixOCF_StatefulPoison covers only Encode/Flush

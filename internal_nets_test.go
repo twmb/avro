@@ -371,7 +371,7 @@ var censusRegistry = []censusQuestion{
 	{
 		id:       "Q13",
 		question: "Which text route does this type take — its MarshalText, its raw string kind, or raw bytes?",
-		authority: "NOT_BUGS #39's precedence order, enforced by two gates: stringFastPathEligibleEncode / " +
+		authority: "the text-route precedence order, enforced by two gates: stringFastPathEligibleEncode / " +
 			"stringFastPathEligibleDecode (reflect.go) are the single source of truth for which types may ride " +
 			"the raw-string fast paths, and the fast paths themselves are the second answerer — they read the " +
 			"underlying string directly and bypass the text arm, so the EXCLUSION LIST is the sibling set",
@@ -518,10 +518,10 @@ var censusRegistry = []censusQuestion{
 	{
 		id:       "Q4",
 		question: "Is this key RESERVED on this kind — consumed into a structural field, or an ordinary custom property?",
-		authority: "the RULINGS, not the code: NOT_BUGS #46 (reserved names match only their exact lowercase " +
-			"spelling; a variant is an ordinary prop on every surface, body-independent) and #63(b)/(f)/(j) " +
-			"(shape-conditional routing on a non-binding kind; placement-conditional, never case-conditional; " +
-			"and a reserved key that is neither bound nor surfaceable has Props as its ONLY surface). " +
+		authority: "the rulings, not the code: reserved names match only their exact lowercase " +
+			"spelling, so a variant is an ordinary prop on every surface, body-independent; " +
+			"routing on a non-binding kind is shape-conditional and placement-conditional, never case-conditional; " +
+			"and a reserved key that is neither bound nor carried structurally goes only to Props. " +
 			"schemaKeyBinds decides binding -- strayKeyBinds for the keys the kind alone settles, plus the two " +
 			"whose binding depends on the value or the logical type -- and schemaReservedKeyForObject decides " +
 			"routing, as the disjunction of exactly two ways a reserved key stays out of Props: the kind BINDS " +
@@ -615,9 +615,9 @@ var censusRegistry = []censusQuestion{
 			"the definition it names — and a splice discards whatever the usage site carried. The exemption set is " +
 			"therefore the ADJUDICATED usage-site attributes and nothing else (nameRefSpliceFieldRules): Doc, " +
 			"Aliases, Namespace and LogicalType, because a definition cannot carry a second name/namespace/doc for " +
-			"its usage site (NOT_BUGS #25) and the parse LANDS those on the structural fields, so blocking them " +
+			"its usage site, and the parse puts those on the structural fields, so blocking them " +
 			"would convert an adjudicated silent drop into a hard \"unknown complex type\" error on the extraction " +
-			"feature; plus Props, which the splice MERGES onto the definition (#63's splice-merge clause). " +
+			"feature; plus Props, which the splice MERGES onto the definition . " +
 			"Precision and Scale are NOT exempt even though they too are usage-site attributes, because the parse " +
 			"routes an unconsumed pair to Props (#71) — a non-zero value on those FIELDS can only come from a " +
 			"caller writing them, and that write must not vanish",
@@ -2945,7 +2945,7 @@ func flatFieldCorpus() []flatFieldCell {
 		// defining key, and it carries the foreign "symbols" into the lifted
 		// array object, where the per-kind exclusivity rule rejects it. So
 		// the verdict is lift and the outcome is a parse error, the
-		// documented path (NOT_BUGS #63(a)). A predicate that lifted on any
+		// documented path. A predicate that lifted on any
 		// complex key, or one that declined here, would both look fine
 		// without this cell.
 		{"mismatched-defining-key", `{"name":"f","type":"array","items":"int","symbols":["A"]}`, true, ""},
@@ -3039,14 +3039,14 @@ func TestCensus_Q7_CorpusIsNotVacuous(t *testing.T) {
 // The most heavily adjudicated question in the package. We define the corpus
 // from the rulings rather than re-derive it from the code:
 //
-//   - NOT_BUGS #46: reserved names match only their exact lowercase spelling. A
+//   - Reserved names match only their exact lowercase spelling. A
 //     case-variant is an ordinary custom property on every reading surface,
 //     body-independent.
-//   - NOT_BUGS #63(b): on a kind that does NOT bind the key, routing is
+//   - On a kind that does not bind the key, routing is
 //     shape-conditional: a schema-shaped body surfaces structurally as-written,
 //     a malformed body rides in Props verbatim, and the structural field stays
 //     zero.
-//   - NOT_BUGS #63(f): routing is placement-conditional, never case-conditional.
+//   - Routing is placement-conditional, never case-conditional.
 //
 // The invariant those share is a biconditional, and that is what the driver
 // asserts. The structural field is set iff the key was consumed, and Props
@@ -3057,7 +3057,7 @@ func TestCensus_Q7_CorpusIsNotVacuous(t *testing.T) {
 //
 // Two of the three implications are universal: consumed means NOT in Props, and
 // structural field set means consumed. The third, consumed means structural
-// field set, has one documented exception, NOT_BUGS #72. "doc" is bound on
+// field set, has one documented exception. "doc" is bound on
 // every kind, but its capture is a silently-declining string read, so a
 // non-string doc is consumed and lands on neither surface. That is exact Apache
 // Avro behavior: parseDoc reads through getOptionalText, i.e.
@@ -3079,7 +3079,7 @@ type reservedKeyCell struct {
 	// dropped marks the documented exception to "consumed means structural
 	// field set". The key is bound, so it stays out of Props, but the
 	// binding read declines this body, so no structural field is set
-	// either. See NOT_BUGS #72. It is one key ("doc") with a non-string
+	// either. It is one key ("doc") with a non-string
 	// body, and every other reserved key with a non-conforming body either
 	// routes to Props or rejects.
 	dropped bool
@@ -3169,8 +3169,8 @@ func reservedKeyCorpus() []reservedKeyCell {
 		// "doc" is bound on every kind, which is what makes it the one place
 		// the third implication can fail. With a string body it behaves like
 		// any other consumed key. With a non-string body the read declines
-		// and the value lands nowhere (NOT_BUGS #72). The variant cell is
-		// #46's control: a case-variant binds nothing, so it is an ordinary
+		// and the value goes nowhere. The variant cell is
+		// the case control: a case-variant binds nothing, so it is an ordinary
 		// prop whatever its body, and the drop cannot be reproduced by
 		// spelling.
 		{name: "int-doc-string", kind: "int", key: "doc", body: `"d"`,
@@ -3278,14 +3278,14 @@ func TestCensus_Q4_ReservedKeyRoutingIsOneRuleAcrossSurfaces(t *testing.T) {
 			}
 			// The biconditional itself. "Never both" is universal. "Never
 			// neither" holds for every cell except the documented drop
-			// (NOT_BUGS #72), which is why the exception is an expectation
+			// (the non-string doc), which is why the exception is an expectation
 			// the cell states rather than a silence.
 			if gotStructural && gotProps {
 				t.Errorf("key %q surfaced BOTH structurally and in Props — the routing is meant to pick exactly one", cell.key)
 			}
 			if cell.dropped {
 				if gotStructural || gotProps {
-					t.Errorf("key %q reached a surface; the documented exception (NOT_BUGS #72) says a bound key whose read declines this body lands nowhere. If the drop is gone, delete `dropped` and state the new routing",
+					t.Errorf("key %q reached a surface; the documented exception says a bound key whose read declines this body lands nowhere. If the drop is gone, delete `dropped` and state the new routing",
 						cell.key)
 				}
 			} else if !gotStructural && !gotProps {
@@ -3360,7 +3360,7 @@ func TestCensus_Q4_CorpusIsNotVacuous(t *testing.T) {
 	// assertion pass vacuously, and one where drops outnumbered the ordinary
 	// outcomes would mean the rule had quietly become the other way round.
 	if dropped != 1 {
-		t.Fatalf("the drop exception is meant to be exactly one cell (NOT_BUGS #72), got %d — a new one needs its own ruling", dropped)
+		t.Fatalf("the drop exception is meant to be exactly one cell, got %d; a new one needs its own ruling", dropped)
 	}
 	// A cell that declares no outcome at all is a corpus bug: it would run
 	// every assertion against zero expectations and report agreement.

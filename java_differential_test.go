@@ -854,7 +854,7 @@ func TestDifferentialJavaWireLeniencies(t *testing.T) {
 // subset of the attribute x placement census through the Java oracle. Java
 // accepts every cell. Stray attributes are either reserved-and-ignored via
 // SCHEMA_RESERVED or kept as props, including the structural-key cells twmb
-// rejects per NOT_BUGS #63. For every cell twmb also accepts, Java's Parsing
+// rejects as structural-key exclusivity. For every cell twmb also accepts, Java's Parsing
 // Canonical Form must equal twmb's. That proves both strip the stray
 // identically, so the Rabin fingerprints agree. The "error" kind is excluded:
 // standalone error schemas are a protocol-context type in Java's parser, and

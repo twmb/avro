@@ -8951,8 +8951,7 @@ func TestRegression_HandBuiltDocInvalidUTF8(t *testing.T) {
 //     and "x.y". Both references reject the foreign-namespace pair.
 //   - the leading-dot spelling matches only the null-namespace writer
 //     (Java-aligned; fastavro keeps the alias verbatim and matches nothing,
-//     the documented divergence, recorded in NOT_BUGS with the executed
-//     evidence).
+//     the documented divergence).
 func TestMatrix_AliasResolutionCensus(t *testing.T) {
 	writerName := map[string]string{"samens": "n1.Old", "foreignns": "n2.Old", "nullns": "Old"}
 	aliasSpelling := map[string]string{
@@ -15688,7 +15687,7 @@ func testFuncBodies(src string, into map[string][2]string) {
 //     or integer formatting, while the walk charged only string-kind keys,
 //     though the budget's own contract is "every Props key".
 //
-// Both are documented postures (NOT_BUGS #68), so these assert the documented
+// Both are documented postures, so these assert the documented
 // behavior per surface. Controls come first. The same magnitude delivered as a
 // plain string, and as string-kind keys, must already be rejected. Otherwise
 // the cap is not live and the marshaler cases would pass vacuously.
@@ -15726,8 +15725,8 @@ func propsNode(v any) *SchemaNode {
 	return &SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"p": v}}
 }
 
-// buildViaSchemaFor drives the CustomType.Schema render, the surface
-// NOT_BUGS #68 names, which has an error channel.
+// buildViaSchemaFor drives the CustomType.Schema render, the one path
+// with an error channel.
 func buildViaSchemaFor(node *SchemaNode) error {
 	ct := CustomType{GoType: reflect.TypeFor[budgetMoney](), Schema: node}
 	_, err := SchemaFor[budgetOneField](ct)
@@ -15813,8 +15812,8 @@ func TestMatrix_WalkBudgetChargesEveryEmissionRoute(t *testing.T) {
 }
 
 // TestRegression_WalkBudgetKeepsMarshalOpaqueValuesOpaque: charging a
-// marshal-opaque value must not change what it marshals to (NOT_BUGS #69,
-// its own MarshalJSON/MarshalText wins). An in-budget marshaler must still
+// marshal-opaque value must not change what it marshals to, since
+// its own MarshalJSON/MarshalText wins. An in-budget marshaler must still
 // build, and its emitted form must be exactly the method's output.
 func TestRegression_WalkBudgetKeepsMarshalOpaqueValuesOpaque(t *testing.T) {
 	n := propsNode(bigJSONMarshaler{n: 8})

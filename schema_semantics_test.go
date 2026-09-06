@@ -40,7 +40,7 @@ import (
 // defined are skipped. Per accepted cell we assert the routing, plus the
 // String() reparse and Root().Schema() rebuild round trips. Wire, Canonical(),
 // and Rabin identity with the stray-free twin hold too: a stray attribute
-// must be inert. Reject cells assert their documented policy (NOT_BUGS #63).
+// must be inert. Reject cells assert their documented policy.
 // The fastavro differential arm executes every cell; the cisuite arm drives a
 // representative subset through the Java oracle.
 //
@@ -54,8 +54,7 @@ import (
 //     #55.
 //   - precision/scale anywhere else are custom properties at both levels,
 //     including malformed bodies at the field level when no decimal lift
-//     consumes them. The body-shape axis lives in the strayPS placement matrix
-//     (NOT_BUGS #71).
+//     consumes them. The body-shape axis lives in the strayPS placement matrix.
 //   - Every other reserved key on a kind that does not consume it is captured,
 //     and surfaces as written on the matching SchemaNode field where one
 //     exists. Where none exists it rides to Props verbatim (order on every
@@ -65,7 +64,7 @@ import (
 //     plus the Props-routed ones, so the rebuild is canonical-identical, not
 //     text-identical.
 //   - A container kind carrying another container kind's defining structural
-//     key hard-rejects: that is NOT_BUGS #63, the cache/metadata walkers'
+//     key hard-rejects: structural-key exclusivity, the cache/metadata walkers'
 //     kind-keyed soundness premise. fastavro and Java accept these as props,
 //     the documented divergence. A stray "name" on an unnamed container kind
 //     rejects for the same walker-parity reason; a stray "namespace" there is
@@ -105,7 +104,7 @@ const (
 	censusSkip     censusVerdict = iota // defined placement, not a stray
 	censusProps                         // accepted; key surfaces in Props
 	censusCaptured                      // accepted; key surfaces on the matching SchemaNode field (or nowhere), never Props
-	censusReject63                      // rejected: structural-key exclusivity (NOT_BUGS #63)
+	censusReject63                      // rejected: structural-key exclusivity
 )
 
 type censusAttr struct {
@@ -2731,8 +2730,8 @@ func TestDifferentialFastavroReservedExactCase(t *testing.T) {
 // as metadata" (Specification/_index.md:43), so an attribute the parser does
 // not consume is a plain custom property. We consume precision/scale as
 // decimal parameters exactly when the node is a recognized decimal carrier,
-// meaning logicalType "decimal" on bytes or fixed, where NOT_BUGS #55
-// validates them. Every other placement surfaces them in Props, matching the
+// meaning logicalType "decimal" on bytes or fixed, where the parser
+// validates them. Every other placement carries them in Props, matching the
 // field level and both references (fastavro 1.12.2 executed 9/9 accepts).
 // Java's LogicalTypes.fromSchemaImpl returns null when logicalType is absent,
 // so precision is never consulted (LogicalTypes.java:127-130).
@@ -2743,8 +2742,8 @@ func TestDifferentialFastavroReservedExactCase(t *testing.T) {
 // as-written. There a malformed body rejects loudly, naming the key; treating
 // it as absent would silently parse as decimal(p,0), scale being optional.
 // Everywhere else any body shape is an ordinary SchemaField.Props property
-// (NOT_BUGS #71; Java's FIELD_RESERVED never includes the pair,
-// Schema.java:503-504). The matrix below crosses a body-shape axis over every
+// (Java's FIELD_RESERVED never includes the pair,
+// so it never consumes them). The matrix below crosses a body-shape axis over every
 // placement for exactly this reason.
 //
 // Pre-fix, validateLogical's tail rejected any leftover precision/scale exactly
@@ -5375,7 +5374,6 @@ func TestDifferentialFastavroLogicalTypeValueTypes(t *testing.T) {
 // and each is exercised twice. Once with a valid argument, which must panic
 // reaching the receiver deref. Once with the bad argument, which returns the
 // arg-validation error, correctly about the argument rather than the receiver.
-// See BUG_AUDIT.md §Known intentional divergences.
 // ─────────────────────────────────────────────────────────────────────────
 
 // outcome runs fn and reports whether it panicked or returned an error.
@@ -5465,7 +5463,7 @@ func TestRegression_NilSchemaPanicsConsistently(t *testing.T) {
 // follows the spec's [INTEGERS] Parsing-Canonical-Form rule ("Eliminate quotes
 // around ... JSON integer literals (which appear in the size attributes of
 // fixed schemas)"). This pins the exact accept/reject at both parse and Root()
-// metadata-read. See BUG_AUDIT.md §Known intentional divergences.
+// metadata-read.
 // ─────────────────────────────────────────────────────────────────────────
 
 func TestRegression_QuotedSizePrecisionScaleMirrorsJava(t *testing.T) {
@@ -5518,7 +5516,7 @@ func TestRegression_QuotedSizePrecisionScaleMirrorsJava(t *testing.T) {
 // "<kind>.<logicalType>" qualifier only for primitive-backed logicals, which
 // is goavro's convention and the reason TagLogicalTypes exists. The encoding
 // stays binary/JSON uniform and round-trips, and the decoder still accepts the
-// legacy form. See BUG_AUDIT.md §Known intentional divergences.
+// legacy form.
 // ─────────────────────────────────────────────────────────────────────────
 
 func TestMatrix_NamedFixedLogicalTaggedUnionName(t *testing.T) {
@@ -8070,7 +8068,7 @@ func TestRegression_UnionFixedSizeFoldedIntoSelection(t *testing.T) {
 	}
 
 	// JSON: the resolved DecodeJSON consumes writer-shaped JSON and resolves the
-	// same way (NOT_BUGS #2). The writer encodes its fixed as a codepoint string.
+	// same way. The writer encodes its fixed as a codepoint string.
 	jwire, err := writer.AppendEncodeJSON(nil, [4]byte{1, 2, 3, 4})
 	if err != nil {
 		t.Fatalf("encode writer JSON: %v", err)
@@ -14505,7 +14503,7 @@ func TestMatrix_InternalReparseBareEmptyName(t *testing.T) {
 		t.Errorf("String() re-parse: %v\nString(): %s", err, writer.String())
 	}
 
-	// NOT_BUGS #60: the bare empty-name root emits "name":"" in canonical
+	// The bare empty-name root emits "name":"" in canonical
 	// form, matching fastavro (1.12.2, executed), the only other
 	// implementation known to parse the shape. Omitting the name emits a
 	// spelling that fingerprints like nothing else. We pin canonical bytes and
@@ -14819,7 +14817,7 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 //
 //	{".x" definition x reference spelling {"x", ".x"} x cross-parse
 //	 x {pure reference, reference-then-define, define-then-reference}}
-//	plus same-parse equivalence, the "." -> empty-name cell (NOT_BUGS #60),
+//	plus same-parse equivalence, the "." -> empty-name cell,
 //	a multi-dot verbatim control, and the Root()/parser agreement cell.
 func TestMatrix_LeadingDotNameNormalization(t *testing.T) {
 	acceptAll := func(string) error { return nil }
@@ -14895,7 +14893,7 @@ func TestMatrix_LeadingDotNameNormalization(t *testing.T) {
 		})
 	}
 
-	// "." collapses into the empty-name family (NOT_BUGS #60). Its canonical
+	// "." collapses into the empty-name family. Its canonical
 	// form and Rabin fingerprint are byte-identical to the bare {"name":""}
 	// definition's, 3d741707ff4bfa45 being the fastavro-executed value. The
 	// type stays unreferenceable in every spelling. fastavro 1.12.2 keeps

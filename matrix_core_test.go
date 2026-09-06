@@ -1570,8 +1570,7 @@ func TestMatrix_GenerativeDefaultFill(t *testing.T) {
 //     wires. The severe surface: a wrapped or wrong-branch default silently
 //     changes the schema's own wire through the documented "Root preserves all
 //     metadata" round-trip. That is representation-agnostic, so it holds for a
-//     logical leaf whose Default surfaces the raw Avro-native value
-//     (NOT_BUGS #30).
+//     logical leaf whose Default carries the raw Avro-native value.
 //   - the direct JSON decode auto-fill agrees with the binary auto-fill.
 //   - for non-logical leaves, Root().Fields[].Default equals the binary
 //     auto-fill decode type-exactly, the pin the int64->int32 wrap violated.
@@ -1751,7 +1750,7 @@ func udfContainers() []udfContainer {
 // for the direct DecodeJSON fill. metaPairs returns, per metadata surface under
 // test, the (Root-derived Default, wire-decoded value) pair that must match
 // type-exactly for a non-logical leaf. A logical leaf surfaces the raw
-// Avro-native value per NOT_BUGS #30, so the rebuild + JSON-decode checks cover
+// Avro-native value, so the rebuild + JSON-decode checks cover
 // it instead. We return the parsed schema, the canonical decode, and the
 // metadata rebuild, so a caller can add shape-specific checks: the diamond's
 // reference path + one-definition structure.
@@ -1787,7 +1786,7 @@ func udInvariant(t *testing.T, schema, fillJSON string, fillVal map[string]any, 
 	// DecodeJSON of the empty outer materializes the stored default via
 	// applyFieldDefault. That is NOT a JSON encode->decode round-trip, which on
 	// these overlapping record branches would hit the documented bare
-	// untagged-union first-match loss (NOT_BUGS #5).
+	// untagged-union first-match loss.
 	var dj map[string]any
 	if err := s.DecodeJSON([]byte(fillJSON), &dj); err != nil {
 		t.Fatalf("json decode auto-fill: %v", err)
@@ -3635,7 +3634,7 @@ func TestMatrix_CacheSelfContainedNamespaces(t *testing.T) {
 // reference spelling (bare "X" vs wrapped {"type":"X"}).
 //
 // A later fix exposed the spelling axis. A cross-parse reference is accepted
-// both ways (NOT_BUGS #23), so the self-contained metadata must be identical
+// both ways, so the self-contained metadata must be identical
 // for either. Two layers: a wrapped reference that splices must be replaced as
 // a whole, else it self-contains as the invalid {"type":{X-def}} and the
 // rebuild falls back to a dangling reference. A later wrapped occurrence of an
@@ -3784,7 +3783,7 @@ func mpEmitTwin(g *mpGraph) string {
 
 // mpRefSpell renders a cross-parse name reference in the chosen spelling, the
 // axis we had missed in the topology cross. Avro accepts a name reference
-// written two ways (NOT_BUGS #23): the bare fullname string "X", and the
+// written two ways: the bare fullname string "X", and the
 // wrapped form {"type":"X"} whose sole key is "type". Both resolve to the same
 // node, so the wire is identical. The splice that self-contains a cache schema
 // must reach the same metadata for either spelling. The bug surface is the
@@ -3997,7 +3996,7 @@ func mpRunCache(t *testing.T, deps []string, root string) *avro.Schema {
 // canonReparses says whether Parse(Canonical()) is expected to succeed. PCF
 // drops namespace attributes and writes fullnames, so a null-namespace type
 // nested in a namespaced scope re-reads as inheriting that scope. That is an
-// intentionally non-re-parseable, fingerprint-faithful form (NOT_BUGS #25; Java
+// intentionally non-re-parseable, fingerprint-faithful form (Java
 // emits byte-identical ambiguity). String() keeps the explicit "namespace":""
 // escape, so it always re-parses.
 func mpAssertSelfContained(t *testing.T, viaCache, inline *avro.Schema, val any, cacheSchema, twinSchema string, canonReparses bool) {
@@ -4146,8 +4145,8 @@ func TestMatrix_SchemaCacheMultiParseSelfContained(t *testing.T) {
 	positions := []string{"field", "array", "map", "union"}
 	kinds := []string{"record", "enum", "fixed"}
 	// The spelling axis the net had missed. A cross-parse reference is written
-	// either as the bare fullname "X" or the wrapped {"type":"X"} (both accepted,
-	// NOT_BUGS #23). The self-contained metadata must be identical for either,
+	// either as the bare fullname "X" or the wrapped {"type":"X"}, both
+	// accepted. The self-contained metadata must be identical for either,
 	// since the wire is. The twin is spelling-independent, always the canonical
 	// first-occurrence inline form, so it anchors both spellings. Bare is the
 	// control that already self-contained; wrapped is the form whose splice was
@@ -4276,7 +4275,7 @@ func TestMatrix_SchemaCacheMultiParseSelfContained(t *testing.T) {
 					twin:  mpJSON(mpRecObj(R, mpField("f1", mpPosWrap(pos, mpFwdObj(T, "record", 1))), mpField("f2", mpFwdObj(xT, "record", 2)))),
 					value: map[string]any{"f1": posVal(pos, mpFwdVal("record", 1)), "f2": mpFwdVal("record", 2)},
 					// f1's spliced null-ns T nests in the namespaced x.R: its PCF form
-					// is the documented lossy-but-fingerprint-faithful kind (NOT_BUGS #25).
+					// is the documented lossy-but-fingerprint-faithful kind.
 					canonNoReparse: true,
 				})
 			}
@@ -9574,7 +9573,7 @@ func jnStringSample(label string) any {
 // Class-elimination differential net: a logical-on-numeric type must treat a
 // json.Number encode source identically to its underlying numeric type.
 //
-// json.Number is a numeric carrier (NOT_BUGS #35): its content must be a valid
+// json.Number is a numeric carrier: its content must be a valid
 // RFC 8259 number. A logical layered on a numeric base must never be more
 // lenient about non-numeric content than the plain int/long it wraps. Our
 // oracle is calibration-free, being the underlying numeric schema's own verdict

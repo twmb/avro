@@ -9289,7 +9289,7 @@ func TestMatrix_UnionContainerNestedFloatDefaultSelectionMatchesWire(t *testing.
 	// agrees. Only binary and metadata are probed: the selected
 	// string-record is the second container branch, and the JSON auto-fill
 	// emits it as a bare union, which the decoder commits to the first
-	// container branch per the documented bare-union rule (NOT_BUGS #5/#36),
+	// container branch per the documented bare-union rule,
 	// a round-trip limitation orthogonal to selection.
 	t.Run("negative/record_noncoercible_picks_string_branch", func(t *testing.T) {
 		s := avrotest.MustParse(t, `{"type":"record","name":"O","fields":[{"name":"u","type":[
@@ -9346,7 +9346,7 @@ func TestMatrix_UnionContainerNestedFloatDefaultSelectionMatchesWire(t *testing.
 
 	// Control 1 (must stay green independent of the fix): a direct scalar
 	// union float/double branch still rejects a string default and picks
-	// string on both surfaces (NOT_BUGS #10). The coercion must *not* leak
+	// string on both sides. The coercion must *not* leak
 	// into the scalar arm.
 	t.Run("control_scalar_union_string_picks_string_branch", func(t *testing.T) {
 		s := avrotest.MustParse(t, `{"type":"record","name":"O","fields":[{"name":"u","type":["double","string"],"default":"5"}]}`)
@@ -9466,7 +9466,7 @@ func TestMatrix_UnionContainerNestedIntDefaultOverflowMatchesWire(t *testing.T) 
 			// value. We probe via a direct DecodeJSON of an empty object, *not*
 			// an encode-then-decode round trip. The latter would re-decode the
 			// bare untagged union value and hit the documented first-match
-			// loss (NOT_BUGS #5) on these overlapping record branches.
+			// loss on these overlapping record branches.
 			var gj map[string]any
 			if err := s.DecodeJSON([]byte(`{}`), &gj); err != nil {
 				t.Fatalf("json decode auto-fill: %v", err)
@@ -11271,7 +11271,7 @@ func TestMatrix_LenientInputAudit(t *testing.T) {
 		{"decimal-fixed / [N]byte opaque", `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":4,"scale":2}`, [4]byte{0, 0, 0, 0x21}, [4]byte{0, 0, 0, 0x21}, ""},
 		{"big-decimal / []byte opaque", `{"type":"bytes","logicalType":"big-decimal"}`, []byte("hello world"), []byte("hello world"), ""},
 		// A big-decimal string carrier is numeric-text-only (a non-numeric
-		// string rejects; see NOT_BUGS #51); only []byte is the opaque escape
+		// string rejects); only []byte is the opaque escape
 		// hatch, so there is no "string opaque" lenient form here.
 
 		// ── duration ─────────────────────────────────────────────
@@ -14193,8 +14193,7 @@ func TestParity_AcceptedLeniencies(t *testing.T) {
 		// (the escape hatch for a hand-constructed wire payload). A
 		// string carrier for decimal and big-decimal is numeric-text-only: a
 		// non-numeric string is rejected, symmetric with decode (whose string
-		// target reads numeric text whenever the wire parses); see
-		// NOT_BUGS #51.
+		// target reads numeric text whenever the wire parses).
 		s := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`)
 		// []byte carrier: opaque pass-through still succeeds.
 		if _, err := s.AppendEncode(nil, []byte("ab")); err != nil {
@@ -15605,7 +15604,7 @@ func TestMatrix_NumberGrammarParityMatrix(t *testing.T) {
 // numeric-text form *only* for both regular decimal and big-decimal, so a
 // non-numeric string is rejected identically to the json.Number arm.
 // Encode stays symmetric with decode, whose string target reads the wire
-// as numeric text whenever it parses (NOT_BUGS #51).
+// as numeric text whenever it parses.
 func TestMatrix_NumberGrammarParityMatrix_Decimal(t *testing.T) {
 	// (input, accepts): the string arm and the json.Number arm accept the
 	// same set (a valid RFC 8259 number) for both decimal and big-decimal.
@@ -18603,7 +18602,7 @@ func TestMatrix_JSONNumberTargetAcceptedForTimeLogicals(t *testing.T) {
 
 // TestMatrix_JSONNumberNonNumericRejectedForTemporalEncode is the encode
 // complement of the time-logicals target net. A json.Number is a numeric
-// carrier (NOT_BUGS #35). So one whose content is a valid date/RFC 3339
+// carrier. So one whose content is a valid date/RFC 3339
 // string but not a number must reject on every temporal logical, exactly
 // as the plain int/long base and the decode side already do. Before the
 // fix, the date/timestamp encode string-convenience arms gated only on
@@ -18627,7 +18626,7 @@ func TestMatrix_JSONNumberNonNumericRejectedForTemporalEncode(t *testing.T) {
 			// The contract-violating (non-numeric) json.Number must reject on
 			// both wire formats.
 			if _, err := s.AppendEncode(nil, json.Number(tc.badContent)); err == nil {
-				t.Errorf("binary Encode(json.Number(%q)) accepted; want reject (non-numeric json.Number per NOT_BUGS #35)", tc.badContent)
+				t.Errorf("binary Encode(json.Number(%q)) accepted; want reject (non-numeric json.Number)", tc.badContent)
 			}
 			if _, err := s.AppendEncodeJSON(nil, json.Number(tc.badContent)); err == nil {
 				t.Errorf("EncodeJSON(json.Number(%q)) accepted; want reject", tc.badContent)
@@ -19771,8 +19770,8 @@ func TestRegression_SchemaForRejectsDashTagWithOptions(t *testing.T) {
 // schemas (string/bytes/fixed/enum) on the encode side regardless of
 // content, symmetric with the decode-side reject
 // (TestMatrix_JSONNumberUnsafeStructFieldRejected). The decode side was
-// pinned; this pins the encode side the BUG_AUDIT "rejected on both
-// encode and decode" entry promises.
+// pinned; this pins the encode side of the "rejected on both encode and
+// decode" rule.
 func TestMatrix_JSONNumberStringySchemasRejectEncode(t *testing.T) {
 	for _, sc := range []struct{ name, schema string }{
 		{"string", `"string"`},
@@ -22220,7 +22219,7 @@ func TestProperty_BinaryJSONRoundTripAgree(t *testing.T) {
 // ---------- invariants_test.go ----------
 
 // Tier-4 executable invariant: the encode/decode target-type parity rule
-// from BUG_AUDIT.md pattern 12, "for every Go type the encoder accepts as
+// "for every Go type the encoder accepts as
 // input to a schema, the decoder must accept it as a target". That is the
 // single most recurring bug shape in the audit history. We drive it across
 // a schema x Go-type matrix rather than hand-picking.
