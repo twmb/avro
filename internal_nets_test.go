@@ -529,7 +529,7 @@ var censusRegistry = []censusQuestion{
 				repr: "the shared binding question", site: "schemaKeyBinds", file: "schema_node.go",
 				note: "not a fourth answerer but the ONE binding predicate the routing asks, which is what keeps the routing from enumerating the consumed keys as a hand-written list. An enumeration is a subset and a subset can be missing a member: the type-level \"default\" and \"order\" fell through such a list and were dropped, reaching neither a structural field nor Props.",
 			},
-			{repr: "cache splice merge", site: "schemaReservedKeyForObject (nil shape verdict)", file: "cache.go"},
+			{repr: "cache splice merge", site: "schemaReservedKeyForObject (strayPresence verdict)", file: "cache.go"},
 			{
 				repr: "tree walker", site: "strayBodyShapeOK gating stray enumeration", file: "schema_walk.go",
 				note: "different-by-design and PINNED as an asymmetry (#63(e)): the binding-kind gate is walkNodeChildren's default, and only the METADATA walker opts into stray enumeration. Collect and inline keep the bound-only view deliberately, so this site answers a deliberately narrower question than the others.",

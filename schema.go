@@ -776,7 +776,11 @@ type aobject struct {
 	Scale     *int   `json:"scale,omitempty"`     // decimal logical type
 	Precision *int   `json:"precision,omitempty"` // decimal logical type
 
-	extra map[string]any // non-reserved properties, populated by aschema.UnmarshalJSON
+	extra map[string]any // non-reserved properties, populated by aobjectFromMap
+
+	// present records which structural and naming keys the parse arms
+	// consumed from a body of the key's shape; see presenceSet.
+	present presenceSet
 }
 
 // laxInt is an int that also accepts JSON strings containing integers,

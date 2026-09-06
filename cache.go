@@ -340,11 +340,8 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 			if def, isMap := resolved.(map[string]any); isMap {
 				defTyp, _ := def["type"].(string)
 				defLogical, _ := def["logicalType"].(string)
-				// The wrapper's props are a flat key set, never a nested
-				// stray schema, so a nil verdict costs one shape check per
-				// key and nothing compounds.
 				for k, wv := range v {
-					if schemaReservedKeyForObject(k, wv, defTyp, defLogical, nil) {
+					if schemaReservedKeyForObject(k, wv, defTyp, defLogical, strayPresence(k, wv)) {
 						continue
 					}
 					if _, has := def[k]; has {

@@ -1423,7 +1423,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 							continue
 						}
 						pv := boundedSerializableValue(d, depth, b, v)
-						if schemaReservedKeyForObject(k, pv, defTyp, defLogical, nil) {
+						if schemaReservedKeyForObject(k, pv, defTyp, defLogical, strayPresence(k, pv)) {
 							continue
 						}
 						if _, has := m2[k]; has {
@@ -1901,10 +1901,13 @@ func nodeCarriesNothingBut(n *SchemaNode, exempt func(*SchemaNode, string) bool)
 	return true
 }
 
-// presenceSet is a bit per attribute that can be written with a body its
-// destination stores as that destination's own zero. One field rather than
-// one bool each keeps the hidden state on the public struct at a single
-// member, and keeps every consumer asking the same question.
+// presenceSet is a bit per attribute a decoding arm consumed from a body of
+// the attribute's shape. On a SchemaNode it tells a written zero from an
+// unwritten one (a doc written as "", an aliases written as []), which the
+// field alone cannot. On both the SchemaNode and the parser's aobject it is
+// the stray-key routing verdict: a structural key the kind does not bind
+// stays out of Props iff its arm set the bit. One field rather than one
+// bool each keeps every consumer asking the same question.
 type presenceSet uint16
 
 const (
@@ -1916,6 +1919,8 @@ const (
 	presSymbols
 	presSize
 	presFields
+	presItems
+	presValues
 )
 
 func (p presenceSet) has(b presenceSet) bool { return p&b != 0 }
@@ -1946,6 +1951,10 @@ func presenceBitFor(field string) (presenceSet, bool) {
 		return presSize, true
 	case "Fields":
 		return presFields, true
+	case "Items":
+		return presItems, true
+	case "Values":
+		return presValues, true
 	}
 	return 0, false
 }
@@ -2117,11 +2126,9 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo, 
 	// arms run, so a structural field is set exactly when the parse consumes
 	// the key. A malformed stray body rides to Props verbatim as its only
 	// surface.
-	sizeOK := false
 	if v, ok := m["size"]; ok {
 		if l, err := decodeLaxInt("size", v); err == nil {
 			n.Size = int(l)
-			sizeOK = true
 			n.present |= presSize
 		}
 	}
@@ -2173,36 +2180,21 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo, 
 		items: func(key, scope string) {
 			node := nodeFromJSON(m[key], scope, memo, wireItems(wire))
 			n.Items = &node
+			n.present |= presItems
 		},
 		values: func(key, scope string) {
 			node := nodeFromJSON(m[key], scope, memo, wireValues(wire))
 			n.Values = &node
+			n.present |= presValues
 		},
 	})
 
 	// Collect custom properties: anything not reserved, with precision/scale
-	// reserved only on a recognized decimal carrier. The structural keys
-	// already recorded their shape verdicts above, so we route on those
-	// rather than decode a second time.
-	shapeOK := func(key string, v any) bool {
-		switch key {
-		case "items":
-			return n.Items != nil
-		case "values":
-			return n.Values != nil
-		case "fields":
-			return n.Fields != nil
-		case "symbols":
-			return n.Symbols != nil
-		case "aliases":
-			return n.Aliases != nil
-		case "size":
-			return sizeOK
-		}
-		return strayBodyShapeOK(key, v)
-	}
+	// reserved only on a recognized decimal carrier. The structural reads
+	// above recorded their verdicts in n.present, so the routing decodes
+	// nothing a second time.
 	for k, v := range m {
-		if schemaReservedKeyForObject(k, v, n.Type, n.LogicalType, shapeOK) {
+		if schemaReservedKeyForObject(k, v, n.Type, n.LogicalType, n.present) {
 			continue
 		}
 		if n.Props == nil {
@@ -2371,22 +2363,16 @@ func schemaKeyBinds(k string, v any, typ, logical string) bool {
 // field, which needs both a field and a body of that key's shape. A key that
 // is neither goes only to Props, which is where type-level
 // "default" and "order" go; Java and fastavro keep both as properties too.
-// shapeOK answers the stray-body shape question from a verdict the caller
-// already computed, since a fresh decode would re-enter aschemaFromAny and
-// compound to O(2^depth) on nested strays. A nil shapeOK takes a fresh
-// decode, for the cache splice merge, which has no nested strays.
-func schemaReservedKeyForObject(k string, v any, typ, logical string, shapeOK strayShapeVerdict) bool {
+// present carries the shape verdicts the caller's decoding arms recorded,
+// so the routing never decodes a body itself; a caller with no arms asks
+// strayPresence for the one key in hand.
+func schemaReservedKeyForObject(k string, v any, typ, logical string, present presenceSet) bool {
 	if !schemaReservedKeys[k] {
 		return false
 	}
 	if schemaKeyBinds(k, v, typ, logical) {
 		return true
 	}
-	if canonicalStrayKey(k) == "" {
-		return false
-	}
-	if shapeOK != nil {
-		return shapeOK(k, v)
-	}
-	return strayBodyShapeOK(k, v)
+	bit, stray := strayKeyBit(k)
+	return stray && present.has(bit)
 }

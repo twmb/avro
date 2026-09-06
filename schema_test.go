@@ -3374,6 +3374,11 @@ var presenceZeroUnwritable = map[string]string{
 	"Aliases": `{"type":"record","name":"R","aliases":[],"fields":[]}`,
 	"Symbols": `{"type":"enum","name":"E","symbols":[]}`,
 	"Fields":  `{"type":"record","name":"R","fields":[]}`,
+	// A schema-shaped body parses to a node the walker points the field
+	// at, so the bit is set only beside a non-nil pointer, which the
+	// value-based walk sees.
+	"Items":  `{"type":"array","items":"int"}`,
+	"Values": `{"type":"map","values":"int"}`,
 }
 
 // TestInvariant_PresenceZeroUnwritableClaimsHold checks the classification
