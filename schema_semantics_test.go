@@ -11227,40 +11227,70 @@ func TestErrorMessageBounded(t *testing.T) {
 	}
 }
 
-// A deeply nested schema that the builder rejects (past the recursion
-// limit) must not produce an unbounded error message. Each nesting level
-// wraps the inner error, so without a cap a 1500-deep array yields a ~15 KB
-// message from a ~37 KB input. That is the same amplification the
-// per-value trunc helpers prevent, accumulated over the wrap chain.
-func TestRegression_DeepSchemaErrorBounded(t *testing.T) {
-	for _, depth := range []int{1100, 1500, 3000} {
-		schema := strings.Repeat(`{"type":"array","items":`, depth) + `"int"` + strings.Repeat(`}`, depth)
-		_, err := avro.Parse(schema)
-		if err == nil {
-			t.Fatalf("depth %d: expected rejection", depth)
-		}
-		if len(err.Error()) > 4096 {
-			t.Errorf("depth %d: error %d bytes exceeds 4096 bound", depth, len(err.Error()))
-		}
+// TestMatrix_DeepSchemaBounds crosses nesting depth over the two chain shapes
+// and the surfaces a deep schema reaches. Two limits apply. The pre-scan
+// refuses more than maxSchemaJSONDepth (4000) brackets before anything
+// recurses, so a 1.25 MB chain never reaches the unmarshal, and the builder
+// refuses more than maxDepth (1000) levels, wrapping its cause once per
+// level, so that rejection stays bounded whatever the depth. Everything under
+// both limits parses in one pass, and its canonical form and Root().Schema()
+// rebuild survive the same depth: a 999-deep record chain is the densest
+// schema the builder accepts, and a 256 KiB doc at the bottom of a 900-deep
+// chain is what a per-level re-scan or re-marshal would turn quadratic.
+func TestMatrix_DeepSchemaBounds(t *testing.T) {
+	arrays := func(depth int) string {
+		return strings.Repeat(`{"type":"array","items":`, depth) + `"int"` + strings.Repeat(`}`, depth)
 	}
-}
-
-// A valid deeply-nested schema, 900 array levels and under the build's
-// maxDepth, must parse, and its canonical form must come out non-empty. The
-// former json.Unmarshaler front-end re-scanned each node's full subtree, and
-// Parse also fed Canonical(), whose nested MarshalJSON re-copied each
-// subtree. Both are now single-pass. What this cell holds is the depth
-// itself: 900 levels is a legal schema, and neither surface may refuse it.
-func TestRegression_DeepValidSchemaParsesLinear(t *testing.T) {
-	deep := strings.Repeat(`{"type":"array","items":`, 900) + `"int"` + strings.Repeat(`}`, 900)
-	s, err := avro.Parse(deep)
-	if err != nil {
-		t.Fatalf("parse valid deep schema: %v", err)
+	records := func(depth int, leaf string) string {
+		var b strings.Builder
+		for i := range depth {
+			fmt.Fprintf(&b, `{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i)
+		}
+		b.WriteString(leaf)
+		for range depth {
+			b.WriteString(`}]}`)
+		}
+		return b.String()
 	}
-	// Canonical() is on the hot Parse path for the single-object-encoding
-	// fingerprint, so it has to survive the same depth.
-	if len(s.Canonical()) == 0 {
-		t.Error("Canonical() of a 900-deep schema is empty")
+	bigLeaf := `{"type":"record","name":"Leaf","doc":"` + strings.Repeat("x", 256*1024) + `","fields":[{"name":"v","type":"int"}]}`
+	for _, c := range []struct {
+		name    string
+		schema  string
+		reject  bool
+		wantErr string // a token the rejection must carry, if any
+	}{
+		{"array 900 deep", arrays(900), false, ""},
+		{"array 1100 deep", arrays(1100), true, ""},
+		{"array 1500 deep", arrays(1500), true, ""},
+		{"array 3000 deep", arrays(3000), true, ""},
+		{"array 4001 deep, past the pre-scan", arrays(4001), true, ""},
+		{"array 50000 deep, 1.25 MB", arrays(50000), true, "deep"},
+		{"record 999 deep, the densest the builder accepts", records(999, `"int"`), false, ""},
+		{"record 900 deep over a 256 KiB doc", records(900, bigLeaf), false, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := avro.Parse(c.schema)
+			if c.reject {
+				if err == nil {
+					t.Fatal("parsed; the depth is past a limit and must be refused")
+				}
+				if n := len(err.Error()); n > 4096 {
+					t.Errorf("the rejection is %d bytes; the per-level wrap must stay bounded", n)
+				}
+				if c.wantErr != "" && !strings.Contains(err.Error(), c.wantErr) {
+					t.Errorf("rejection %v does not name %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a schema under both depth limits must parse: %v", err)
+			}
+			if len(s.Canonical()) == 0 {
+				t.Error("Canonical() is empty")
+			}
+			root := s.Root()
+			avrotest.MustNodeSchema(t, root)
+		})
 	}
 }
 
@@ -11289,32 +11319,6 @@ func TestMatrix_CanonicalBackslashNameValid(t *testing.T) {
 func jsonEscapeForTest(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b[1 : len(b)-1]) // strip surrounding quotes
-}
-
-// SchemaNode.Schema() (the Root().Schema() metadata round-trip) must be O(n) in
-// schema size, not O(depth*subtree). toJSONWalk snapshotted every named type's
-// full marshaled body for conflict detection. On a nested record chain each
-// enclosing record therefore re-marshaled everything below it (O(n^2)). That
-// work was wasted: the snapshot map is only ever read on a duplicate fullname.
-// Parse() and Canonical() of the same schema already handle this shape, and
-// this drives the metadata emitter over the same 900-deep, ~318KB record chain:
-// it must rebuild it.
-func TestRegression_RootSchemaEmitterLinearOnDeepNesting(t *testing.T) {
-	const depth = 900
-	var sb strings.Builder
-	for i := 0; i < depth; i++ {
-		fmt.Fprintf(&sb, `{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i)
-	}
-	sb.WriteString(`{"type":"record","name":"Leaf","doc":"` + strings.Repeat("x", 256*1024) + `","fields":[{"name":"v","type":"int"}]}`)
-	for i := 0; i < depth; i++ {
-		sb.WriteString(`}]}`)
-	}
-	s, err := avro.Parse(sb.String())
-	if err != nil {
-		t.Fatalf("parse deep record chain: %v", err)
-	}
-	root := s.Root()
-	avrotest.MustNodeSchema(t, root)
 }
 
 // A schema field name has no length cap at parse: validName is pure grammar,
@@ -12029,63 +12033,6 @@ func TestMatrix_SchemaCacheSelfRefReParseWithCustom(t *testing.T) {
 			t.Fatal("expected rejection: a cross-parse REFERENCE to a clean cached type with a matching custom must still reject (stale-node hazard)")
 		}
 	})
-}
-
-// A schema nested past the limit must be rejected on the pre-scan, and one
-// under the limit must still be accepted. aschema.UnmarshalJSON's object case
-// scans each node's full JSON subtree to capture extra properties. A
-// build-time maxDepth guard firing only after that unmarshal is too late. A
-// linear pre-scan rejects past maxSchemaJSONDepth first. Its limit clears the
-// provable ceiling of a build-acceptable schema by a full maxDepth. So this
-// cell drives both sides of the line: 50000 and 4001 must reject, 900 must
-// parse.
-func TestRegression_DeepSchemaNestingRejectedInBoundedTime(t *testing.T) {
-	arrayNest := func(d int) string {
-		return strings.Repeat(`{"type":"array","items":`, d) + `"int"` + strings.Repeat(`}`, d)
-	}
-
-	// A schema nested far past the limit must be rejected, and rejected by the
-	// pre-scan. This 1.25 MB input never reaches the recursive unmarshal.
-	huge := arrayNest(50000)
-	_, err := avro.Parse(huge)
-	if err == nil {
-		t.Fatal("a 50000-deep schema must be rejected, not parsed")
-	}
-	if !strings.Contains(err.Error(), "deep") {
-		t.Errorf("expected a nesting-depth error, got: %v", err)
-	}
-
-	// Just past the limit is rejected; comfortably within it still parses.
-	// maxSchemaJSONDepth is 4*maxDepth (4000) brackets.
-	if _, err := avro.Parse(arrayNest(4001)); err == nil {
-		t.Error("schema at 4001 array brackets (past the 4000 limit) must be rejected")
-	}
-	if _, err := avro.Parse(arrayNest(900)); err != nil {
-		// 900 nested arrays = 900 brackets, well under the limit and under
-		// maxDepth, so it is a valid schema.
-		t.Errorf("a 900-deep array schema is valid and must parse: %v", err)
-	}
-
-	// No false rejection of a build-acceptable schema at its densest: a
-	// maxDepth-1 chain of nested records reaches ~3*(maxDepth-1) brackets
-	// (well under 4*maxDepth), so it must still parse.
-	var b strings.Builder
-	const recDepth = 999 // maxDepth-1: the deepest the builder accepts
-	for i := range recDepth {
-		fmt.Fprintf(&b, `{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i)
-	}
-	b.WriteString(`"int"`)
-	for range recDepth {
-		b.WriteString(`}]}`)
-	}
-	if _, err := avro.Parse(b.String()); err != nil {
-		t.Errorf("a %d-deep record schema is build-acceptable and must not be falsely rejected by the pre-scan: %v", recDepth, err)
-	}
-
-	// Ordinary schemas are unaffected.
-	if _, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":["null","string"]}]}`); err != nil {
-		t.Errorf("ordinary schema regressed: %v", err)
-	}
 }
 
 // Parsing a fixed schema whose size is large must not allocate proportional to

@@ -5761,51 +5761,46 @@ func TestMatrix_SkipValueBareSpecialFloat(t *testing.T) {
 	}
 }
 
-// TestRegression_DuplicateCanonicalKeyLastWins pins the duplicate-key
-// behavior at iterateRecordFields: encoding/json (Go), Jackson (Java),
-// and Python json.loads (fastavro) all implement last-wins for
-// duplicate keys, so the canonical key appearing twice is accepted
-// (last value wins). The alias-collision guard fires only when
-// two different JSON keys resolve to the same idx (the actual collision
-// case).
-func TestRegression_DuplicateCanonicalKeyLastWins(t *testing.T) {
-	schemaJSON := `{"type":"record","name":"R","fields":[{"name":"f","type":"long"}]}`
-	s := avro.MustParse(schemaJSON)
-
-	t.Run("same_canonical_key_twice_last_wins", func(t *testing.T) {
-		var got map[string]any
-		if err := s.DecodeJSON([]byte(`{"f":11,"f":22}`), &got); err != nil {
-			t.Fatalf("expected last-wins (Java/fastavro/encoding-json parity); got error: %v", err)
-		}
-		if got["f"] != int64(22) {
-			t.Fatalf("expected last-wins f=22; got %v", got["f"])
-		}
-	})
-
-	// Triple-duplicate still last-wins.
-	t.Run("triple_canonical_key_last_wins", func(t *testing.T) {
-		var got map[string]any
-		if err := s.DecodeJSON([]byte(`{"f":11,"f":22,"f":33}`), &got); err != nil {
-			t.Fatalf("expected last-wins; got error: %v", err)
-		}
-		if got["f"] != int64(33) {
-			t.Fatalf("expected f=33; got %v", got["f"])
-		}
-	})
-
-	// Alias collision (the original target of this guard) still errors.
-	t.Run("alias_collision_still_rejects", func(t *testing.T) {
-		aliasSchema := `{"type":"record","name":"R","fields":[{"name":"new_name","type":"long","aliases":["old_name"]}]}`
-		sa := avro.MustParse(aliasSchema)
-		var got map[string]any
-		err := sa.DecodeJSON([]byte(`{"new_name":11,"old_name":22}`), &got)
-		if err == nil {
-			t.Fatalf("expected reject for canonical+alias both present; accepted")
-		}
-		if !strings.Contains(err.Error(), "resolved from both") {
-			t.Fatalf("expected 'resolved from both' error; got: %v", err)
-		}
-	})
+// TestMatrix_JSONRecordDuplicateKeys crosses a record JSON object that names
+// one field twice over the two ways that can happen. The same key repeated is
+// last-wins, as in Java, fastavro, and encoding/json. A field's canonical name
+// beside one of its aliases is producer ambiguity and rejects, naming both
+// spellings, while either spelling alone still binds.
+func TestMatrix_JSONRecordDuplicateKeys(t *testing.T) {
+	plain := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"long"}]}`)
+	aliased := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"new_name","type":"int","aliases":["old_name"]}]}`)
+	for _, c := range []struct {
+		name    string
+		schema  *avro.Schema
+		doc     string
+		wantErr string // "" accepts
+		field   string
+		want    any
+	}{
+		{"same key twice is last-wins", plain, `{"f":11,"f":22}`, "", "f", int64(22)},
+		{"same key three times is last-wins", plain, `{"f":11,"f":22,"f":33}`, "", "f", int64(33)},
+		{"canonical then alias rejects", aliased, `{"new_name":11,"old_name":22}`, "resolved from both", "", nil},
+		{"alias then canonical rejects", aliased, `{"old_name":11,"new_name":22}`, "resolved from both", "", nil},
+		{"canonical alone binds", aliased, `{"new_name":42}`, "", "new_name", int32(42)},
+		{"alias alone binds", aliased, `{"old_name":42}`, "", "new_name", int32(42)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var got map[string]any
+			err := c.schema.DecodeJSON([]byte(c.doc), &got)
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("DecodeJSON(%s) = %v, want an error naming %q", c.doc, err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DecodeJSON(%s): %v", c.doc, err)
+			}
+			if got[c.field] != c.want {
+				t.Fatalf("DecodeJSON(%s)[%s] = %#v, want %#v", c.doc, c.field, got[c.field], c.want)
+			}
+		})
+	}
 }
 
 // TestMatrix_ResolvedLongToFloatLossy pins that int/long to float/double
@@ -17238,52 +17233,6 @@ func TestMatrix_AliasClashRejectAtResolve(t *testing.T) {
 	})
 }
 
-// TestRegression_JSONDecodeAliasDuplicateKeysReject pins that a JSON
-// object containing *both* the canonical field name and an alias mapping
-// to the same field is rejected rather than silently overwritten. The
-// schema parse already rejects within-schema name/alias collisions
-// (schema.go:1999), so fieldIdx has multiple keys per index only for the
-// renamed-with-alias case. A single JSON object emitting both forms
-// is producer-side ambiguity that must fail loudly. Sibling of
-// TestMatrix_AliasClashRejectAtResolve on the binary Resolve path.
-func TestRegression_JSONDecodeAliasDuplicateKeysReject(t *testing.T) {
-	schema := avrotest.MustParse(t, `{
-		"type":"record","name":"R",
-		"fields":[{"name":"new_name","type":"int","aliases":["old_name"]}]
-	}`)
-
-	t.Run("alias + canonical name in same JSON object rejects", func(t *testing.T) {
-		var out map[string]any
-		err := schema.DecodeJSON([]byte(`{"old_name":11,"new_name":22}`), &out)
-		if err == nil {
-			t.Errorf("expected rejection of duplicate key (alias+canonical); got %v", out)
-		}
-		if !strings.Contains(err.Error(), "resolved from both") {
-			t.Errorf("error message should name the duplicate: %v", err)
-		}
-	})
-
-	t.Run("canonical name alone still works (boundary-1)", func(t *testing.T) {
-		var out map[string]any
-		if err := schema.DecodeJSON([]byte(`{"new_name":42}`), &out); err != nil {
-			t.Fatalf("canonical-name decode rejected: %v", err)
-		}
-		if out["new_name"] != int32(42) {
-			t.Errorf("got %v, want int32(42)", out["new_name"])
-		}
-	})
-
-	t.Run("alias alone still works (boundary-1)", func(t *testing.T) {
-		var out map[string]any
-		if err := schema.DecodeJSON([]byte(`{"old_name":42}`), &out); err != nil {
-			t.Fatalf("alias-only decode rejected: %v", err)
-		}
-		if out["new_name"] != int32(42) {
-			t.Errorf("got %v, want int32(42)", out["new_name"])
-		}
-	})
-}
-
 // TestRegression_MetadataAPINameRefDefaultCoerce pins that
 // Schema.Root().Fields[].Default for a record field whose type is a
 // name-reference, and whose default is nested inside the referenced
@@ -17341,31 +17290,6 @@ func TestRegression_MetadataAPINameRefDefaultCoerce(t *testing.T) {
 			t.Fatalf("inline default: got %T(%v), want float32(1.5)", m["f"], m["f"])
 		}
 	})
-}
-
-// TestRegression_DeepSchemaParseRunsInBoundedTime pins that avro.Parse
-// accepts a 500-deep record schema. The depth is legal, well under
-// maxDepth. So the re-Marshal-for-dedup pattern that used to sit in
-// aschema.UnmarshalJSON / afield.UnmarshalJSON, and the direct struct
-// decode that replaced it, must both agree that this schema parses. A
-// front end that gives up at depth is a rejection, not a slow accept.
-func TestRegression_DeepSchemaParseRunsInBoundedTime(t *testing.T) {
-	build := func(depth int) string {
-		var b strings.Builder
-		for i := range depth {
-			b.WriteString(fmt.Sprintf(`{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i))
-		}
-		b.WriteString(`"int"`)
-		for range depth {
-			b.WriteString(`}]}`)
-		}
-		return b.String()
-	}
-	const depth = 500
-	schema := build(depth)
-	if _, err := avro.Parse(schema); err != nil {
-		t.Fatalf("depth-%d schema parse failed: %v", depth, err)
-	}
 }
 
 // TestRegression_DuplicateKeyResetsAschemaState pins that aschema and
