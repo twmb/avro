@@ -235,11 +235,6 @@ func treeScope(obj map[string]any, enclosingNS string) (fullname, ns string) {
 	return resolveScope(name, nsAttr, hasNS, enclosingNS)
 }
 
-func nodeNamespace(obj map[string]any, enclosingNS string) string {
-	_, ns := treeScope(obj, enclosingNS)
-	return ns
-}
-
 func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
 	fullname, _ := treeScope(obj, enclosingNS)
 	return fullname

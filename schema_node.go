@@ -1728,15 +1728,10 @@ func isNamedKind(typ string) bool {
 	return typ == "record" || typ == "error" || typ == "enum" || typ == "fixed"
 }
 
-// nodeEffNS returns n's effective namespace and nodeFullname its fullname,
-// both by resolveScope over the node's own Name and Namespace. Namespace is
-// already resolved, so it stands in for a written attribute and "" means the
-// null namespace; a dotted Name takes precedence over it, as at parse.
-func nodeEffNS(n *SchemaNode) string {
-	_, ns := resolveScope(n.Name, n.Namespace, true, "")
-	return ns
-}
-
+// nodeFullname returns n's fullname by resolveScope over the node's own
+// Name and Namespace. Namespace is already resolved, so it stands in for a
+// written attribute and "" means the null namespace; a dotted Name takes
+// precedence over it, as at parse.
 func nodeFullname(n *SchemaNode) string {
 	fullname, _ := resolveScope(n.Name, n.Namespace, true, "")
 	return fullname
@@ -1747,11 +1742,12 @@ func nodeFullname(n *SchemaNode) string {
 // through.
 func nsForChildren(n *SchemaNode, enclosing string) string {
 	// Named *kinds* open their own scope even with an empty short name (a user
-	// WithLaxNames fn can accept ""; nodeEffNS carries the resolved namespace
+	// WithLaxNames fn can accept ""; Namespace carries the resolved namespace
 	// either way). The Name != "" arm keeps hand-built names on non-named kinds
-	// scoping as before.
+	// scoping as before. The scope is resolveScope's, as for nodeFullname.
 	if n != nil && (n.Name != "" || isNamedKind(n.Type)) {
-		return nodeEffNS(n)
+		_, ns := resolveScope(n.Name, n.Namespace, true, "")
+		return ns
 	}
 	return enclosing
 }
@@ -1862,6 +1858,13 @@ func nodeCarriesNothingBut(n *SchemaNode, exempt func(*SchemaNode, string) bool)
 	return true
 }
 
+// nodePresenceSet reports whether the named exported field carries content
+// by presence alone.
+func nodePresenceSet(n *SchemaNode, field string) bool {
+	b, ok := presenceBitFor(field)
+	return ok && n.present.has(b)
+}
+
 // presenceSet is a bit per attribute a decoding arm consumed from a body of
 // the attribute's shape. On a SchemaNode it tells a written zero from an
 // unwritten one (a doc written as "", an aliases written as []), which the
@@ -1933,18 +1936,6 @@ func strayKeyBit(k string) (presenceSet, bool) {
 		}
 	}
 	return 0, false
-}
-
-// nodePresenceSet reports whether the named exported field carries content
-// its value cannot show: an attribute written as the field's own zero.
-// Without it the emptiness walk and the emitter disagree, since a doc
-// written as "" reads as an empty node and collapses to a bare type name.
-// It is keyed by field name so it composes with the exemption sets: at a
-// name-reference splice Doc and LogicalType are exempt usage-site
-// attributes, so we ignore their presence as we ignore their value.
-func nodePresenceSet(n *SchemaNode, field string) bool {
-	b, ok := presenceBitFor(field)
-	return ok && n.present.has(b)
 }
 
 // bareEmissionExempt classifies the fields whose value cannot be lost by
