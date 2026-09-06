@@ -209,7 +209,7 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 
 	switch node.kind {
 	case "null":
-		return ctx.decodeNull(v, toAny)
+		return ctx.decodeNull(v)
 	case "boolean":
 		return ctx.decodeBool(v, toAny)
 	case "int":
@@ -316,7 +316,7 @@ func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, er
 	}
 }
 
-func (ctx *jsonDecoder) decodeNull(v reflect.Value, _ bool) error {
+func (ctx *jsonDecoder) decodeNull(v reflect.Value) error {
 	if err := ctx.scanner.consumeNull(); err != nil {
 		return err
 	}

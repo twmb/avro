@@ -1817,11 +1817,14 @@ var (
 	deserStringIface  = deserIface(readOneString)
 )
 
+// ifaceFnForPrimitive returns the iface-direct decoder for a plain primitive
+// field, or nil where a logical type or custom decoder applies, or the kind
+// is not a primitive.
 func ifaceFnForPrimitive(meta *fieldMeta) deserIfaceFn {
 	if meta == nil || meta.logical != "" || meta.hasCustomType {
 		return nil
 	}
-	return ifaceFnForKind(meta.avroType)
+	return deserIfaceFnByKind[meta.avroType]
 }
 
 // deserIfaceFnByKind maps an Avro primitive kind name to its iface-direct
@@ -1835,11 +1838,6 @@ var deserIfaceFnByKind = map[string]deserIfaceFn{
 	"double":  deserDoubleIface,
 	"string":  deserStringIface,
 }
-
-// ifaceFnForKind returns the iface-direct decoder for an avro kind name, or
-// nil if the kind isn't a plain primitive. You must verify no logical type or
-// custom decoder applies before using the result.
-func ifaceFnForKind(kind string) deserIfaceFn { return deserIfaceFnByKind[kind] }
 
 // deserFixedUUIDReflect decodes a fixed(16) UUID. Into any it returns
 // [16]byte; into [16]byte it copies the raw bytes; into string it

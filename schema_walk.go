@@ -18,7 +18,7 @@ package avro
 // short name, fullname "ns."), and the children build under it.
 func nodeChildScope(v map[string]any, ns string) string {
 	if typ, _ := v["type"].(string); isNamedKind(typ) {
-		return nodeNamespace(v, ns)
+		_, ns = treeScope(v, ns)
 	}
 	return ns
 }

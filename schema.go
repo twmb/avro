@@ -2473,11 +2473,11 @@ func (b *builder) buildPrimitiveObject(o *aobject, ser serfn, origLogical string
 	// stays raw. The deser gate on a matching CustomType is independent:
 	// a CustomType naming a different AvroType resurrects the logical
 	// without matching for suppression.
-	if logSer := logicalSer(o.Logical); logSer != nil && logicalUnderlyingAcceptsObject(o) {
+	if logSer := logicalSers[o.Logical]; logSer != nil && logicalUnderlyingAcceptsObject(o) {
 		b.ser = logSer
 	}
 	if !b.hasMatchingCustomType(o.Type, o.Logical) && logicalUnderlyingAcceptsObject(o) {
-		if logDeser := logicalDeser(o.Logical); logDeser != nil {
+		if logDeser := logicalDesers[o.Logical]; logDeser != nil {
 			b.deser = logDeser
 		}
 	}
@@ -3282,9 +3282,6 @@ var (
 		"uuid":                   deserUUID,
 	}
 )
-
-func logicalSer(logical string) serfn     { return logicalSers[logical] }
-func logicalDeser(logical string) deserfn { return logicalDesers[logical] }
 
 // unmarshalDefault parses a field's raw JSON default. Numeric literals stay
 // json.Number rather than rounding through float64, which is what the shared
