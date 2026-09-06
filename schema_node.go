@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/json"
 	"errors"
@@ -477,13 +478,14 @@ func (s *Schema) Root() *SchemaNode {
 		panic("avro: Schema.Root: invalid stored JSON: " + err.Error())
 	}
 	// One shape memo for the whole walk: stray bodies nest, so re-validating
-	// each subtree once per enclosing level would be O(depth^2).
-	n := nodeFromJSON(raw, "", make(strayShapeMemo))
-	table := fixupNameRefDefaults(&n)
+	// each subtree once per enclosing level would be O(depth^2). The wire
+	// node tree rides alongside so each field default is read from the node
+	// the parse validated it against.
+	n := nodeFromJSON(raw, "", make(strayShapeMemo), s.node)
 	// We stamp each name-reference node with its resolved target so an
-	// extracted subtree converts even when the definition lives outside it. It
-	// is the same table the default fixup resolved through, so the two paths
-	// cannot bind a reference differently.
+	// extracted subtree converts even when the definition lives outside it.
+	table := map[string]*SchemaNode{}
+	collectNamedTypes(&n, table)
 	stampNameRefs(&n, table, "")
 	return &n
 }
@@ -1606,22 +1608,63 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 
 // nodeFromJSON converts a parsed JSON value into a SchemaNode. parentNS
 // is the enclosing namespace scope; named types without an explicit
-// "namespace" attribute resolve into it (see [SchemaNode].Namespace).
-func nodeFromJSON(v any, parentNS string, memo strayShapeMemo) SchemaNode {
+// "namespace" attribute resolve into it (see [SchemaNode].Namespace). wire
+// is the compiled node at this position, or nil where the parse built none
+// (a stray body); the walk descends the two in step, since the JSON is what
+// the node tree was built from.
+func nodeFromJSON(v any, parentNS string, memo strayShapeMemo, wire *schemaNode) SchemaNode {
 	switch s := v.(type) {
 	case string:
 		return SchemaNode{Type: s}
 	case []any:
 		branches := make([]SchemaNode, len(s))
 		for i, b := range s {
-			branches[i] = nodeFromJSON(b, parentNS, memo)
+			branches[i] = nodeFromJSON(b, parentNS, memo, wireBranch(wire, i))
 		}
 		return SchemaNode{Type: "union", Branches: branches}
 	case map[string]any:
-		return nodeFromJSONObject(s, parentNS, memo)
+		return nodeFromJSONObject(s, parentNS, memo, wire)
 	default:
 		return SchemaNode{}
 	}
+}
+
+// wireField, wireItems, wireValues and wireBranch return the compiled node
+// at one child position of n, or nil when n is nil or its kind does not
+// bind that position: a stray body has no compiled twin.
+func wireField(n *schemaNode, i int) *fieldNode {
+	if n == nil || !isRecordKind(n.kind) || i >= len(n.fields) {
+		return nil
+	}
+	return &n.fields[i]
+}
+
+func wireFieldNode(n *schemaNode, i int) *schemaNode {
+	if f := wireField(n, i); f != nil {
+		return f.node
+	}
+	return nil
+}
+
+func wireItems(n *schemaNode) *schemaNode {
+	if n == nil || n.kind != "array" {
+		return nil
+	}
+	return n.items
+}
+
+func wireValues(n *schemaNode) *schemaNode {
+	if n == nil || n.kind != "map" {
+		return nil
+	}
+	return n.values
+}
+
+func wireBranch(n *schemaNode, i int) *schemaNode {
+	if n == nil || n.kind != "union" || i >= len(n.branches) {
+		return nil
+	}
+	return n.branches[i]
 }
 
 // Known schema keys that are *not* custom properties.
@@ -1704,161 +1747,6 @@ func isNamedKind(typ string) bool {
 	return typ == "record" || typ == "error" || typ == "enum" || typ == "fixed"
 }
 
-// coerceMetadataDefault is the metadata parallel of coerceDefault: it puts a
-// parsed-JSON default into the Go form the wire pipeline materializes, so
-// SchemaField.Default's type matches the wire bytes. Numbers become the
-// schema-width Go type, as in Java. A string default on bytes/fixed becomes
-// []byte through the codepoint mapping, so encoding f.Default back works for
-// fixed+uuid too. We walk unions and nested containers. A string-form
-// numeric default coerces to float only on an outer float/double field,
-// never a union branch, as in Java.
-func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode, ns string) any {
-	if t == nil {
-		return val
-	}
-	// Name-ref resolution: with a non-nil table, a bare name-reference Type
-	// resolves to the named node and recurses inside the *target's* own
-	// namespace scope. table == nil is the best-effort inline pass during
-	// nodeFromJSON, where the full tree, and so the name table, does not
-	// exist yet.
-	if resolved := lookupNameRef(t, table, ns); resolved != nil {
-		return coerceMetadataDefault(val, resolved, table, nodeEffNS(resolved))
-	}
-	if t.Type == "union" {
-		// On the best-effort first pass we cannot resolve the name-referenced
-		// branches. A greedy earlier branch (bytes accepting a string) would
-		// destructively coerce string to []byte and lock out the enum branch
-		// the table-populated pass would pick, since the enum arm takes only a
-		// string. So we defer all branch selection to coerceTreeDefaults.
-		if table == nil {
-			return val
-		}
-		// The *first* branch that accepts val's Go type, matching
-		// coerceDefault's validateDefault selection and Java's parseField.
-		// "First branch that transforms" would diverge on ["string","float"]
-		// default "1.5": the wire picks string, while a transform check picks
-		// float because string to string looks like a no-op.
-		if branch := firstMetadataBranchAcceptingDefault(t, val, table, ns); branch != nil {
-			return coerceMetadataDefault(val, branch, table, nsForChildren(branch, ns))
-		}
-		return val
-	}
-	if val == nil {
-		return val
-	}
-	if t.Type == "int" {
-		// Every numeric form routes through the range-checked defaultAsInt32.
-		// During union-branch selection a wider sibling makes the schema
-		// parse-valid, so this can run on an out-of-int32 value; a blind cast
-		// would wrap it and select the int branch the wire rejects. Leaving it
-		// alone lets defaultAsInt32 reject so selection falls to the sibling.
-		switch val := val.(type) {
-		case int32:
-			return val
-		case int64, json.Number, string, float64:
-			if n, err := defaultAsInt32(val); err == nil {
-				return n
-			}
-			return val
-		}
-		return val
-	}
-	if t.Type == "long" {
-		// Coerce non-int64 numeric inputs (json.Number, string,
-		// float64-whole-number) to int64. int64 inputs pass through.
-		// Schema parse rejects out-of-int64 via defaultAsInt64.
-		switch val := val.(type) {
-		case int64:
-			return val
-		case int32:
-			return int64(val)
-		case json.Number, string, float64:
-			if n, err := defaultAsInt64(val); err == nil {
-				return n
-			}
-			return val
-		}
-		return val
-	}
-	if t.Type == "float" || t.Type == "double" {
-		// Width-faithful narrowing, as in Java: a float schema gives float32,
-		// finite overflows and mantissa rounding included, so Default is what
-		// the wire encoder emits. Strings parse inline rather than through
-		// defaultAsFloat, which stays strict for union matching and encode;
-		// this is the outer-field text-to-float coercion.
-		var f float64
-		switch val := val.(type) {
-		case float64:
-			f = val
-		case float32:
-			f = float64(val)
-		case string:
-			var err error
-			if f, err = parseFloatAcceptOverflow(val, 64); err != nil {
-				return val
-			}
-		case int64, int32, json.Number:
-			var err error
-			if f, err = defaultAsFloat(val); err != nil {
-				return val
-			}
-		default:
-			return val
-		}
-		if t.Type == "float" {
-			return float32(f)
-		}
-		return f
-	}
-	if t.Type == "bytes" || t.Type == "fixed" {
-		if s, ok := val.(string); ok {
-			if b, err := avroJSONBytesToBytes(s); err == nil {
-				return b
-			}
-		}
-		return val
-	}
-	if isRecordKind(t.Type) {
-		if m, ok := val.(map[string]any); ok {
-			childNS := nsForChildren(t, ns)
-			out := make(map[string]any, len(m))
-			for k, v := range m {
-				inner := v
-				for i := range t.Fields {
-					if t.Fields[i].Name == k {
-						inner = coerceMetadataDefault(v, &t.Fields[i].Type, table, childNS)
-						break
-					}
-				}
-				out[k] = inner
-			}
-			return out
-		}
-		return val
-	}
-	if t.Type == "array" && t.Items != nil {
-		if a, ok := val.([]any); ok {
-			out := make([]any, len(a))
-			for i, v := range a {
-				out[i] = coerceMetadataDefault(v, t.Items, table, ns)
-			}
-			return out
-		}
-		return val
-	}
-	if t.Type == "map" && t.Values != nil {
-		if m, ok := val.(map[string]any); ok {
-			out := make(map[string]any, len(m))
-			for k, v := range m {
-				out[k] = coerceMetadataDefault(v, t.Values, table, ns)
-			}
-			return out
-		}
-		return val
-	}
-	return val
-}
-
 // nodeEffNS returns n's effective namespace: a dotted Name carries its
 // own namespace (taking precedence per the spec); otherwise Namespace,
 // which is already resolved ("" means the null namespace).
@@ -1928,22 +1816,6 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *Sche
 		}
 	}
 	return nil
-}
-
-// fixupNameRefDefaults walks the SchemaNode tree once to populate a name-table
-// of every reachable record/enum/fixed, then re-coerces HasDefault fields with
-// the table. Name-referenced defaults, and defaults whose union contains a
-// name-ref branch, then materialize the way inline-typed siblings already do
-// via the synchronous coerce. We return the table for Root's reference
-// stamping, so both paths resolve through the identical name set.
-func fixupNameRefDefaults(root *SchemaNode) map[string]*SchemaNode {
-	table := map[string]*SchemaNode{}
-	collectNamedTypes(root, table)
-	if len(table) == 0 {
-		return table
-	}
-	coerceTreeDefaults(root, table, "")
-	return table
 }
 
 // stampNameRefs records, on every node whose Type is a name reference that
@@ -2198,177 +2070,7 @@ func collectNamedTypes(n *SchemaNode, table map[string]*SchemaNode) {
 	}
 }
 
-func coerceTreeDefaults(n *SchemaNode, table map[string]*SchemaNode, ns string) {
-	if n == nil {
-		return
-	}
-	childNS := nsForChildren(n, ns)
-	for i := range n.Fields {
-		f := &n.Fields[i]
-		if f.HasDefault {
-			f.Default = coerceMetadataDefault(f.Default, &f.Type, table, childNS)
-		}
-		coerceTreeDefaults(&f.Type, table, childNS)
-	}
-	if n.Items != nil {
-		coerceTreeDefaults(n.Items, table, childNS)
-	}
-	if n.Values != nil {
-		coerceTreeDefaults(n.Values, table, childNS)
-	}
-	for i := range n.Branches {
-		coerceTreeDefaults(&n.Branches[i], table, childNS)
-	}
-}
-
-// defaultMatchesBytesOrFixedKind mirrors the wire pipeline's validateLeaf for
-// bytes and fixed: the codepoint range and, for fixed, the exact size.
-// Without the size check, [fixed:8,"string"] with a 4-char default would
-// metadata-match fixed while the wire matches string.
-func defaultMatchesBytesOrFixedKind(t *SchemaNode, val any) bool {
-	switch v := val.(type) {
-	case string:
-		if err := validateAvroByteString(v, t.Type); err != nil {
-			return false
-		}
-		if t.Type == "fixed" && len([]rune(v)) != t.Size {
-			return false
-		}
-		return true
-	case []byte:
-		if t.Type == "fixed" && len(v) != t.Size {
-			return false
-		}
-		return true
-	}
-	return false
-}
-
-// branchAcceptsDefault reports whether the Avro type t accepts val as a
-// default, with the same compatibility validateDefault enforces on the wire
-// side, so union selection picks the same branch on both sides. The
-// numeric arms delegate to the defaultAs helpers: float/double accept any
-// numeric input and reject strings. The structural arms recurse, so a record
-// enforces required-field presence and containers require every element to
-// accept; otherwise [{record needing X}, {record needing nothing}] with
-// default {} would metadata-match the first while the wire picks the second.
-func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, ns string) bool {
-	// Resolve a bare name-reference if the caller supplied a name-table.
-	if resolved := lookupNameRef(t, table, ns); resolved != nil {
-		return branchAcceptsDefault(resolved, val, table, nodeEffNS(resolved))
-	}
-	switch t.Type {
-	case "null":
-		return val == nil
-	case "boolean":
-		_, ok := val.(bool)
-		return ok
-	case "int":
-		_, err := defaultAsInt32(val)
-		return err == nil
-	case "long":
-		_, err := defaultAsInt64(val)
-		return err == nil
-	case "float", "double":
-		_, err := defaultAsFloat(val)
-		return err == nil
-	case "string":
-		_, ok := val.(string)
-		return ok
-	case "enum":
-		sym, ok := val.(string)
-		if !ok {
-			return false
-		}
-		// The wire rejects non-member symbols, so enum needs its own arm; the
-		// string arm would accept any string. An empty enum accepts nothing.
-		return slices.Contains(t.Symbols, sym)
-	case "bytes", "fixed":
-		return defaultMatchesBytesOrFixedKind(t, val)
-	case "record", "error":
-		m, ok := val.(map[string]any)
-		if !ok {
-			return false
-		}
-		childNS := nsForChildren(t, ns)
-		for i := range t.Fields {
-			f := &t.Fields[i]
-			fv, present := m[f.Name]
-			if !present {
-				if !f.HasDefault {
-					return false
-				}
-				continue
-			}
-			// We coerce the child before the accept check, as the wire
-			// selector does, so a string in a nested float/double field
-			// selects the container branch on both sides. Fresh containers
-			// keep a rejected sibling's value unmutated. The scalar
-			// float/double arm is not coerced, so ["double","string"] default
-			// "5" still picks string.
-			fv = coerceMetadataDefault(fv, &f.Type, table, childNS)
-			if !branchAcceptsDefault(&f.Type, fv, table, childNS) {
-				return false
-			}
-		}
-		return true
-	case "array":
-		arr, ok := val.([]any)
-		if !ok {
-			return false
-		}
-		if t.Items == nil {
-			return true
-		}
-		for _, item := range arr {
-			// Coerce each element to mirror the wire selector; see the
-			// record arm above.
-			item = coerceMetadataDefault(item, t.Items, table, ns)
-			if !branchAcceptsDefault(t.Items, item, table, ns) {
-				return false
-			}
-		}
-		return true
-	case "map":
-		m, ok := val.(map[string]any)
-		if !ok {
-			return false
-		}
-		if t.Values == nil {
-			return true
-		}
-		for _, v := range m {
-			// Coerce each value to mirror the wire selector; see the
-			// record arm above.
-			v = coerceMetadataDefault(v, t.Values, table, ns)
-			if !branchAcceptsDefault(t.Values, v, table, ns) {
-				return false
-			}
-		}
-		return true
-	case "union":
-		return firstMetadataBranchAcceptingDefault(t, val, table, ns) != nil
-	}
-	return false
-}
-
-// firstMetadataBranchAcceptingDefault returns the first branch of union t
-// whose branchAcceptsDefault accepts val, name refs resolved, or nil: the
-// *SchemaNode twin of firstUnionBranchAcceptingDefault.
-func firstMetadataBranchAcceptingDefault(t *SchemaNode, val any, table map[string]*SchemaNode, ns string) *SchemaNode {
-	for i := range t.Branches {
-		branch := &t.Branches[i]
-		if resolved := lookupNameRef(branch, table, ns); resolved != nil {
-			branch = resolved
-		}
-		if branchAcceptsDefault(branch, val, table, nsForChildren(branch, ns)) {
-			return branch
-		}
-	}
-	return nil
-}
-
-func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) SchemaNode {
+func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo, wire *schemaNode) SchemaNode {
 	n := SchemaNode{}
 
 	getString(m, "type", &n.Type)
@@ -2451,14 +2153,14 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 		strayShapeMemo: memo,
 		fields:         func(arr []any) { n.Fields = make([]SchemaField, len(arr)); n.present |= presFields },
 		field: func(i int, fm map[string]any, typeKey, scope string) {
-			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope, memo), nil)
+			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope, memo, wireFieldNode(wire, i)), nil, wireField(wire, i))
 		},
 		fieldNoType: func(i int, fm map[string]any) {
 			// Typeless element inside a stray "fields": we carry the
 			// written attributes (name / doc / aliases / order / default
 			// / props) on the field with a zero Type, as-written, never
 			// a fabricated zero element.
-			n.Fields[i] = metadataField(fm, SchemaNode{}, nil)
+			n.Fields[i] = metadataField(fm, SchemaNode{}, nil, nil)
 		},
 		flatField: func(i int, fm map[string]any, kind, scope string) {
 			// Flat goavro-style field format: the wire parser lifts the
@@ -2466,14 +2168,14 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 			// and the metadata tree must describe that same post-lift schema
 			// or the rebuild emits an empty shell.
 			flatType := flatLiftTypeMap(fm, kind)
-			n.Fields[i] = metadataField(fm, nodeFromJSONObject(flatType, scope, memo), flatType)
+			n.Fields[i] = metadataField(fm, nodeFromJSONObject(flatType, scope, memo, wireFieldNode(wire, i)), flatType, wireField(wire, i))
 		},
 		items: func(key, scope string) {
-			node := nodeFromJSON(m[key], scope, memo)
+			node := nodeFromJSON(m[key], scope, memo, wireItems(wire))
 			n.Items = &node
 		},
 		values: func(key, scope string) {
-			node := nodeFromJSON(m[key], scope, memo)
+			node := nodeFromJSON(m[key], scope, memo, wireValues(wire))
 			n.Values = &node
 		},
 	})
@@ -2516,16 +2218,17 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 // already-built type node. flatType, non-nil for a flat-form field, is the
 // lifted key set. We keep the keys the lift routed into the type out of Props,
 // and the routed doc belongs to the lifted type rather than the field, as
-// the wire lift routes it.
-func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) SchemaField {
+// the wire lift routes it. wf is the compiled field, whose default the
+// parse validated and coerced; a field inside a stray body has none and
+// carries its default as written.
+func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any, wf *fieldNode) SchemaField {
 	sf := SchemaField{Type: typ}
 	getString(fm, "name", &sf.Name)
 	if d, ok := fm["default"]; ok {
-		// String defaults coerce to float64 for float/double fields, as
-		// Java and the wire pipeline do. The nil name table makes this
-		// best-effort; fixupNameRefDefaults re-coerces at the end of Root
-		// with a populated table.
-		sf.Default = coerceMetadataDefault(d, &sf.Type, nil, "")
+		sf.Default = d
+		if wf != nil {
+			sf.Default = metadataDefault(wf.defaultVal, wf.node)
+		}
 		sf.HasDefault = true
 	}
 	if flatType == nil {
@@ -2557,6 +2260,76 @@ func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) S
 		sf.Props[k] = v
 	}
 	return sf
+}
+
+// metadataDefault converts a field's wire default, which the parse validated
+// and coerced, into the Go form [SchemaField.Default] promises: int32 for
+// int, int64 for long, float32 for float, float64 for double, with
+// containers rebuilt leaf by leaf. A union narrows along the branch the wire
+// selected, so the metadata cannot report a branch the encoder does not
+// fill. Every container and byte slice is a fresh copy: the wire value is
+// shared by every Root call and must not be reachable through the tree we
+// hand back.
+func metadataDefault(val any, node *schemaNode) any {
+	if node == nil {
+		return deepCopyTree(val)
+	}
+	switch node.kind {
+	case "int":
+		if n, err := defaultAsInt32(val); err == nil {
+			return n
+		}
+	case "long":
+		if n, err := defaultAsInt64(val); err == nil {
+			return n
+		}
+	case "float":
+		if f, err := defaultAsFloat(val); err == nil {
+			return float32(f)
+		}
+	case "double":
+		if f, err := defaultAsFloat(val); err == nil {
+			return f
+		}
+	case "bytes", "fixed":
+		if b, ok := val.([]byte); ok {
+			return bytes.Clone(b)
+		}
+	case "union":
+		if branch := firstUnionBranchAcceptingDefault(val, node); branch != nil {
+			return metadataDefault(val, branch)
+		}
+	case "record":
+		if m, ok := val.(map[string]any); ok {
+			out := make(map[string]any, len(m))
+			for k, v := range m {
+				out[k] = deepCopyTree(v)
+			}
+			for _, f := range node.fields {
+				if v, ok := m[f.name]; ok {
+					out[f.name] = metadataDefault(v, f.node)
+				}
+			}
+			return out
+		}
+	case "array":
+		if a, ok := val.([]any); ok {
+			out := make([]any, len(a))
+			for i, v := range a {
+				out[i] = metadataDefault(v, node.items)
+			}
+			return out
+		}
+	case "map":
+		if m, ok := val.(map[string]any); ok {
+			out := make(map[string]any, len(m))
+			for k, v := range m {
+				out[k] = metadataDefault(v, node.values)
+			}
+			return out
+		}
+	}
+	return val
 }
 
 // decimalConsumesPrecisionScale reports whether a type object with the given
