@@ -168,11 +168,11 @@ var censusRegistry = []censusQuestion{
 	{
 		id:        "Q2",
 		question:  "What fullname does this named-type DEFINITION occupy?",
-		authority: "the wire builder's registration (schema.go, `o.Name = ns + \".\" + o.Name` feeding registerNamed) — every other representation must land on the same string, because the fullname is what a reference binds to",
+		authority: "the wire builder's registration (schema.go, resolveScope feeding registerNamed) — every other representation must land on the same string, because the fullname is what a reference binds to. resolveScope is the one rule; the three representations differ only in where they read the name and the attribute from",
 		answerers: []censusAnswerer{
-			{repr: "as-written aschema → compiled schemaNode", site: "builder namespace qualification → schemaNode.name", file: "schema.go"},
-			{repr: "metadata SchemaNode", site: "nodeFullname", file: "schema_node.go"},
-			{repr: "cache raw JSON tree", site: "nodeFullnameTree", file: "cache.go"},
+			{repr: "as-written aschema → compiled schemaNode", site: "builder namespace qualification → resolveScope → schemaNode.name", file: "schema.go"},
+			{repr: "metadata SchemaNode", site: "nodeFullname → resolveScope", file: "schema_node.go"},
+			{repr: "cache raw JSON tree", site: "nodeFullnameTree → treeScope → resolveScope", file: "cache.go"},
 			{
 				repr: "pre-Parse any tree", site: "SchemaFor's namespace joins", file: "schema_for.go",
 				note: "not driven by the census: SchemaFor COMPOSES a tree rather than reading one, so it has no definition in hand to ask about. Its output is checked instead by handing the emitted schema to Parse — the authority above — in the SchemaFor round-trip suites.",
@@ -180,10 +180,8 @@ var censusRegistry = []censusQuestion{
 		},
 		tells: []censusTell{
 			{pattern: `+ "." +`, files: []string{
-				"cache.go",       // nodeFullnameTree
-				"schema_node.go", // nodeFullname
-				"schema_for.go",  // SchemaFor composition
-				"schema.go",      // builder qualification (2727); logical key (2165), not this question
+				"schema_for.go", // SchemaFor composition
+				"schema.go",     // resolveScope, the one definition-side join; the logical key join is not this question
 				// Not answerers: an error field-path join, not a schema name.
 				"compat.go",
 				"errors.go",

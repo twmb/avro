@@ -1222,6 +1222,33 @@ func leadingDotName(name string) (string, bool) {
 	return name, false
 }
 
+// resolveScope applies the namespace rule to one named-type definition and
+// returns the fullname it registers under and the namespace its children
+// resolve in. A dotted name carries its own namespace and ignores the
+// attribute; its single leading dot spells the null-namespace escape, so
+// ".x" is the fullname "x" and "." the empty name (Java's Name constructor
+// rule). An undotted name takes the attribute when written, the explicit ""
+// form included, else the enclosing namespace. The wire builder, the
+// metadata walker, and the cache splice all derive a definition's fullname
+// here, and scopedRefKeys below derives a reference's keys, so a definition
+// and the references to it cannot bind differently.
+func resolveScope(name, nsAttr string, hasNSAttr bool, enclosing string) (fullname, ns string) {
+	if strings.Contains(name, ".") {
+		if short, ok := leadingDotName(name); ok {
+			return short, ""
+		}
+		return name, namespaceOf(name)
+	}
+	ns = enclosing
+	if hasNSAttr {
+		ns = nsAttr
+	}
+	if ns == "" {
+		return name, ""
+	}
+	return ns + "." + name, ns
+}
+
 // scopedRefKeys writes the lookup keys for a name reference into dst in
 // binding-precedence order and returns the filled prefix. A dotted reference
 // is an exact fullname lookup. A bare reference tries the
@@ -2451,34 +2478,13 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// writer's illegal legacy name, and fastavro validates none. Java
 		// validates type aliases but not field aliases. qualifyAliases still
 		// applies namespace qualification and the leading-dot escape.
-		ns := ""
-		hasNS := false
+		ns, hasNS := "", false
 		if o.Namespace != nil {
-			ns = *o.Namespace
-			hasNS = true
+			ns, hasNS = *o.Namespace, true
 		}
-		if strings.Contains(o.Name, ".") {
-			// Fullname (dot-separated): ignore parent & our own namespace.
-			parentName = ""
-			hasNS = false
-			if short, ok := leadingDotName(o.Name); ok {
-				// ".x" is the null-namespace fullname "x" and "." collapses to
-				// the empty name, reachable only under a WithLaxNames fn that
-				// accepts "". Without this the name registered verbatim while
-				// child registration and reference resolution disagreed, so a
-				// bare sibling reference inside ".x" could not resolve.
-				o.Name = short
-			}
-		}
-		if hasNS && ns != "" {
-			o.Name = ns + "." + o.Name // have namespace: prefix our name
-		} else if hasNS && ns == "" {
-			// Explicit empty namespace: clear inherited namespace.
-		} else if parentName != "" {
-			if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
-				o.Name = parentName[:dot+1] + o.Name // no namespace: prefix our name with parent namespace if there is one
-			}
-		}
+		// The children build under o.Name, so their enclosing namespace is
+		// namespaceOf(o.Name), the ns resolveScope returns.
+		o.Name, _ = resolveScope(o.Name, ns, hasNS, namespaceOf(parentName))
 		// Per the Avro spec (Names): a primitive type name has no
 		// namespace and may not name a record/enum/fixed. o.Name is now
 		// the resolved fullname; serPrimitive's keys are exactly the 8

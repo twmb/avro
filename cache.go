@@ -226,29 +226,23 @@ func avroNamedRef(typ string) bool {
 	return typ != ""
 }
 
-// nodeNamespace returns the namespace in scope inside a named-type object:
-// the prefix of a dotted name, else its "namespace" attribute, else
-// inherited. We read keys by exact name, mirroring the parser.
+// treeScope resolves a raw named-type object's fullname and the namespace
+// in scope inside it, by resolveScope over the "name" and "namespace" keys
+// read by exact name, as the parser reads them.
+func treeScope(obj map[string]any, enclosingNS string) (fullname, ns string) {
+	name, _ := obj["name"].(string)
+	nsAttr, hasNS := obj["namespace"].(string)
+	return resolveScope(name, nsAttr, hasNS, enclosingNS)
+}
+
 func nodeNamespace(obj map[string]any, enclosingNS string) string {
-	// A dotted name carries its own namespace and suppresses the attribute
-	// even when the prefix is empty (".x"), so presence of the dot decides,
-	// not a non-empty split. namespaceOf performs the split.
-	if name, ok := obj["name"].(string); ok && strings.ContainsRune(name, '.') {
-		return namespaceOf(name)
-	}
-	if ns, ok := obj["namespace"].(string); ok {
-		return ns
-	}
-	return enclosingNS
+	_, ns := treeScope(obj, enclosingNS)
+	return ns
 }
 
 func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
-	name, _ := obj["name"].(string)
-	short := unqualified(name)
-	if ns := nodeNamespace(obj, enclosingNS); ns != "" {
-		return ns + "." + short
-	}
-	return short
+	fullname, _ := treeScope(obj, enclosingNS)
+	return fullname
 }
 
 // collectTreeDefs calls visit for every named-type definition in the tree

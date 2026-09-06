@@ -1747,31 +1747,18 @@ func isNamedKind(typ string) bool {
 	return typ == "record" || typ == "error" || typ == "enum" || typ == "fixed"
 }
 
-// nodeEffNS returns n's effective namespace: a dotted Name carries its
-// own namespace (taking precedence per the spec); otherwise Namespace,
-// which is already resolved ("" means the null namespace).
+// nodeEffNS returns n's effective namespace and nodeFullname its fullname,
+// both by resolveScope over the node's own Name and Namespace. Namespace is
+// already resolved, so it stands in for a written attribute and "" means the
+// null namespace; a dotted Name takes precedence over it, as at parse.
 func nodeEffNS(n *SchemaNode) string {
-	if i := strings.LastIndexByte(n.Name, '.'); i >= 0 {
-		return n.Name[:i]
-	}
-	return n.Namespace
+	_, ns := resolveScope(n.Name, n.Namespace, true, "")
+	return ns
 }
 
-// nodeFullname returns n's fullname: the dotted Name verbatim, or the resolved
-// namespace joined to the name. A single *leading* dot collapses per the
-// null-namespace escape the parser normalizes at build (leadingDotName), so
-// ".x" is the fullname "x" and "." is the bare empty name.
 func nodeFullname(n *SchemaNode) string {
-	if strings.Contains(n.Name, ".") {
-		if short, ok := leadingDotName(n.Name); ok {
-			return short
-		}
-		return n.Name
-	}
-	if n.Namespace != "" {
-		return n.Namespace + "." + n.Name
-	}
-	return n.Name
+	fullname, _ := resolveScope(n.Name, n.Namespace, true, "")
+	return fullname
 }
 
 // nsForChildren returns the namespace scope in effect inside n: a named
@@ -2084,28 +2071,14 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo, 
 
 	getString(m, "type", &n.Type)
 	n.present.setIf(getString(m, "name", &n.Name), presName)
-	// Namespace resolves at build. An explicit attribute wins, the explicit
-	// "namespace":"" form included, which is a different type than one
-	// inheriting the enclosing namespace. A dotted name carries its own
-	// namespace; we preserve any attribute beside it but ignore it, as the
-	// parser does.
-	explicitNS, hasExplicitNS := "", false
-	if s, ok := m["namespace"].(string); ok {
-		explicitNS, hasExplicitNS = s, true
-	}
-	n.present.setIf(hasExplicitNS, presNamespace)
-	switch {
-	// Named kinds with an empty short name inherit/take-explicit exactly
-	// like any undotted name (the parser resolves "name":"" under an
-	// enclosing namespace to fullname "ns.").
-	case (n.Name != "" || isNamedKind(n.Type)) && !strings.Contains(n.Name, "."):
-		if hasExplicitNS {
-			n.Namespace = explicitNS
-		} else {
-			n.Namespace = parentNS
-		}
-	case hasExplicitNS:
-		n.Namespace = explicitNS
+	// Namespace resolves at build through resolveScope, the parser's rule.
+	// A dotted name carries its own namespace; we preserve any attribute
+	// beside it as written but it scopes nothing. Named kinds with an empty
+	// short name resolve like any undotted name (the parser registers
+	// "name":"" under an enclosing namespace as fullname "ns.").
+	n.present.setIf(getString(m, "namespace", &n.Namespace), presNamespace)
+	if (n.Name != "" || isNamedKind(n.Type)) && !strings.Contains(n.Name, ".") {
+		_, n.Namespace = resolveScope(n.Name, n.Namespace, n.present.has(presNamespace), parentNS)
 	}
 	childNS := nsForChildren(&n, parentNS)
 	// getString consumes only a string body, so recording presence off the
