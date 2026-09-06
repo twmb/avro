@@ -604,7 +604,6 @@ func innerCtxKind(label string) string {
 type gval struct {
 	boundary string // normal | 2^53 | maxint | inf | snan | nzero | empty | large | ...
 	generic  any    // the form the generic/reflect path encodes
-	typed    any    // strongly-typed Go form (nil => same as generic)
 	oracle   []byte // independent top-context wire bytes (nil => no oracle)
 	// jsonLossy marks a value whose exact binary wire is provably not
 	// representable in Avro JSON text. Every NaN, quiet or signaling and
@@ -10522,9 +10521,6 @@ type recShape struct {
 	// value builds a generic value chain of the given depth (depth 0 =
 	// terminal node, no recursion taken).
 	value func(depth int) any
-	// tagged: whether the shape's unions are same-class ambiguous when bare.
-	// If so, runCore runs with TaggedUnions (branch fully recoverable).
-	needTagged bool
 }
 
 func recShapes() []recShape {

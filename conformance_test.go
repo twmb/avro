@@ -8856,11 +8856,6 @@ func TestRegression_UnionDefaultMetadataMatchesWireBranch_BranchAcceptsDelegates
 	// form of integer-literal JSON defaults). Without int32/int64
 	// acceptance, the metadata-API matcher would need its own type
 	// switch, allowing drift between the two matchers.
-	type R struct {
-		schema string
-		val    any
-		ok     bool
-	}
 	avroParse := avro.Parse
 	_ = avroParse
 	// Inputs are exercised indirectly via Schema parse with the
@@ -12520,9 +12515,6 @@ func TestMatrix_DefaultValueMaterializationParity(t *testing.T) {
 // order matters: it must beat the []byte arm so net.IP-style
 // named-slice types use UnmarshalText.
 func TestRegression_StringTargetParityBinaryJSON(t *testing.T) {
-	type textTarget struct {
-		s string
-	}
 	// The marshaler is reachable only via Addr, mirroring the live
 	// code path in both setStringValue and decodeString.
 	// Defined inline to keep the test self-contained.
@@ -12564,8 +12556,6 @@ func TestRegression_StringTargetParityBinaryJSON(t *testing.T) {
 			t.Errorf("promotion got %q, want %q", got.V.s, "hello")
 		}
 	})
-
-	_ = textTarget{} // silence unused
 }
 
 // textTargetUnmarshalable is the TextUnmarshaler target used by
@@ -23297,16 +23287,14 @@ func TestMatrix_DecimalCarrierNumericTextContract(t *testing.T) {
 	}
 }
 
-// encodeWire / decodeWire / encodeWireAny / wireName are shared helpers for the
-// decimal carrier tests: one place selects the binary vs JSON entry point.
+// decodeWire / encodeWireAny / wireName are shared helpers for the decimal
+// carrier tests: one place selects the binary vs JSON entry point.
 func wireName(bin bool) string {
 	if bin {
 		return "binary"
 	}
 	return "json"
 }
-
-func encodeWire(s *avro.Schema, v any, bin bool) ([]byte, error) { return encodeWireAny(s, v, bin) }
 
 func encodeWireAny(s *avro.Schema, v any, bin bool) ([]byte, error) {
 	if bin {

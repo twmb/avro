@@ -2493,10 +2493,6 @@ type customString struct{ v string }
 func (c customString) MarshalText() ([]byte, error)  { return []byte(c.v), nil }
 func (c *customString) UnmarshalText(b []byte) error { c.v = string(b); return nil }
 
-type stringerType struct{ v string }
-
-func (s stringerType) String() string { return s.v }
-
 func TestSchemaForTextMarshalerInferredAsString(t *testing.T) {
 	type Record struct {
 		A customString `avro:"a"`

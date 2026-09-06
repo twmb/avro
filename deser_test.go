@@ -16749,7 +16749,6 @@ func TestCustomTypeJSONMapAvroTypeOnly(t *testing.T) {
 
 func TestCustomTypeFixedLogicalType(t *testing.T) {
 	// Exercises hasMatchingCustomType("fixed", logical) path.
-	type PackedID [8]byte
 	ct := CustomType{
 		LogicalType: "packed-id",
 		AvroType:    "fixed",
