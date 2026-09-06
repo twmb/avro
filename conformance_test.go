@@ -25263,3 +25263,4025 @@ func resolvedDecodeAny(t *testing.T, writer, reader string, v any) any {
 	avrotest.MustDecode(t, resolved, wire, &got)
 	return got
 }
+
+// ---------- audit_regression_test.go ----------
+
+// A decimal logical on a non-bytes/fixed primitive is malformed, so we
+// soft-drop it. A registered decimal CustomType resurrects the logical so the
+// custom can handle it. The resurrected logical must not enter the built-in
+// decimal path. That path assumes a bytes/fixed underlying with a validated
+// precision, and would dereference a nil precision pointer. We route the raw
+// value through the custom decoder instead.
+func TestRegression_DecimalCustomTypeWrongUnderlyingNoPanic(t *testing.T) {
+	ct := func() avro.CustomType {
+		return avro.CustomType{
+			LogicalType: "decimal",
+			Decode:      func(v any, _ *avro.SchemaNode) (any, error) { return v, nil },
+		}
+	}
+
+	// The exact malformed shape: decimal on int, with no precision. The parse
+	// must not panic; valid JSON must never crash the parser.
+	for _, typ := range []string{"int", "long", "string"} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Parse panicked for %q+decimal: %v", typ, r)
+				}
+			}()
+			if _, err := avro.Parse(`{"type":"`+typ+`","logicalType":"decimal"}`, avro.WithCustomType(ct())); err != nil {
+				t.Fatalf("%q+decimal+CustomType should parse: %v", typ, err)
+			}
+		}()
+	}
+
+	// We route the resurrected logical's raw Avro-native value through the
+	// custom decoder. The wire stays a plain int.
+	s, err := avro.Parse(`{"type":"int","logicalType":"decimal"}`, avro.WithCustomType(ct()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := s.Encode(int32(42))
+	if err != nil {
+		t.Fatalf("encode int+decimal: %v", err)
+	}
+	var got any
+	if _, err := s.Decode(wire, &got); err != nil {
+		t.Fatalf("decode int+decimal: %v", err)
+	}
+	if got != int32(42) {
+		t.Fatalf("int+decimal custom decode = %T %v, want int32(42)", got, got)
+	}
+
+	// A genuine bytes+decimal with a CustomType still parses and round-trips.
+	sb, err := avro.Parse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`, avro.WithCustomType(ct()))
+	if err != nil {
+		t.Fatalf("valid bytes+decimal+CustomType should parse: %v", err)
+	}
+	if _, err := sb.Encode(big.NewRat(314, 100)); err != nil {
+		t.Fatalf("encode bytes+decimal: %v", err)
+	}
+}
+
+type auditMoney int64
+
+// A custom decoder returning ErrSkipCustomType falls through to built-in
+// decode. The canonical Avro-native value lands in the target exactly as a
+// no-custom decode would. A target the value fits succeeds and equals the
+// no-custom decode on both wires. The fall-through re-decodes through the base
+// deserializer rather than boxing the canonical int64 into `any` and gating it
+// on AssignableTo. A target the value does *not* fit still errors with a
+// SemanticError, never a panic in reflect.Set.
+func TestRegression_DecodeJSONCustomDecoderConcreteTargetErrors(t *testing.T) {
+	ct := avro.CustomType{
+		LogicalType: "money",
+		AvroType:    "long",
+		Decode:      func(v any, _ *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType },
+	}
+	schema := `{"type":"record","name":"R","fields":[{"name":"p","type":{"type":"long","logicalType":"money"}}]}`
+	plain := avro.MustParse(schema)
+	s := avrotest.MustParse(t, schema, avro.WithCustomType(ct))
+
+	// Compatible target (long into a named integer): skip-custom == no-custom
+	// on both wires.
+	type R struct {
+		P auditMoney `avro:"p"`
+	}
+	wire := avrotest.MustEncode(t, plain, R{P: 5})
+	jsonBytes := avrotest.MustEncodeJSON(t, plain, R{P: 5})
+	var noCustom R
+	if _, err := plain.Decode(wire, &noCustom); err != nil {
+		t.Fatalf("no-custom decode (oracle): %v", err)
+	}
+	var rbin R
+	if _, err := s.Decode(wire, &rbin); err != nil {
+		t.Errorf("binary skip-custom into named integer should succeed (== no-custom): %v", err)
+	}
+	var rjson R
+	if err := s.DecodeJSON(jsonBytes, &rjson); err != nil {
+		t.Errorf("JSON skip-custom into named integer should succeed (== no-custom): %v", err)
+	}
+	if rbin != noCustom || rjson != noCustom {
+		t.Errorf("skip-custom value diverges from no-custom: bin=%+v json=%+v want=%+v", rbin, rjson, noCustom)
+	}
+
+	// Incompatible target (long into a string field): both wires error
+	// gracefully, no panic.
+	type Bad struct {
+		P string `avro:"p"`
+	}
+	binErr := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("binary Decode panicked on incompatible target: %v", r)
+			}
+		}()
+		var b Bad
+		_, err = s.Decode(wire, &b)
+		return
+	}()
+	if binErr == nil {
+		t.Fatal("binary Decode should reject a long into a string field")
+	}
+	jsonErr := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("DecodeJSON panicked on incompatible target where binary returned %v: %v", binErr, r)
+			}
+		}()
+		var b Bad
+		return s.DecodeJSON(jsonBytes, &b)
+	}()
+	if jsonErr == nil {
+		t.Fatal("DecodeJSON should reject a long into a string field, like binary Decode")
+	}
+}
+
+// A union default must select the same branch on both wires. A default string
+// with a codepoint above 255 cannot be a bytes or fixed default, since those
+// map each codepoint 0-255 to one byte. Binary therefore falls through to the
+// string branch. EncodeJSON's raw-UTF-8 appendAvroJSON accepted it as bytes,
+// picking a different branch than binary, the default-fill and the metadata
+// API.
+func TestRegression_UnionBytesFixedDefaultJSONBinaryParity(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		want   any // the Go value both wire formats must decode the filled default into
+	}{
+		{
+			"bytes-branch-codepoint-over-255-falls-through-to-string",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["bytes","string"],"default":"Ā"}]}`,
+			"Ā",
+		},
+		{
+			"fixed-branch-codepoint-over-255-falls-through-to-string",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":[{"type":"fixed","name":"F","size":2},"string"],"default":"Ā"}]}`,
+			"Ā",
+		},
+		{
+			"bytes-branch-codepoint-in-range-stays-bytes",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["bytes","string"],"default":"ÿ"}]}`,
+			[]byte{0xff},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := avrotest.MustParse(t, c.schema)
+			bw := avrotest.MustAppendEncode(t, s, nil, map[string]any{})
+			var bm map[string]any
+			avrotest.MustDecode(t, s, bw, &bm)
+			jw := avrotest.MustAppendEncodeJSON(t, s, nil, map[string]any{})
+			var jm map[string]any
+			avrotest.MustDecodeJSON(t, s, jw, &jm)
+			if !reflect.DeepEqual(bm["f"], c.want) {
+				t.Errorf("binary default-fill f = %T(%v), want %T(%v)", bm["f"], bm["f"], c.want, c.want)
+			}
+			if !reflect.DeepEqual(jm["f"], c.want) {
+				t.Errorf("JSON default-fill f = %T(%v), want %T(%v) — JSON picked a different union branch than binary (wire %s)", jm["f"], jm["f"], c.want, c.want, jw)
+			}
+		})
+	}
+}
+
+// An empty Avro array decodes to a non-nil empty slice on both wire formats.
+// That matches the JSON array decoder and the binary map decoder. A nil slice
+// out of binary array decode sits beside a non-nil empty slice out of JSON,
+// and a non-nil empty map out of binary map decode. One logical value would
+// then have a different Go representation per wire format.
+func TestRegression_EmptyArrayDecodesNonNilBothFormats(t *testing.T) {
+	type Rec struct {
+		Items []int `avro:"items"`
+	}
+	s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"items","type":{"type":"array","items":"int"}}]}`)
+
+	bin := avrotest.MustAppendEncode(t, s, nil, Rec{Items: nil})
+	js := avrotest.MustAppendEncodeJSON(t, s, nil, Rec{Items: nil})
+
+	var bo, jo Rec
+	avrotest.MustDecode(t, s, bin, &bo)
+	avrotest.MustDecodeJSON(t, s, js, &jo)
+	if bo.Items == nil {
+		t.Error("binary decode of empty array left the slice nil; want non-nil empty (JSON/map parity)")
+	}
+	if jo.Items == nil {
+		t.Error("JSON decode of empty array left the slice nil; want non-nil empty")
+	}
+	if len(bo.Items) != 0 || len(jo.Items) != 0 {
+		t.Errorf("empty array decoded to non-empty: binary len=%d json len=%d", len(bo.Items), len(jo.Items))
+	}
+
+	// Top-level (non-field) empty array decodes non-nil too.
+	st := avro.MustParse(`{"type":"array","items":"int"}`)
+	tw := avrotest.MustAppendEncode(t, st, nil, []int{})
+	var top []int
+	avrotest.MustDecode(t, st, tw, &top)
+	if top == nil {
+		t.Error("binary decode of top-level empty array left the slice nil; want non-nil empty")
+	}
+
+	// Cover the other unsafe array element paths that funnel through
+	// udArrayBlocks: a string slice (direct) and a pointer-record slice
+	// (batch-allocated). All must come back non-nil empty too.
+	type Sub struct {
+		X int `avro:"x"`
+	}
+	type Multi struct {
+		Strs []string `avro:"strs"`
+		Recs []*Sub   `avro:"recs"`
+	}
+	ms := avro.MustParse(`{"type":"record","name":"M","fields":[
+		{"name":"strs","type":{"type":"array","items":"string"}},
+		{"name":"recs","type":{"type":"array","items":{"type":"record","name":"Sub","fields":[{"name":"x","type":"int"}]}}}]}`)
+	mw := avrotest.MustAppendEncode(t, ms, nil, Multi{})
+	var mo Multi
+	avrotest.MustDecode(t, ms, mw, &mo)
+	if mo.Strs == nil || mo.Recs == nil {
+		t.Errorf("unsafe array fields left nil: strs nil=%v recs nil=%v", mo.Strs == nil, mo.Recs == nil)
+	}
+}
+
+// skipMap bounds its block count against the remaining buffer, like deserMap
+// and skipArray. An unbounded int(count) loop truncates a count above 2^31 on
+// a 32-bit build (narrow before check) and mis-frames the skip. That
+// truncation is not observable on a 64-bit host. So we pin instead that the
+// bound does not break the valid map-skip path. A resolved decode takes that
+// path when the reader drops a writer's map field.
+func TestRegression_SkipMapBoundedValidSkip(t *testing.T) {
+	writer := avro.MustParse(`{"type":"record","name":"W","fields":[
+		{"name":"m","type":{"type":"map","values":"long"}},
+		{"name":"keep","type":"int"}]}`)
+	reader := avro.MustParse(`{"type":"record","name":"W","fields":[{"name":"keep","type":"int"}]}`)
+	resolved := avrotest.MustResolve(t, writer, reader)
+	wire := avrotest.MustEncode(t, writer, map[string]any{
+		"m":    map[string]int64{"a": 1, "b": 2, "c": 3},
+		"keep": int32(7),
+	})
+	var out map[string]any
+	if _, err := resolved.Decode(wire, &out); err != nil {
+		t.Fatalf("resolved decode (skipping map field) failed: %v", err)
+	}
+	if out["keep"] != int32(7) {
+		t.Fatalf("keep = %T %v after skipping map field, want int32(7)", out["keep"], out["keep"])
+	}
+	if _, present := out["m"]; present {
+		t.Fatalf("dropped map field should not appear in reader output: %v", out)
+	}
+}
+
+// CustomType.Decode must receive the raw Avro-native value its field
+// documents: int32 for int, int64 for long, []byte for bytes/fixed. The binary
+// path enforces that by suppressing the logical deserializer when a custom
+// matches. The JSON path must produce the same raw value, not the
+// logical-transformed Go type. Without parity, a custom decoder that works
+// through Decode panics or misreads through DecodeJSON.
+func TestMatrix_CustomDecodeReceivesRawValueBinaryJSONParity(t *testing.T) {
+	cases := []struct {
+		name     string
+		logical  string
+		avroType string
+		schema   string
+		encode   any    // Encode=nil: the built-in logical encoder handles this
+		wantType string // raw Avro-native Go type the Decode callback must receive
+	}{
+		{"timestamp-millis", "timestamp-millis", "long", `{"type":"long","logicalType":"timestamp-millis"}`, time.UnixMilli(1700000000000).UTC(), "int64"},
+		{"date", "date", "int", `{"type":"int","logicalType":"date"}`, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), "int32"},
+		{"time-micros", "time-micros", "long", `{"type":"long","logicalType":"time-micros"}`, 5 * time.Hour, "int64"},
+		{"decimal-bytes", "decimal", "bytes", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(33, 100), "[]uint8"},
+		{"uuid-fixed", "uuid", "fixed", `{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`, [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, "[]uint8"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ct := avro.CustomType{
+				LogicalType: c.logical,
+				AvroType:    c.avroType,
+				Decode:      func(v any, _ *avro.SchemaNode) (any, error) { return fmt.Sprintf("%T", v), nil },
+			}
+			s := avrotest.MustParse(t, c.schema, ct)
+			bin := avrotest.MustEncode(t, s, c.encode)
+			jsn := avrotest.MustEncodeJSON(t, s, c.encode)
+			var binVal, jsonVal any
+			avrotest.MustDecode(t, s, bin, &binVal)
+			avrotest.MustDecodeJSON(t, s, jsn, &jsonVal)
+			if binVal != c.wantType {
+				t.Errorf("binary Decode callback received %v, want raw %s", binVal, c.wantType)
+			}
+			if jsonVal != c.wantType {
+				t.Errorf("JSON Decode callback received %v, want raw %s (binary↔JSON parity)", jsonVal, c.wantType)
+			}
+		})
+	}
+}
+
+// The type-safe NewCustomType constructor generates a v.(A) assertion in its
+// Decode wrapper. Handing it the logical-transformed value (time.Time) where
+// the raw int64 belongs panics on otherwise-valid input. We must round-trip
+// through DecodeJSON without panicking.
+func TestRegression_CustomDecodeNewCustomTypeJSONNoPanic(t *testing.T) {
+	type eventTime time.Time
+	ct := avro.NewCustomType[eventTime, int64]("timestamp-millis",
+		func(e eventTime, _ *avro.SchemaNode) (int64, error) { return time.Time(e).UnixMilli(), nil },
+		func(ms int64, _ *avro.SchemaNode) (eventTime, error) { return eventTime(time.UnixMilli(ms)), nil })
+	s := avro.MustParse(`{"type":"long","logicalType":"timestamp-millis"}`, ct)
+	ev := eventTime(time.UnixMilli(1700000000000))
+	jsn := avrotest.MustEncodeJSON(t, s, ev)
+	var out eventTime
+	avrotest.MustDecodeJSON(t, s, jsn, &out)
+	if !time.Time(out).Equal(time.Time(ev)) {
+		t.Errorf("round-trip mismatch: got %v want %v", time.Time(out), time.Time(ev))
+	}
+}
+
+// A CustomType whose GoType is a pointer (e.g. *url.URL, the documented
+// pointer-GoType shape) must fire its Encode on both binary and JSON. The
+// binary path checks GoType per indirection level while peeling. The JSON path
+// must consult the custom hook before stripping the pointer. Otherwise the
+// pointer GoType never matches and we silently skip the encoder.
+func TestRegression_CustomEncodePointerGoTypeBinaryJSONParity(t *testing.T) {
+	type w struct{ N int64 }
+	mk := func(goType reflect.Type) avro.CustomType {
+		return avro.CustomType{
+			AvroType: "long", LogicalType: "wlt", GoType: goType,
+			Encode: func(v any, _ *avro.SchemaNode) (any, error) {
+				switch x := v.(type) {
+				case *w:
+					return x.N, nil
+				case w:
+					return x.N, nil
+				}
+				return nil, avro.ErrSkipCustomType
+			},
+		}
+	}
+	check := func(t *testing.T, s *avro.Schema, v any) {
+		t.Helper()
+		bin, errBin := s.Encode(v)
+		if errBin != nil {
+			t.Fatalf("binary Encode: %v", errBin)
+		}
+		jsn, errJSON := s.EncodeJSON(v)
+		if errJSON != nil {
+			t.Fatalf("JSON Encode (custom encoder skipped on JSON?): %v", errJSON)
+		}
+		var binVal, jsonVal any
+		avrotest.MustDecode(t, s, bin, &binVal)
+		avrotest.MustDecodeJSON(t, s, jsn, &jsonVal)
+		if binVal != int64(5) || jsonVal != int64(5) {
+			t.Errorf("binary=%v json=%v, want both int64(5)", binVal, jsonVal)
+		}
+	}
+	t.Run("pointer-GoType", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"long","logicalType":"wlt"}`, mk(reflect.TypeOf((*w)(nil))))
+		check(t, s, &w{N: 5})
+	})
+	t.Run("value-GoType-still-works", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"long","logicalType":"wlt"}`, mk(reflect.TypeOf(w{})))
+		check(t, s, w{N: 5})
+	})
+	t.Run("value-GoType-user-pointer", func(t *testing.T) {
+		// Value GoType with the user passing a pointer: customEncode peels then
+		// matches at the value level. Must still work on both paths.
+		s := avro.MustParse(`{"type":"long","logicalType":"wlt"}`, mk(reflect.TypeOf(w{})))
+		check(t, s, &w{N: 5})
+	})
+}
+
+// A custom type with a nil Decode callback suppresses the built-in logical
+// decoder and produces the raw Avro-native value. CustomType.Decode and doc.go
+// both document that. The binary path enforces it by suppressing the logical
+// deserializer whenever any matching custom type exists. The JSON path must
+// produce the same raw value, not the logical-transformed Go type, even with
+// no Decode chain to wrap.
+func TestMatrix_CustomDecodeNilRawValueBinaryJSONParity(t *testing.T) {
+	type w struct{ N int64 }
+	cases := []struct {
+		name     string
+		schema   string
+		logical  string
+		avroType string
+		wantType string
+		encVal   any // value the built-in logical encoder accepts
+	}{
+		// Every logical type: the drift-guard for jsonDecodeAppliesLogical,
+		// which is derived by probing decodeLogical*. An Encode-only
+		// non-wildcard custom suppresses the logical decoder, so a
+		// decode-into-any must yield the raw Avro-native type on both paths.
+		// If the probe wrongly reports a logical as non-transforming, JSON
+		// leaks the enriched type here.
+		{"date", `{"type":"int","logicalType":"date"}`, "date", "int", "int32", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, "time-millis", "int", "int32", 3 * time.Hour},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, "time-micros", "long", "int64", 3 * time.Hour},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, "timestamp-millis", "long", "int64", time.UnixMilli(1700000000000).UTC()},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, "timestamp-micros", "long", "int64", time.UnixMilli(1700000000000).UTC()},
+		{"timestamp-nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, "timestamp-nanos", "long", "int64", time.Unix(1700000000, 5).UTC()},
+		{"local-timestamp-millis", `{"type":"long","logicalType":"local-timestamp-millis"}`, "local-timestamp-millis", "long", "int64", time.UnixMilli(1700000000000).UTC()},
+		{"local-timestamp-micros", `{"type":"long","logicalType":"local-timestamp-micros"}`, "local-timestamp-micros", "long", "int64", time.UnixMilli(1700000000000).UTC()},
+		{"local-timestamp-nanos", `{"type":"long","logicalType":"local-timestamp-nanos"}`, "local-timestamp-nanos", "long", "int64", time.Unix(1700000000, 5).UTC()},
+		{"decimal-bytes", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, "decimal", "bytes", "[]uint8", big.NewRat(33, 100)},
+		{"decimal-fixed", `{"type":"fixed","name":"DF","size":8,"logicalType":"decimal","precision":10,"scale":2}`, "decimal", "fixed", "[]uint8", big.NewRat(33, 100)},
+		{"big-decimal", `{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal", "bytes", "[]uint8", big.NewRat(33, 100)},
+		{"uuid-string", `{"type":"string","logicalType":"uuid"}`, "uuid", "string", "string", "6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{"uuid-fixed", `{"type":"fixed","name":"UF","size":16,"logicalType":"uuid"}`, "uuid", "fixed", "[]uint8", [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}},
+		{"duration", `{"type":"fixed","name":"DUR","size":12,"logicalType":"duration"}`, "duration", "fixed", "[]uint8", [12]byte{1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// Encode through a plain (no-custom) schema using the built-in
+			// logical encoder, then decode through an Encode-only custom schema.
+			plain := avro.MustParse(c.schema)
+			bin := avrotest.MustEncode(t, plain, c.encVal)
+			jsn := avrotest.MustEncodeJSON(t, plain, c.encVal)
+			// Encode-only custom (Decode==nil) suppresses the logical decoder,
+			// giving the raw Avro-native value on both decode paths. We never
+			// invoke the Encode callback here (we only decode); its presence
+			// is what makes the type Encode-only.
+			custom := avro.MustParse(c.schema, avro.CustomType{
+				LogicalType: c.logical, AvroType: c.avroType, GoType: reflect.TypeOf(w{}),
+				Encode: func(v any, _ *avro.SchemaNode) (any, error) { return v, nil },
+			})
+			var bv, jv any
+			avrotest.MustDecode(t, custom, bin, &bv)
+			avrotest.MustDecodeJSON(t, custom, jsn, &jv)
+			if got := fmt.Sprintf("%T", bv); got != c.wantType {
+				t.Errorf("binary nil-Decode produced %s, want raw %s", got, c.wantType)
+			}
+			if got := fmt.Sprintf("%T", jv); got != c.wantType {
+				t.Errorf("JSON nil-Decode produced %s, want raw %s (binary↔JSON parity)", got, c.wantType)
+			}
+		})
+	}
+}
+
+// A custom encoder with a pointer GoType registered on a *union branch* must
+// fire on both binary and JSON encode. The binary path passes the un-peeled
+// value to the branch serializer. The JSON path must dispatch the union before
+// the pointer-peel loop, so the branch's custom encoder matches the pointer.
+func TestRegression_CustomEncodePointerGoTypeUnionBranchParity(t *testing.T) {
+	type wu struct{ N int64 }
+	s := avro.MustParse(`["null",{"type":"long","logicalType":"timestamp-millis"}]`, avro.CustomType{
+		LogicalType: "timestamp-millis", AvroType: "long", GoType: reflect.TypeOf(&wu{}),
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) { return v.(*wu).N, nil },
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) { return wu{N: v.(int64)}, nil },
+	})
+	if _, err := s.Encode(&wu{N: 1000}); err != nil {
+		t.Fatalf("binary Encode of union-branch pointer-GoType custom: %v", err)
+	}
+	if _, err := s.EncodeJSON(&wu{N: 1000}); err != nil {
+		t.Errorf("JSON Encode of union-branch pointer-GoType custom failed but binary succeeded: %v", err)
+	}
+	// A pointer to a tagged-union map must still encode (regression guard for
+	// dispatching union before the peel loop).
+	su := avro.MustParse(`["null","int","string"]`)
+	m := map[string]any{"int": int32(7)}
+	if _, err := su.EncodeJSON(&m); err != nil {
+		t.Errorf("EncodeJSON of *map tagged union regressed: %v", err)
+	}
+}
+
+// A custom decimal/big-decimal encoder (Encode!=nil) suppresses the built-in
+// decimal serializer to base bytes on the binary path. We write a value
+// matching the custom GoType as its raw []byte, and reject a non-matching
+// pass-through such as *big.Rat. JSON encode must agree on both directions.
+func TestRegression_CustomDecimalEncodePassThroughParity(t *testing.T) {
+	type bdec struct{ Raw []byte }
+	for _, logical := range []string{"decimal", "big-decimal"} {
+		t.Run(logical, func(t *testing.T) {
+			// decimal carries precision/scale; big-decimal (AVRO-4124) is
+			// scale-free (the scale rides in the payload).
+			schema := `{"type":"bytes","logicalType":"big-decimal"}`
+			if logical == "decimal" {
+				schema = `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+			}
+			s := avro.MustParse(schema, avro.CustomType{
+				LogicalType: logical, AvroType: "bytes", GoType: reflect.TypeOf(bdec{}),
+				Encode: func(v any, _ *avro.SchemaNode) (any, error) { return v.(bdec).Raw, nil },
+				Decode: func(v any, _ *avro.SchemaNode) (any, error) { return bdec{Raw: v.([]byte)}, nil },
+			})
+			// Matching GoType: encodes raw bytes on both, round-trips.
+			if _, err := s.Encode(bdec{Raw: []byte{0x21}}); err != nil {
+				t.Fatalf("binary Encode of matching custom: %v", err)
+			}
+			if _, err := s.EncodeJSON(bdec{Raw: []byte{0x21}}); err != nil {
+				t.Fatalf("JSON Encode of matching custom: %v", err)
+			}
+			// Pass-through *big.Rat: rejected on both paths (no decimal arm).
+			_, eb := s.Encode(big.NewRat(33, 100))
+			_, ej := s.EncodeJSON(big.NewRat(33, 100))
+			if eb == nil {
+				t.Errorf("binary must reject *big.Rat pass-through for custom %s", logical)
+			}
+			if ej == nil {
+				t.Errorf("JSON must reject *big.Rat pass-through for custom %s (binary↔JSON parity)", logical)
+			}
+		})
+	}
+
+	// Non-custom decimal still coerces *big.Rat (the fix must not disable the
+	// decimal arm globally).
+	plain := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
+	if _, err := plain.EncodeJSON(big.NewRat(33, 100)); err != nil {
+		t.Errorf("non-custom decimal JSON encode of *big.Rat regressed: %v", err)
+	}
+}
+
+// The binary fixed build suppresses the serializer to base serSize for every
+// fixed logical (decimal, duration, uuid) when a custom Encode exists. We then
+// write a non-matching pass-through value as raw bytes, not through the strict
+// logical encoder. JSON encode must agree. A 16-char non-UUID string against
+// fixed+uuid+custom must encode (raw) on both, not reject on JSON via
+// parseUUID.
+func TestRegression_CustomEncodeFixedLogicalBaseBytesParity(t *testing.T) {
+	type my16 struct{ B [16]byte }
+	s := avro.MustParse(`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`, avro.CustomType{
+		LogicalType: "uuid", AvroType: "fixed", GoType: reflect.TypeOf(my16{}),
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) { b := v.(my16).B; return b[:], nil },
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) { return my16{B: [16]byte(v.([]byte))}, nil },
+	})
+	// Matching custom value round-trips.
+	var x my16
+	for i := range x.B {
+		x.B[i] = byte(i)
+	}
+	if _, err := s.Encode(x); err != nil {
+		t.Fatalf("binary Encode of matching custom: %v", err)
+	}
+	if _, err := s.EncodeJSON(x); err != nil {
+		t.Fatalf("JSON Encode of matching custom: %v", err)
+	}
+	// Pass-through 16-char non-UUID string: base serSize accepts it on binary;
+	// JSON must too (logical uuid arm suppressed by the custom encoder).
+	_, eb := s.Encode("0123456789abcdef")
+	_, ej := s.EncodeJSON("0123456789abcdef")
+	if (eb == nil) != (ej == nil) {
+		t.Errorf("fixed+uuid+custom pass-through string: binary err=%v json err=%v (must agree)", eb, ej)
+	}
+}
+
+// A wildcard CustomType (empty LogicalType and AvroType, the property-based
+// dispatch pattern) is excluded from the binary decoder-suppression gate.
+// Binary therefore leaves the built-in logical decoder in place and feeds the
+// callback the enriched value. The JSON decode path must *not* suppress the
+// transform for wildcards either, or it feeds raw int64/[]byte instead.
+// Non-wildcard customs still suppress to the raw value on both paths.
+func TestRegression_WildcardCustomDecodeBinaryJSONParity(t *testing.T) {
+	skip := func(v any, _ *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }
+	typeOf := func(v any) string {
+		if v == nil {
+			return "<nil>"
+		}
+		return reflect.TypeOf(v).String()
+	}
+	decBoth := func(t *testing.T, s *avro.Schema, enc any) (string, string) {
+		t.Helper()
+		bin := avrotest.MustEncode(t, s, enc)
+		js := avrotest.MustEncodeJSON(t, s, enc)
+		var bo, jo any
+		avrotest.MustDecode(t, s, bin, &bo)
+		avrotest.MustDecodeJSON(t, s, js, &jo)
+		return typeOf(bo), typeOf(jo)
+	}
+
+	cases := []struct {
+		name     string
+		schema   string
+		enc      any
+		enriched string // the non-raw Go type the wildcard must see on both paths
+		rawType  string // the raw Avro-native type a non-wildcard custom suppresses to
+		logical  string
+		avroType string
+	}{
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, int64(1687221496000), "time.Time", "int64", "timestamp-millis", "long"},
+		{"date", `{"type":"int","logicalType":"date"}`, int32(19000), "time.Time", "int32", "date", "int"},
+		{"decimal", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, []byte{0x21}, "*big.Rat", "[]uint8", "decimal", "bytes"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// Wildcard: enriched on both paths.
+			ws := avro.MustParse(c.schema, avro.CustomType{Decode: skip})
+			wb, wj := decBoth(t, ws, c.enc)
+			if wb != wj {
+				t.Errorf("wildcard: binary=%s json=%s (must agree)", wb, wj)
+			}
+			if wb != c.enriched {
+				t.Errorf("wildcard binary should keep enriched %s, got %s", c.enriched, wb)
+			}
+
+			// Non-wildcard (LogicalType-only / AvroType-only / both): raw on both.
+			for _, ct := range []avro.CustomType{
+				{LogicalType: c.logical, Decode: skip},
+				{AvroType: c.avroType, Decode: skip},
+				{LogicalType: c.logical, AvroType: c.avroType, Decode: skip},
+			} {
+				ns := avro.MustParse(c.schema, ct)
+				nb, nj := decBoth(t, ns, c.enc)
+				if nb != nj {
+					t.Errorf("non-wildcard: binary=%s json=%s (must agree)", nb, nj)
+				}
+				if nb != c.rawType {
+					t.Errorf("non-wildcard should suppress to raw %s, got %s", c.rawType, nb)
+				}
+			}
+		})
+	}
+}
+
+// Encode-side mirror of the wildcard parity. The binary encoder-suppression
+// gate also excludes wildcards, so a wildcard with an Encode keeps the
+// built-in decimal/fixed serializer, which accepts *big.Rat. The JSON encode
+// arms must gate on the same predicate, not on the custom[node].encode != nil
+// proxy. Otherwise binary accepts *big.Rat while JSON rejects it. Non-wildcard
+// Encode customs still suppress to base bytes on both.
+func TestRegression_WildcardCustomEncodeBinaryJSONParity(t *testing.T) {
+	skipEnc := func(v any, _ *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }
+	schemas := []string{
+		`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
+		`{"type":"fixed","name":"F","size":8,"logicalType":"decimal","precision":10,"scale":2}`,
+		`{"type":"bytes","logicalType":"big-decimal"}`,
+	}
+	for _, sch := range schemas {
+		// Wildcard with Encode: we accept the *big.Rat pass-through on both
+		// paths. Binary keeps serBytesDecimal/serFixedDecimal, a wildcard being
+		// excluded from the encoder-suppression gate.
+		ws := avro.MustParse(sch, avro.CustomType{Encode: skipEnc})
+		_, web := ws.Encode(big.NewRat(33, 100))
+		_, wej := ws.EncodeJSON(big.NewRat(33, 100))
+		if (web == nil) != (wej == nil) {
+			t.Errorf("wildcard encode %s: binary err=%v json err=%v (must agree)", sch[:34], web, wej)
+		}
+		if web != nil {
+			t.Errorf("wildcard encode %s should ACCEPT *big.Rat (binary), got %v", sch[:34], web)
+		}
+
+		// Non-wildcard with Encode: suppressed to base bytes, so the *big.Rat
+		// pass-through is rejected on both paths.
+		ns := avro.MustParse(sch, avro.CustomType{
+			LogicalType: logicalOf(sch), AvroType: avroTypeOf(sch), Encode: skipEnc,
+		})
+		_, neb := ns.Encode(big.NewRat(33, 100))
+		_, nej := ns.EncodeJSON(big.NewRat(33, 100))
+		if (neb == nil) != (nej == nil) {
+			t.Errorf("non-wildcard encode %s: binary err=%v json err=%v (must agree)", sch[:34], neb, nej)
+		}
+		if neb == nil {
+			t.Errorf("non-wildcard encode %s should REJECT *big.Rat pass-through (suppressed)", sch[:34])
+		}
+	}
+}
+
+func logicalOf(sch string) string {
+	if strings.Contains(sch, "big-decimal") {
+		return "big-decimal"
+	}
+	return "decimal"
+}
+
+func avroTypeOf(sch string) string {
+	if strings.Contains(sch, `"type":"fixed"`) {
+		return "fixed"
+	}
+	return "bytes"
+}
+
+// A wildcard CustomType's Encode callback must fire the same number of times
+// on both wires. The binary 2-branch ["null",T] fast path skips the null
+// branch for a non-nil value, so the hook fires once. A JSON union try-each
+// that trials null first fires it a spurious second time. That double-fires a
+// side-effecting wildcard. N>=3 unions trial null on both paths and already
+// agree, so the hazard is specific to 2-branch null-first unions.
+func TestMatrix_WildcardEncodeCallbackCountUnionParity(t *testing.T) {
+	count := func(schema string, v any) (bin, jsonN int) {
+		var n int
+		s := avro.MustParse(schema, avro.CustomType{
+			Encode: func(any, *avro.SchemaNode) (any, error) { n++; return nil, avro.ErrSkipCustomType },
+		})
+		n = 0
+		if _, err := s.Encode(v); err != nil {
+			t.Fatalf("Encode %s: %v", schema, err)
+		}
+		bin = n
+		n = 0
+		if _, err := s.EncodeJSON(v); err != nil {
+			t.Fatalf("EncodeJSON %s: %v", schema, err)
+		}
+		return bin, n
+	}
+	ts := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	cases := []struct {
+		name, schema string
+		v            any
+	}{
+		{"2-branch null-first", `["null",{"type":"long","logicalType":"timestamp-millis"}]`, ts},
+		{"2-branch null-second", `[{"type":"long","logicalType":"timestamp-millis"},"null"]`, ts},
+		{"3-branch null-first", `["null",{"type":"long","logicalType":"timestamp-millis"},"string"]`, ts},
+		{"2-branch null-first int", `["null","int"]`, int32(7)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b, j := count(c.schema, c.v)
+			if b != j {
+				t.Errorf("wildcard Encode fired binary=%d json=%d times (must agree)", b, j)
+			}
+		})
+	}
+}
+
+// customLogicalCase is one logical type plus a value the built-in logical
+// encoder accepts. It carries the raw Avro-native Go type the suppressed
+// decoder produces too. We share it between the no-callback-suppression and
+// promotion-suppression regression tests so both cover every logical type
+// uniformly.
+type customLogicalCase struct {
+	name     string
+	schema   string
+	logical  string
+	avroType string
+	encVal   any
+	rawType  string // %T of the raw Avro-native value a suppressed decode yields
+}
+
+func customLogicalCases() []customLogicalCase {
+	return []customLogicalCase{
+		{"date", `{"type":"int","logicalType":"date"}`, "date", "int", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), "int32"},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, "time-millis", "int", 3 * time.Hour, "int32"},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, "time-micros", "long", 3 * time.Hour, "int64"},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, "timestamp-millis", "long", time.UnixMilli(1700000000000).UTC(), "int64"},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, "timestamp-micros", "long", time.UnixMilli(1700000000000).UTC(), "int64"},
+		{"timestamp-nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, "timestamp-nanos", "long", time.Unix(1700000000, 5).UTC(), "int64"},
+		{"local-timestamp-millis", `{"type":"long","logicalType":"local-timestamp-millis"}`, "local-timestamp-millis", "long", time.UnixMilli(1700000000000).UTC(), "int64"},
+		{"local-timestamp-micros", `{"type":"long","logicalType":"local-timestamp-micros"}`, "local-timestamp-micros", "long", time.UnixMilli(1700000000000).UTC(), "int64"},
+		{"local-timestamp-nanos", `{"type":"long","logicalType":"local-timestamp-nanos"}`, "local-timestamp-nanos", "long", time.Unix(1700000000, 5).UTC(), "int64"},
+		{"decimal-bytes", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, "decimal", "bytes", big.NewRat(33, 100), "[]uint8"},
+		{"decimal-fixed", `{"type":"fixed","name":"DF","size":8,"logicalType":"decimal","precision":10,"scale":2}`, "decimal", "fixed", big.NewRat(33, 100), "[]uint8"},
+		{"big-decimal", `{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal", "bytes", big.NewRat(33, 100), "[]uint8"},
+		{"uuid-string", `{"type":"string","logicalType":"uuid"}`, "uuid", "string", "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "string"},
+		{"uuid-fixed", `{"type":"fixed","name":"UF","size":16,"logicalType":"uuid"}`, "uuid", "fixed", "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "[]uint8"},
+		{"duration", `{"type":"fixed","name":"DUR","size":12,"logicalType":"duration"}`, "duration", "fixed", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, "[]uint8"},
+	}
+}
+
+// A CustomType that matches a logical node but provides neither callback still
+// suppresses the built-in logical decoder on binary. hasMatchingCustomType
+// counts callback-less matchers, excluding only wildcards. Per
+// CustomType.Decode it yields the raw Avro-native type, and DecodeJSON must
+// yield the same one. It will not, if the wiring for a callback-less matcher
+// returns early before installing the JSON suppress-wrapper. We drive this
+// across every logical and both matcher forms.
+func TestMatrix_CustomNoCallbackSuppressionBinaryJSONParity(t *testing.T) {
+	matchers := []struct {
+		name string
+		make func(c customLogicalCase) avro.CustomType
+	}{
+		{"logical-only", func(c customLogicalCase) avro.CustomType { return avro.CustomType{LogicalType: c.logical} }},
+		{"avrotype-only", func(c customLogicalCase) avro.CustomType { return avro.CustomType{AvroType: c.avroType} }},
+	}
+	for _, c := range customLogicalCases() {
+		for _, m := range matchers {
+			t.Run(c.name+"/"+m.name, func(t *testing.T) {
+				plain := avro.MustParse(c.schema)
+				bin := avrotest.MustEncode(t, plain, c.encVal)
+				jsn := avrotest.MustEncodeJSON(t, plain, c.encVal)
+				cs := avro.MustParse(c.schema, m.make(c))
+				var bv, jv any
+				avrotest.MustDecode(t, cs, bin, &bv)
+				avrotest.MustDecodeJSON(t, cs, jsn, &jv)
+				if got := fmt.Sprintf("%T", bv); got != c.rawType {
+					t.Errorf("binary callback-less Decode produced %s, want raw %s", got, c.rawType)
+				}
+				if got := fmt.Sprintf("%T", jv); got != c.rawType {
+					t.Errorf("JSON callback-less DecodeJSON produced %s, want raw %s (binary<->JSON parity)", got, c.rawType)
+				}
+				if !reflect.DeepEqual(bv, jv) {
+					t.Errorf("callback-less decode divergence: binary=%#v json=%#v", bv, jv)
+				}
+			})
+		}
+	}
+}
+
+// A matching CustomType suppresses the reader's built-in logical decoder. That
+// suppression must hold whether we decode a value directly or reach it through
+// a writer-to-reader promotion. A promotion deser that re-applies the reader's
+// logical conversion unconditionally breaks that. One reader+custom then feeds
+// the raw type from a direct long wire and the enriched type from a promoted
+// int wire. That is an inconsistency inside the binary path itself. We drive
+// this across every long-backed logical and all four callback configurations.
+// The decode-bearing configs record which raw type they were handed, so a
+// type-only check cannot mask a value divergence.
+func TestMatrix_CustomPromotionHonorsLogicalSuppression(t *testing.T) {
+	dummyGo := reflect.TypeOf(struct{ N int64 }{})
+	mark := func(v any, _ *avro.SchemaNode) (any, error) { return "raw:" + fmt.Sprintf("%T", v), nil }
+	enc := func(v any, _ *avro.SchemaNode) (any, error) { return v, nil }
+	configs := []struct {
+		name string
+		make func(c customLogicalCase) avro.CustomType
+	}{
+		{"no-callbacks", func(c customLogicalCase) avro.CustomType { return avro.CustomType{LogicalType: c.logical} }},
+		{"encode-only", func(c customLogicalCase) avro.CustomType {
+			return avro.CustomType{LogicalType: c.logical, AvroType: c.avroType, GoType: dummyGo, Encode: enc}
+		}},
+		{"decode-only", func(c customLogicalCase) avro.CustomType {
+			return avro.CustomType{LogicalType: c.logical, AvroType: c.avroType, Decode: mark}
+		}},
+		{"both", func(c customLogicalCase) avro.CustomType {
+			return avro.CustomType{LogicalType: c.logical, AvroType: c.avroType, GoType: dummyGo, Encode: enc, Decode: mark}
+		}},
+	}
+	for _, c := range customLogicalCases() {
+		if c.avroType != "long" {
+			continue // int->long promotion applies only to long-backed logicals
+		}
+		for _, cfg := range configs {
+			t.Run(c.name+"/"+cfg.name, func(t *testing.T) {
+				ct := cfg.make(c)
+				r := avro.MustParse(c.schema, ct)
+
+				longWire, err := avro.MustParse(c.schema).Encode(c.encVal)
+				if err != nil {
+					t.Fatalf("encode long wire: %v", err)
+				}
+				var direct any
+				if _, err := r.Decode(longWire, &direct); err != nil {
+					t.Fatalf("direct Decode: %v", err)
+				}
+
+				w := avro.MustParse(`"int"`)
+				resolved, err := avro.Resolve(w, r)
+				if err != nil {
+					t.Fatalf("Resolve: %v", err)
+				}
+				intWire, _ := w.Encode(int32(1700000000))
+				var promoted any
+				if _, err := resolved.Decode(intWire, &promoted); err != nil {
+					t.Fatalf("promoted Decode: %v", err)
+				}
+
+				// decode-only/both: the marker value records the raw type fed to
+				// Decode and must match. no-callbacks/encode-only: the result Go
+				// type itself (raw int64 vs enriched time.X) must match.
+				dv, pv := fmt.Sprintf("%T=%v", direct, direct), fmt.Sprintf("%T=%v", promoted, promoted)
+				dMark, _ := direct.(string)
+				pMark, _ := promoted.(string)
+				if dMark != "" || pMark != "" {
+					if dMark != pMark {
+						t.Errorf("custom Decode fed different raw types: direct=%q promoted=%q", dMark, pMark)
+					}
+					return
+				}
+				if fmt.Sprintf("%T", direct) != fmt.Sprintf("%T", promoted) {
+					t.Errorf("promotion ignored custom suppression: direct=%s promoted=%s", dv, pv)
+				}
+			})
+		}
+	}
+}
+
+// On a Resolve-returned schema, DecodeJSON consumes writer-shaped JSON and
+// applies full writer-to-reader resolution. That matches Java's
+// ResolvingDecoder over a JsonDecoder built with the writer schema. We take
+// the binary resolved decode as the oracle: resolved.DecodeJSON(writerJSON)
+// must equal resolved.Decode(writerBinary). Decoding against the bare reader
+// node instead errors on a writer-only enum symbol where binary produces the
+// reader default.
+func TestMatrix_ResolvedDecodeJSONMatchesBinary(t *testing.T) {
+	cases := []struct {
+		name           string
+		writer, reader string
+		readerOpts     []avro.SchemaOpt
+		writerVal      any
+	}{
+		{
+			"enum-writer-symbol-to-reader-default",
+			`{"type":"enum","name":"E","symbols":["A","B","C"]}`,
+			`{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`,
+			nil, "C", // only in writer; resolution -> reader default "A"
+		},
+		{
+			"promotion-int-to-long",
+			`"int"`, `"long"`, nil, int32(5),
+		},
+		{
+			"promotion-int-to-timestamp-logical",
+			`"int"`, `{"type":"long","logicalType":"timestamp-millis"}`, nil, int32(1700000000),
+		},
+		{
+			"promotion-with-nocallback-custom-suppression",
+			`"int"`, `{"type":"long","logicalType":"timestamp-millis"}`,
+			[]avro.SchemaOpt{avro.CustomType{LogicalType: "timestamp-millis"}}, int32(1700000000),
+		},
+		{
+			"record-add-default-drop-writer-field-promote",
+			`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"x","type":"int"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"c","type":"int","default":99}]}`,
+			nil, map[string]any{"a": int32(1), "x": int32(2)},
+		},
+		{
+			"record-field-rename-via-alias",
+			`{"type":"record","name":"R","fields":[{"name":"old","type":"int"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"new","type":"int","aliases":["old"]}]}`,
+			nil, map[string]any{"old": int32(7)},
+		},
+		{
+			"union-writer-branch-promote",
+			`["null","int"]`, `["null","long"]`, nil, int32(9),
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := avro.MustParse(c.writer)
+			r := avro.MustParse(c.reader, c.readerOpts...)
+			resolved, err := avro.Resolve(w, r)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			binWire, err := w.Encode(c.writerVal)
+			if err != nil {
+				t.Fatalf("writer Encode: %v", err)
+			}
+			jsonWire, err := w.EncodeJSON(c.writerVal)
+			if err != nil {
+				t.Fatalf("writer EncodeJSON: %v", err)
+			}
+			var binOut, jsonOut any
+			if _, err := resolved.Decode(binWire, &binOut); err != nil {
+				t.Fatalf("resolved.Decode (binary oracle): %v", err)
+			}
+			if err := resolved.DecodeJSON(jsonWire, &jsonOut); err != nil {
+				t.Fatalf("resolved.DecodeJSON: %v", err)
+			}
+			if !reflect.DeepEqual(binOut, jsonOut) {
+				t.Errorf("resolved JSON decode != binary decode:\n  binary=%#v\n  json  =%#v", binOut, jsonOut)
+			}
+		})
+	}
+
+	// The headline Java behavior, spelled out explicitly.
+	t.Run("enum-default-value-explicit", func(t *testing.T) {
+		w := avro.MustParse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+		r := avro.MustParse(`{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`)
+		resolved := avrotest.MustResolve(t, w, r)
+		var got any
+		avrotest.MustDecodeJSON(t, resolved, []byte(`"C"`), &got)
+		if got != "A" {
+			t.Errorf("writer-only enum symbol via JSON resolution: got %v, want reader default A", got)
+		}
+	})
+}
+
+// A resolved schema's DecodeJSON must preserve tagged union branch identity
+// through decode and re-encode. That includes the decoded value when
+// resolution differs per branch. The {"branch": value} envelope is the only
+// carrier of the writer's choice when two branches accept the same value.
+// Re-deriving by first match rewrites it. Writer E2/"A" with reader E2
+// dropping "A" for default "Y" yields "Y", where a flip to E1 yields "A".
+// Oracle: Java's readIndex reads the label into the exact index, and binary
+// Decode and fastavro's json_reader agree on "Y".
+func TestRegression_ResolvedJSONTaggedUnionValueMatchesBinary(t *testing.T) {
+	w := avro.MustParse(`[{"type":"enum","name":"E1","symbols":["A"]},{"type":"enum","name":"E2","symbols":["A","Y"]}]`)
+	r := avro.MustParse(`[{"type":"enum","name":"E1","symbols":["A"]},{"type":"enum","name":"E2","symbols":["Y"],"default":"Y"}]`)
+	resolved, err := avro.Resolve(w, r)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	// Binary oracle: the same tagged branch choice on the binary wire.
+	wire, err := w.Encode(map[string]any{"E2": "A"})
+	if err != nil {
+		t.Fatalf("writer Encode tagged: %v", err)
+	}
+	var binOut any
+	if _, err := resolved.Decode(wire, &binOut); err != nil {
+		t.Fatalf("resolved.Decode: %v", err)
+	}
+	if binOut != "Y" {
+		t.Fatalf("binary oracle: got %#v, want reader enum default \"Y\"", binOut)
+	}
+
+	var jsonOut any
+	if err := resolved.DecodeJSON([]byte(`{"E2":"A"}`), &jsonOut); err != nil {
+		t.Fatalf("resolved.DecodeJSON tagged: %v", err)
+	}
+	if !reflect.DeepEqual(jsonOut, binOut) {
+		t.Errorf("resolved JSON decode diverged from binary on a tagged union:\n  binary=%#v\n  json  =%#v", binOut, jsonOut)
+	}
+}
+
+// The tagged {"branch": value} envelope names the writer's union branch. A
+// resolved DecodeJSON must dispatch on that name exactly like binary Decode
+// dispatches on the wire index. Each shape declares a branch pair whose values
+// are interchangeable, so only the envelope carries the choice. Naming the
+// later branch must not silently rewrite it to the earlier one. We put the
+// union in a record and add a defaulted reader field so writer != reader. The
+// observable is the TaggedUnions envelope key, compared against binary Decode
+// of the equivalent tagged wire.
+func TestMatrix_ResolvedJSONTaggedUnionBranchIdentity(t *testing.T) {
+	cases := []struct {
+		name   string
+		union  string // the colliding union (writer == reader)
+		branch string // tagged branch the writer names (the later, collision-prone one)
+		value  any    // the branch value for the binary-oracle encode
+		json   string // the branch value as writer-shaped JSON
+	}{
+		{
+			"enum-vs-string",
+			`["string",{"type":"enum","name":"E","symbols":["A"]}]`,
+			"E", "A", `"A"`,
+		},
+		{
+			"two-records",
+			`[{"type":"record","name":"R1","fields":[{"name":"f","type":"string"}]},{"type":"record","name":"R2","fields":[{"name":"f","type":"string"}]}]`,
+			"R2", map[string]any{"f": "x"}, `{"f":"x"}`,
+		},
+		{
+			"two-enums",
+			`[{"type":"enum","name":"E1","symbols":["A","B"]},{"type":"enum","name":"E2","symbols":["A","C"]}]`,
+			"E2", "A", `"A"`,
+		},
+		{
+			"two-fixed",
+			`[{"type":"fixed","name":"F1","size":2},{"type":"fixed","name":"F2","size":2}]`,
+			"F2", []byte("ab"), `"ab"`,
+		},
+		{
+			"map-vs-record",
+			`[{"type":"map","values":"string"},{"type":"record","name":"R","fields":[{"name":"f","type":"string"}]}]`,
+			"R", map[string]any{"f": "x"}, `{"f":"x"}`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := avro.MustParse(`{"type":"record","name":"Top","fields":[{"name":"u","type":` + c.union + `}]}`)
+			r := avro.MustParse(`{"type":"record","name":"Top","fields":[{"name":"u","type":` + c.union + `},{"name":"pad","type":"int","default":0}]}`)
+			resolved, err := avro.Resolve(w, r)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			wire, err := w.Encode(map[string]any{"u": map[string]any{c.branch: c.value}})
+			if err != nil {
+				t.Fatalf("writer Encode tagged: %v", err)
+			}
+			var binOut, jsonOut any
+			if _, err := resolved.Decode(wire, &binOut, avro.TaggedUnions()); err != nil {
+				t.Fatalf("resolved.Decode: %v", err)
+			}
+			if err := resolved.DecodeJSON([]byte(`{"u":{"`+c.branch+`":`+c.json+`}}`), &jsonOut, avro.TaggedUnions()); err != nil {
+				t.Fatalf("resolved.DecodeJSON tagged: %v", err)
+			}
+			binKey := unionEnvelopeKey(t, binOut)
+			jsonKey := unionEnvelopeKey(t, jsonOut)
+			if binKey != c.branch {
+				t.Fatalf("binary oracle picked branch %q, want %q (test construction)", binKey, c.branch)
+			}
+			if jsonKey != c.branch {
+				t.Errorf("tagged JSON branch rewritten: envelope named %q, decoded as %q", c.branch, jsonKey)
+			}
+			if !reflect.DeepEqual(jsonOut, binOut) {
+				t.Errorf("resolved JSON decode != binary decode:\n  binary=%#v\n  json  =%#v", binOut, jsonOut)
+			}
+		})
+	}
+}
+
+// unionEnvelopeKey extracts the single {branch: value} envelope key of a
+// decoded record's "u" union field.
+func unionEnvelopeKey(t *testing.T, out any) string {
+	t.Helper()
+	m, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("decoded top not a map: %#v", out)
+	}
+	env, ok := m["u"].(map[string]any)
+	if !ok {
+		t.Fatalf("union field not enveloped: %#v", m["u"])
+	}
+	if len(env) != 1 {
+		t.Fatalf("envelope not single-key: %#v", env)
+	}
+	for k := range env {
+		return k
+	}
+	return ""
+}
+
+// A resolved schema's DecodeJSON must match its binary Decode, the oracle. That
+// holds even when the writer carries a CustomType whose Decode its own Encode
+// cannot reproduce. decodeJSONResolved transforms writer-JSON into
+// writer-binary before the resolving decode. We run that transform against a
+// custom-free view of the writer. Decoding writer-JSON through the writer's own
+// custom Decode produces a Go-domain value the re-encode cannot invert. The
+// invertible-custom cells take the identical path and round-trip either way, so
+// they are the control rather than the probe.
+func TestMatrix_ResolvedDecodeJSONWriterCustomDecodeRawRoundTrip(t *testing.T) {
+	type domainTS struct{ ms int64 }
+	type domainDec struct{ raw string }
+
+	tsType := reflect.TypeFor[domainTS]()
+	decType := reflect.TypeFor[domainDec]()
+
+	// Decode-only customs (read-side domain mapping, no Encode) are the probe
+	// cells. The writer encodes the Avro-native/enriched value through the
+	// built-in encoder, since a Decode-only custom does not suppress encode.
+	// That isolates the hazard to the resolved-JSON decode round-trip.
+	logicals := []struct {
+		name         string
+		fieldType    string
+		ct           avro.CustomType
+		writerXVal   any
+		assertDomain func(t *testing.T, x any)
+	}{
+		{
+			"timestamp-millis",
+			`{"type":"long","logicalType":"timestamp-millis"}`,
+			avro.CustomType{
+				LogicalType: "timestamp-millis", AvroType: "long", GoType: tsType,
+				Decode: func(v any, _ *avro.SchemaNode) (any, error) { return domainTS{ms: v.(int64)}, nil },
+			},
+			time.UnixMilli(1700000000000).UTC(),
+			func(t *testing.T, x any) {
+				if _, ok := x.(domainTS); !ok {
+					t.Fatalf("reader custom Decode did not fire (vacuous pass): x=%#v", x)
+				}
+			},
+		},
+		{
+			"decimal-bytes",
+			`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
+			avro.CustomType{
+				LogicalType: "decimal", AvroType: "bytes", GoType: decType,
+				Decode: func(v any, _ *avro.SchemaNode) (any, error) { return domainDec{raw: string(v.([]byte))}, nil },
+			},
+			big.NewRat(12345, 100), // 123.45
+			func(t *testing.T, x any) {
+				if _, ok := x.(domainDec); !ok {
+					t.Fatalf("reader custom Decode did not fire (vacuous pass): x=%#v", x)
+				}
+			},
+		},
+	}
+	evolutions := []struct {
+		name         string
+		writerFields func(x string) string
+		readerFields func(x string) string
+		val          func(xv any) map[string]any
+	}{
+		{
+			"reorder",
+			func(x string) string { return `{"name":"x","type":` + x + `},{"name":"y","type":"int"}` },
+			func(x string) string { return `{"name":"y","type":"int"},{"name":"x","type":` + x + `}` },
+			func(xv any) map[string]any { return map[string]any{"x": xv, "y": int32(7)} },
+		},
+		{
+			"drop-writer-field",
+			func(x string) string { return `{"name":"x","type":` + x + `},{"name":"drop","type":"int"}` },
+			func(x string) string { return `{"name":"x","type":` + x + `}` },
+			func(xv any) map[string]any { return map[string]any{"x": xv, "drop": int32(3)} },
+		},
+		{
+			"add-reader-default",
+			func(x string) string { return `{"name":"x","type":` + x + `}` },
+			func(x string) string {
+				return `{"name":"x","type":` + x + `},{"name":"added","type":"int","default":42}`
+			},
+			func(xv any) map[string]any { return map[string]any{"x": xv} },
+		},
+	}
+
+	roundTrip := func(t *testing.T, writer, reader *avro.Schema, val map[string]any) (binOut, jsonOut map[string]any) {
+		binWire, err := writer.Encode(val)
+		if err != nil {
+			t.Fatalf("writer Encode: %v", err)
+		}
+		jsonWire, err := writer.EncodeJSON(val)
+		if err != nil {
+			t.Fatalf("writer EncodeJSON: %v", err)
+		}
+		resolved, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		if _, err := resolved.Decode(binWire, &binOut); err != nil {
+			t.Fatalf("resolved.Decode (binary oracle): %v", err)
+		}
+		if err := resolved.DecodeJSON(jsonWire, &jsonOut); err != nil {
+			t.Fatalf("resolved.DecodeJSON failed where binary Decode succeeded: %v\n  binary oracle: %#v", err, binOut)
+		}
+		if !reflect.DeepEqual(binOut, jsonOut) {
+			t.Errorf("resolved JSON decode != binary decode:\n  binary=%#v\n  json  =%#v", binOut, jsonOut)
+		}
+		return binOut, jsonOut
+	}
+
+	for _, lg := range logicals {
+		for _, ev := range evolutions {
+			t.Run(lg.name+"/decode-only/"+ev.name, func(t *testing.T) {
+				writer := avro.MustParse(`{"type":"record","name":"R","fields":[`+ev.writerFields(lg.fieldType)+`]}`, avro.WithCustomType(lg.ct))
+				reader := avro.MustParse(`{"type":"record","name":"R","fields":[`+ev.readerFields(lg.fieldType)+`]}`, avro.WithCustomType(lg.ct))
+				binOut, _ := roundTrip(t, writer, reader, ev.val(lg.writerXVal))
+				lg.assertDomain(t, binOut["x"])
+			})
+		}
+	}
+
+	// Control: an invertible custom (Decode + Encode) takes the identical
+	// resolved-JSON path and must round-trip. We route that round-trip through
+	// a custom-free writer view regardless of the custom's invertibility. The
+	// writer encodes the domain value here, so the custom Encode fires.
+	t.Run("invertible-control/timestamp-millis/reorder", func(t *testing.T) {
+		ct := avro.CustomType{
+			LogicalType: "timestamp-millis", AvroType: "long", GoType: tsType,
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) { return domainTS{ms: v.(int64)}, nil },
+			Encode: func(v any, _ *avro.SchemaNode) (any, error) { return v.(domainTS).ms, nil },
+		}
+		ft := `{"type":"long","logicalType":"timestamp-millis"}`
+		writer := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":`+ft+`},{"name":"y","type":"int"}]}`, avro.WithCustomType(ct))
+		reader := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"y","type":"int"},{"name":"x","type":`+ft+`}]}`, avro.WithCustomType(ct))
+		binOut, _ := roundTrip(t, writer, reader, map[string]any{"x": domainTS{ms: 1700000000000}, "y": int32(7)})
+		if _, ok := binOut["x"].(domainTS); !ok {
+			t.Fatalf("invertible custom Decode did not fire (vacuous pass): x=%#v", binOut["x"])
+		}
+	})
+}
+
+// A self-/mutually-recursive or forward-referenced named type whose subtree
+// contains a logical a registered CustomType matches must Parse, and both
+// wires must then agree. The cached-named-ref guard is for types inherited
+// from a SchemaCache across Parses. A self-reference resolves mid-build,
+// before the record's fields finish wiring their CTs, so hadCustomType is
+// still false there. Gating on cachedNames is what keeps the guard from
+// rejecting valid recursive schemas.
+func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
+	ct := avro.CustomType{LogicalType: "timestamp-millis"}
+	schemas := []struct{ name, schema string }{
+		{"self-nested", `{"type":"record","name":"Node","fields":[
+			{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
+			{"name":"next","type":["null","Node"]}]}`},
+		{"self-wrapped", `{"type":"record","name":"Node","fields":[
+			{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
+			{"name":"next","type":["null",{"type":"Node"}]}]}`},
+		{"mutual", `{"type":"record","name":"A","fields":[
+			{"name":"b","type":["null",{"type":"record","name":"B","fields":[
+				{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
+				{"name":"a","type":["null","A"]}]}]}]}`},
+		{"shared-multiref", `{"type":"record","name":"R","fields":[
+			{"name":"x","type":{"type":"record","name":"Pair","fields":[
+				{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}},
+			{"name":"y","type":"Pair"}]}`},
+	}
+	for _, sc := range schemas {
+		t.Run(sc.name, func(t *testing.T) {
+			s, err := avro.Parse(sc.schema, ct)
+			if err != nil {
+				t.Fatalf("Parse(recursive + CustomType) failed: %v", err)
+			}
+			// Decode a minimal leaf both ways; suppression -> raw int64 on both.
+			plain := avro.MustParse(sc.schema)
+			// Build a minimal value: just the ts (and nil recursion / required
+			// subrecords).
+			var val any
+			switch sc.name {
+			case "self-nested", "self-wrapped":
+				val = map[string]any{"ts": time.UnixMilli(1700000000000).UTC(), "next": nil}
+			case "mutual":
+				val = map[string]any{"b": nil}
+			case "shared-multiref":
+				val = map[string]any{
+					"x": map[string]any{"ts": time.UnixMilli(1700000000000).UTC()},
+					"y": map[string]any{"ts": time.UnixMilli(1700000001000).UTC()},
+				}
+			}
+			bin, err := plain.Encode(val)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			jsn, err := plain.EncodeJSON(val)
+			if err != nil {
+				t.Fatalf("encodeJSON: %v", err)
+			}
+			var bv, jv any
+			avrotest.MustDecode(t, s, bin, &bv)
+			avrotest.MustDecodeJSON(t, s, jsn, &jv)
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("recursive custom binary<->JSON divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
+			}
+		})
+	}
+}
+
+// A forward-referenced named type carrying a CustomType must encode and decode
+// identically to an in-order reference, and to the JSON path. Finalize fixups
+// that wire a forward reference through the unwrapped namedType functions skip
+// the custom wrap. The field then encodes raw on binary while JSON applies the
+// custom. A named reference is position-independent in Avro, so its encoding
+// cannot depend on definition order. We route the in-order site and all three
+// fixup sites through one shared wrap.
+func TestMatrix_ForwardRefCustomTypeBinaryJSONParity(t *testing.T) {
+	// E used in field "a" (forward ref) *before* its definition in field "b".
+	enumPos := []struct{ name, schema string }{
+		{"union-branch", `{"type":"record","name":"R","fields":[
+			{"name":"a","type":["null","E"]},
+			{"name":"b","type":{"type":"enum","name":"E","symbols":["RED","GREEN","BLUE"]}}]}`},
+		{"array-item", `{"type":"record","name":"R","fields":[
+			{"name":"a","type":{"type":"array","items":"E"}},
+			{"name":"b","type":{"type":"enum","name":"E","symbols":["RED","GREEN","BLUE"]}}]}`},
+	}
+	for _, p := range enumPos {
+		t.Run(p.name+"/encode", func(t *testing.T) {
+			// Encode-side: a reorder Encode makes raw-ordinal vs custom-ordinal
+			// observable. GoType drives the custom on the Color value.
+			ct := avro.CustomType{AvroType: "enum", GoType: reflect.TypeOf(testColor(0)),
+				Encode: func(v any, sn *avro.SchemaNode) (any, error) {
+					return sn.Symbols[len(sn.Symbols)-1-int(v.(testColor))], nil
+				}}
+			s := avro.MustParse(p.schema, ct)
+			var aVal any = testColor(0)
+			if p.name == "array-item" {
+				aVal = []testColor{0}
+			}
+			val := map[string]any{"a": aVal, "b": testColor(0)}
+			bin, eb := s.Encode(val)
+			jsn, ej := s.EncodeJSON(val)
+			if eb != nil || ej != nil {
+				t.Fatalf("encode: bin=%v json=%v", eb, ej)
+			}
+			var bv, jv any
+			avrotest.MustDecode(t, s, bin, &bv)
+			avrotest.MustDecodeJSON(t, s, jsn, &jv)
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("forward-ref custom encode divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
+			}
+		})
+		t.Run(p.name+"/decode", func(t *testing.T) {
+			ct := avro.CustomType{AvroType: "enum",
+				Decode: func(v any, _ *avro.SchemaNode) (any, error) { return "DEC:" + fmt.Sprintf("%v", v), nil }}
+			plain := avro.MustParse(p.schema)
+			var aVal any = "RED"
+			if p.name == "array-item" {
+				aVal = []any{"RED"}
+			}
+			val := map[string]any{"a": aVal, "b": "GREEN"}
+			bin, _ := plain.Encode(val)
+			jsn, _ := plain.EncodeJSON(val)
+			s := avro.MustParse(p.schema, ct)
+			var bv, jv any
+			avrotest.MustDecode(t, s, bin, &bv)
+			avrotest.MustDecodeJSON(t, s, jsn, &jv)
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("forward-ref custom decode divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
+			}
+		})
+	}
+}
+
+type testColor int32
+
+// A no-Decode CustomType that suppresses a logical produces the raw
+// Avro-native value, and the wires must agree on it. Take a fixed-size
+// byte-array target: binary's raw deserFixed copies into [N]byte. A JSON path
+// that boxes into any instead has setCustomResult reject the []byte to [N]byte
+// assignment. Take uuid-on-string into [16]byte: binary's raw deserString has
+// no array arm and errors, where JSON applying the uuid arm succeeds. We route
+// suppression through the same raw decode arms binary uses.
+func TestMatrix_CustomSuppressionByteArrayTargetParity(t *testing.T) {
+	cases := []struct {
+		name    string
+		schema  string
+		logical string
+		wantErr bool // true: both wire formats must error ([N]byte can't hold a raw string)
+	}{
+		{"fixed-uuid-16", `{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`, "uuid", false},
+		{"fixed-duration-12", `{"type":"fixed","name":"D","size":12,"logicalType":"duration"}`, "duration", false},
+		{"fixed-decimal-8", `{"type":"fixed","name":"DF","size":8,"logicalType":"decimal","precision":10,"scale":2}`, "decimal", false},
+		{"string-uuid-16", `{"type":"string","logicalType":"uuid"}`, "uuid", true},
+	}
+	u := "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			plain := avro.MustParse(c.schema)
+			var encVal any = u
+			if c.name == "fixed-duration-12" {
+				encVal = avro.Duration{Months: 1, Days: 2, Milliseconds: 3}
+			} else if c.name == "fixed-decimal-8" {
+				encVal = big.NewRat(33, 100)
+			}
+			bin, _ := plain.Encode(encVal)
+			jsn, _ := plain.EncodeJSON(encVal)
+			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
+
+			szArr := func() reflect.Value {
+				switch c.name {
+				case "fixed-duration-12":
+					return reflect.New(reflect.ArrayOf(12, reflect.TypeOf(byte(0))))
+				case "fixed-decimal-8":
+					return reflect.New(reflect.ArrayOf(8, reflect.TypeOf(byte(0))))
+				default:
+					return reflect.New(reflect.ArrayOf(16, reflect.TypeOf(byte(0))))
+				}
+			}
+			bp, jp := szArr(), szArr()
+			_, eb := cs.Decode(bin, bp.Interface())
+			ej := cs.DecodeJSON(jsn, jp.Interface())
+			if (eb == nil) != (ej == nil) {
+				t.Fatalf("[N]byte target parity: binary err=%v ; json err=%v", eb, ej)
+			}
+			if c.wantErr && eb == nil {
+				t.Errorf("expected both to error ([N]byte can't hold a raw string), got success")
+			}
+			if !c.wantErr {
+				if eb != nil {
+					t.Fatalf("expected success, got binary err=%v", eb)
+				}
+				if !reflect.DeepEqual(bp.Elem().Interface(), jp.Elem().Interface()) {
+					t.Errorf("[N]byte value divergence: binary=%v json=%v", bp.Elem(), jp.Elem())
+				}
+			}
+		})
+	}
+}
+
+// A CustomType whose Decode returns a pointer, decoded into a pointer target,
+// must succeed identically on both wires. setCustomResult walks pointer
+// indirections to find the assignable level. The JSON decoder chain must hand
+// it the same un-indirected target binary does. Pre-dereferencing with
+// indirectAlloc peels a *wrap result's outer pointer out of a **wrap target.
+func TestRegression_CustomDecodePointerResultPointerTargetParity(t *testing.T) {
+	type wrap struct{ V string }
+	ct := avro.CustomType{
+		LogicalType: "wrapped", AvroType: "string", GoType: reflect.TypeOf((*wrap)(nil)),
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) { return v.(*wrap).V, nil },
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) { return &wrap{V: v.(string)}, nil },
+	}
+	s := avro.MustParse(`{"type":"string","logicalType":"wrapped"}`, ct)
+	bin := avrotest.MustEncode(t, s, &wrap{V: "hi"})
+	jsn := avrotest.MustEncodeJSON(t, s, &wrap{V: "hi"})
+
+	var tb, tj *wrap
+	_, eb := s.Decode(bin, &tb)
+	ej := s.DecodeJSON(jsn, &tj)
+	if (eb == nil) != (ej == nil) {
+		t.Fatalf("pointer-result/pointer-target parity broken: binary err=%v ; json err=%v", eb, ej)
+	}
+	if eb != nil {
+		t.Fatalf("both should succeed (setCustomResult walks pointers), got binary err=%v json err=%v", eb, ej)
+	}
+	if tb == nil || tj == nil || *tb != *tj {
+		t.Errorf("pointer-result divergence: binary=%v json=%v", tb, tj)
+	}
+	if tj.V != "hi" {
+		t.Errorf("json pointer Decode result lost its value: %+v", tj)
+	}
+}
+
+// A no-Decode CustomType that suppresses a logical must yield the raw
+// Avro-native value on both wires for a scalar typed target, as binary's raw
+// deser* already does. JSON per-kind decoders that honor suppression only in
+// their decode-into-any branch apply the transform unconditionally for a typed
+// target. A suppressed decimal into *string then reads "123.45" where binary
+// hands back the raw payload. time-millis into time.Duration silently produces
+// a different value. We thread the flag into assignBytes/decodeInt/decodeLong.
+func TestMatrix_CustomSuppressionScalarTargetParity(t *testing.T) {
+	strT := reflect.TypeOf("")
+	ratT := reflect.TypeOf((*big.Rat)(nil))
+	durT := reflect.TypeOf(avro.Duration{})
+	timeT := reflect.TypeOf(time.Time{})
+	godurT := reflect.TypeOf(time.Duration(0))
+	cases := []struct {
+		name    string
+		schema  string
+		logical string
+		encVal  any
+		target  reflect.Type // reflect.New(target) is the decode target
+		wantRaw any          // when non-nil, both must succeed and DeepEqual this raw value
+		wantErr bool         // both must reject (enriched target invalid once the arm is suppressed)
+	}{
+		// The headline case: 123.45 at scale 2 is unscaled 12345 = 0x3039, whose
+		// two raw bytes are '0','9'. The suppressed string target must read "09",
+		// *not* the logical-formatted "123.45".
+		{"decimal-bytes/string", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, "decimal", big.NewRat(12345, 100), strT, "09", false},
+		{"decimal-bytes/bigRat", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, "decimal", big.NewRat(12345, 100), ratT, nil, true},
+		{"decimal-fixed/string", `{"type":"fixed","name":"DF","size":8,"logicalType":"decimal","precision":10,"scale":2}`, "decimal", big.NewRat(12345, 100), strT, nil, false},
+		{"big-decimal/string", `{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal", big.NewRat(12345, 100), strT, nil, false},
+		{"big-decimal/bigRat", `{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal", big.NewRat(12345, 100), ratT, nil, true},
+		{"duration-fixed/string", `{"type":"fixed","name":"DUR","size":12,"logicalType":"duration"}`, "duration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, strT, nil, false},
+		{"duration-fixed/duration", `{"type":"fixed","name":"DUR2","size":12,"logicalType":"duration"}`, "duration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, durT, nil, true},
+		// Non-standard logical placements resurrected by a CustomType: the
+		// logical sits on a kind it is not spec-valid for (uuid/duration are
+		// fixed-only, big-decimal bytes-only), so validateLogical soft-drops
+		// it. The CustomType restores it and suppresses the codec. The contract
+		// is then the raw Avro-native bytes on both wires. Ungated, the JSON
+		// typed-decode path applies the transform for the wrong kind while
+		// binary returns raw.
+		{"uuid-on-bytes/string", `{"type":"bytes","logicalType":"uuid"}`, "uuid", []byte("0123456789abcdef"), strT, "0123456789abcdef", false},
+		{"duration-on-bytes/duration", `{"type":"bytes","logicalType":"duration"}`, "duration", []byte("aaaabbbbcccc"), durT, nil, true},
+		{"big-decimal-on-fixed/bigRat", `{"type":"fixed","name":"FBD","size":4,"logicalType":"big-decimal"}`, "big-decimal", []byte{0x04, 0x30, 0x39, 0x04}, ratT, nil, true},
+		// int/long logicals: the suppressed raw int must *not* be transformed.
+		{"date/time", `{"type":"int","logicalType":"date"}`, "date", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), timeT, nil, true},
+		{"date/string", `{"type":"int","logicalType":"date"}`, "date", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), strT, nil, true},
+		// 3h as time-millis is 10_800_000 on the wire; raw into a time.Duration
+		// (ns) is 10.8ms, *not* the logical 3h: the silent value-divergence case.
+		{"time-millis/duration", `{"type":"int","logicalType":"time-millis"}`, "time-millis", 3 * time.Hour, godurT, time.Duration(10800000), false},
+		{"timestamp-millis/time", `{"type":"long","logicalType":"timestamp-millis"}`, "timestamp-millis", time.UnixMilli(1700000000000).UTC(), timeT, nil, true},
+		{"timestamp-millis/string", `{"type":"long","logicalType":"timestamp-millis"}`, "timestamp-millis", time.UnixMilli(1700000000000).UTC(), strT, nil, true},
+		// 3h as time-micros is 10_800_000_000; raw into time.Duration is 10.8s.
+		{"time-micros/duration", `{"type":"long","logicalType":"time-micros"}`, "time-micros", 3 * time.Hour, godurT, time.Duration(10800000000), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			plain := avro.MustParse(c.schema)
+			bin := avrotest.MustEncode(t, plain, c.encVal)
+			jsn := avrotest.MustEncodeJSON(t, plain, c.encVal)
+			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
+			bp, jp := reflect.New(c.target), reflect.New(c.target)
+			_, eb := cs.Decode(bin, bp.Interface())
+			ej := cs.DecodeJSON(jsn, jp.Interface())
+			if (eb == nil) != (ej == nil) {
+				t.Fatalf("binary<->JSON parity broken: binary err=%v ; json err=%v", eb, ej)
+			}
+			if c.wantErr {
+				if eb == nil {
+					t.Errorf("expected both to reject the enriched target under suppression, got success (binary=%v)", bp.Elem())
+				}
+				return
+			}
+			if eb != nil {
+				t.Fatalf("expected success, got binary err=%v json err=%v", eb, ej)
+			}
+			bv, jv := bp.Elem().Interface(), jp.Elem().Interface()
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("suppressed scalar-target divergence: binary=%#v json=%#v", bv, jv)
+			}
+			if c.wantRaw != nil && !reflect.DeepEqual(bv, c.wantRaw) {
+				t.Errorf("expected RAW value %#v (logical arm suppressed), got %#v — JSON applied the logical transform", c.wantRaw, bv)
+			}
+		})
+	}
+}
+
+// Encode-side complement of the scalar-target parity net. A CustomType
+// registered for a built-in logical name resurrects that logical when
+// validateLogical soft-dropped it for sitting on a kind it is not spec-valid
+// for. The resurrection suppresses the codec, so the contract is the raw value
+// on every path, the binary encoder included. logicalSer is keyed only on the
+// logical name. Without a kind gate it writes the logical form, disagreeing
+// with the raw value JSON encodes. Where the wire shapes differ, that produces
+// a wire this schema's own decoder cannot read.
+func TestMatrix_CustomSuppressionWrongKindLogicalEncodeParity(t *testing.T) {
+	uuid16 := [16]byte{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8}
+	tm := time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)
+	// Every entry in the logical-serializer table, placed on a kind it is not
+	// spec-valid for. uuid (string/fixed) on bytes; the int/long time logicals
+	// on string. The encode value is a Go type the base (suppressed) serializer
+	// accepts: a [16]byte for bytes, a time.Time (TextMarshaler) for string.
+	cases := []struct {
+		name, schema, logical string
+		encVal                any
+	}{
+		{"uuid-on-bytes", `{"type":"bytes","logicalType":"uuid"}`, "uuid", uuid16},
+		{"date-on-string", `{"type":"string","logicalType":"date"}`, "date", tm},
+		{"time-millis-on-string", `{"type":"string","logicalType":"time-millis"}`, "time-millis", tm},
+		{"time-micros-on-string", `{"type":"string","logicalType":"time-micros"}`, "time-micros", tm},
+		{"timestamp-millis-on-string", `{"type":"string","logicalType":"timestamp-millis"}`, "timestamp-millis", tm},
+		{"timestamp-micros-on-string", `{"type":"string","logicalType":"timestamp-micros"}`, "timestamp-micros", tm},
+		{"timestamp-nanos-on-string", `{"type":"string","logicalType":"timestamp-nanos"}`, "timestamp-nanos", tm},
+		{"local-timestamp-millis-on-string", `{"type":"string","logicalType":"local-timestamp-millis"}`, "local-timestamp-millis", tm},
+		{"local-timestamp-micros-on-string", `{"type":"string","logicalType":"local-timestamp-micros"}`, "local-timestamp-micros", tm},
+		{"local-timestamp-nanos-on-string", `{"type":"string","logicalType":"local-timestamp-nanos"}`, "local-timestamp-nanos", tm},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
+			bin, eb := cs.Encode(c.encVal)
+			if eb != nil {
+				t.Fatalf("binary Encode: %v", eb)
+			}
+			jsn, ej := cs.EncodeJSON(c.encVal)
+			if ej != nil {
+				t.Fatalf("EncodeJSON: %v", ej)
+			}
+			// The binary wire must be readable by this schema's own decoder. A
+			// suppressed wrong-kind logical encodes the base kind, so a bytes/
+			// string wire is length-prefixed, never a bare varint.
+			var bv, jv any
+			if _, err := cs.Decode(bin, &bv); err != nil {
+				t.Fatalf("binary Encode produced a wire its own Decode rejects: %v", err)
+			}
+			avrotest.MustDecodeJSON(t, cs, jsn, &jv)
+			// Both formats must encode the same raw Avro-native value.
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("binary vs JSON encode diverge under wrong-kind suppression: binary=%#v json=%#v", bv, jv)
+			}
+		})
+	}
+}
+
+// The kind gate that suppresses a wrong-kind logical's binary serializer must
+// *not* regress spec-valid placements. There the logical serializer is a
+// genuine superset of the base serializer: it alone accepts time.Time or a UUID
+// string. Encoding a time.Time against long+timestamp-millis (or a UUID string
+// against string+uuid) succeeds only when the logical serializer stays applied.
+// The base long/string serializer rejects a time.Time outright.
+func TestMatrix_CustomSuppressionSpecValidLogicalStillApplied(t *testing.T) {
+	tm := time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)
+	cases := []struct {
+		name, schema, logical string
+		encVal                any
+	}{
+		{"uuid-on-string", `{"type":"string","logicalType":"uuid"}`, "uuid", "6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{"date-on-int", `{"type":"int","logicalType":"date"}`, "date", tm},
+		{"time-millis-on-int", `{"type":"int","logicalType":"time-millis"}`, "time-millis", 3 * time.Hour},
+		{"timestamp-millis-on-long", `{"type":"long","logicalType":"timestamp-millis"}`, "timestamp-millis", tm},
+		{"timestamp-micros-on-long", `{"type":"long","logicalType":"timestamp-micros"}`, "timestamp-micros", tm},
+		// The spec-valid fixed sizes (uuid=16, duration=12) are the boundary-1
+		// controls for the wrong-size fixed gate below. The logical serializer
+		// must stay applied here: it alone accepts a UUID string or avro.Duration,
+		// and the base serSize rejects them. Only the wrong-size placements drop
+		// it.
+		{"uuid-on-fixed16", `{"type":"fixed","name":"F16","size":16,"logicalType":"uuid"}`, "uuid", "6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{"duration-on-fixed12", `{"type":"fixed","name":"D12","size":12,"logicalType":"duration"}`, "duration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
+			bin, eb := cs.Encode(c.encVal)
+			if eb != nil {
+				t.Fatalf("spec-valid logical encode regressed (logical serializer suppressed): %v", eb)
+			}
+			jsn, ej := cs.EncodeJSON(c.encVal)
+			if ej != nil {
+				t.Fatalf("spec-valid logical EncodeJSON: %v", ej)
+			}
+			// The encode must succeed and round-trip through this schema's own
+			// (suppressed-to-raw) decoders identically on both wires.
+			var bv, jv any
+			avrotest.MustDecode(t, cs, bin, &bv)
+			avrotest.MustDecodeJSON(t, cs, jsn, &jv)
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("spec-valid logical binary vs JSON diverge: binary=%#v json=%#v", bv, jv)
+			}
+		})
+	}
+}
+
+// Wrong-size complement of the wrong-kind encode parity net: uuid is
+// fixed-valid only at size 16 and duration only at 12
+// (logicalUnderlyingAccept, the same predicate validateLogical soft-drops
+// with). A no-Encode CustomType resurrects the logical, so the contract is the
+// raw value on every path. serFixedUUIDReflect always emits 16 bytes and
+// serDuration 12, regardless of the declared size. Without the gate both write
+// the logical form into a differently-sized fixed, a wire this schema's own
+// decoders reject.
+func TestRegression_CustomSuppressionWrongSizeFixedLogicalEncodeParity(t *testing.T) {
+	uuid16 := [16]byte{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8}
+	dur := avro.Duration{Months: 1, Days: 2, Milliseconds: 3}
+	cases := []struct {
+		name, schema, logical string
+		size                  int
+		// logical is the Go value the size-blind logical serializer accepts
+		// (a 16-byte UUID array or an avro.Duration). At the wrong size that
+		// input produces a self-incompatible wire. The custom schema must
+		// treat it identically to the plain fixed, both rejecting it since it
+		// is not `size` raw bytes. raw[size] is the legitimate raw fixed value
+		// both must accept identically.
+		logical2 any
+	}{
+		{"uuid-on-fixed20", `{"type":"fixed","name":"F","size":20,"logicalType":"uuid"}`, "uuid", 20, uuid16},
+		{"duration-on-fixed16", `{"type":"fixed","name":"D","size":16,"logicalType":"duration"}`, "duration", 16, dur},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw := make([]byte, c.size)
+			for i := range raw {
+				raw[i] = byte(i + 1)
+			}
+			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
+			plain := avro.MustParse(c.schema) // no custom: logical soft-drops to plain fixed
+
+			// A passive (no-Encode) custom registered for the logical name must
+			// make the wrong-size fixed behave exactly like the plain fixed of
+			// that size for every input. The raw[size] input pins the
+			// legitimate round trip. The logical-shaped input pins that the
+			// size-blind logical serializer is *not* applied: applying it
+			// writes a wire the schema's own decoder rejects on both wires.
+			for _, in := range []any{any(raw), c.logical2} {
+				cbin, ceb := cs.Encode(in)
+				pbin, peb := plain.Encode(in)
+				if (ceb == nil) != (peb == nil) {
+					t.Errorf("input %T: custom binary err=%v but plain binary err=%v — passive custom changed acceptance (wrong-size logical applied)", in, ceb, peb)
+				}
+				if ceb == nil && peb == nil {
+					if !bytes.Equal(cbin, pbin) {
+						t.Errorf("input %T: custom binary wire != plain wire — wrong-size logical serializer applied", in)
+					}
+					var bv any
+					if _, err := cs.Decode(cbin, &bv); err != nil {
+						t.Errorf("input %T: custom binary wire (len=%d) not readable by its own decoder: %v", in, len(cbin), err)
+					}
+				}
+
+				cjsn, cej := cs.EncodeJSON(in)
+				pjsn, pej := plain.EncodeJSON(in)
+				if (cej == nil) != (pej == nil) {
+					t.Errorf("input %T: custom JSON err=%v but plain JSON err=%v — passive custom changed acceptance (wrong-size logical applied)", in, cej, pej)
+				}
+				if cej == nil && pej == nil {
+					if !bytes.Equal(cjsn, pjsn) {
+						t.Errorf("input %T: custom JSON %q != plain JSON %q — wrong-size logical serializer applied", in, cjsn, pjsn)
+					}
+					var jv any
+					if err := cs.DecodeJSON(cjsn, &jv); err != nil {
+						t.Errorf("input %T: custom JSON not readable by its own decoder: %v", in, err)
+					}
+				}
+			}
+		})
+	}
+}
+
+// We preserve an invalid-UTF-8 Avro string verbatim on the binary wire, and
+// coerce each invalid byte to U+FFFD on the JSON wire. The divergence is
+// documented and intentional. An RFC 8259 JSON string cannot carry a raw
+// non-UTF-8 byte, so byte-faithful parity is impossible. Java produces
+// byte-identical output on both wires (verified live by
+// TestDifferentialJavaInvalidUTF8). Do not "fix" either side toward the other:
+// making binary lossy corrupts the faithful wire, and making EncodeJSON reject
+// diverges from Java's lenient coercion.
+func TestRegression_InvalidUTF8StringBinaryVerbatimJSONCoercion(t *testing.T) {
+	s := avro.MustParse(`"string"`)
+	in := "A\xffB"
+
+	bin, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("binary Encode must accept invalid UTF-8 (verbatim wire): %v", err)
+	}
+	// varint length 3, then the raw bytes 'A' 0xff 'B': byte-faithful.
+	if want := "\x06A\xffB"; string(bin) != want {
+		t.Errorf("binary wire = % x, want % x (verbatim bytes)", bin, want)
+	}
+	var binBack string
+	avrotest.MustDecode(t, s, bin, &binBack)
+	if binBack != in {
+		t.Errorf("binary round-trip = %q, want verbatim %q", binBack, in)
+	}
+
+	jsn, err := s.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("EncodeJSON must accept invalid UTF-8 (U+FFFD coercion, Java parity): %v", err)
+	}
+	// `"A<efbfbd>B"` holds the invalid byte coerced to the replacement char,
+	// byte-identical to Java's JsonEncoder output for the same datum.
+	if want := "\"A�B\""; string(jsn) != want {
+		t.Errorf("JSON wire = % x, want % x (U+FFFD coercion)", jsn, want)
+	}
+	var jsonBack string
+	avrotest.MustDecodeJSON(t, s, jsn, &jsonBack)
+	if jsonBack != "A�B" {
+		t.Errorf("JSON round-trip = %q, want coerced %q", jsonBack, "A�B")
+	}
+
+	// Map keys take the same JSON path (appendJSONString); pin one level deep.
+	ms := avro.MustParse(`{"type":"map","values":"int"}`)
+	mj, err := ms.EncodeJSON(map[string]int32{"\xffA": 1})
+	if err != nil {
+		t.Fatalf("EncodeJSON map with invalid-UTF-8 key: %v", err)
+	}
+	if want := "{\"�A\":1}"; string(mj) != want {
+		t.Errorf("map-key JSON = % x, want % x", mj, want)
+	}
+	mb, err := ms.Encode(map[string]int32{"\xffA": 1})
+	if err != nil {
+		t.Fatalf("binary Encode map with invalid-UTF-8 key: %v", err)
+	}
+	var mBack map[string]int32
+	if _, err := ms.Decode(mb, &mBack); err != nil {
+		t.Fatalf("binary Decode map: %v", err)
+	}
+	if _, ok := mBack["\xffA"]; !ok {
+		t.Errorf("binary map round-trip lost the verbatim key: %v", mBack)
+	}
+}
+
+type untaggedPinBig int64
+
+// A bare (untagged) JSON union value cannot name its branch, so DecodeJSON
+// commits to the first declaration-order branch of the matching token class.
+// That is documented and intentional. The untagged wire for int32(7)-via-int
+// and int64(7)-via-long is the identical byte `7`, so the writer's branch is
+// information-theoretically unrecoverable. Do not "fix" it with branch
+// guessing. We spell the consequences out below so the policy stays visible
+// rather than reading as an unexplained asymmetry.
+func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
+	t.Run("decode-into-any-first-class-branch", func(t *testing.T) {
+		sc := avro.MustParse(`["long","int"]`)
+		bw := avrotest.MustEncode(t, sc, int32(7))     // writer chose the "int" branch (index 1)
+		jw := avrotest.MustEncodeJSON(t, sc, int32(7)) // bare wire: `7`, no branch on the wire
+		var bo, jo any
+		avrotest.MustDecode(t, sc, bw, &bo)
+		avrotest.MustDecodeJSON(t, sc, jw, &jo)
+		if _, ok := bo.(int32); !ok {
+			t.Errorf("binary decode-into-any = %T, want int32 (wire index recovers the writer's branch)", bo)
+		}
+		if _, ok := jo.(int64); !ok {
+			t.Errorf("untagged JSON decode-into-any = %T, want int64 (documented first-class-branch commit)", jo)
+		}
+
+		// TaggedUnions names the branch: decode recovers it (in the documented
+		// {branch: value} envelope form for an any target).
+		tw := avrotest.MustEncodeJSON(t, sc, int32(7), avro.TaggedUnions())
+		var to any
+		avrotest.MustDecodeJSON(t, sc, tw, &to, avro.TaggedUnions())
+		env, ok := to.(map[string]any)
+		if !ok || len(env) != 1 {
+			t.Fatalf("tagged decode-into-any = %T %v, want one-key envelope", to, to)
+		}
+		if v, ok := env["int"]; !ok {
+			t.Errorf("tagged envelope key = %v, want \"int\" (writer's branch recovered)", env)
+		} else if _, ok := v.(int32); !ok {
+			t.Errorf("tagged envelope value = %T, want int32", v)
+		}
+	})
+
+	t.Run("custom-on-non-first-branch-skipped", func(t *testing.T) {
+		ct := avro.NewCustomType[untaggedPinBig, int64]("upb",
+			func(m untaggedPinBig, _ *avro.SchemaNode) (int64, error) { return int64(m), nil },
+			func(v int64, _ *avro.SchemaNode) (untaggedPinBig, error) { return untaggedPinBig(v * 10), nil })
+		sc := avro.MustParse(`["int",{"type":"long","logicalType":"upb"}]`, ct)
+		bw := avrotest.MustEncode(t, sc, untaggedPinBig(7))     // long+custom branch on the wire
+		jw := avrotest.MustEncodeJSON(t, sc, untaggedPinBig(7)) // bare `7`
+		var bc, jc untaggedPinBig
+		avrotest.MustDecode(t, sc, bw, &bc)
+		avrotest.MustDecodeJSON(t, sc, jw, &jc)
+		if bc != 70 {
+			t.Errorf("binary concrete-target decode = %v, want 70 (custom Decode fired on the long branch)", bc)
+		}
+		if jc != 7 {
+			t.Errorf("untagged JSON concrete-target decode = %v, want 7 (documented: first int branch + coercion, custom skipped)", jc)
+		}
+
+		// TaggedUnions recovers the custom branch for the concrete target.
+		tw := avrotest.MustEncodeJSON(t, sc, untaggedPinBig(7), avro.TaggedUnions())
+		var tc untaggedPinBig
+		avrotest.MustDecodeJSON(t, sc, tw, &tc, avro.TaggedUnions())
+		if tc != 70 {
+			t.Errorf("tagged JSON concrete-target decode = %v, want 70 (branch named on the wire, custom fires)", tc)
+		}
+	})
+}
+
+// A CustomType on a recursive node must not skew the recursion-depth bound. The
+// custom wrapper annotates an existing schema node rather than adding a nesting
+// level. It charges 0 depth, matching the decode wrapper and the JSON path. A
+// binary-encode wrapper that re-enters the base serializer at depth+1 charges
+// an extra unit per recursive level. That trips errTooDeep on encode roughly
+// 1.5x shallower than on decode: a value Decode can emit that Encode can never
+// reproduce.
+func TestRegression_CustomTypeRecursiveDepthUniform(t *testing.T) {
+	ct := avro.CustomType{
+		AvroType: "record",
+		Encode:   func(v any, _ *avro.SchemaNode) (any, error) { return v, avro.ErrSkipCustomType },
+		Decode:   func(v any, _ *avro.SchemaNode) (any, error) { return v, avro.ErrSkipCustomType },
+	}
+	const schema = `{"type":"record","name":"LL","fields":[{"name":"next","type":["null","LL"]},{"name":"v","type":"int"}]}`
+	s, err := avro.Parse(schema, ct)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	plain := avro.MustParse(schema) // no custom: the reference depth bound
+
+	mk := func(depth int) map[string]any {
+		v := map[string]any{"v": int32(0), "next": nil}
+		for i := 0; i < depth; i++ {
+			v = map[string]any{"v": int32(0), "next": v}
+		}
+		return v
+	}
+
+	// A depth the plain (no-custom) schema encodes must also encode with the
+	// custom applied: the custom must not lower the bound.
+	plainMax := 0
+	for d := 0; d <= 600; d++ {
+		if _, e := plain.Encode(mk(d)); e != nil {
+			break
+		}
+		plainMax = d
+	}
+	probe := plainMax - 50 // comfortably inside the plain bound, far above a depth+1 bound
+	if probe < 350 {
+		t.Fatalf("plain bound unexpectedly low (%d); test assumptions stale", plainMax)
+	}
+	b, err := s.Encode(mk(probe))
+	if err != nil {
+		t.Fatalf("custom-on-record Encode at depth %d must succeed (plain bound %d), got: %v", probe, plainMax, err)
+	}
+	var got any
+	if _, err := s.Decode(b, &got); err != nil {
+		t.Fatalf("custom-on-record Decode at depth %d: %v", probe, err)
+	}
+
+	// Cap still protects: a cyclic value must error on encode (not loop).
+	type Node struct {
+		Next *Node `avro:"next"`
+		V    int32 `avro:"v"`
+	}
+	n := &Node{}
+	n.Next = n
+	if _, err := s.Encode(n); err == nil {
+		t.Error("cyclic value must error (errTooDeep), not loop")
+	}
+}
+
+// timestamp-nanos must encode the spec-correct "nanoseconds from epoch" for a
+// negative-second instant. Java's TimestampNanosConversion.toLong has an
+// off-by-1000 typo that corrupts pre-1970 sub-second instants. We are
+// deliberately spec-correct. The other nanos tests use positive timestamps,
+// which round-trip identically on both formulas. This is the pin that goes red
+// if someone "fixes" us toward Java's bug.
+func TestRegression_TimestampNanosNegativeSecondSpecValue(t *testing.T) {
+	s := avro.MustParse(`{"type":"long","logicalType":"timestamp-nanos"}`)
+	tm := time.Unix(-1, 500_000_000).UTC() // 0.5s before epoch, so -5e8 ns
+	b := avrotest.MustEncode(t, s, tm)
+	var got int64
+	avrotest.MustDecode(t, s, b, &got)
+	const specValue = int64(-500_000_000) // Java's off-by-1000 yields a different value
+	if got != specValue {
+		t.Errorf("timestamp-nanos(0.5s-before-epoch) = %d, want spec-correct %d (regression toward Java's off-by-1000?)", got, specValue)
+	}
+	var back time.Time
+	if _, err := s.Decode(b, &back); err != nil {
+		t.Fatalf("decode time: %v", err)
+	}
+	if !back.UTC().Equal(tm) {
+		t.Errorf("round-trip = %v, want %v", back.UTC(), tm)
+	}
+}
+
+// TestMatrix_JSONErrorsAreSemanticWithFieldPath pins doc.go's "# Errors"
+// contract for the JSON wire. A type mismatch on EncodeJSON / DecodeJSON is an
+// *avro.SemanticError carrying the same dotted record-field path the binary
+// codecs produce. JSON encode arms returning bare fmt.Errorf values break that,
+// as does a JSON decode path folding the field name into the message text only.
+// A caller's errors.As + .Field handling then works for Encode/Decode and is
+// silently broken for the JSON pair on the same value and schema.
+func TestMatrix_JSONErrorsAreSemanticWithFieldPath(t *testing.T) {
+	s := avro.MustParse(`{"type":"record","name":"O","fields":[
+		{"name":"a","type":{"type":"record","name":"I","fields":[
+			{"name":"b","type":"int"}]}}]}`)
+
+	type inner struct {
+		B string `avro:"b"` // string is not an int
+	}
+	type outer struct {
+		A inner `avro:"a"`
+	}
+
+	assertFieldPath := func(t *testing.T, label string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: expected error, got nil", label)
+		}
+		var se *avro.SemanticError
+		if !errors.As(err, &se) {
+			t.Fatalf("%s: error is not *SemanticError: %v", label, err)
+		}
+		if se.Field != "a.b" {
+			t.Errorf("%s: SemanticError.Field = %q, want %q (err: %v)", label, se.Field, "a.b", err)
+		}
+	}
+
+	if _, err := s.Encode(&outer{A: inner{B: "x"}}); true {
+		assertFieldPath(t, "binary encode", err)
+	}
+	if _, err := s.EncodeJSON(&outer{A: inner{B: "x"}}); true {
+		assertFieldPath(t, "json encode", err)
+	}
+	wire, err := s.Encode(map[string]any{"a": map[string]any{"b": int32(1)}})
+	if err != nil {
+		t.Fatalf("seed encode: %v", err)
+	}
+	var out1 outer
+	if _, err := s.Decode(wire, &out1); true {
+		assertFieldPath(t, "binary decode", err)
+	}
+	var out2 outer
+	if err := s.DecodeJSON([]byte(`{"a":{"b":1}}`), &out2); true {
+		assertFieldPath(t, "json decode", err)
+	}
+
+	// Top-level (non-record) JSON type mismatch must also be errors.As-able,
+	// matching binary: the numeric coerce helpers tag their failures.
+	for _, tc := range []struct {
+		schema string
+		encode any
+	}{
+		{`"int"`, "not an int"},
+		{`"long"`, "not a long"},
+		{`"double"`, "not a double"},
+		{`"boolean"`, 5},
+	} {
+		js := avro.MustParse(tc.schema)
+		_, err := js.EncodeJSON(tc.encode)
+		var se *avro.SemanticError
+		if err == nil || !errors.As(err, &se) {
+			t.Errorf("EncodeJSON(%v) against %s: want *SemanticError, got %v", tc.encode, tc.schema, err)
+		}
+	}
+}
+
+// TestMatrix_JSONEncodeErrorSemanticParity is the standing net for the JSON
+// error-surface class. For every Avro fragment, a wrong-Go-typed value wrapped
+// as a record field "f" must be rejected by both encoders with an
+// *avro.SemanticError carrying the field path "f". A JSON encoder returning
+// bare fmt.Errorf values for any of these diverges silently from the binary
+// encoder and from doc.go. The axis covers every fragment's JSON type-mismatch
+// arm.
+func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
+	frags := []struct {
+		name, schema string
+		wrong        any // a value of the wrong Go type for this fragment
+	}{
+		{"int", `"int"`, "x"},
+		{"long", `"long"`, "x"},
+		{"float", `"float"`, "x"},
+		{"double", `"double"`, "x"},
+		{"boolean", `"boolean"`, "x"},
+		{"string", `"string"`, 5},
+		{"bytes", `"bytes"`, 5},
+		{"enum", `{"type":"enum","name":"E","symbols":["A"]}`, 5.5},
+		// Right Go type, wrong content: a string naming no symbol is a
+		// user-value failure. It must carry the same SemanticError identity
+		// and field path as the type-mismatch rows on both wires.
+		{"enum-unknown-symbol", `{"type":"enum","name":"E","symbols":["A"]}`, "NOPE"},
+		{"fixed", `{"type":"fixed","name":"Fx","size":2}`, 5},
+		{"array", `{"type":"array","items":"int"}`, 5},
+		{"map", `{"type":"map","values":"int"}`, 5},
+		{"record", `{"type":"record","name":"Sub","fields":[{"name":"n","type":"int"}]}`, 5},
+	}
+	for _, f := range frags {
+		t.Run(f.name, func(t *testing.T) {
+			s := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":%s}]}`, f.schema))
+			val := map[string]any{"f": f.wrong}
+			encoders := []struct {
+				name string
+				fn   func(any) ([]byte, error)
+			}{
+				{"binary", func(v any) ([]byte, error) { return s.AppendEncode(nil, v) }},
+				{"json", func(v any) ([]byte, error) { return s.AppendEncodeJSON(nil, v) }},
+			}
+			for _, enc := range encoders {
+				_, err := enc.fn(val)
+				var se *avro.SemanticError
+				if err == nil || !errors.As(err, &se) {
+					t.Errorf("%s encode of wrong-typed %q field: want *SemanticError, got %v", enc.name, f.name, err)
+					continue
+				}
+				if !strings.Contains(se.Field, "f") {
+					t.Errorf("%s encode of %q: SemanticError.Field = %q, want it to contain \"f\"", enc.name, f.name, se.Field)
+				}
+			}
+		})
+	}
+}
+
+// A bare (untagged) JSON union value commits to the first token-class-matching
+// container branch. It does *not* backtrack to re-decode the whole subtree as
+// each later container branch. Backtracking is 2^depth for a recursive
+// union-of-records: a ~120-byte bare nested object mismatching at the bottom
+// takes seconds to reject. The spec encodes a non-null union as the tagged
+// form, and Java, fastavro and goavro all read the branch from that tag. Scalar
+// branches keep their bounded backtrack. They cannot recurse into the union, so
+// they add no blowup and preserve the numeric-width fall-through.
+func TestRegression_BareUnionJSONNoExponentialBacktrack(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		// keyed builds the nested object using the given field key. The
+		// innermost value (a bare number) matches no branch, forcing failure at
+		// the bottom: the worst case for container backtracking.
+		key string
+	}{
+		{
+			// Bare path: the field name ("v") is *not* a branch name, so every
+			// level routes through decodeUnionBare. That must commit to the
+			// first matching container branch instead of trying A then B.
+			name: "bare-path-distinct-field-name",
+			schema: `["null",
+				{"type":"record","name":"A","fields":[{"name":"v","type":["null","A","B"]}]},
+				{"type":"record","name":"B","fields":[{"name":"v","type":["null","A","B"]}]}]`,
+			key: "v",
+		},
+		{
+			// Tagged-fallback path: the field name ("A") collides with a branch
+			// name, so decodeUnionObject's tagged decode matches a container
+			// branch at every level. It must commit to the tagged interpretation
+			// rather than also trying the bare fallback. The two together double
+			// the recursion to 2^depth.
+			name:   "tagged-fallback-field-name-collides-with-branch",
+			schema: `["null",{"type":"record","name":"A","fields":[{"name":"A","type":["null","A"]}]}]`,
+			key:    "A",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := avro.MustParse(c.schema)
+			build := func(depth int) []byte {
+				var b strings.Builder
+				for range depth {
+					b.WriteString(`{"`)
+					b.WriteString(c.key)
+					b.WriteString(`":`)
+				}
+				b.WriteString(`1`)
+				for range depth {
+					b.WriteString(`}`)
+				}
+				return []byte(b.String())
+			}
+
+			// Depth 20 costs ~2^20 full subtree re-decodes if the decoder
+			// backtracks; committing to the first container branch rejects at
+			// the bottom instead.
+			var out any
+			if err := s.DecodeJSON(build(20), &out); err == nil {
+				t.Fatal("expected a decode error (innermost value matches no branch)")
+			}
+
+			// Depth 200 is the arm the backtracking cannot reach at all. 2^200
+			// re-decodes do not return, so a regression here does not produce a
+			// slow answer, it produces no answer. Depth 200 stays within
+			// maxDepth, so the rejection is the bottom mismatch, exercising the
+			// commit-to-first path itself.
+			if err := s.DecodeJSON(build(200), &out); err == nil {
+				t.Fatal("expected a decode error at depth 200")
+			}
+		})
+	}
+}
+
+// ---------- custom_named_avro_type_test.go ----------
+
+// A CustomType's Avro-native type A may be a named Go type over a canonical
+// kind, such as type UnixMillis int64 as the long representation. inferAvroType
+// classifies A by reflect.Kind, so it registers as an ordinary primitive
+// custom. On decode the base deserializer produces the canonical Go value for
+// that kind. The generated decode wrapper must convert it to A before invoking
+// the user's decode. The canonical value's dynamic type is the base kind, not
+// the named type, so a bare type assertion panics. The encode side already
+// type-guards, so only decode is exposed. We pin every canonical kind on both
+// wires.
+
+type namedBool bool
+type namedInt32 int32
+type namedInt64 int64
+type namedFloat32 float32
+type namedFloat64 float64
+type namedString string
+type namedBytes []byte
+
+func TestMatrix_CustomNamedAvroNativeTypeDecodes(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		ct     avro.CustomType
+		in     any // a G value to encode
+		want   any // the expected decoded G value
+	}{
+		{"boolean", `{"type":"boolean"}`,
+			avro.NewCustomType[bool, namedBool]("",
+				func(g bool, _ *avro.SchemaNode) (namedBool, error) { return namedBool(g), nil },
+				func(a namedBool, _ *avro.SchemaNode) (bool, error) { return bool(a), nil }),
+			true, true},
+		{"int", `{"type":"int"}`,
+			avro.NewCustomType[int32, namedInt32]("",
+				func(g int32, _ *avro.SchemaNode) (namedInt32, error) { return namedInt32(g), nil },
+				func(a namedInt32, _ *avro.SchemaNode) (int32, error) { return int32(a), nil }),
+			int32(5), int32(5)},
+		{"long", `{"type":"long"}`,
+			avro.NewCustomType[int64, namedInt64]("",
+				func(g int64, _ *avro.SchemaNode) (namedInt64, error) { return namedInt64(g), nil },
+				func(a namedInt64, _ *avro.SchemaNode) (int64, error) { return int64(a), nil }),
+			int64(1700000000000), int64(1700000000000)},
+		{"float", `{"type":"float"}`,
+			avro.NewCustomType[float32, namedFloat32]("",
+				func(g float32, _ *avro.SchemaNode) (namedFloat32, error) { return namedFloat32(g), nil },
+				func(a namedFloat32, _ *avro.SchemaNode) (float32, error) { return float32(a), nil }),
+			float32(2.5), float32(2.5)},
+		{"double", `{"type":"double"}`,
+			avro.NewCustomType[float64, namedFloat64]("",
+				func(g float64, _ *avro.SchemaNode) (namedFloat64, error) { return namedFloat64(g), nil },
+				func(a namedFloat64, _ *avro.SchemaNode) (float64, error) { return float64(a), nil }),
+			float64(2.5), float64(2.5)},
+		{"string", `{"type":"string"}`,
+			avro.NewCustomType[string, namedString]("",
+				func(g string, _ *avro.SchemaNode) (namedString, error) { return namedString(g), nil },
+				func(a namedString, _ *avro.SchemaNode) (string, error) { return string(a), nil }),
+			"hello", "hello"},
+		{"bytes", `{"type":"bytes"}`,
+			avro.NewCustomType[[]byte, namedBytes]("",
+				func(g []byte, _ *avro.SchemaNode) (namedBytes, error) { return namedBytes(g), nil },
+				func(a namedBytes, _ *avro.SchemaNode) ([]byte, error) { return []byte(a), nil }),
+			[]byte("hi"), []byte("hi")},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := avro.Parse(c.schema, avro.WithCustomType(c.ct))
+			if err != nil {
+				t.Fatalf("registration/parse: %v", err)
+			}
+			decodeNoPanic(t, "binary", c.want, func() (any, error) {
+				wire, err := s.Encode(c.in)
+				if err != nil {
+					return nil, err
+				}
+				var got any
+				_, err = s.Decode(wire, &got)
+				return got, err
+			})
+			decodeNoPanic(t, "json", c.want, func() (any, error) {
+				js, err := s.AppendEncodeJSON(nil, c.in)
+				if err != nil {
+					return nil, err
+				}
+				var got any
+				err = s.DecodeJSON(js, &got)
+				return got, err
+			})
+		})
+	}
+}
+
+func decodeNoPanic(t *testing.T, label string, want any, run func() (any, error)) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("%s: decode PANIC on a registration-accepted custom: %v", label, r)
+		}
+	}()
+	got, err := run()
+	if err != nil {
+		t.Fatalf("%s: %v", label, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("%s: round-trip = %#v, want %#v", label, got, want)
+	}
+}
+
+// ---------- custom_skip_decode_test.go ----------
+
+// Test types for the skip-custom parity matrix. Package-level so reflect.New
+// sees named (not anonymous) types, matching real caller targets.
+type csInner struct {
+	X int32 `avro:"x"`
+}
+type csStruct struct {
+	A int64  `avro:"a"`
+	B string `avro:"b"`
+}
+type csNest struct {
+	In csInner `avro:"in"`
+	N  int64   `avro:"n"`
+}
+type csMoney int64
+type csPtr struct {
+	P *int32 `avro:"p"`
+}
+type csDec struct {
+	D *big.Rat `avro:"d"`
+}
+
+// Named scalar types: the canonical Avro value (int32/string/bool/float32/
+// float64/[]byte) is *not* assignable to a named type. A bare value placement
+// cannot satisfy these targets. The all-skip fall-through must re-decode the
+// wire into them through the base deserializer, exactly as a no-custom decode
+// does. Mishandling a named target reds the matching row.
+type (
+	csI32   int32
+	csStr   string
+	csBool  bool
+	csF32   float32
+	csF64   float64
+	csBytes []byte
+)
+
+// namedI32 is a named int32 so a *namedI32 union target is *not* trivially
+// assignable from the canonical int32. The all-skip fall-through must re-decode
+// the union through the base deserializer, which reads the exact wire branch. A
+// plain *int32 is the easy case; the named type forces the full per-branch
+// decode.
+type namedI32 int32
+type csUPtr struct {
+	P *namedI32 `avro:"p"`
+}
+
+// TestMatrix_CustomSkipDecodeMatchesNoCustom pins that a custom decoder
+// returning ErrSkipCustomType falls through to built-in decode. The value lands
+// in the typed target exactly as a no-custom decode would, on binary, JSON and
+// resolved paths. A wildcard custom wraps every node and skips, so the
+// fall-through re-decodes every kind through the base deserializer. A wildcard
+// does not suppress logicals, so each row decodes one wire with both schemas
+// into one target. We prove non-vacuity by neutering the re-decode to place a
+// probe value.
+func TestMatrix_CustomSkipDecodeMatchesNoCustom(t *testing.T) {
+	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+	ptr := func(x int32) *int32 { return &x }
+	pn := func(x namedI32) *namedI32 { return &x }
+
+	rows := []struct {
+		name   string
+		schema string
+		value  any // typed value; its type is also the decode target
+	}{
+		{"record-struct", `{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"}]}`, csStruct{A: 1, B: "x"}},
+		{"nested-struct", `{"type":"record","name":"R","fields":[{"name":"in","type":{"type":"record","name":"In","fields":[{"name":"x","type":"int"}]}},{"name":"n","type":"long"}]}`, csNest{In: csInner{X: 7}, N: 9}},
+		{"record-map", `{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"long"}]}`, map[string]int64{"a": 1, "b": 2}},
+		{"array-int", `{"type":"array","items":"long"}`, []int64{1, 2, 3}},
+		{"array-struct", `{"type":"array","items":{"type":"record","name":"In","fields":[{"name":"x","type":"int"}]}}`, []csInner{{X: 1}, {X: 2}}},
+		{"array-fixedlen", `{"type":"array","items":"int"}`, [3]int32{4, 5, 6}},
+		{"map-int", `{"type":"map","values":"long"}`, map[string]int64{"k": 5}},
+		{"map-struct", `{"type":"map","values":{"type":"record","name":"In","fields":[{"name":"x","type":"int"}]}}`, map[string]csInner{"k": {X: 3}}},
+		{"named-long", `"long"`, csMoney(42)},
+		{"named-int", `"int"`, csI32(7)},
+		{"named-string", `"string"`, csStr("hi")},
+		{"named-bool", `"boolean"`, csBool(true)},
+		{"named-float", `"float"`, csF32(1.5)},
+		{"named-double", `"double"`, csF64(2.5)},
+		{"named-bytes", `"bytes"`, csBytes{1, 2, 3}},
+		{"ptr-field-set", `{"type":"record","name":"R","fields":[{"name":"p","type":["null","int"]}]}`, csPtr{P: ptr(8)}},
+		{"ptr-field-nil", `{"type":"record","name":"R","fields":[{"name":"p","type":["null","int"]}]}`, csPtr{P: nil}},
+		// Union into a named-pointer target: int32 is not assignable to namedI32,
+		// so setCustomResult's pointer-walk cannot resolve it. The union branches
+		// arm then runs and recovers the lost branch index. A plain *int32
+		// (ptr-field-set above) is resolved before the loop, leaving it un-netted.
+		{"union-named-ptr-set", `{"type":"record","name":"R","fields":[{"name":"p","type":["null","int"]}]}`, csUPtr{P: pn(8)}},
+		{"union-named-ptr-nil", `{"type":"record","name":"R","fields":[{"name":"p","type":["null","int"]}]}`, csUPtr{P: nil}},
+		{"union-named-slice", `{"type":"array","items":["null","int"]}`, []*namedI32{pn(5), nil}},
+		{"enum-string", `{"type":"enum","name":"E","symbols":["A","B","C"]}`, "B"},
+		{"enum-named-int", `{"type":"enum","name":"E","symbols":["A","B","C"]}`, csMoney(2)},
+		{"fixed-array", `{"type":"fixed","name":"F","size":4}`, [4]byte{1, 2, 3, 4}},
+		{"bytes", `"bytes"`, []byte{9, 8, 7}},
+		{"bool", `"boolean"`, true},
+		{"float", `"float"`, float32(1.5)},
+		{"double", `"double"`, float64(2.5)},
+		{"string", `"string"`, "hi"},
+		{"timestamp", `{"type":"long","logicalType":"timestamp-millis"}`, time.UnixMilli(1600000000000).UTC()},
+		{"decimal-in-record", `{"type":"record","name":"R","fields":[{"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}}]}`, csDec{D: big.NewRat(33, 100)}},
+		{"uuid-string", `{"type":"string","logicalType":"uuid"}`, "12345678-1234-1234-1234-123456789abc"},
+	}
+
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			plain := avro.MustParse(r.schema)
+			sskip := avro.MustParse(r.schema, skip)
+			tt := reflect.TypeOf(r.value)
+
+			wireBin, err := plain.Encode(r.value)
+			if err != nil {
+				t.Fatalf("encode binary: %v", err)
+			}
+			wireJSON, err := plain.EncodeJSON(r.value)
+			if err != nil {
+				t.Fatalf("encode json: %v", err)
+			}
+
+			dec := func(s *avro.Schema, wire []byte, jsonForm bool, opts ...avro.Opt) (any, error) {
+				p := reflect.New(tt)
+				if jsonForm {
+					return p.Elem().Interface(), s.DecodeJSON(wire, p.Interface(), opts...)
+				}
+				_, err := s.Decode(wire, p.Interface(), opts...)
+				return p.Elem().Interface(), err
+			}
+
+			resolved, rerr := avro.Resolve(plain, sskip)
+			if rerr != nil {
+				t.Fatalf("resolve: %v", rerr)
+			}
+
+			// Run the matrix untagged and with TaggedUnions. The all-skip
+			// fall-through re-decodes the wire into the target, so a union field
+			// lands identically to a no-custom decode under either option. The
+			// re-decode reads the exact wire branch, so neither a typed target
+			// nor a tagged envelope can be misplaced.
+			check := func(opt string, opts ...avro.Opt) {
+				// Oracle: plain no-custom decode (binary + JSON).
+				binPlain, e := dec(plain, wireBin, false, opts...)
+				if e != nil {
+					t.Fatalf("[%s] plain binary decode: %v", opt, e)
+				}
+				jsonPlain, e := dec(plain, wireJSON, true, opts...)
+				if e != nil {
+					t.Fatalf("[%s] plain json decode: %v", opt, e)
+				}
+				// Skip-custom and resolved (skip-custom reader) must equal it.
+				binSkip, e := dec(sskip, wireBin, false, opts...)
+				if e != nil {
+					t.Fatalf("[%s] skip-custom binary decode errored where no-custom succeeded: %v", opt, e)
+				}
+				if !matEqual(binPlain, binSkip) {
+					t.Errorf("[%s] binary skip-custom != no-custom:\n no-custom=%#v\n skip     =%#v", opt, binPlain, binSkip)
+				}
+				jsonSkip, e := dec(sskip, wireJSON, true, opts...)
+				if e != nil {
+					t.Fatalf("[%s] skip-custom json decode errored where no-custom succeeded: %v", opt, e)
+				}
+				if !matEqual(jsonPlain, jsonSkip) {
+					t.Errorf("[%s] json skip-custom != no-custom:\n no-custom=%#v\n skip     =%#v", opt, jsonPlain, jsonSkip)
+				}
+				binRes, e := dec(resolved, wireBin, false, opts...)
+				if e != nil {
+					t.Fatalf("[%s] resolved binary decode errored: %v", opt, e)
+				}
+				if !matEqual(binPlain, binRes) {
+					t.Errorf("[%s] resolved binary skip-custom != no-custom:\n no-custom=%#v\n resolved =%#v", opt, binPlain, binRes)
+				}
+				jsonRes, e := dec(resolved, wireJSON, true, opts...)
+				if e != nil {
+					t.Fatalf("[%s] resolved json decode errored: %v", opt, e)
+				}
+				if !matEqual(jsonPlain, jsonRes) {
+					t.Errorf("[%s] resolved json skip-custom != no-custom:\n no-custom=%#v\n resolved =%#v", opt, jsonPlain, jsonRes)
+				}
+			}
+			check("untagged")
+			check("tagged", avro.TaggedUnions())
+		})
+	}
+}
+
+type csTransformed struct{ Cents int64 }
+
+// Targets for the nested-match axis. Each pairs a container holding a
+// marked inner node with the sibling positions that must stay untouched.
+type (
+	csMatchField struct {
+		Amt  csTransformed `avro:"amt"`
+		Name string        `avro:"name"`
+	}
+	csMatchFieldRaw struct {
+		Amt  int64  `avro:"amt"`
+		Name string `avro:"name"`
+	}
+	csMatchInner struct {
+		Amt csTransformed `avro:"amt"`
+	}
+	csMatchInnerRaw struct {
+		Amt int64 `avro:"amt"`
+	}
+	csMatchOuter struct {
+		In csMatchInner `avro:"in"`
+		N  int64        `avro:"n"`
+	}
+	csMatchOuterRaw struct {
+		In csMatchInnerRaw `avro:"in"`
+		N  int64           `avro:"n"`
+	}
+)
+
+// TestMatrix_CustomSkipNestedMatchRedecodes adds the selectivity axis. The skip
+// matrix drives a wildcard that skips at every node, so its corpus only reaches
+// the fall-through's bypass arm. The other value of the axis is a custom that
+// skips at the outer node but matched somewhere in its subtree. The
+// fall-through cannot bypass then, since that would discard the nested match.
+// It re-decodes with customs active, and both wires carry their own copy of
+// that decision.
+//
+// We cross that with container kind, since the fall-through sits in each
+// container's decoder. The oracle is a no-custom decode into the raw-typed
+// twin. The marked position carries the transform of exactly the value the raw
+// decode saw, and every sibling is untouched.
+func TestMatrix_CustomSkipNestedMatchRedecodes(t *testing.T) {
+	t.Parallel()
+	money := avro.CustomType{
+		Decode: func(v any, sn *avro.SchemaNode) (any, error) {
+			if sn.Props["domain"] == "money" {
+				return csTransformed{Cents: v.(int64)}, nil
+			}
+			return nil, avro.ErrSkipCustomType
+		},
+	}
+	const marked = `{"type":"long","domain":"money"}`
+
+	rows := []struct {
+		name   string
+		schema string
+		// raw is the value encoded through the plain schema, typed so that
+		// the marked position is an ordinary int64.
+		raw any
+		// want is the same value as the custom-decoding target expects.
+		want any
+	}{
+		{
+			"record-field",
+			`{"type":"record","name":"R","fields":[{"name":"amt","type":` + marked + `},{"name":"name","type":"string"}]}`,
+			csMatchFieldRaw{Amt: 500, Name: "alice"},
+			csMatchField{Amt: csTransformed{Cents: 500}, Name: "alice"},
+		},
+		{
+			"record-nested",
+			`{"type":"record","name":"R","fields":[{"name":"in","type":{"type":"record","name":"In","fields":[{"name":"amt","type":` + marked + `}]}},{"name":"n","type":"long"}]}`,
+			csMatchOuterRaw{In: csMatchInnerRaw{Amt: 700}, N: 9},
+			csMatchOuter{In: csMatchInner{Amt: csTransformed{Cents: 700}}, N: 9},
+		},
+		{
+			"array-element",
+			`{"type":"array","items":` + marked + `}`,
+			[]int64{1, 2, 3},
+			[]csTransformed{{Cents: 1}, {Cents: 2}, {Cents: 3}},
+		},
+		{
+			"map-value",
+			`{"type":"map","values":` + marked + `}`,
+			map[string]int64{"k": 42},
+			map[string]csTransformed{"k": {Cents: 42}},
+		},
+	}
+
+	// Liveness floor, counted inside the cell. A row whose outer node
+	// stopped skipping, or whose inner node stopped matching, would take
+	// the bypass arm and pass every assertion below by accident.
+	redecoded := 0
+
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			plain := avro.MustParse(r.schema)
+			s := avro.MustParse(r.schema, money)
+
+			wireBin, err := plain.Encode(r.raw)
+			if err != nil {
+				t.Fatalf("encode binary: %v", err)
+			}
+			wireJSON, err := plain.EncodeJSON(r.raw)
+			if err != nil {
+				t.Fatalf("encode json: %v", err)
+			}
+
+			// The oracle: the raw-typed twin decoded with no custom. We read the
+			// marked position's expected transform off it, so the expectation is
+			// not a restatement of what the custom did.
+			rawOut := reflect.New(reflect.TypeOf(r.raw))
+			if _, err := plain.Decode(wireBin, rawOut.Interface()); err != nil {
+				t.Fatalf("oracle decode: %v", err)
+			}
+			if !matEqual(rawOut.Elem().Interface(), r.raw) {
+				t.Fatalf("oracle decode did not round-trip the raw value:\n got  %#v\n want %#v", rawOut.Elem().Interface(), r.raw)
+			}
+
+			for _, w := range []struct {
+				name string
+				run  func(any) error
+			}{
+				{"binary", func(p any) error { _, err := s.Decode(wireBin, p); return err }},
+				{"json", func(p any) error { return s.DecodeJSON(wireJSON, p) }},
+			} {
+				t.Run(w.name, func(t *testing.T) {
+					p := reflect.New(reflect.TypeOf(r.want))
+					if err := w.run(p.Interface()); err != nil {
+						t.Fatalf("decode: %v", err)
+					}
+					got := p.Elem().Interface()
+					if !matEqual(got, r.want) {
+						t.Fatalf("the nested match did not survive the outer skip:\n got  %#v\n want %#v", got, r.want)
+					}
+					redecoded++
+				})
+			}
+		})
+	}
+	if want := len(rows) * 2; redecoded != want {
+		t.Errorf("%d of %d cells reached the re-decode; a row stopped exercising the nested-match arm", redecoded, want)
+	}
+}
+
+// TestRegression_CustomSkipDecodeMatchedTransformSurvives nets the deep-match
+// re-decode path, which the main net's purely-skipping wildcard never carries.
+// A wildcard transforms one node, a long tagged "domain":"money" into a domain
+// Go type, and skips the rest. The record itself is skipped, but a nested
+// custom matched in its subtree. The fall-through therefore re-decodes it with
+// customs active, reproducing the money field's transform while the skipped
+// sibling decodes normally. A bypass here, or a placement that drops the
+// match, lands int64 where the transformed type is expected.
+func TestRegression_CustomSkipDecodeMatchedTransformSurvives(t *testing.T) {
+	ct := avro.CustomType{
+		Decode: func(v any, sn *avro.SchemaNode) (any, error) {
+			if sn.Props["domain"] == "money" {
+				return csTransformed{Cents: v.(int64)}, nil
+			}
+			return nil, avro.ErrSkipCustomType
+		},
+	}
+	schema := `{"type":"record","name":"R","fields":[{"name":"amt","type":{"type":"long","domain":"money"}},{"name":"name","type":"string"}]}`
+	plain := avro.MustParse(schema)
+	s := avro.MustParse(schema, ct)
+
+	// Encode the raw wire through a plain (int64) shape.
+	type Rw struct {
+		Amt  int64  `avro:"amt"`
+		Name string `avro:"name"`
+	}
+	wireBin := avrotest.MustEncode(t, plain, Rw{Amt: 500, Name: "alice"})
+	wireJSON := avrotest.MustEncodeJSON(t, plain, Rw{Amt: 500, Name: "alice"})
+
+	type R struct {
+		Amt  csTransformed `avro:"amt"`
+		Name string        `avro:"name"`
+	}
+	want := R{Amt: csTransformed{Cents: 500}, Name: "alice"}
+
+	var gb R
+	avrotest.MustDecode(t, s, wireBin, &gb)
+	if gb != want {
+		t.Errorf("binary: matched transform did not survive (or skipped sibling wrong):\n got=%+v\n want=%+v", gb, want)
+	}
+	var gj R
+	avrotest.MustDecodeJSON(t, s, wireJSON, &gj)
+	if gj != want {
+		t.Errorf("json: matched transform did not survive (or skipped sibling wrong):\n got=%+v\n want=%+v", gj, want)
+	}
+}
+
+// TestMatrix_CustomSkipDecodeReusesTarget pins that a wildcard all-skip custom
+// decode reuses a pre-populated target identically to a no-custom decode. A
+// non-nil typed map, and an interface already wrapping a map[string]any, retain
+// keys absent from the wire. The fall-through re-decodes into the same target
+// through the base deserializer, so reuse is inherited rather than
+// re-implemented.
+//
+// Invisible to the main skip matrix, which decodes only into fresh targets. The
+// map[string]any subtest is the cell an assignable-fast-path placement
+// swallows. An Avro map decoded into `any` is the control, since deserMap's
+// iface arm allocates fresh. Non-vacuity: neutering the typed-target re-decode
+// reds the map[string]any and record-into-any cells.
+func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
+	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+
+	t.Run("typed-map", func(t *testing.T) {
+		schema := `{"type":"map","values":"long"}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+		bin := avrotest.MustEncode(t, plain, map[string]int64{"k": 5})
+		jsonw := avrotest.MustEncodeJSON(t, plain, map[string]int64{"k": 5})
+		nb := map[string]int64{"stale": 99}
+		avrotest.MustDecode(t, plain, bin, &nb)
+		sb := map[string]int64{"stale": 99}
+		avrotest.MustDecode(t, sskip, bin, &sb)
+		if !reflect.DeepEqual(nb, sb) {
+			t.Errorf("binary typed-map: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
+		}
+		nj := map[string]int64{"stale": 99}
+		avrotest.MustDecodeJSON(t, plain, jsonw, &nj)
+		sj := map[string]int64{"stale": 99}
+		avrotest.MustDecodeJSON(t, sskip, jsonw, &sj)
+		if !reflect.DeepEqual(nj, sj) {
+			t.Errorf("json typed-map: skip-custom=%v != no-custom=%v", sj, nj)
+		}
+	})
+
+	t.Run("typed-map-any", func(t *testing.T) {
+		// map[string]any (Kind Map, any-valued) is the value type an assignable
+		// fast-path placement swallows. That replaces the whole map and drops
+		// stale keys the base decoder retains. Re-decode reuses it like any
+		// other non-nil typed map, on binary and JSON.
+		schema := `{"type":"map","values":"long"}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+		bin := avrotest.MustEncode(t, plain, map[string]int64{"k": 5})
+		jsonw := avrotest.MustEncodeJSON(t, plain, map[string]int64{"k": 5})
+		nb := map[string]any{"stale": int64(99)}
+		avrotest.MustDecode(t, plain, bin, &nb)
+		sb := map[string]any{"stale": int64(99)}
+		avrotest.MustDecode(t, sskip, bin, &sb)
+		if !reflect.DeepEqual(nb, sb) {
+			t.Errorf("binary map[string]any: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
+		}
+		nj := map[string]any{"stale": int64(99)}
+		avrotest.MustDecodeJSON(t, plain, jsonw, &nj)
+		sj := map[string]any{"stale": int64(99)}
+		avrotest.MustDecodeJSON(t, sskip, jsonw, &sj)
+		if !reflect.DeepEqual(nj, sj) {
+			t.Errorf("json map[string]any: skip-custom=%v != no-custom=%v", sj, nj)
+		}
+	})
+
+	t.Run("record-into-any", func(t *testing.T) {
+		schema := `{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+		type Rw struct {
+			A int64 `avro:"a"`
+		}
+		bin := avrotest.MustEncode(t, plain, Rw{A: 5})
+		var nb any = map[string]any{"stale": int64(99)}
+		avrotest.MustDecode(t, plain, bin, &nb)
+		var sb any = map[string]any{"stale": int64(99)}
+		avrotest.MustDecode(t, sskip, bin, &sb)
+		if !reflect.DeepEqual(nb, sb) {
+			t.Errorf("binary record-into-any: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
+		}
+	})
+
+	t.Run("map-into-any-control", func(t *testing.T) {
+		// Avro map into `any` must match no-custom, and no-custom does *not*
+		// reuse: deserMap's iface arm allocates fresh, so the stale key is
+		// dropped on both. This guards an over-eager reuse from retaining the
+		// stale key where the base decoder would not.
+		schema := `{"type":"map","values":"long"}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+		bin := avrotest.MustEncode(t, plain, map[string]int64{"k": 5})
+		var nb any = map[string]any{"stale": int64(99)}
+		avrotest.MustDecode(t, plain, bin, &nb)
+		var sb any = map[string]any{"stale": int64(99)}
+		avrotest.MustDecode(t, sskip, bin, &sb)
+		if !reflect.DeepEqual(nb, sb) {
+			t.Errorf("binary map-into-any: skip-custom=%v != no-custom=%v", sb, nb)
+		}
+	})
+}
+
+// TestMatrix_CustomSkipDecodeLogicalIntoBaseTypedTarget pins that a wildcard
+// all-skip custom, which does not suppress logicals, decoding a logical node
+// into a base typed target lands identically to a no-custom decode. The base
+// deserializer fills the target natively and the fall-through re-decodes
+// through it. A box-into-any placement cannot: its probe holds the enriched
+// type no base-kind setter accepts. The main skip matrix holds the target equal
+// to the encode value's own type, so we cross the foreclosed cell here.
+func TestMatrix_CustomSkipDecodeLogicalIntoBaseTypedTarget(t *testing.T) {
+	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+	rows := []struct {
+		name   string
+		schema string
+		enc    any
+		mk     func() any
+	}{
+		{"date->int32", `{"type":"int","logicalType":"date"}`, int32(19000), func() any { return new(int32) }},
+		{"timestamp-millis->int64", `{"type":"long","logicalType":"timestamp-millis"}`, int64(1600000000000), func() any { return new(int64) }},
+		{"time-micros->int64", `{"type":"long","logicalType":"time-micros"}`, int64(3600000000), func() any { return new(int64) }},
+		{"duration->array12", `{"type":"fixed","name":"D","size":12,"logicalType":"duration"}`, avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, func() any { return new([12]byte) }},
+		{"decimal->bytes", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(1234, 100), func() any { return new([]byte) }},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			plain := avro.MustParse(r.schema)
+			sskip := avro.MustParse(r.schema, skip)
+			bin := avrotest.MustEncode(t, plain, r.enc)
+			jsonw := avrotest.MustEncodeJSON(t, plain, r.enc)
+			no := r.mk()
+			if _, err := plain.Decode(bin, no); err != nil {
+				t.Fatalf("no-custom binary: %v", err)
+			}
+			sk := r.mk()
+			if _, err := sskip.Decode(bin, sk); err != nil {
+				t.Fatalf("skip-custom binary errored where no-custom succeeded: %v", err)
+			}
+			if !reflect.DeepEqual(no, sk) {
+				t.Errorf("binary: skip-custom=%v != no-custom=%v", sk, no)
+			}
+			noj := r.mk()
+			if err := plain.DecodeJSON(jsonw, noj); err != nil {
+				t.Fatalf("no-custom json: %v", err)
+			}
+			skj := r.mk()
+			if err := sskip.DecodeJSON(jsonw, skj); err != nil {
+				t.Fatalf("skip-custom json errored where no-custom succeeded: %v", err)
+			}
+			if !reflect.DeepEqual(noj, skj) {
+				t.Errorf("json: skip-custom=%v != no-custom=%v", skj, noj)
+			}
+		})
+	}
+}
+
+// TestMatrix_CustomSkipDecodeTaggedUnionIntoAny pins that a wildcard all-skip
+// custom decode into an interface target under TaggedUnions reproduces the
+// {branch: value} envelope a no-custom decode emits. A fresh interface target
+// goes straight through the base deserializer with TaggedUnions in force, so
+// the envelope is produced natively. The main skip matrix decodes only into
+// typed targets, which maybeWrap never tags, so this axis was unnetted.
+func TestMatrix_CustomSkipDecodeTaggedUnionIntoAny(t *testing.T) {
+	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+	p := func(x int32) *int32 { return &x }
+
+	rows := []struct {
+		name   string
+		schema string
+		value  any
+	}{
+		{"null-first", `{"type":"record","name":"R","fields":[{"name":"u","type":["null","int"]}]}`, struct {
+			U *int32 `avro:"u"`
+		}{U: p(7)}},
+		{"null-second", `{"type":"record","name":"R","fields":[{"name":"u","type":["int","null"]}]}`, struct {
+			U *int32 `avro:"u"`
+		}{U: p(7)}},
+		{"multibranch-distinct", `{"type":"record","name":"R","fields":[{"name":"u","type":["int","string"]}]}`, struct {
+			U string `avro:"u"`
+		}{U: "hi"}},
+		{"array-of-nullunion", `{"type":"array","items":["null","int"]}`, []*int32{p(7), nil}},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			plain := avro.MustParse(r.schema)
+			sskip := avro.MustParse(r.schema, skip)
+			bin := avrotest.MustEncode(t, plain, r.value)
+			jsonw := avrotest.MustEncodeJSON(t, plain, r.value)
+			var nb any
+			avrotest.MustDecode(t, plain, bin, &nb, avro.TaggedUnions())
+			var sb any
+			avrotest.MustDecode(t, sskip, bin, &sb, avro.TaggedUnions())
+			if !reflect.DeepEqual(nb, sb) {
+				t.Errorf("binary: skip-custom=%#v != no-custom=%#v", sb, nb)
+			}
+			var nj any
+			avrotest.MustDecodeJSON(t, plain, jsonw, &nj, avro.TaggedUnions())
+			var sj any
+			avrotest.MustDecodeJSON(t, sskip, jsonw, &sj, avro.TaggedUnions())
+			if !reflect.DeepEqual(nj, sj) {
+				t.Errorf("json: skip-custom=%#v != no-custom=%#v", sj, nj)
+			}
+		})
+	}
+}
+
+// TestRegression_CustomSkipDecodeChainInputUntagged pins the custom decoder
+// chain's input contract. The chain receives the probe value decoded with the
+// caller's options in force. With no TaggedUnions that is the raw untagged
+// value a no-custom decode into `any` produces. The custom records its input
+// and we compare it to that oracle, so feeding the chain a tagged envelope or
+// any transformed shape reds it.
+func TestRegression_CustomSkipDecodeChainInputUntagged(t *testing.T) {
+	var captured any
+	rec := avro.CustomType{
+		AvroType: "record",
+		Decode: func(v any, sn *avro.SchemaNode) (any, error) {
+			captured = v
+			return nil, avro.ErrSkipCustomType
+		},
+	}
+	schema := `{"type":"record","name":"R","fields":[` +
+		`{"name":"u","type":["null","int"]},` +
+		`{"name":"s","type":"string"},` +
+		`{"name":"arr","type":{"type":"array","items":["null","long"]}}]}`
+	plain := avro.MustParse(schema)
+	s := avro.MustParse(schema, rec)
+
+	type Rw struct {
+		U   *int32   `avro:"u"`
+		S   string   `avro:"s"`
+		Arr []*int64 `avro:"arr"`
+	}
+	x32, x64 := int32(7), int64(9)
+	in := Rw{U: &x32, S: "hi", Arr: []*int64{&x64, nil}}
+	bin := avrotest.MustEncode(t, plain, in)
+	jsonw := avrotest.MustEncodeJSON(t, plain, in)
+
+	// Oracle: an untagged no-custom decode into any, what the chain sees.
+	var oracle any
+	avrotest.MustDecode(t, plain, bin, &oracle)
+
+	captured = nil
+	var sinkB any
+	avrotest.MustDecode(t, s, bin, &sinkB)
+	if !reflect.DeepEqual(captured, oracle) {
+		t.Errorf("binary: custom chain saw\n %#v\n want untagged\n %#v", captured, oracle)
+	}
+
+	captured = nil
+	var sinkJ any
+	avrotest.MustDecodeJSON(t, s, jsonw, &sinkJ)
+	if !reflect.DeepEqual(captured, oracle) {
+		t.Errorf("json: custom chain saw\n %#v\n want untagged\n %#v", captured, oracle)
+	}
+}
+
+// TestRegression_CustomSkipDecodeOverlappingUnion pins that the all-skip path
+// recovers the exact wire branch of an overlapping same-symbol union by
+// re-decoding the wire. The branch index comes from the wire itself, not a
+// guess. An enum-union into an int-ordinal target gets the wire branch's
+// ordinal, and into a tagged-any its name. A fall-through that places a probe
+// value instead reds both: the ordinal arm cannot derive the right ordinal from
+// an untagged probe, and the any arm mis-tags.
+func TestRegression_CustomSkipDecodeOverlappingUnion(t *testing.T) {
+	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+
+	t.Run("ordinal-target", func(t *testing.T) {
+		// EnumA "X"@0, EnumB "X"@1; the wire selects EnumB.
+		schema := `{"type":"array","items":[` +
+			`{"type":"enum","name":"EnumA","symbols":["X","Y"]},` +
+			`{"type":"enum","name":"EnumB","symbols":["P","X"]}]}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+
+		// binary: array[1] = union branch 1 (EnumB) + enum idx 1 ("X"), end block.
+		bin := []byte{0x02, 0x02, 0x02, 0x00}
+		var nb, sb []int32
+		avrotest.MustDecode(t, plain, bin, &nb)
+		avrotest.MustDecode(t, sskip, bin, &sb)
+		if !reflect.DeepEqual(nb, sb) || len(nb) != 1 || nb[0] != 1 {
+			t.Errorf("binary ordinal: skip=%v no-custom=%v (want [1] = EnumB ordinal of X)", sb, nb)
+		}
+
+		// json: tagged-union spec form selecting EnumB.
+		jsonw := []byte(`[{"EnumB":"X"}]`)
+		var nj, sj []int32
+		avrotest.MustDecodeJSON(t, plain, jsonw, &nj)
+		avrotest.MustDecodeJSON(t, sskip, jsonw, &sj)
+		if !reflect.DeepEqual(nj, sj) || len(nj) != 1 || nj[0] != 1 {
+			t.Errorf("json ordinal: skip=%v no-custom=%v (want [1])", sj, nj)
+		}
+	})
+
+	t.Run("tagged-any-target", func(t *testing.T) {
+		schema := `{"type":"record","name":"R","fields":[{"name":"e","type":[` +
+			`{"type":"enum","name":"EA","symbols":["X","Y"]},` +
+			`{"type":"enum","name":"EB","symbols":["P","X"]}]}]}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+
+		// binary: record -> union branch 1 (EB) -> enum idx 1 ("X").
+		bin := []byte{0x02, 0x02}
+		var nb, sb any
+		avrotest.MustDecode(t, plain, bin, &nb, avro.TaggedUnions())
+		avrotest.MustDecode(t, sskip, bin, &sb, avro.TaggedUnions())
+		if !reflect.DeepEqual(nb, sb) {
+			t.Errorf("binary tagged-any: skip=%#v no-custom=%#v", sb, nb)
+		}
+
+		jsonw := []byte(`{"e":{"EB":"X"}}`)
+		var nj, sj any
+		avrotest.MustDecodeJSON(t, plain, jsonw, &nj, avro.TaggedUnions())
+		avrotest.MustDecodeJSON(t, sskip, jsonw, &sj, avro.TaggedUnions())
+		if !reflect.DeepEqual(nj, sj) {
+			t.Errorf("json tagged-any: skip=%#v no-custom=%#v", sj, nj)
+		}
+	})
+}
+
+// TestRegression_CustomSkipDecodeLogicalSuppression crosses the
+// logical-suppression axis through the all-skip path. A LogicalType-matching
+// custom suppresses the built-in logical (hasMatchingCustomType), so a skip
+// falls through to the raw Avro-native value. That is identical to a
+// no-callback (Decode==nil) LogicalType custom, which suppresses the same way.
+// A wildcard custom does *not* suppress, so a skip preserves the enriched
+// value. The all-skip placement must honor each.
+func TestRegression_CustomSkipDecodeLogicalSuppression(t *testing.T) {
+	schema := `{"type":"long","logicalType":"timestamp-millis"}`
+	matchSkip := avro.CustomType{LogicalType: "timestamp-millis", Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+	matchRaw := avro.CustomType{LogicalType: "timestamp-millis"} // Decode==nil suppresses, giving raw
+	wildSkip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+
+	wire := avrotest.MustEncode(t, avro.MustParse(schema), time.UnixMilli(1600000000000).UTC())
+
+	dec := func(opts ...avro.SchemaOpt) any {
+		var got any
+		avrotest.MustDecode(t, avro.MustParse(schema, opts...), wire, &got)
+		return got
+	}
+
+	matchSkipVal := dec(matchSkip)
+	matchRawVal := dec(matchRaw)
+	wildSkipVal := dec(wildSkip)
+	noCustomVal := func() any {
+		var got any
+		avro.MustParse(schema).Decode(wire, &got)
+		return got
+	}()
+
+	// LogicalType-matching skip == no-callback (both suppress to raw int64).
+	if !reflect.DeepEqual(matchSkipVal, matchRawVal) {
+		t.Errorf("matching skip %T(%v) != no-callback %T(%v)", matchSkipVal, matchSkipVal, matchRawVal, matchRawVal)
+	}
+	if _, ok := matchSkipVal.(int64); !ok {
+		t.Errorf("suppressed logical: want raw int64, got %T", matchSkipVal)
+	}
+	// Wildcard skip preserves the logical == no-custom (enriched time.Time).
+	if !reflect.DeepEqual(wildSkipVal, noCustomVal) {
+		t.Errorf("wildcard skip %T(%v) != no-custom %T(%v)", wildSkipVal, wildSkipVal, noCustomVal, noCustomVal)
+	}
+	if _, ok := wildSkipVal.(time.Time); !ok {
+		t.Errorf("non-suppressing wildcard: want enriched time.Time, got %T", wildSkipVal)
+	}
+}
+
+// ---------- resolve_custom_record_test.go ----------
+
+// A record-level CustomType (AvroType:"record") Decode callback fires on a
+// direct Decode, applyCustomTypes wiring record nodes at build time. It must
+// also fire through a resolved decode. resolveRecord builds a fresh node.
+// Unless it re-applies the reader's custom wiring as every other resolve arm
+// does, any real evolution silently returns the raw map[string]any, a
+// direct-vs-resolved divergence. The callback is value-transforming, so "fired"
+// is distinguishable from "raw passthrough".
+func TestRegression_RecordCustomTypeThroughResolve(t *testing.T) {
+	const marker = "WRAPPED_BY_CUSTOM"
+	newCT := func() avro.CustomType {
+		return avro.CustomType{
+			AvroType: "record",
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+				return map[string]any{marker: v}, nil
+			},
+		}
+	}
+
+	readerJSON := `{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},{"name":"b","type":"string"}]}`
+
+	// Each writer schema is compatible with the reader but has a different
+	// canonical form. Resolve therefore builds a real resolving decoder,
+	// bypassing the canonical-equality fast path that returns the reader as-is.
+	writers := map[string]string{
+		"reorder": `{"type":"record","name":"R","fields":[
+			{"name":"b","type":"string"},{"name":"a","type":"int"}]}`,
+		"drop_extra_writer_field": `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":"long"}]}`,
+		"add_reader_default": `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"}]}`, // reader's "b" filled from... needs a default
+	}
+
+	// Control: a direct decode fires the custom (proves the harness + callback).
+	reader := avro.MustParse(readerJSON, newCT())
+	wireDirect, err := reader.AppendEncode(nil, map[string]any{"a": int32(1), "b": "x"})
+	if err != nil {
+		t.Fatalf("direct encode: %v", err)
+	}
+	var direct any
+	if _, err := reader.Decode(wireDirect, &direct); err != nil {
+		t.Fatalf("direct decode: %v", err)
+	}
+	if dm, ok := direct.(map[string]any); !ok || dm[marker] == nil {
+		t.Fatalf("control: record custom did not fire on DIRECT decode: %#v", direct)
+	}
+
+	for name, writerJSON := range writers {
+		t.Run(name, func(t *testing.T) {
+			// The "add_reader_default" case needs the reader's dropped-from-writer
+			// field to have a default; rebuild the reader accordingly.
+			rJSON := readerJSON
+			if name == "add_reader_default" {
+				rJSON = `{"type":"record","name":"R","fields":[
+					{"name":"a","type":"int"},{"name":"b","type":"string","default":"d"}]}`
+			}
+			r := avro.MustParse(rJSON, newCT())
+			w := avro.MustParse(writerJSON)
+			res, err := avro.Resolve(w, r)
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+
+			val := map[string]any{"a": int32(1), "b": "x"}
+			if name == "drop_extra_writer_field" {
+				val["c"] = int64(9)
+			}
+			if name == "add_reader_default" {
+				delete(val, "b")
+			}
+			wire, err := w.AppendEncode(nil, val)
+			if err != nil {
+				t.Fatalf("writer encode: %v", err)
+			}
+
+			// Resolved binary decode must fire the custom.
+			var gotBin any
+			if _, err := res.Decode(wire, &gotBin); err != nil {
+				t.Fatalf("resolved binary decode: %v", err)
+			}
+			if m, ok := gotBin.(map[string]any); !ok || m[marker] == nil {
+				t.Fatalf("record custom DROPPED through resolved binary decode: %#v", gotBin)
+			}
+
+			// Resolved JSON decode (consumes writer-shaped JSON) must agree.
+			wireJSON, err := w.AppendEncodeJSON(nil, val)
+			if err != nil {
+				t.Fatalf("writer encodeJSON: %v", err)
+			}
+			var gotJSON any
+			if err := res.DecodeJSON(wireJSON, &gotJSON); err != nil {
+				t.Fatalf("resolved JSON decode: %v", err)
+			}
+			if m, ok := gotJSON.(map[string]any); !ok || m[marker] == nil {
+				t.Fatalf("record custom DROPPED through resolved JSON decode: %#v", gotJSON)
+			}
+		})
+	}
+}
+
+// A record-level custom must also fire through resolution of a recursive
+// (self-referential) record at every level. resolveNode's cycle placeholder
+// copies the resolved node's contents, so the custom wrap applied before the
+// copy must propagate to the inner recursive references.
+func TestRegression_RecursiveRecordCustomThroughResolve(t *testing.T) {
+	const marker = "WRAP"
+	ct := avro.CustomType{
+		AvroType: "record",
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return map[string]any{marker: v}, nil
+		},
+	}
+	// Reader reorders fields vs writer so Resolve builds a real resolving decoder.
+	reader := avro.MustParse(`{"type":"record","name":"LL","fields":[{"name":"v","type":"int"},{"name":"next","type":["null","LL"]}]}`, ct)
+	writer := avro.MustParse(`{"type":"record","name":"LL","fields":[{"name":"next","type":["null","LL"]},{"name":"v","type":"int"}]}`)
+	res := avrotest.MustResolve(t, writer, reader)
+	val := map[string]any{"v": int32(1), "next": map[string]any{"v": int32(2), "next": nil}}
+	wire := avrotest.MustAppendEncode(t, writer, nil, val)
+	var got any
+	if _, err := res.Decode(wire, &got); err != nil {
+		t.Fatalf("resolved decode: %v", err)
+	}
+	m, ok := got.(map[string]any)
+	if !ok || m[marker] == nil {
+		t.Fatalf("record custom dropped at outer level: %#v", got)
+	}
+	inner, ok := m[marker].(map[string]any)["next"].(map[string]any)
+	if !ok || inner[marker] == nil {
+		t.Fatalf("record custom dropped at inner recursive level: %#v", m[marker])
+	}
+}
+
+// Control: a non-custom resolved record decode must *not* grow a marker key.
+// The re-applied wiring is a no-op when no CustomType is registered.
+func TestResolvedRecordWithoutCustomIsUnwrapped(t *testing.T) {
+	r := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	w := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"b","type":"string"},{"name":"a","type":"int"}]}`)
+	res := avrotest.MustResolve(t, w, r)
+	wire := avrotest.MustAppendEncode(t, w, nil, map[string]any{"a": int32(1), "b": "x"})
+	var got map[string]any
+	avrotest.MustDecode(t, res, wire, &got)
+	if fmt.Sprintf("%v", got["a"]) != "1" || got["b"] != "x" {
+		t.Fatalf("plain resolved record decode wrong: %#v", got)
+	}
+}
+
+// ---------- union_custom_pointer_reuse_test.go ----------
+
+// A CustomType whose Decode returns a pointer, registered on a logical at a
+// union branch, must decode identically on both wires even when the target is
+// reused and already holds a non-nil pointer. That is the
+// streaming-decode-into-a-reused-struct pattern. The binary union deser passes
+// the un-indirected target to the custom wrapper. A JSON union decoder that
+// pre-dereferences a reused *T held in an interface before dispatching to the
+// branch rejects the fresh pointer result from the second datum onward. We pin
+// per-branch indirection parity here.
+
+type ucpEvent struct{ T time.Time }
+
+func ucpCustom() avro.CustomType {
+	return avro.CustomType{
+		LogicalType: "timestamp-millis",
+		AvroType:    "long",
+		GoType:      reflect.TypeFor[*ucpEvent](),
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return &ucpEvent{T: time.UnixMilli(v.(int64)).UTC()}, nil
+		},
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return v.(*ucpEvent).T.UnixMilli(), nil
+		},
+	}
+}
+
+func TestRegression_UnionCustomDecodePointerReusedTargetParity(t *testing.T) {
+	const schema = `{"type":"record","name":"R","fields":[{"name":"when","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}]}`
+	s := avrotest.MustParse(t, schema, avro.WithCustomType(ucpCustom()))
+	type Event struct {
+		When any `avro:"when"`
+	}
+	want := time.UnixMilli(1700000000000).UTC()
+	mk := func() Event { return Event{When: &ucpEvent{T: want}} }
+
+	// Pre-encode three identical datums on each wire.
+	var bin [][]byte
+	var jsn [][]byte
+	for i := 0; i < 3; i++ {
+		b, err := s.AppendEncode(nil, mk())
+		if err != nil {
+			t.Fatalf("binary encode %d: %v", i, err)
+		}
+		bin = append(bin, b)
+		j, err := s.AppendEncodeJSON(nil, mk())
+		if err != nil {
+			t.Fatalf("json encode %d: %v", i, err)
+		}
+		jsn = append(jsn, j)
+	}
+
+	check := func(name string, got Event, i int) {
+		ev, ok := got.When.(*ucpEvent)
+		if !ok {
+			t.Fatalf("%s datum %d: got %T, want *ucpEvent", name, i, got.When)
+		}
+		if !ev.T.Equal(want) {
+			t.Fatalf("%s datum %d: got %v want %v", name, i, ev.T, want)
+		}
+	}
+
+	// Reused target (the streaming pattern): the same struct value decoded into
+	// repeatedly, its any field carrying the prior *ucpEvent.
+	var evB Event
+	for i, b := range bin {
+		if _, err := s.Decode(b, &evB); err != nil {
+			t.Fatalf("binary decode (reused) %d: %v", i, err)
+		}
+		check("binary-reused", evB, i)
+	}
+	var evJ Event
+	for i, j := range jsn {
+		if err := s.DecodeJSON(j, &evJ); err != nil {
+			t.Fatalf("json decode (reused) %d: %v", i, err)
+		}
+		check("json-reused", evJ, i)
+	}
+
+	// Fresh nil-interface target (first decode) must also produce the *ucpEvent
+	// on both wires, the boundary the reuse case builds on.
+	var freshB, freshJ Event
+	if _, err := s.Decode(bin[0], &freshB); err != nil {
+		t.Fatalf("binary decode (fresh): %v", err)
+	}
+	check("binary-fresh", freshB, 0)
+	if err := s.DecodeJSON(jsn[0], &freshJ); err != nil {
+		t.Fatalf("json decode (fresh): %v", err)
+	}
+	check("json-fresh", freshJ, 0)
+
+	// TaggedUnions decode: the {branchName: value} envelope must wrap the custom
+	// result identically on both wires, and still survive target reuse. The
+	// envelope value is the (pointer) custom result; assert it key-agnostically.
+	taggedVal := func(name string, v any) *ucpEvent {
+		m, ok := v.(map[string]any)
+		if !ok || len(m) != 1 {
+			t.Fatalf("%s: got %T (%v), want single-entry map envelope", name, v, v)
+		}
+		for _, e := range m {
+			ev, ok := e.(*ucpEvent)
+			if !ok {
+				t.Fatalf("%s: envelope value %T, want *ucpEvent", name, e)
+			}
+			return ev
+		}
+		return nil
+	}
+	var tagB, tagJ Event
+	for i := range bin {
+		if _, err := s.Decode(bin[i], &tagB, avro.TaggedUnions()); err != nil {
+			t.Fatalf("binary tagged decode %d: %v", i, err)
+		}
+		if err := s.DecodeJSON(jsn[i], &tagJ, avro.TaggedUnions()); err != nil {
+			t.Fatalf("json tagged decode %d: %v", i, err)
+		}
+		eb := taggedVal("binary-tagged", tagB.When)
+		ej := taggedVal("json-tagged", tagJ.When)
+		if !eb.T.Equal(want) || !ej.T.Equal(want) {
+			t.Fatalf("tagged %d: binary=%v json=%v want %v", i, eb.T, ej.T, want)
+		}
+	}
+}
+
+// A CustomType.Decode returning a pointer must decode into a concrete *T field
+// target through a union branch on every union shape and both wires. The
+// general union deser passes the un-indirected target to the branch fn, so
+// setCustomResult lands the *T. A 2-branch null-union fast path that
+// pre-dereferences a concrete pointer first fails a *T target in a
+// ["null",customLong] union while succeeding in a 3+-branch one. That is an
+// arbitrary inconsistency, rejecting a target the general path decodes. The
+// JSON unionTarget derefs concrete pointers the same way.
+func TestRegression_UnionCustomDecodePointerFieldTarget(t *testing.T) {
+	type EventPtr struct {
+		When *ucpEvent `avro:"when"`
+	}
+	want := time.UnixMilli(1700000000000).UTC()
+
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{"2-branch-null-union", `{"type":"record","name":"R","fields":[{"name":"when","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}]}`},
+		// A 3+-branch union routes through the general deserUnion.deser path.
+		{"3-branch-union", `{"type":"record","name":"R","fields":[{"name":"when","type":["null",{"type":"long","logicalType":"timestamp-millis"},"string"]}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := avrotest.MustParse(t, tc.schema, avro.WithCustomType(ucpCustom()))
+			in := EventPtr{When: &ucpEvent{T: want}}
+			b := avrotest.MustAppendEncode(t, s, nil, in)
+			var gotB EventPtr
+			if _, err := s.Decode(b, &gotB); err != nil {
+				t.Fatalf("binary decode into *T field: %v", err)
+			}
+			if gotB.When == nil || !gotB.When.T.Equal(want) {
+				t.Fatalf("binary *T field: got %v", gotB.When)
+			}
+			j := avrotest.MustAppendEncodeJSON(t, s, nil, in)
+			var gotJ EventPtr
+			if err := s.DecodeJSON(j, &gotJ); err != nil {
+				t.Fatalf("json decode into *T field: %v", err)
+			}
+			if gotJ.When == nil || !gotJ.When.T.Equal(want) {
+				t.Fatalf("json *T field: got %v", gotJ.When)
+			}
+		})
+	}
+}
+
+// Boundary-1 control: a non-custom union decode into a reused interface holding
+// a manually pre-populated *T must keep doing in-place reuse (the result's
+// dynamic type stays *T) identically on binary and JSON. The per-branch
+// indirection must *not* regress this to a boxed value.
+func TestRegression_UnionNonCustomReuseInPlaceUnchanged(t *testing.T) {
+	s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"v","type":["null","long"]}]}`)
+	type Rec struct {
+		V any `avro:"v"`
+	}
+	bw, _ := s.AppendEncode(nil, Rec{V: int64(42)})
+	jw, _ := s.AppendEncodeJSON(nil, Rec{V: int64(42)})
+
+	// Manual *int64 pre-population reuses in place, holding *int64 on both.
+	for _, tc := range []struct {
+		name   string
+		decode func(target *Rec) error
+		wire   []byte
+	}{
+		{"binary", func(r *Rec) error { _, e := s.Decode(bw, r); return e }, bw},
+		{"json", func(r *Rec) error { return s.DecodeJSON(jw, r) }, jw},
+	} {
+		p := int64(7)
+		r := Rec{V: &p}
+		if err := tc.decode(&r); err != nil {
+			t.Fatalf("%s decode: %v", tc.name, err)
+		}
+		pp, ok := r.V.(*int64)
+		if !ok {
+			t.Fatalf("%s: in-place reuse lost: got %T, want *int64", tc.name, r.V)
+		}
+		if *pp != 42 {
+			t.Fatalf("%s: got %d want 42", tc.name, *pp)
+		}
+	}
+
+	// Fresh nil interface gives a boxed value (int64) on both.
+	for _, tc := range []struct {
+		name   string
+		decode func(target *Rec) error
+	}{
+		{"binary", func(r *Rec) error { _, e := s.Decode(bw, r); return e }},
+		{"json", func(r *Rec) error { return s.DecodeJSON(jw, r) }},
+	} {
+		var r Rec
+		if err := tc.decode(&r); err != nil {
+			t.Fatalf("%s fresh decode: %v", tc.name, err)
+		}
+		if got, ok := r.V.(int64); !ok || got != 42 {
+			t.Fatalf("%s fresh: got %T %v, want int64 42", tc.name, r.V, r.V)
+		}
+	}
+}
+
+// ---------- slab_free_test.go ----------
+
+// Issue #41: Decode of a slab-free schema (scalar leaf, no custom wiring)
+// bypasses the internal slab pool entirely and runs on a nil *slab. These
+// tests pin the classifier and prove, two-sidedly against the matrix corpus,
+// that the classification exactly matches which compiled desers touch the
+// slab. We reach internal state through the export_test.go bridges.
+
+// TestScalarDecodeNoAllocAfterGC pins issue #41: Decode of a scalar schema must
+// not allocate even when GC has drained the slab pool. That is the steady
+// state of a low-allocation application. A Decode that unconditionally pulls a
+// slab from the pool makes every post-GC decode pay a fresh allocation it never
+// uses. The min-over-iterations guards against unrelated background mallocs. A
+// genuinely slab-free Decode hits 0 on every quiet iteration, while a refilling
+// one allocates on every one.
+func TestScalarDecodeNoAllocAfterGC(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	s := avro.MustParse(`"long"`)
+	wire := []byte{4}
+	var v int64
+	if _, err := s.Decode(wire, &v); err != nil { // warm one-time state
+		t.Fatal(err)
+	}
+	minMallocs := ^uint64(0)
+	var before, after runtime.MemStats
+	for i := 0; i < 5; i++ {
+		runtime.GC()
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		avrotest.MustDecode(t, s, wire, &v)
+		runtime.ReadMemStats(&after)
+		minMallocs = min(minMallocs, after.Mallocs-before.Mallocs)
+	}
+	if v != 2 {
+		t.Fatalf("decoded %d, want 2", v)
+	}
+	if minMallocs != 0 {
+		t.Errorf("scalar Decode allocated on every post-GC iteration (min %d mallocs/op); slab pool should be bypassed for slab-free schemas", minMallocs)
+	}
+}
+
+// TestSlabFreeClassifier pins slab-free membership across the axes that
+// decide it: schema kind × logical type × custom wiring × cache-inherited
+// custom × resolution × opts presence.
+func TestSlabFreeClassifier(t *testing.T) {
+	free := []string{
+		`"null"`, `"boolean"`, `"int"`, `"long"`, `"float"`, `"double"`, `"bytes"`,
+		`{"type":"fixed","name":"F","size":4}`,
+		`{"type":"enum","name":"E","symbols":["A"]}`,
+		`{"type":"int","logicalType":"date"}`,
+		`{"type":"int","logicalType":"time-millis"}`,
+		`{"type":"long","logicalType":"time-micros"}`,
+		`{"type":"long","logicalType":"timestamp-millis"}`,
+		`{"type":"long","logicalType":"timestamp-nanos"}`,
+		`{"type":"long","logicalType":"local-timestamp-micros"}`,
+		`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`,
+		`{"type":"fixed","name":"FD","size":4,"logicalType":"decimal","precision":4,"scale":2}`,
+		`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`,
+		`{"type":"fixed","name":"D","size":12,"logicalType":"duration"}`,
+	}
+	needsSlab := []string{
+		`"string"`,
+		`{"type":"string","logicalType":"uuid"}`,
+		`{"type":"record","name":"R","fields":[{"name":"f","type":"long"}]}`,
+		`{"type":"array","items":"long"}`,
+		`{"type":"map","values":"long"}`,
+		`["null","long"]`,
+		// Recursive and diamond named-type shapes: the second-occurrence
+		// reference path can only appear under a composite kind, so it can
+		// never smuggle a slab-needing node beneath a slab-free top.
+		`{"type":"record","name":"L","fields":[{"name":"next","type":["null","L"]}]}`,
+		`{"type":"record","name":"Dia","fields":[{"name":"a","type":{"type":"fixed","name":"Sh","size":2}},{"name":"b","type":"Sh"}]}`,
+	}
+	for _, sch := range free {
+		if s := avro.MustParse(sch); !s.SlabFreeForTest() {
+			t.Errorf("schema %s: slabFree=false, want true", sch)
+		}
+	}
+	for _, sch := range needsSlab {
+		if s := avro.MustParse(sch); s.SlabFreeForTest() {
+			t.Errorf("schema %s: slabFree=true, want false", sch)
+		}
+	}
+
+	// A custom decoder on a scalar forces the pool: the wrapper reads and
+	// writes slab state (customMatches / bypassCustom).
+	ct := avro.CustomType{
+		AvroType: "fixed",
+		Decode:   func(v any, _ *avro.SchemaNode) (any, error) { return v, nil },
+	}
+	sc, err := avro.Parse(`{"type":"fixed","name":"CF","size":2}`, ct)
+	if err != nil {
+		t.Fatalf("custom parse: %v", err)
+	}
+	if sc.SlabFreeForTest() {
+		t.Error("custom-wired fixed: slabFree=true, want false")
+	}
+	var fxAny any
+	if _, err := sc.Decode([]byte{1, 2}, &fxAny); err != nil {
+		t.Errorf("custom-wired fixed decode: %v", err)
+	}
+
+	// Cache-inherited custom wraps: the defining parse wires the custom. A
+	// later reference parse (re-registering the same custom, as the cache
+	// requires) inherits the baked deser while its own overlay may stay
+	// empty, applyCustomTypes visiting only newly built nodes. It must
+	// therefore classify slab-needing through customBaked. The custom-free
+	// twin inherits a plain deser and stays slab-free.
+	ctEnum := avro.CustomType{
+		AvroType: "enum",
+		Decode:   func(v any, _ *avro.SchemaNode) (any, error) { return v, nil },
+	}
+	cc := &avro.SchemaCache{}
+	if _, err := cc.Parse(`{"type":"enum","name":"CE","symbols":["A","B"]}`, ctEnum); err != nil {
+		t.Fatalf("cache defining parse: %v", err)
+	}
+	ref, err := cc.Parse(`"CE"`, ctEnum)
+	if err != nil {
+		t.Fatalf("cache reference parse: %v", err)
+	}
+	if ref.SlabFreeForTest() {
+		t.Error("cache-inherited custom enum reference: slabFree=true, want false")
+	}
+	cc2 := &avro.SchemaCache{}
+	if _, err := cc2.Parse(`{"type":"enum","name":"CE","symbols":["A","B"]}`); err != nil {
+		t.Fatalf("cache defining parse (no custom): %v", err)
+	}
+	ref2, err := cc2.Parse(`"CE"`)
+	if err != nil {
+		t.Fatalf("cache reference parse (no custom): %v", err)
+	}
+	if !ref2.SlabFreeForTest() {
+		t.Error("cache-inherited plain enum reference: slabFree=false, want true")
+	}
+	var sym string
+	if _, err := ref2.Decode([]byte{2}, &sym); err != nil || sym != "B" {
+		t.Errorf("inherited enum nil-slab decode: %q, %v", sym, err)
+	}
+
+	// Non-identity resolution keeps the pool (zero value on the fresh
+	// Schema). Promote/skip paths use the slab: bytes-to-string promotion
+	// slab-copies, and resolved record skips bump the recursion depth.
+	res, err := avro.Resolve(avro.MustParse(`"bytes"`), avro.MustParse(`"string"`))
+	if err != nil {
+		t.Fatalf("resolve bytes→string: %v", err)
+	}
+	if res.SlabFreeForTest() {
+		t.Error("resolved bytes→string: slabFree=true, want false")
+	}
+	var str string
+	if _, err := res.Decode([]byte{2, 'x'}, &str); err != nil || str != "x" {
+		t.Errorf("resolved bytes→string decode: %q, %v", str, err)
+	}
+	// Identity resolution returns the reader itself; its own
+	// classification applies because its own deser runs.
+	ident, err := avro.Resolve(avro.MustParse(`"long"`), avro.MustParse(`"long"`))
+	if err != nil {
+		t.Fatalf("identity resolve: %v", err)
+	}
+	if !ident.SlabFreeForTest() {
+		t.Error("identity-resolved long: slabFree=false, want true")
+	}
+
+	// Opts on a slab-free schema take the pooled path (opts only ever
+	// alter slab state) and must stay correct.
+	var lv int64
+	if _, err := avro.MustParse(`"long"`).Decode([]byte{4}, &lv, avro.TaggedUnions()); err != nil || lv != 2 {
+		t.Errorf("slab-free decode with opts: %d, %v", lv, err)
+	}
+}
+
+// TestSlabFreeMatchesNilSlabOracle is the two-sided generative net. For every
+// matrix fragment in every context, the slab-free classification must exactly
+// equal the independent oracle "decoding every encoded value with a nil slab
+// does not panic". Too eager is a user-visible crash in Decode; too
+// conservative regresses issue #41. Non-vacuity: adding "string" to
+// slabFreeKinds fails the string cells, and hardcoding slabFree=false fails
+// every scalar cell the other way.
+func TestSlabFreeMatchesNilSlabOracle(t *testing.T) {
+	u := &uniq{}
+	var freeCells, pooledCells int
+	for _, fr := range matFrags() {
+		for _, cx := range matCtxs() {
+			if cx.skip != nil && cx.skip(fr.kind) {
+				continue
+			}
+			schema := cx.schema(fr.schema(u), fr.kind, u)
+			s, err := avro.Parse(schema)
+			if err != nil {
+				t.Fatalf("parse %s: %v", schema, err)
+			}
+			for _, val := range fr.values {
+				wv := cx.wrap(val)
+				wire, err := s.Encode(wv)
+				if err != nil {
+					t.Fatalf("encode %s %v: %v", schema, wv, err)
+				}
+				var nilGot any
+				panicked := false
+				var derr error
+				var rest []byte
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							panicked = true
+						}
+					}()
+					rest, derr = s.DeserNilSlabForTest(wire, &nilGot)
+				}()
+				if panicked == s.SlabFreeForTest() {
+					t.Fatalf("schema %s (frag %s, ctx %s): slabFree=%v but nil-slab decode panicked=%v",
+						schema, fr.label, cx.label, s.SlabFreeForTest(), panicked)
+				}
+				if panicked {
+					pooledCells++
+					continue
+				}
+				freeCells++
+				if derr != nil {
+					t.Fatalf("schema %s: nil-slab decode error: %v", schema, derr)
+				}
+				if len(rest) != 0 {
+					t.Fatalf("schema %s: nil-slab decode left %d bytes", schema, len(rest))
+				}
+				var poolGot any
+				if _, err := s.Decode(wire, &poolGot); err != nil {
+					t.Fatalf("schema %s: pooled decode error: %v", schema, err)
+				}
+				if !matEqual(nilGot, poolGot) {
+					t.Fatalf("schema %s value %v: nil-slab decode %v != pooled decode %v", schema, wv, nilGot, poolGot)
+				}
+			}
+		}
+	}
+	if freeCells == 0 || pooledCells == 0 {
+		t.Fatalf("vacuous net: %d slab-free cells, %d pooled cells — both sides must be exercised", freeCells, pooledCells)
+	}
+	t.Logf("oracle cells: %d slab-free, %d pooled", freeCells, pooledCells)
+}
+
+// ---------- named_byte_element_test.go ----------
+
+// A Go byte-container type whose element type is a named byte (type B byte;
+// [N]B, []B) has element Kind Uint8 but an element type that is not exactly
+// uint8. The byte encoder accepts such types, so by the encode/decode
+// target-type parity contract every decoder and the JSON encoder must too.
+// reflect.Copy and Set(reflect.ValueOf([]byte)) require an exactly-uint8
+// element and panic otherwise. That reaches the caller of a public API on a
+// valid Go value. We pin every fixed/bytes/uuid path on both wires, scalar and
+// as a struct field, and through bytes-to-string+uuid promotion.
+
+type nbeByte byte
+type nbeFix3 [3]nbeByte
+type nbeUUID [16]nbeByte
+type nbeSlice []nbeByte
+
+func TestMatrix_NamedByteElementRoundTrip(t *testing.T) {
+	uuidWire := nbeUUID{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe}
+
+	t.Run("fixed/binary", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
+		in := nbeFix3{1, 2, 3}
+		b := avrotest.MustAppendEncode(t, s, nil, in)
+		var out nbeFix3
+		avrotest.MustDecode(t, s, b, &out)
+		if out != in {
+			t.Fatalf("round-trip: got %v want %v", out, in)
+		}
+	})
+
+	t.Run("fixed/json", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
+		in := nbeFix3{1, 2, 3}
+		j := avrotest.MustAppendEncodeJSON(t, s, nil, in)
+		var out nbeFix3
+		avrotest.MustDecodeJSON(t, s, j, &out)
+		if out != in {
+			t.Fatalf("round-trip json: got %v want %v", out, in)
+		}
+	})
+
+	t.Run("bytes/array/binary", func(t *testing.T) {
+		s := avro.MustParse(`"bytes"`)
+		in := nbeFix3{4, 5, 6}
+		b := avrotest.MustAppendEncode(t, s, nil, in)
+		var out nbeFix3
+		avrotest.MustDecode(t, s, b, &out)
+		if out != in {
+			t.Fatalf("round-trip: got %v want %v", out, in)
+		}
+	})
+
+	t.Run("bytes/slice/binary+json", func(t *testing.T) {
+		s := avro.MustParse(`"bytes"`)
+		in := nbeSlice{7, 8, 9}
+		b := avrotest.MustAppendEncode(t, s, nil, in)
+		var out nbeSlice
+		avrotest.MustDecode(t, s, b, &out)
+		if !bytes.Equal([]byte(toBytes(out)), []byte{7, 8, 9}) {
+			t.Fatalf("round-trip: got %v", out)
+		}
+		j := avrotest.MustAppendEncodeJSON(t, s, nil, in)
+		var outJ nbeSlice
+		avrotest.MustDecodeJSON(t, s, j, &outJ)
+	})
+
+	t.Run("bytes/array->fixed-slice-target/binary", func(t *testing.T) {
+		// deserFixed's slice arm must SetBytes, not Set(reflect.ValueOf).
+		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
+		b := avrotest.MustAppendEncode(t, s, nil, nbeFix3{1, 2, 3})
+		var out nbeSlice
+		if _, err := s.Decode(b, &out); err != nil {
+			t.Fatalf("decode into named-byte slice: %v", err)
+		}
+		if len(out) != 3 {
+			t.Fatalf("got %v", out)
+		}
+	})
+
+	t.Run("uuid-fixed/binary+json", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`)
+		b := avrotest.MustAppendEncode(t, s, nil, uuidWire)
+		var out nbeUUID
+		avrotest.MustDecode(t, s, b, &out)
+		if out != uuidWire {
+			t.Fatalf("round-trip: got %v want %v", out, uuidWire)
+		}
+		j := avrotest.MustAppendEncodeJSON(t, s, nil, uuidWire)
+		var outJ nbeUUID
+		avrotest.MustDecodeJSON(t, s, j, &outJ)
+		if outJ != uuidWire {
+			t.Fatalf("round-trip json: got %v want %v", outJ, uuidWire)
+		}
+	})
+
+	t.Run("uuid-string->[16]named/binary+json", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"string","logicalType":"uuid"}`)
+		str := "01234567-89ab-cdef-1032-547698badcfe"
+		b := avrotest.MustAppendEncode(t, s, nil, str)
+		var out nbeUUID
+		avrotest.MustDecode(t, s, b, &out)
+		if out != uuidWire {
+			t.Fatalf("round-trip: got %v want %v", out, uuidWire)
+		}
+		j := avrotest.MustAppendEncodeJSON(t, s, nil, str)
+		var outJ nbeUUID
+		avrotest.MustDecodeJSON(t, s, j, &outJ)
+		if outJ != uuidWire {
+			t.Fatalf("round-trip json: got %v want %v", outJ, uuidWire)
+		}
+	})
+
+	t.Run("struct-field-fixed/unsafe-path/binary", func(t *testing.T) {
+		type R struct {
+			F nbeFix3
+		}
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"F","type":{"type":"fixed","name":"F3","size":3}}]}`)
+		in := R{F: nbeFix3{1, 2, 3}}
+		b := avrotest.MustAppendEncode(t, s, nil, in)
+		var out R
+		avrotest.MustDecode(t, s, b, &out)
+		if out != in {
+			t.Fatalf("round-trip: got %v want %v", out, in)
+		}
+	})
+
+	t.Run("struct-field-uuid/unsafe-path/binary", func(t *testing.T) {
+		type R struct {
+			U nbeUUID `avro:"u"`
+		}
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"u","type":{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}}]}`)
+		in := R{U: uuidWire}
+		b := avrotest.MustAppendEncode(t, s, nil, in)
+		var out R
+		avrotest.MustDecode(t, s, b, &out)
+		if out != in {
+			t.Fatalf("round-trip: got %v want %v", out, in)
+		}
+	})
+
+	t.Run("bytes->string+uuid promotion/[16]named", func(t *testing.T) {
+		// promoteBytesToStringUUID: writer bytes, reader string+uuid, target
+		// [16]named. reflect.Copy panics here; copyBytesToArray does not.
+		w := avro.MustParse(`"bytes"`)
+		r := avro.MustParse(`{"type":"string","logicalType":"uuid"}`)
+		res := avrotest.MustResolve(t, w, r)
+		// Writer encodes the 36-char canonical UUID string as bytes.
+		b := avrotest.MustAppendEncode(t, w, nil, []byte("01234567-89ab-cdef-1032-547698badcfe"))
+		var out nbeUUID
+		if _, err := res.Decode(b, &out); err != nil {
+			t.Fatalf("promoted decode: %v", err)
+		}
+		if out != uuidWire {
+			t.Fatalf("promotion round-trip: got %v want %v", out, uuidWire)
+		}
+	})
+}
+
+// toBytes converts a named byte slice to []byte for comparison.
+func toBytes(s nbeSlice) []byte {
+	b := make([]byte, len(s))
+	for i := range s {
+		b[i] = byte(s[i])
+	}
+	return b
+}
+
+// TestRegression_ExactByteContainersStillRoundTrip is the boundary-1 control.
+// The exact-uint8 element fast path (the common [N]byte / []byte case) must
+// keep working unchanged after the named-byte-element fix relaxed the copy
+// helpers.
+func TestRegression_ExactByteContainersStillRoundTrip(t *testing.T) {
+	t.Run("fixed/[3]byte", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
+		in := [3]byte{1, 2, 3}
+		b, _ := s.AppendEncode(nil, in)
+		var out [3]byte
+		if _, err := s.Decode(b, &out); err != nil || out != in {
+			t.Fatalf("got %v err %v", out, err)
+		}
+		j, _ := s.AppendEncodeJSON(nil, in)
+		var outJ [3]byte
+		if err := s.DecodeJSON(j, &outJ); err != nil || outJ != in {
+			t.Fatalf("json got %v err %v", outJ, err)
+		}
+	})
+	t.Run("uuid-fixed/[16]byte", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`)
+		in := [16]byte{1, 2, 3, 4}
+		b, _ := s.AppendEncode(nil, in)
+		var out [16]byte
+		if _, err := s.Decode(b, &out); err != nil || out != in {
+			t.Fatalf("got %v err %v", out, err)
+		}
+	})
+	t.Run("bytes/[]byte", func(t *testing.T) {
+		s := avro.MustParse(`"bytes"`)
+		in := []byte{9, 8, 7}
+		b, _ := s.AppendEncode(nil, in)
+		var out []byte
+		if _, err := s.Decode(b, &out); err != nil || !bytes.Equal(out, in) {
+			t.Fatalf("got %v err %v", out, err)
+		}
+	})
+}
+
+// ---------- unsafe_nullunion_nil_test.go ----------
+
+// The 2-branch ["null",T] optimization treats a value as the null branch
+// exactly when isNilValue reports it nil, peeling pointer/interface layers then
+// nil-checking the bottom kind. A non-nil pointer to a nil slice/map is
+// therefore null. The reflect-binary and JSON encoders both honor isNilValue,
+// and the unsafe struct fast path must agree. One value must encode to one
+// branch whether the struct is passed addressable or by value. A divergence is
+// addressability-dependent wire corruption.
+
+// nullUnionParity encodes v addressable (unsafe), by value (reflect), and as
+// JSON, then asserts all three pick the same union branch. The two binary wires
+// are byte-identical, the JSON wires are byte-identical, and the binary wire
+// decodes to wantNull (true => the field comes back nil/absent).
+func nullUnionParity(t *testing.T, schema string, v any, vptr any, wantNull bool) {
+	t.Helper()
+	s := avro.MustParse(schema)
+
+	wPtr, err := s.AppendEncode(nil, vptr) // addressable struct -> unsafe fast path
+	if err != nil {
+		t.Fatalf("Encode(&v): %v", err)
+	}
+	wVal, err := s.AppendEncode(nil, v) // non-addressable -> reflect path
+	if err != nil {
+		t.Fatalf("Encode(v): %v", err)
+	}
+	if !bytes.Equal(wPtr, wVal) {
+		t.Errorf("binary branch divergence (addressable vs value): Encode(&v)=% x  Encode(v)=% x", wPtr, wVal)
+	}
+
+	jPtr, err := s.AppendEncodeJSON(nil, vptr)
+	if err != nil {
+		t.Fatalf("EncodeJSON(&v): %v", err)
+	}
+	jVal, err := s.AppendEncodeJSON(nil, v)
+	if err != nil {
+		t.Fatalf("EncodeJSON(v): %v", err)
+	}
+	if !bytes.Equal(jPtr, jVal) {
+		t.Errorf("JSON branch divergence (addressable vs value): EncodeJSON(&v)=%s  EncodeJSON(v)=%s", jPtr, jVal)
+	}
+
+	// The unsafe binary wire must agree with JSON on the branch too. Decode the
+	// unsafe binary wire into a map and confirm the field is/isn't null.
+	var got map[string]any
+	if _, err := s.Decode(wPtr, &got); err != nil {
+		t.Fatalf("Decode(Encode(&v)): %v", err)
+	}
+	isNull := got["f"] == nil
+	if isNull != wantNull {
+		t.Errorf("decode(Encode(&v)).f null=%v, want null=%v (value=%#v; wire=% x)", isNull, wantNull, got["f"], wPtr)
+	}
+}
+
+func TestMatrix_NullUnionPtrToNilSliceEncodeParity(t *testing.T) {
+	t.Run("ptr-to-nil-slice/array-null-first", func(t *testing.T) {
+		var nilSlice []string
+		nullUnionParity(t,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["null",{"type":"array","items":"string"}]}]}`,
+			Rec{F: &nilSlice}, &Rec{F: &nilSlice}, true)
+	})
+
+	t.Run("ptr-to-nil-slice/array-null-second", func(t *testing.T) {
+		var nilSlice []string
+		nullUnionParity(t,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":[{"type":"array","items":"string"},"null"]}]}`,
+			Rec{F: &nilSlice}, &Rec{F: &nilSlice}, true)
+	})
+
+	t.Run("ptr-to-nil-bytes", func(t *testing.T) {
+		type Rec struct {
+			F *[]byte `avro:"f"`
+		}
+		var nilBytes []byte
+		nullUnionParity(t,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["null","bytes"]}]}`,
+			Rec{F: &nilBytes}, &Rec{F: &nilBytes}, true)
+	})
+
+	t.Run("array-element-ptr-to-nil-slice", func(t *testing.T) {
+		type Rec struct {
+			A []*[]string `avro:"a"`
+		}
+		var nilSlice []string
+		// One element: a non-nil pointer to a nil slice -> that element is the
+		// null branch; reflect/JSON agree, unsafe must too.
+		s := `{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":["null",{"type":"array","items":"string"}]}}]}`
+		sc := avro.MustParse(s)
+		wPtr, err := sc.AppendEncode(nil, &Rec{A: []*[]string{&nilSlice}})
+		if err != nil {
+			t.Fatalf("Encode(&v): %v", err)
+		}
+		wVal, err := sc.AppendEncode(nil, Rec{A: []*[]string{&nilSlice}})
+		if err != nil {
+			t.Fatalf("Encode(v): %v", err)
+		}
+		if !bytes.Equal(wPtr, wVal) {
+			t.Errorf("array-element branch divergence: Encode(&v)=% x  Encode(v)=% x", wPtr, wVal)
+		}
+		jPtr, _ := sc.AppendEncodeJSON(nil, &Rec{A: []*[]string{&nilSlice}})
+		jVal, _ := sc.AppendEncodeJSON(nil, Rec{A: []*[]string{&nilSlice}})
+		if !bytes.Equal(jPtr, jVal) {
+			t.Errorf("array-element JSON divergence: %s vs %s", jPtr, jVal)
+		}
+	})
+}
+
+func TestRegression_NullUnionPtrToNilMapEncodeParity(t *testing.T) {
+	type Rec struct {
+		F *map[string]string `avro:"f"`
+	}
+	var nilMap map[string]string
+	nullUnionParity(t,
+		`{"type":"record","name":"R","fields":[{"name":"f","type":["null",{"type":"map","values":"string"}]}]}`,
+		Rec{F: &nilMap}, &Rec{F: &nilMap}, true)
+}
+
+func TestRegression_NullUnionPtrToNonNilSliceControl(t *testing.T) {
+	// Control: a non-nil slice behind the pointer is the value branch on every
+	// path.
+	good := []string{"x"}
+	nullUnionParity(t,
+		`{"type":"record","name":"R","fields":[{"name":"f","type":["null",{"type":"array","items":"string"}]}]}`,
+		Rec{F: &good}, &Rec{F: &good}, false)
+}
+
+// ---------- omitzero_bsoft_test.go ----------
+
+// TestMatrix_OmitzeroFillsSchemaDefault pins the b-soft omitzero contract. On a
+// zero/IsZero value, omitzero encodes the field's default if it has one, else
+// null if the field is nullable, else nothing (encoding the zero, a forced
+// no-op). It therefore matches map[string]any default-fill wherever a default
+// exists. It deliberately diverges for a nullable field with no default, where
+// omitzero encodes null while map-fill errors ("missing key").
+func TestMatrix_OmitzeroFillsSchemaDefault(t *testing.T) {
+	type R struct {
+		Count int `avro:"Count,omitzero"`
+	}
+	cases := []struct {
+		name, schema, wantHex string
+		mapParity             bool // struct-omitzero wire must equal map{} default-fill wire
+	}{
+		// With a default, fill it. Matches map-fill.
+		{"non-union int default", `{"type":"record","name":"R","fields":[{"name":"Count","type":"int","default":10}]}`, "14", true},
+		{"null-second union default", `{"type":"record","name":"R","fields":[{"name":"Count","type":["int","null"],"default":5}]}`, "000a", true},
+		// Nullable with no default gives null; map-fill errors instead.
+		{"null-second union no default", `{"type":"record","name":"R","fields":[{"name":"Count","type":["int","null"]}]}`, "02", false},
+		// Non-union with no default is a no-op: encode the zero.
+		{"non-union int no default", `{"type":"record","name":"R","fields":[{"name":"Count","type":"int"}]}`, "00", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := avro.MustParse(tc.schema)
+			structWire, err := s.AppendEncode(nil, R{Count: 0})
+			if err != nil {
+				t.Fatalf("encode struct: %v", err)
+			}
+			if got := fmt.Sprintf("%x", structWire); got != tc.wantHex {
+				t.Errorf("omitzero wire = %s, want %s", got, tc.wantHex)
+			}
+			// The unsafe (addressable) path must agree with the reflect path.
+			// It delegates actionable omitzero to the reflect slow path, so we
+			// pin here that the delegation stays correct.
+			ptrWire, err := s.AppendEncode(nil, &R{Count: 0})
+			if err != nil {
+				t.Fatalf("encode &struct (unsafe path): %v", err)
+			}
+			if !bytes.Equal(structWire, ptrWire) {
+				t.Errorf("unsafe path diverges from reflect: value=%x ptr=%x", structWire, ptrWire)
+			}
+			if tc.mapParity {
+				// Binary parity with map[string]any default-fill (the oracle).
+				mapWire, err := s.AppendEncode(nil, map[string]any{})
+				if err != nil {
+					t.Fatalf("encode map{}: %v", err)
+				}
+				if !bytes.Equal(structWire, mapWire) {
+					t.Errorf("omitzero != map default-fill (binary): struct=%x map=%x", structWire, mapWire)
+				}
+				// JSON path parity with the same oracle.
+				sj, err := s.EncodeJSON(R{Count: 0})
+				if err != nil {
+					t.Fatalf("encode struct JSON: %v", err)
+				}
+				mj, err := s.EncodeJSON(map[string]any{})
+				if err != nil {
+					t.Fatalf("encode map{} JSON: %v", err)
+				}
+				if !bytes.Equal(sj, mj) {
+					t.Errorf("omitzero != map default-fill (JSON): struct=%s map=%s", sj, mj)
+				}
+			}
+		})
+	}
+}
+
+// assertTwinWire requires s and its directly-parsed twin to encode in to the
+// same bytes, the oracle-independent anchor for every cache/splice cell. Equal
+// wire proves the two *are* the same logical schema, so a metadata divergence
+// is provably a metadata bug. It returns s's wire for callers that go on to
+// decode it.
+func assertTwinWire(t *testing.T, s, twin *avro.Schema, in any) []byte {
+	t.Helper()
+	wire, wireTwin := avrotest.MustEncode(t, s, in), avrotest.MustEncode(t, twin, in)
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
+	}
+	return wire
+}
