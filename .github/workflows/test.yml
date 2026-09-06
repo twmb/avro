@@ -31,15 +31,35 @@ jobs:
   # per target a PR can afford it found almost nothing while costing 7m36s of
   # a 9m46s run. Discovery moved to fuzz.yml, which runs on a schedule with a
   # budget that can actually find something.
+  #
+  # The matrix covers both encoding/json implementations. Go 1.27 made the v2
+  # implementation the default, and it names map keys and spells invalid
+  # UTF-8 differently from v1. The package pins its own answers to both
+  # (mapKeyName, validUTF8), and this is the only place that is checked
+  # against the real thing rather than restated: 1.26 is v1, 1.26 with the
+  # experiment is v2 on the older toolchain, and 1.27 is v2 as shipped.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - go: "1.26"
+            experiment: ""
+          - go: "1.26"
+            experiment: "jsonv2"
+          - go: "1.27"
+            experiment: ""
+    name: test (go ${{ matrix.go }}${{ matrix.experiment && format(', GOEXPERIMENT={0}', matrix.experiment) || '' }})
+    env:
+      GOEXPERIMENT: ${{ matrix.experiment }}
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version: ${{ matrix.go }}
 
       - run: go test -race ./...
 

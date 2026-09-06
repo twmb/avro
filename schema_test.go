@@ -6828,7 +6828,10 @@ func cvHostileValues() []cvHostile {
 		{name: "complex", val: complex(1, 2)},
 		{name: "cyclicMap", val: cvCyclicMap()},
 		{name: "cyclicSlice", val: cvCyclicSlice()},
-		{name: "floatKeyMap", val: map[float64]string{1.5: "a"}},
+		{
+			name: "floatKeyMap", val: map[float64]string{1.5: "a"}, override: "error",
+			why: "the v1 stdlib refuses a float-kind map key and the v2 stdlib (Go 1.27) formats it; a float has no single text form, so this package refuses it on every toolchain (mapKeyName)",
+		},
 		{name: "structKeyMap", val: map[cvBadKey]string{{X: 1}: "a"}},
 		{name: "invalidRawMessage", val: json.RawMessage("{oops")},
 		{name: "nonNumericJSONNumber", val: json.Number("notanumber")},
@@ -8442,15 +8445,18 @@ func TestMatrix_TreeValueNilEmptyImage(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Map keys of string kind always marshal as their raw string under
-// encoding/json: the key resolver checks the string kind before consulting
-// TextMarshaler. So a map whose key type is string-kind, with or without a
-// MarshalText method, is image-identical to the plain map[string]any twin and
-// canonicalizes to it. The walkers see its defs, the fixups reach its values,
-// and the composed output does not depend on which stdlib JSON implementation
-// a future toolchain ships. Non-string-kind keys with MarshalText keep the
-// method on every toolchain, executed both ways, with and without
-// GOEXPERIMENT=jsonv2, so those maps remain marshal-opaque image-owners.
+// A map key is named by mapKeyName on every toolchain, so a string-kind key
+// with a MarshalText method renders as that text, the rule the v2
+// encoding/json follows and the v1 one did not. A key type whose MarshalText
+// has a pointer receiver, used as a value key, does not have the method in
+// its method set, so both implementations and this package name it by the
+// raw string. The two string-kind shapes below therefore have different
+// plain twins: the value-receiver shape's twin carries the MarshalText
+// names, the pointer-receiver shape's twin is the plain map. Each shape must
+// compose exactly like its twin: null-namespace pin applied, defs
+// deduplicated, byte values codepoint-fixed, Props parity on rebuild.
+// Non-string-kind keys with MarshalText keep the method under both
+// implementations, so those maps remain marshal-opaque image-owners.
 
 type tvIntTextKey int
 
@@ -8462,11 +8468,35 @@ type tvTextKeyPtr string
 
 func (k *tvTextKeyPtr) MarshalText() ([]byte, error) { return []byte(string(*k) + "P"), nil }
 
+// tvTextStrSame is a string-kind key whose MarshalText returns the key
+// itself, so a def carried under it is still a def once named.
+type tvTextStrSame string
+
+func (s tvTextStrSame) MarshalText() ([]byte, error) { return []byte(s), nil }
+
+// sameOutcome requires two builds to agree: both fail with the same error, or
+// both succeed with the same text.
+func sameOutcome(t *testing.T, what, got string, gotErr error, want string, wantErr error) {
+	t.Helper()
+	switch {
+	case (gotErr == nil) != (wantErr == nil):
+		t.Errorf("%s: shape err=%v, twin err=%v", what, gotErr, wantErr)
+	case gotErr != nil:
+		if gotErr.Error() != wantErr.Error() {
+			t.Errorf("%s: shape err %q, twin err %q", what, gotErr, wantErr)
+		}
+	case got != want:
+		t.Errorf("%s diverges from the plain twin:\n twin:  %s\n shape: %s", what, want, got)
+	}
+}
+
 // TestRegression_StringKindTextKeyMapComposesAsPlainMap pins the name-identity
 // consequence: a def carried in a string-kind+MarshalText keyed map composes
 // exactly like the plain-map twin, null-namespace pin included. We observe
 // name identity through Canonical(), since String() renders namespaces
-// relative.
+// relative. The key type's MarshalText returns the key itself, so the def
+// keeps its keys: what is under test is that the walkers see through the key
+// type, not what they name it.
 func TestRegression_StringKindTextKeyMapComposesAsPlainMap(t *testing.T) {
 	primary := reflect.TypeFor[scopeMatrixPrimary]()
 	fields := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
@@ -8489,9 +8519,9 @@ func TestRegression_StringKindTextKeyMapComposesAsPlainMap(t *testing.T) {
 	if !strings.Contains(control, `"name":"X"`) {
 		t.Fatalf("anchored control lost the null-namespace pin: %s", control)
 	}
-	tmDef := map[tvTextStr]any{}
+	tmDef := map[tvTextStrSame]any{}
 	for k, v := range xDef() {
-		tmDef[tvTextStr(k)] = v
+		tmDef[tvTextStrSame(k)] = v
 	}
 	got, err := build(tmDef)
 	if err != nil {
@@ -8505,13 +8535,14 @@ func TestRegression_StringKindTextKeyMapComposesAsPlainMap(t *testing.T) {
 // TestRegression_StringKindTextKeyMapBytesFixup pins the content consequence
 // on the plain rebuild surface. A []byte inside a string-kind text-keyed map
 // gets the codepoint fixup exactly like the plain-map twin (base64 leaking
-// through would silently change the re-read content).
+// through would silently change the re-read content). The twin carries the
+// MarshalText name, since that is the name the map renders under.
 func TestRegression_StringKindTextKeyMapBytesFixup(t *testing.T) {
-	control, err := treeValuePropsObserved(t, "rebuild", map[string]any{"b": []byte{1, 2, 3}})
+	control, err := treeValuePropsObserved(t, "rebuild", map[string]any{"b?": []byte{1, 2, 3}})
 	if err != nil {
 		t.Fatalf("plain map: %v", err)
 	}
-	want := map[string]any{"b": "\x01\x02\x03"}
+	want := map[string]any{"b?": "\x01\x02\x03"}
 	if !reflect.DeepEqual(control, want) {
 		t.Fatalf("anchored control: plain map rebuilds as %#v, want %#v", control, want)
 	}
@@ -8524,15 +8555,16 @@ func TestRegression_StringKindTextKeyMapBytesFixup(t *testing.T) {
 	}
 }
 
-// TestMatrix_TreeValueMapKeyShapes: key shape × consequence surface. The
-// string-kind shapes (plain, MarshalText value receiver, MarshalText pointer
-// receiver) are image-identical, which we assert as an executed premise per
-// cell family. They must compose identically: null-namespace pin applied, defs
-// deduplicated, byte values codepoint-fixed, Props parity on rebuild. The
-// int-kind MarshalText shape is the documented opaque image-owner. Its marshal
-// (method output keys, base64 bytes) is the contract, defs inside are
-// invisible to the walkers, and a duplicated invisible def stays a loud
-// Parse-side reject.
+// TestMatrix_TreeValueMapKeyShapes: key shape x consequence surface. Each
+// string-kind shape must compose exactly like its plain twin on every
+// surface: null-namespace pin applied, defs deduplicated, byte values
+// codepoint-fixed, Props parity on rebuild. The value-receiver shape's twin
+// carries the MarshalText names, so a def under it is no longer a def and the
+// twin and the shape must fail alike; the pointer-receiver shape's twin is
+// the plain map. The int-kind MarshalText shape is the documented opaque
+// image-owner. Its marshal (method output keys, base64 bytes) is the
+// contract, defs inside are invisible to the walkers, and a duplicated
+// invisible def stays a loud Parse-side reject.
 func TestMatrix_TreeValueMapKeyShapes(t *testing.T) {
 	primary := reflect.TypeFor[scopeMatrixPrimary]()
 	oneField := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
@@ -8543,6 +8575,13 @@ func TestMatrix_TreeValueMapKeyShapes(t *testing.T) {
 	xDef := func() map[string]any {
 		return map[string]any{"type": "record", "name": "X",
 			"fields": []any{map[string]any{"name": "c", "type": "long"}}}
+	}
+	renamed := func(m map[string]any, f func(string) string) map[string]any {
+		out := map[string]any{}
+		for k, v := range m {
+			out[f(k)] = v
+		}
+		return out
 	}
 	asTextKey := func(m map[string]any) map[tvTextStr]any {
 		out := map[tvTextStr]any{}
@@ -8559,13 +8598,24 @@ func TestMatrix_TreeValueMapKeyShapes(t *testing.T) {
 		return out
 	}
 
-	t.Run("premise_string_kind_keys_marshal_raw", func(t *testing.T) {
-		plain := map[string]any{"a": 1}
-		for _, v := range []any{map[tvTextStr]any{"a": 1}, map[tvTextKeyPtr]any{"a": 1}} {
-			pb, perr := json.Marshal(plain)
-			vb, verr := json.Marshal(v)
-			if perr != nil || verr != nil || string(pb) != string(vb) {
-				t.Fatalf("string-kind key premise: %T marshals %s (%v), plain %s (%v)", v, vb, verr, pb, perr)
+	t.Run("premise_string_kind_key_names", func(t *testing.T) {
+		// Executed against the package, which is the authority for this
+		// question: a value-receiver MarshalText names the key, and a
+		// pointer-receiver one on a value key is not in its method set and
+		// does not.
+		for _, tc := range []struct {
+			v    any
+			want string
+		}{
+			{map[tvTextStr]any{"a": 1}, `"a?":1`},
+			{map[tvTextKeyPtr]any{"a": 1}, `"a":1`},
+		} {
+			s, err := propsNode(tc.v).Schema()
+			if err != nil {
+				t.Fatalf("%T: %v", tc.v, err)
+			}
+			if got := s.String(); !strings.Contains(got, `"p":{`+tc.want+`}`) {
+				t.Fatalf("%T renders %s, want the member %s", tc.v, got, tc.want)
 			}
 		}
 	})
@@ -8577,17 +8627,29 @@ func TestMatrix_TreeValueMapKeyShapes(t *testing.T) {
 	})
 
 	shapes := []struct {
-		name   string
-		items  func() any // the pin/dedup def carrier
-		bytes  any        // the fixup carrier
-		opaque bool
+		name      string
+		items     func() any // the pin/dedup def carrier
+		twin      func() any // the plain map items must compose like
+		bytes     any        // the fixup carrier
+		bytesTwin any
+		kv        any // the rebuild carrier
+		kvTwin    any
+		opaque    bool
 	}{
 		{name: "string_text_key",
-			items: func() any { return asTextKey(xDef()) },
-			bytes: map[tvTextStr]any{"b": []byte{1, 2, 3}}},
+			items:     func() any { return asTextKey(xDef()) },
+			twin:      func() any { return renamed(xDef(), func(k string) string { return k + "?" }) },
+			bytes:     map[tvTextStr]any{"b": []byte{1, 2, 3}},
+			bytesTwin: map[string]any{"b?": []byte{1, 2, 3}},
+			kv:        map[tvTextStr]any{"k": "v"},
+			kvTwin:    map[string]any{"k?": "v"}},
 		{name: "string_ptr_text_key",
-			items: func() any { return asPtrTextKey(xDef()) },
-			bytes: map[tvTextKeyPtr]any{"b": []byte{1, 2, 3}}},
+			items:     func() any { return asPtrTextKey(xDef()) },
+			twin:      func() any { return xDef() },
+			bytes:     map[tvTextKeyPtr]any{"b": []byte{1, 2, 3}},
+			bytesTwin: map[string]any{"b": []byte{1, 2, 3}},
+			kv:        map[tvTextKeyPtr]any{"k": "v"},
+			kvTwin:    map[string]any{"k": "v"}},
 		{name: "int_text_key_opaque",
 			items:  func() any { return map[tvIntTextKey]any{} },
 			bytes:  map[tvIntTextKey]any{2: []byte{1, 2, 3}},
@@ -8612,27 +8674,14 @@ func TestMatrix_TreeValueMapKeyShapes(t *testing.T) {
 		}
 		for _, sh := range shapes {
 			if sh.opaque {
-				continue // the opaque def carrier has no X inside; posture covered below
+				continue
 			}
 			t.Run(sh.name, func(t *testing.T) {
-				got, err := build(oneField, sh.items())
-				if err != nil {
-					t.Fatalf("build: %v", err)
-				}
-				if got != control {
-					t.Errorf("pin diverges from the plain twin:\n plain: %s\n shape: %s", control, got)
-				}
+				want, wantErr := build(oneField, sh.twin())
+				got, gotErr := build(oneField, sh.items())
+				sameOutcome(t, "pin", got, gotErr, want, wantErr)
 			})
 		}
-		t.Run("int_text_key_opaque_posture", func(t *testing.T) {
-			// An int-keyed map at a structural position marshals
-			// verbatim as its own keyed object, never a valid
-			// schema there. So the build is a loud Parse-side
-			// reject, not a silent rebind.
-			if _, err := build(oneField, map[tvIntTextKey]any{1: xDef()}); err == nil {
-				t.Errorf("opaque map as the items schema: want the loud Parse reject, got success")
-			}
-		})
 	})
 
 	t.Run("dedup", func(t *testing.T) {
@@ -8656,13 +8705,9 @@ func TestMatrix_TreeValueMapKeyShapes(t *testing.T) {
 				continue
 			}
 			t.Run(sh.name, func(t *testing.T) {
-				got, err := build(sh.items)
-				if err != nil {
-					t.Fatalf("build: %v", err)
-				}
-				if got != control {
-					t.Errorf("dedup diverges from the plain twin:\n plain: %s\n shape: %s", control, got)
-				}
+				want, wantErr := build(sh.twin)
+				got, gotErr := build(sh.items)
+				sameOutcome(t, "dedup", got, gotErr, want, wantErr)
 			})
 		}
 	})
@@ -8688,36 +8733,33 @@ func TestMatrix_TreeValueMapKeyShapes(t *testing.T) {
 					}
 					return
 				}
-				if !reflect.DeepEqual(got, control) {
-					t.Errorf("fixup diverges: got %#v, plain twin %#v", got, control)
+				want, err := treeValuePropsObserved(t, "rebuild", sh.bytesTwin)
+				if err != nil {
+					t.Fatalf("twin: %v", err)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("fixup diverges: got %#v, plain twin %#v", got, want)
 				}
 			})
 		}
 	})
 
 	t.Run("rebuild", func(t *testing.T) {
-		control, err := treeValuePropsObserved(t, "rebuild", map[string]any{"k": "v"})
-		if err != nil {
-			t.Fatalf("plain control: %v", err)
-		}
 		for _, sh := range shapes {
 			if sh.opaque {
 				continue
 			}
 			t.Run(sh.name, func(t *testing.T) {
-				var m any
-				switch sh.name {
-				case "string_text_key":
-					m = map[tvTextStr]any{"k": "v"}
-				default:
-					m = map[tvTextKeyPtr]any{"k": "v"}
-				}
-				got, err := treeValuePropsObserved(t, "rebuild", m)
+				got, err := treeValuePropsObserved(t, "rebuild", sh.kv)
 				if err != nil {
 					t.Fatalf("rebuild: %v", err)
 				}
-				if !reflect.DeepEqual(got, control) {
-					t.Errorf("rebuild diverges: got %#v, plain twin %#v", got, control)
+				want, err := treeValuePropsObserved(t, "rebuild", sh.kvTwin)
+				if err != nil {
+					t.Fatalf("twin: %v", err)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("rebuild diverges: got %#v, plain twin %#v", got, want)
 				}
 			})
 		}
@@ -8731,6 +8773,155 @@ func TestMatrix_TreeValueMapKeyShapes(t *testing.T) {
 			}
 		})
 	})
+}
+
+// The three places encoding/json changed between its v1 and v2
+// implementations (Go 1.26 and Go 1.27) are each a rule this package owns, so
+// a hand-built tree renders the same bytes on every toolchain:
+//
+//   - a string-kind map key with a MarshalText method renders as that text,
+//     and a failing MarshalText is an error. v1 ignored the method for string
+//     kinds while honoring it for every other kind; v2 honors it everywhere.
+//   - a float-kind map key is an error. v2 formats it, but a float has no
+//     single text form, so we keep v1's refusal.
+//   - invalid UTF-8 in a string or key becomes a real U+FFFD, three bytes,
+//     never the six-byte \ufffd escape. v1 escaped, v2 does not.
+//
+// Each rule is crossed with both composition surfaces and with the value's
+// position: alone, or beside a +Inf that forces the canonicalizing copy to
+// run. The position axis is what caught the original bug. On a v2 toolchain
+// the lazy copy honored MarshalText only when a sibling happened to need a
+// fixup, so one Go value rendered as two different schemas.
+type pinnedTextKey string
+
+func (k pinnedTextKey) MarshalText() ([]byte, error) { return []byte("text:" + string(k)), nil }
+
+type pinnedFailKey string
+
+func (pinnedFailKey) MarshalText() ([]byte, error) { return nil, errors.New("pinned-key-boom") }
+
+type pinnedNamedString string
+
+func TestMatrix_TreeValueJSONRulesPinned(t *testing.T) {
+	primary := reflect.TypeFor[scopeMatrixPrimary]()
+	fields := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
+	// observe composes v as a Props value through surface and returns the
+	// observed value plus the schema text it rode in.
+	observe := func(t *testing.T, surface string, v any) (any, string, error) {
+		t.Helper()
+		if surface == "rebuild" {
+			s, err := (&SchemaNode{Type: "int", Props: map[string]any{"x": v}}).Schema()
+			if err != nil {
+				return nil, "", err
+			}
+			return s.Root().Props["x"], s.String(), nil
+		}
+		node := &SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"x": v}}
+		s, err := schemaForScopeCell(t, fields, "", []CustomType{{GoType: primary, Schema: node}})
+		if err != nil {
+			return nil, "", err
+		}
+		return s.Root().Fields[0].Type.Props["x"], s.String(), nil
+	}
+
+	positions := []struct {
+		name string
+		wrap func(v any) any
+		path []string
+	}{
+		{"alone", func(v any) any { return v }, nil},
+		{"beside-fixup", func(v any) any {
+			return map[string]any{"inf": math.Inf(1), "v": v}
+		}, []string{"v"}},
+	}
+	rules := []struct {
+		name string
+		v    any
+		want any    // observed Root() value
+		err  string // non-empty: must fail, carrying this text
+		utf8 bool   // the text must carry a raw U+FFFD and no \ufffd escape
+	}{
+		{name: "string-kind key MarshalText", v: map[pinnedTextKey]any{"k": "v"},
+			want: map[string]any{"text:k": "v"}},
+		{name: "string-kind key MarshalText nested", v: map[string]any{"m": map[pinnedTextKey]any{"k": "v"}},
+			want: map[string]any{"m": map[string]any{"text:k": "v"}}},
+		{name: "string-kind key MarshalText fails", v: map[pinnedFailKey]any{"k": "v"},
+			err: "pinned-key-boom"},
+		{name: "float-kind key", v: map[float64]int{1.5: 1},
+			err: "no JSON object-key form"},
+		{name: "invalid UTF-8 string", v: "a\x80b", want: "a\uFFFDb", utf8: true},
+		{name: "invalid UTF-8 named string", v: pinnedNamedString("a\x80b"), want: "a\uFFFDb", utf8: true},
+		{name: "invalid UTF-8 map key", v: map[string]any{"k\x80": "v"},
+			want: map[string]any{"k\uFFFD": "v"}, utf8: true},
+		{name: "invalid UTF-8 in []string", v: []string{"a\x80b"}, want: []any{"a\uFFFDb"}, utf8: true},
+		{name: "invalid UTF-8 in MarshalText key", v: map[pinnedTextKey]any{"\x80": "v"},
+			want: map[string]any{"text:\uFFFD": "v"}, utf8: true},
+	}
+	for _, surface := range treeValueSurfaces {
+		for _, pos := range positions {
+			for _, r := range rules {
+				t.Run(surface+"/"+pos.name+"/"+r.name, func(t *testing.T) {
+					got, text, err := observe(t, surface, pos.wrap(r.v))
+					if r.err != "" {
+						if err == nil {
+							t.Fatalf("built %s; want an error carrying %q", text, r.err)
+						}
+						if !strings.Contains(err.Error(), r.err) {
+							t.Fatalf("error %v does not carry %q", err, r.err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("build: %v", err)
+					}
+					for _, step := range pos.path {
+						m, ok := got.(map[string]any)
+						if !ok {
+							t.Fatalf("observed value is not an object at %q: %#v", step, got)
+						}
+						got = m[step]
+					}
+					if !reflect.DeepEqual(got, r.want) {
+						t.Errorf("observed %#v, want %#v", got, r.want)
+					}
+					if r.utf8 {
+						if strings.Contains(text, `\ufffd`) {
+							t.Errorf("schema text escapes the replacement character; it must be the raw three bytes: %s", text)
+						}
+						if !strings.Contains(text, "\uFFFD") {
+							t.Errorf("schema text carries no replacement character: %s", text)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestRegression_HandBuiltDocInvalidUTF8 pins the same replacement for the
+// structural strings a hand-built node carries, the doc on a node and on a
+// field, which reach the emitter through emitString rather than the value
+// walk. A name cannot carry an invalid byte: the strict name grammar rejects
+// it, and a lax validator that admits one gets the same replacement at Parse.
+func TestRegression_HandBuiltDocInvalidUTF8(t *testing.T) {
+	n := &SchemaNode{Type: "record", Name: "R", Doc: "a\x80b", Fields: []SchemaField{
+		{Name: "f", Type: SchemaNode{Type: "int"}, Doc: "c\x80d"},
+	}}
+	s, err := n.Schema()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	text := s.String()
+	if strings.Contains(text, `\ufffd`) {
+		t.Errorf("schema text escapes the replacement character; it must be the raw three bytes: %s", text)
+	}
+	if strings.Count(text, "\uFFFD") != 2 {
+		t.Errorf("schema text should carry two replacement characters: %s", text)
+	}
+	r := s.Root()
+	if r.Doc != "a\uFFFDb" || r.Fields[0].Doc != "c\uFFFDd" {
+		t.Errorf("docs read back as %q and %q", r.Doc, r.Fields[0].Doc)
+	}
 }
 
 // ---------- matrix_alias_resolution_test.go ----------
@@ -15709,9 +15900,15 @@ func callNoPanic(fn func() (string, error)) (out string, err error, panicked any
 	return
 }
 
-// The map-key charge arm exists to mirror encoding/json's resolveKeyName. So
-// that function, not a restatement of its rules, decides every cell here. For
-// each key shape: whatever json.Marshal makes of the value is what
+// resolverTextKey is a string-kind key with a MarshalText, the one shape the
+// two encoding/json implementations name differently.
+type resolverTextKey string
+
+func (k resolverTextKey) MarshalText() ([]byte, error) { return []byte("t:" + string(k)), nil }
+
+// The map-key charge arm mirrors encoding/json's key resolver wherever the v1
+// and v2 implementations agree, and for those cells json.Marshal itself, not
+// a restatement of its rules, decides: whatever it makes of the value is what
 // SchemaNode.Schema must make of it as a Props value. If json can name the
 // keys, the walk must emit exactly those bytes. If it cannot, the walk must
 // fail with a named error. The walk may never panic, including on the shapes
@@ -15720,32 +15917,33 @@ func callNoPanic(fn func() (string, error)) (out string, err error, panicked any
 // without calling the method. A nil interface key is one its resolver admits
 // and then cannot name. We use single-key maps throughout, so a byte
 // comparison against the authority is exact.
+//
+// Two cells are the package's own rule, stated rather than read from the
+// oracle, because the two implementations disagree there (mapKeyName): a
+// string-kind key with a MarshalText is named by that text, and a float-kind
+// key is refused.
 func TestMatrix_WalkBudgetMapKeyMatchesJSONKeyResolver(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		v    any
+		name   string
+		v      any
+		pinned string // non-empty: the member the package must emit
+		refuse string // non-empty: the package must refuse, for this reason
 	}{
-		{"string-kind", map[string]int{"a": 1}},
-		{"named-string-kind", map[namedStringKey]int{"a": 1}},
-		{"int-negative", map[int]int{-1: 1}},
-		{"int64-min", map[int64]int{math.MinInt64: 1}},
-		{"uint64-max", map[uint64]int{math.MaxUint64: 1}},
-		{"value-textmarshaler", map[textKeyVal]int{{s: "a"}: 1}},
-		{"pointer-textmarshaler", map[*textKeyPtr]int{{s: "a"}: 1}},
-		{"pointer-textmarshaler-nil", map[*textKeyPtr]int{nil: 1}},
-		{"interface-textmarshaler", map[encoding.TextMarshaler]int{textKeyVal{s: "a"}: 1}},
-		{"interface-textmarshaler-nil", map[encoding.TextMarshaler]int{nil: 1}},
-		{"float-kind", map[float64]int{1.5: 1}},
-		{"array-kind", map[[2]int]int{{1, 2}: 1}},
+		{name: "string-kind", v: map[string]int{"a": 1}},
+		{name: "named-string-kind", v: map[namedStringKey]int{"a": 1}},
+		{name: "int-negative", v: map[int]int{-1: 1}},
+		{name: "int64-min", v: map[int64]int{math.MinInt64: 1}},
+		{name: "uint64-max", v: map[uint64]int{math.MaxUint64: 1}},
+		{name: "value-textmarshaler", v: map[textKeyVal]int{{s: "a"}: 1}},
+		{name: "pointer-textmarshaler", v: map[*textKeyPtr]int{{s: "a"}: 1}},
+		{name: "pointer-textmarshaler-nil", v: map[*textKeyPtr]int{nil: 1}},
+		{name: "interface-textmarshaler", v: map[encoding.TextMarshaler]int{textKeyVal{s: "a"}: 1}},
+		{name: "interface-textmarshaler-nil", v: map[encoding.TextMarshaler]int{nil: 1}},
+		{name: "array-kind", v: map[[2]int]int{{1, 2}: 1}},
+		{name: "string-kind-textmarshaler", v: map[resolverTextKey]int{"a": 1}, pinned: `{"t:a":1}`},
+		{name: "float-kind", v: map[float64]int{1.5: 1}, refuse: "a float has no single text form"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// The authority, executed.
-			want, wantErr, wantPanic := callNoPanic(func() (string, error) {
-				b, err := json.Marshal(tc.v)
-				return string(b), err
-			})
-			authorityCanEmit := wantErr == nil && wantPanic == nil
-
 			node := propsNode(tc.v)
 			got, gotErr, gotPanic := callNoPanic(func() (string, error) {
 				s, err := node.Schema()
@@ -15757,6 +15955,28 @@ func TestMatrix_WalkBudgetMapKeyMatchesJSONKeyResolver(t *testing.T) {
 			if gotPanic != nil {
 				t.Fatalf("SchemaNode.Schema panicked on a Props map key: %v", gotPanic)
 			}
+			if tc.refuse != "" {
+				if gotErr == nil {
+					t.Fatalf("the package must refuse these keys (%s) but built: %s", tc.refuse, got)
+				}
+				return
+			}
+			if tc.pinned != "" {
+				if gotErr != nil {
+					t.Fatalf("the package must emit %s but refused: %v", tc.pinned, gotErr)
+				}
+				if !strings.Contains(got, `"p":`+tc.pinned) {
+					t.Fatalf("emitted prop disagrees with the package's own rule:\n got: %s\nwant substring: %s", got, `"p":`+tc.pinned)
+				}
+				return
+			}
+
+			// The authority, executed.
+			want, wantErr, wantPanic := callNoPanic(func() (string, error) {
+				b, err := json.Marshal(tc.v)
+				return string(b), err
+			})
+			authorityCanEmit := wantErr == nil && wantPanic == nil
 
 			if !authorityCanEmit {
 				if gotErr == nil {
