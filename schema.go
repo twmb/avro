@@ -1277,19 +1277,28 @@ func scopedRefKeys(dst *[2]string, ref, ns string) []string {
 	return dst[:1]
 }
 
-// resolveNamedRef looks up a named-type reference in scopedRefKeys precedence
-// order against parentName's namespace, returning ("", nil) when unresolved.
-// Both the build-time backward references and finalize's forward-reference
-// fixups use it, so a forward reference into a namespaced scope resolves the
-// same as the byte-identical backward-ordered schema.
-func (b *builder) resolveNamedRef(name, parentName string) (string, *namedType) {
+// lookupScoped resolves a name reference against table in scopedRefKeys
+// order and returns the key that hit. Every table keyed by fullname (the
+// builder's named types, the metadata name table) resolves through it.
+func lookupScoped[V any](table map[string]V, ref, ns string) (string, V, bool) {
 	var keys [2]string
-	for _, k := range scopedRefKeys(&keys, name, namespaceOf(parentName)) {
-		if nt := b.named[k]; nt != nil {
-			return k, nt
+	for _, k := range scopedRefKeys(&keys, ref, ns) {
+		if v, ok := table[k]; ok {
+			return k, v, true
 		}
 	}
-	return "", nil
+	var zero V
+	return "", zero, false
+}
+
+// resolveNamedRef looks up a named-type reference against parentName's
+// namespace, returning ("", nil) when unresolved. Both the build-time
+// backward references and finalize's forward-reference fixups use it, so a
+// forward reference into a namespaced scope resolves the same as the
+// byte-identical backward-ordered schema.
+func (b *builder) resolveNamedRef(name, parentName string) (string, *namedType) {
+	k, nt, _ := lookupScoped(b.named, name, namespaceOf(parentName))
+	return k, nt
 }
 
 // tryAssignNamedRef resolves a named-type reference, possibly with

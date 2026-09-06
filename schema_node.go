@@ -1776,13 +1776,11 @@ func nsForChildren(n *SchemaNode, enclosing string) string {
 }
 
 // lookupNameRef returns the named target of t when t.Type is a name reference
-// (not a structural or primitive kind) and table has it, else nil. A nil table
-// always returns nil: synchronous-build callers disable name-ref resolution
-// because the tree isn't fully walked yet. ns is the enclosing namespace scope
-// at the reference site. The key order comes from scopedRefKeys (schema.go), so
-// the metadata binding cannot drift from the wire's.
+// (not a structural or primitive kind) and table has it, else nil. ns is the
+// enclosing namespace scope at the reference site. The lookup is
+// lookupScoped, the wire's own, so the metadata binding cannot drift from it.
 func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *SchemaNode {
-	if t == nil || table == nil {
+	if t == nil {
 		return nil
 	}
 	// Structural kinds (primitives, "record"/"error", "enum", "fixed",
@@ -1796,13 +1794,8 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *Sche
 		"bytes", "string", "record", "error", "enum", "fixed", "array", "map", "union":
 		return nil
 	}
-	var keys [2]string
-	for _, k := range scopedRefKeys(&keys, t.Type, ns) {
-		if r, ok := table[k]; ok {
-			return r
-		}
-	}
-	return nil
+	_, r, _ := lookupScoped(table, t.Type, ns)
+	return r
 }
 
 // stampNameRefs records, on every node whose Type is a name reference that
