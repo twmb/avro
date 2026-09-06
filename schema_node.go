@@ -939,12 +939,13 @@ func (b *walkBudget) takeBytes(n int) bool {
 	return true
 }
 
-// emitString charges a structural scalar string's bytes, returning it for
-// emission with any invalid UTF-8 replaced (validUTF8), or "" (recording the
-// over-budget error) when the byte budget is exhausted, so json.Marshal never
-// copies a payload past the bound.
+// emitString charges a structural scalar string's escaped bytes, the same
+// charge the value walk makes for a string, and returns it for emission with
+// any invalid UTF-8 replaced (validUTF8), or "" (recording the over-budget
+// error) when the byte budget is exhausted, so json.Marshal never copies a
+// payload past the bound.
 func (b *walkBudget) emitString(d *deduper, s string) string {
-	if b.takeBytes(len(s)) {
+	if b.takeBytes(jsonEscapedLen(s, b.bytes)) {
 		return validUTF8(s)
 	}
 	d.fail(errSchemaTreeBytes())
@@ -965,7 +966,10 @@ func (b *walkBudget) emitStrings(d *deduper, ss []string) []string {
 	}
 	total := 0
 	for _, s := range ss {
-		total += len(s)
+		total += jsonEscapedLen(s, b.bytes)
+		if total > b.bytes {
+			break
+		}
 	}
 	if !b.takeBytes(total) {
 		d.fail(errSchemaTreeBytes())
@@ -1261,11 +1265,18 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 		// We name every key ourselves (mapKeyName), so the charge is for the
 		// name we emit, a key we cannot name is refused here rather than
 		// forwarded to encoding/json, and two keys that would share one
-		// object name are refused rather than silently collapsed. Distinct
-		// Go keys can share a name once invalid UTF-8 becomes U+FFFD, or
-		// through MarshalText, and a JSON object with a repeated name reads
-		// back as whichever member came last.
+		// object name are refused rather than silently collapsed, since a
+		// JSON object with a repeated name reads back as whichever member
+		// came last. Distinct Go keys can share a name only through
+		// MarshalText, through an interface key's dynamic types, or once
+		// invalid UTF-8 becomes U+FFFD. A string or integer key without a
+		// method names itself, so those maps, nearly all of them, pay no
+		// bookkeeping: we track names for the first two shapes only, and
+		// check the third in a second pass only when a key was invalid.
+		keyT := rv.Type().Key()
+		track := rv.Len() > 1 && (keyT.Kind() == reflect.Interface || keyT.Implements(textMarshalerType))
 		var seen map[string]struct{}
+		invalid := false
 		for iter := rv.MapRange(); iter.Next(); {
 			name, err := mapKeyName(iter.Key())
 			if err != nil {
@@ -1275,19 +1286,28 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 			if !b.takeBytes(jsonEscapedLen(name, b.bytes)) {
 				return valueWalkTooLarge
 			}
-			if rv.Len() > 1 {
-				emitted := validUTF8(name)
-				if _, dup := seen[emitted]; dup {
-					b.keyErr = fmt.Errorf("avro: SchemaNode default/property value contains a map with two keys that share the JSON object name %q", emitted)
-					return valueWalkBadMapKey
-				}
+			if track {
 				if seen == nil {
 					seen = make(map[string]struct{}, rv.Len())
 				}
-				seen[emitted] = struct{}{}
+				if r := b.noteMapKeyName(seen, validUTF8(name)); r != valueWalkOK {
+					return r
+				}
+			} else if !utf8.ValidString(name) {
+				invalid = true
 			}
 			if r := valueWalkLimit(iter.Value(), depthLeft-1, b); r != valueWalkOK {
 				return r
+			}
+		}
+		if invalid && rv.Len() > 1 {
+			// Only a string-kind key can be invalid, and without a method
+			// its name is the key itself.
+			seen = make(map[string]struct{}, rv.Len())
+			for iter := rv.MapRange(); iter.Next(); {
+				if r := b.noteMapKeyName(seen, validUTF8(iter.Key().String())); r != valueWalkOK {
+					return r
+				}
 			}
 		}
 	case reflect.Slice, reflect.Array:
@@ -1330,6 +1350,16 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 			return valueWalkTooLarge
 		}
 	}
+	return valueWalkOK
+}
+
+// noteMapKeyName records one emitted map key name in seen, refusing a repeat.
+func (b *walkBudget) noteMapKeyName(seen map[string]struct{}, name string) int {
+	if _, dup := seen[name]; dup {
+		b.keyErr = fmt.Errorf("avro: SchemaNode default/property value contains a map with two keys that share the JSON object name %q", name)
+		return valueWalkBadMapKey
+	}
+	seen[name] = struct{}{}
 	return valueWalkOK
 }
 
