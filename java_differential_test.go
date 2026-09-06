@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/twmb/avro"
+	"github.com/twmb/avro/internal/avrotest"
 )
 
 // ---------- java_differential_test.go ----------
@@ -232,8 +233,8 @@ func javaMatrixCheck(t *testing.T, rt func(*testing.T, string, []byte) (bool, []
 	schemaJSON string, vin any,
 ) {
 	t.Helper()
-	s := mustParse(t, schemaJSON)
-	w1 := mustAppendEncode(t, s, nil, vin)
+	s := avrotest.MustParse(t, schemaJSON)
+	w1 := avrotest.MustAppendEncode(t, s, nil, vin)
 	ok, _, binOut, errMsg := rt(t, schemaJSON, w1)
 	if !ok {
 		t.Fatalf("Java could not round-trip twmb's bytes: %s\nschema: %s\nwire: %x", errMsg, schemaJSON, w1)
@@ -398,12 +399,12 @@ func TestDifferentialJavaJSONForm(t *testing.T) {
 			t.Run(fr.label+"/"+cx.label, func(t *testing.T) {
 				u := &uniq{}
 				schemaJSON := cx.schema(fr.schema(u), fr.kind, u)
-				s := mustParse(t, schemaJSON)
+				s := avrotest.MustParse(t, schemaJSON)
 				vin := cx.wrap(fr.values[0])
-				w1 := mustAppendEncode(t, s, nil, vin, avro.TaggedUnions())
+				w1 := avrotest.MustAppendEncode(t, s, nil, vin, avro.TaggedUnions())
 				var a1 any
-				mustDecode(t, s, w1, &a1, avro.TaggedUnions())
-				j1 := mustAppendEncodeJSON(t, s, nil, a1, avro.TaggedUnions())
+				avrotest.MustDecode(t, s, w1, &a1, avro.TaggedUnions())
+				j1 := avrotest.MustAppendEncodeJSON(t, s, nil, a1, avro.TaggedUnions())
 				ok, javaJSON, _, errMsg := rt(t, schemaJSON, w1)
 				if !ok {
 					t.Fatalf("Java rt: %s", errMsg)
@@ -853,7 +854,7 @@ func TestDifferentialJavaWireLeniencies(t *testing.T) {
 // subset of the attribute x placement census through the Java oracle. Java
 // accepts every cell. Stray attributes are either reserved-and-ignored via
 // SCHEMA_RESERVED or kept as props, including the structural-key cells twmb
-// rejects per NOT_BUGS #63. For every cell twmb also accepts, Java's Parsing
+// rejects as structural-key exclusivity. For every cell twmb also accepts, Java's Parsing
 // Canonical Form must equal twmb's. That proves both strip the stray
 // identically, so the Rabin fingerprints agree. The "error" kind is excluded:
 // standalone error schemas are a protocol-context type in Java's parser, and

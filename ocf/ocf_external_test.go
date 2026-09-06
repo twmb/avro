@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"github.com/twmb/avro"
+	"github.com/twmb/avro/internal/avrotest"
+	"github.com/twmb/avro/internal/ocftest"
 	"github.com/twmb/avro/ocf"
 )
 
@@ -206,8 +208,8 @@ func ExampleNewReader_evolution() {
 func TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate(t *testing.T) {
 	// A valid header for "long", reused for its embedded 16-byte sync marker.
 	var hb bytes.Buffer
-	w := mustNewWriter(t, &hb, avro.MustParse(`"long"`))
-	mustClose(t, w)
+	w := ocftest.MustNewWriter(t, &hb, avro.MustParse(`"long"`))
+	avrotest.MustClose(t, w)
 	hdr := hb.Bytes()
 	sync := hdr[len(hdr)-16:]
 
@@ -221,7 +223,7 @@ func TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate(t *testing.T) {
 
 	// Cap raised *above* the declared size, so the size>maxBlockBytes guard
 	// does not fire and the read path itself must stay bounded.
-	r := mustNewReader(t, bytes.NewReader(file.Bytes()), ocf.WithMaxBlockBytes(1<<50))
+	r := ocftest.MustNewReader(t, bytes.NewReader(file.Bytes()), ocf.WithMaxBlockBytes(1<<50))
 	var v int64
 	if err := r.Decode(&v); err == nil {
 		t.Fatal("expected an error for a 256 TiB declared-size block with no payload, got nil")
@@ -250,11 +252,11 @@ func TestRegression_OCFUserBuiltinCodecBoundsDecompression(t *testing.T) {
 
 	mkFile := func(codec ocf.Codec) []byte {
 		var buf bytes.Buffer
-		w := mustNewWriter(t, &buf, s, ocf.WithCodec(codec))
+		w := ocftest.MustNewWriter(t, &buf, s, ocf.WithCodec(codec))
 		if err := w.Encode(make([]byte, datumSize)); err != nil {
 			t.Fatalf("encode: %v", err)
 		}
-		mustClose(t, w)
+		avrotest.MustClose(t, w)
 		return buf.Bytes()
 	}
 
@@ -450,7 +452,7 @@ func TestRegression_OCFLargeDatumReaderCap(t *testing.T) {
 	if err := w.Encode(blob); err != nil {
 		t.Fatalf("writer must accept a large datum freely: %v", err)
 	}
-	mustClose(t, w)
+	avrotest.MustClose(t, w)
 
 	// A default reader refuses the oversized block, with an error that names
 	// the option to raise: not a silent failure, and not a cryptic one.
