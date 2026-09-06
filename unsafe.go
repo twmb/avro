@@ -10,11 +10,10 @@ import (
 	"unsafe"
 )
 
-// userfn serializes the value at p into dst. p points directly to the Go
-// field's memory; for reading only.
+// userfn serializes the value at p into dst. p points straight at the Go
+// field's memory, and we only ever read through it.
 type userfn func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error)
 
-// udeserfn deserializes from src into the value at p.
 type udeserfn func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error)
 
 type fastRecordSer struct {
@@ -23,10 +22,9 @@ type fastRecordSer struct {
 	fields  []fastFieldSer
 }
 
-// fastFieldSer uses a hybrid approach: primitive fields get the unsafe
-// fast path (ser != nil), complex/union fields use reflect-based
-// FieldByIndex (slowFn != nil). Mixing avoids paying reflect.NewAt
-// overhead for the primitive subset.
+// fastFieldSer is a hybrid: primitive fields take the unsafe fast path
+// (ser != nil), complex and union fields take reflect FieldByIndex
+// (slowFn != nil). Mixing keeps the primitive subset off reflect.NewAt.
 type fastFieldSer struct {
 	offset   uintptr
 	name     string
@@ -34,14 +32,14 @@ type fastFieldSer struct {
 	slowFn   serfn  // non-nil for reflect-based fields (complex types)
 	slowIdx  []int  // field index path for FieldByIndex (used with slowFn)
 	omitzero bool   // true when omitzero acts on this field (fills a default or null)
-	// when omitzero fires on a zero value, the bytes to emit: the field's
+	// When omitzero fires on a zero value, the bytes we emit: the field's
 	// default (ozDefault) or the null-branch index byte (ozNull). Precomputed
-	// at compile from omitzeroAction so the fast path matches the reflect path.
+	// at compile from omitzeroAction so we match the reflect path.
 	omitzeroBytes []byte
-	// omitzeroErr carries serRecordField.defaultErr through the compile, so
-	// the fast path refuses exactly where the reflect path refuses. Copying
-	// the bytes without the verdict that governs them is how a fast path
-	// silently emits what its slow twin rejects.
+	// omitzeroErr carries serRecordField.defaultErr through the compile, so we
+	// refuse here exactly where the reflect path refuses. Copying the bytes
+	// without the verdict that governs them is how a fast path silently emits
+	// what its slow twin rejects.
 	omitzeroErr error
 }
 
@@ -57,6 +55,7 @@ type fastFieldDeser struct {
 	deser   udeserfn // non-nil for unsafe-optimized fields (primitives)
 	slowFn  deserfn  // non-nil for reflect-based fields (complex types)
 	slowIdx []int    // field index path for fieldByIndex (used with slowFn)
+	skip    skipfn   // non-nil when SkipUnknown found no Go field for this one
 }
 
 func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t reflect.Type) *fastRecordSer {
@@ -70,10 +69,9 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 		f := &fields[i]
 		offset, goType, ok := computeFieldOffset(t, mapping.indices[i])
 		// An omitzero field that actually acts (fills a default or a null
-		// branch — see omitzeroAction) needs a runtime zero check the
-		// unsafe fast path can't do, so fall back to the reflect slow path.
-		// A no-op omitzero (non-nullable, no default) just encodes the
-		// value, so it stays on the fast path.
+		// branch; see omitzeroAction) needs a runtime zero check the unsafe
+		// path can't do, so we fall back to reflect. A no-op omitzero
+		// (non-nullable, no default) just encodes the value and stays fast.
 		oz := mapping.omitzero[i] && f.omitzeroAction() != ozNoop
 		var fn userfn
 		if ok && !oz {
@@ -110,15 +108,25 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 	return fast
 }
 
-func compileFastDeser(fields []deserRecordField, names []string, cache *sync.Map, t reflect.Type) *fastRecordDeser {
-	mapping, err := typeFieldMapping(names, cache, t)
+func compileFastDeser(rec *deserRecord, t reflect.Type, skipUnknown bool) *fastRecordDeser {
+	fields := rec.fields
+	mapping, err := typeFieldMappingSkip(rec.names, &rec.cache, t, skipUnknown)
 	if err != nil {
 		return nil
 	}
 	fast := &fastRecordDeser{typ: t, fields: make([]fastFieldDeser, len(fields))}
 	allFast := true
+	var skips []skipfn
 	for i := range fields {
 		f := &fields[i]
+		if mapping.unmapped(i) {
+			if skips == nil {
+				skips = rec.fieldSkips()
+			}
+			allFast = false
+			fast.fields[i] = fastFieldDeser{name: f.name, skip: skips[i]}
+			continue
+		}
 		offset, goType, ok := computeFieldOffset(t, mapping.indices[i])
 		var fn udeserfn
 		if ok {
@@ -143,9 +151,9 @@ func compileFastDeser(fields []deserRecordField, names []string, cache *sync.Map
 	return fast
 }
 
-// computeFieldOffset computes a flat byte offset for a struct field index
-// path. Returns false if the path goes through a pointer (which requires
-// runtime dereferencing and cannot be precomputed).
+// computeFieldOffset flattens a struct field index path into one byte offset.
+// We return false for a path through a pointer: that needs a runtime deref,
+// so there is nothing to precompute.
 func computeFieldOffset(t reflect.Type, index []int) (uintptr, reflect.Type, bool) {
 	var offset uintptr
 	for _, i := range index {
@@ -172,8 +180,8 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 		} else {
 			fv := fieldByIndexZero(v, f.slowIdx)
 			if f.omitzero && valueIsZero(fv) {
-				// f.omitzeroBytes is populated at compile (compileFastSer)
-				// from omitzeroAction — the field's default, or the
+				// We populated f.omitzeroBytes at compile (compileFastSer)
+				// from omitzeroAction: the field's default, or the
 				// null-branch byte (0x00 for ["null",T], 0x02 for
 				// ["T","null"]).
 				if f.omitzeroErr != nil {
@@ -191,22 +199,23 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 	return dst, nil
 }
 
-// deserRecordFast is the unsafe fast body for ONE record node. Its only
-// caller is deserRecord.deser, which has already bumped sl.depth (and run
-// the maxDepth guard) for this exact record node. It therefore does NOT
-// bump again: a record is one schema node and must cost exactly one depth
-// unit regardless of whether it is decoded via the reflect body, the fast
-// body, or the reflect-body-then-fast-body chain. Double-bumping here
-// would halve the bound for struct-fast records vs the reflect/map path
-// and break depth uniformity (deserRecordFastPtr, the OTHER fast entry,
-// is reached on child edges that bypass deserRecord.deser, so it keeps
-// its own bump — it is the sole record-node entry on those paths).
+// deserRecordFast is the unsafe fast body for one record node. Our only caller
+// is deserRecord.deser, which already bumped sl.depth (and ran the maxDepth
+// guard) for this exact node, so we do *not* bump again. A record is one
+// schema node and must cost exactly one depth unit, whether it decodes via the
+// reflect body, the fast body, or the reflect-then-fast chain. Bumping twice
+// would halve the bound for struct-fast records against the reflect/map path
+// and break depth uniformity. deserRecordFastPtr, the other fast entry, is
+// reached on child edges that bypass deserRecord.deser, so it keeps its own
+// bump: on those paths it is the sole record-node entry.
 func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *slab) ([]byte, error) {
 	base := v.Addr().UnsafePointer()
 	var err error
 	for i := range fast.fields {
 		f := &fast.fields[i]
-		if f.deser != nil {
+		if f.skip != nil {
+			src, err = f.skip(src, sl)
+		} else if f.deser != nil {
 			src, err = f.deser(src, unsafe.Add(base, f.offset), sl)
 		} else {
 			fv, ferr := fieldByIndex(v, f.slowIdx)
@@ -222,8 +231,8 @@ func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *sla
 	return src, nil
 }
 
-// serRecordFastPtr serializes a record when all fields have unsafe ser fns.
-// Only requires a raw pointer to the struct base — no reflect.Value needed.
+// serRecordFastPtr serializes a record whose fields all have unsafe ser fns.
+// We need only a raw pointer to the struct base, no reflect.Value.
 func serRecordFastPtr(dst []byte, fast *fastRecordSer, base unsafe.Pointer, depth int) ([]byte, error) {
 	if depth >= maxDepth {
 		return nil, errTooDeep
@@ -239,7 +248,8 @@ func serRecordFastPtr(dst []byte, fast *fastRecordSer, base unsafe.Pointer, dept
 	return dst, nil
 }
 
-// deserRecordFastPtr deserializes a record when all fields have unsafe deser fns.
+// deserRecordFastPtr deserializes a record whose fields all have unsafe
+// deser fns.
 func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, sl *slab) ([]byte, error) {
 	if sl.depth >= maxDepth {
 		return nil, errTooDeep
@@ -257,17 +267,16 @@ func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, 
 	return src, nil
 }
 
-// serRecordVia dispatches one record encode via the all-fast unsafe
-// path when available, falling back to the reflect-based path.
-// Callers pass pre-resolved fast (from rec.fastFor) so per-element
-// loops compute the lookup once outside the loop.
+// serRecordVia encodes one record through the all-fast unsafe path when we
+// have one, else through reflect. You pass fast pre-resolved (rec.fastFor) so
+// a per-element loop looks it up once, outside the loop.
 //
-// Do NOT inline this into per-element array loops: the helper exceeds
-// the Go inline budget (cost ~290 vs 80) because reflect.NewAt+Elem
-// counts as interface method calls, and the t/rec parameters escape
-// to heap. The four array sites in this file (usArrayRecord,
-// usArrayPtrRecord, usArrayNullUnionRecord, udArrayPtrRecord) keep
-// the if/else open-coded with useFast hoisted outside the loop.
+// Do *not* inline this into per-element array loops: the helper blows the Go
+// inline budget (cost ~290 vs 80) because reflect.NewAt+Elem counts as
+// interface method calls, and the t/rec parameters escape to heap. The four
+// array sites in this file (usArrayRecord, usArrayPtrRecord,
+// usArrayNullUnionRecord, udArrayPtrRecord) keep the if/else open-coded with
+// useFast hoisted out of the loop.
 func serRecordVia(dst []byte, fast *fastRecordSer, rec *serRecord, t reflect.Type, p unsafe.Pointer, depth int) ([]byte, error) {
 	if fast != nil && fast.allFast {
 		return serRecordFastPtr(dst, fast, p, depth)
@@ -275,8 +284,8 @@ func serRecordVia(dst []byte, fast *fastRecordSer, rec *serRecord, t reflect.Typ
 	return rec.ser(dst, reflect.NewAt(t, p).Elem(), depth)
 }
 
-// deserRecordVia is serRecordVia's decode-side mirror. The same
-// inline-budget caveat applies: do not use in per-element loops.
+// deserRecordVia is serRecordVia's decode-side mirror. The same inline-budget
+// caveat applies: do not use it in per-element loops.
 func deserRecordVia(src []byte, fast *fastRecordDeser, rec *deserRecord, t reflect.Type, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if fast != nil && fast.allFast {
 		return deserRecordFastPtr(src, fast, p, sl)
@@ -284,9 +293,9 @@ func deserRecordVia(src []byte, fast *fastRecordDeser, rec *deserRecord, t refle
 	return rec.deser(src, reflect.NewAt(t, p).Elem(), sl)
 }
 
-// tryCompileFieldSer returns a userfn for fields that can be fully handled
-// via unsafe pointer access. Returns nil for complex types that must use
-// the reflect-based slow path.
+// tryCompileFieldSer returns a userfn for a field we can handle entirely
+// through unsafe pointer access, or nil for one that must take the reflect
+// slow path.
 func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 	// Custom types need the reflect slow path for the conversion wrapper.
 	if f.meta != nil && (f.meta.hasCustomType || (f.meta.inner != nil && f.meta.inner.hasCustomType)) {
@@ -317,13 +326,13 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		// wrapping a nil pointer (**T), a nil slice (*[]E), a nil map
 		// (*map[K]V), or a nil interface (*iface) is nil-equivalent per
 		// isNilValue, which peels the outer pointer then nil-checks the
-		// bottom kind — so the reflect path encodes the null branch. The
-		// unsafe enter (usNullUnionEnter) tests ONLY the outer pointer and
-		// would commit to the value branch (then either emit an empty
-		// slice/map or fault on the nil inner). Decline the whole nilable
-		// inner set to the reflect path, which consults isNilValue; this
-		// gate is the fifth dispatch site isNilValue's contract names, kept
-		// in lockstep via the shared isNilableKind predicate.
+		// bottom kind, so the reflect path encodes the null branch. The
+		// unsafe enter (usNullUnionEnter) tests *only* the outer pointer. It
+		// would commit to the value branch and then emit an empty slice/map
+		// or fault on the nil inner. So we decline the whole nilable inner
+		// set to the reflect path, which consults isNilValue. This gate is
+		// the fifth dispatch site isNilValue's contract names; the shared
+		// isNilableKind predicate keeps the two in lockstep.
 		if isNilableKind(innerGoType.Kind()) {
 			return nil
 		}
@@ -354,11 +363,12 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			}
 			// Element inner nil-able beyond the outer pointer ([]**T,
 			// []*[]E, []*map[K]V, []*iface): &(nilInner) is nil-equivalent
-			// per isNilValue (peels the outer pointer then nil-checks the
-			// bottom kind → null branch on reflect/JSON); the unsafe array
-			// enter tests only the outer pointer and would emit the value
-			// branch. Decline the whole nilable inner set to the reflect
-			// path. (See the field nullunion case; shared isNilableKind.)
+			// per isNilValue, which peels the outer pointer then nil-checks
+			// the bottom kind, giving the null branch on reflect and JSON.
+			// The unsafe array enter tests only the outer pointer and would
+			// emit the value branch, so we decline the whole nilable inner
+			// set to reflect. See the field nullunion case; shared
+			// isNilableKind.
 			if isNilableKind(elemGoType.Elem().Kind()) {
 				return nil
 			}
@@ -396,27 +406,27 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		}
 		rec := f.meta.serRecord
 		// depth (not depth+1): the field-pass call in serRecordFast/Ptr
-		// already incremented for the parent-record→child-record edge.
-		// The field IS the child record node, so its node depth equals the
-		// field-pass depth; serRecordVia treats its depth arg as the
-		// record's node depth. Adding +1 here would charge the single edge
-		// twice (the reflect path and every decode path charge it once),
-		// breaking depth uniformity for a directly-nested struct record.
+		// already charged the parent-record-to-child-record edge. The field
+		// *is* the child record node, so its node depth equals the field-pass
+		// depth, and serRecordVia reads its depth arg as the record's node
+		// depth. A +1 here would charge the one edge twice (reflect and every
+		// decode path charge it once), breaking depth uniformity for a
+		// directly-nested struct record.
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 			return serRecordVia(dst, rec.fastFor(goType), rec, goType, p, depth)
 		}
 	}
 
 	if k == reflect.Pointer {
-		// Bound the pointer-chain peel before recursing on the element type.
-		// A cyclic pointer type (type P *P, where P.Elem() == P) recurses here
-		// forever AT COMPILE TIME and overflows the stack, unrecoverably. Depth
-		// matters too: the reflect encoder peels at most maxIndirectDepth
-		// levels, so an unbounded fast path would accept chains it rejects and
-		// stop mirroring it byte-for-byte. Counting levels and declining beyond
-		// the cap ends the cycle and keeps both accept sets identical — within
-		// the cap compiles, deeper routes to the reflect path, which errors
-		// uniformly.
+		// We bound the pointer-chain peel before recursing on the element
+		// type. A cyclic pointer type (type P *P, where P.Elem() == P)
+		// recurses here forever at compile time and overflows the stack,
+		// unrecoverably. Depth matters too: the reflect encoder peels at most
+		// maxIndirectDepth levels, so an unbounded fast path would accept
+		// chains it rejects and stop mirroring it byte-for-byte. Counting
+		// levels and declining past the cap ends the cycle and keeps both
+		// accept sets identical: within the cap we compile, deeper routes to
+		// reflect, which errors uniformly.
 		levels := 1
 		for e := goType.Elem(); e.Kind() == reflect.Pointer; e = e.Elem() {
 			levels++
@@ -458,10 +468,11 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 	case "string":
 		if k == reflect.String {
 			// json.Number and text-method string-kind types take the safe
-			// path: the unsafe *(*string)(p) read would write the raw
+			// path. The unsafe *(*string)(p) read would write the raw
 			// underlying string, bypassing appendAvroString's json.Number
-			// reject and text-out arm — diverging a struct field from the
-			// scalar encode of the same value. See stringFastPathEligibleEncode.
+			// reject and text-out arm, so a struct field would diverge from
+			// the scalar encode of the same value. See
+			// stringFastPathEligibleEncode.
 			if !stringFastPathEligibleEncode(goType) {
 				return nil
 			}
@@ -476,9 +487,8 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 	return nil
 }
 
-// tryCompileFieldDeser returns a udeserfn for fields that can be written
-// directly via unsafe. Returns nil for complex types that must use the
-// reflect-based slow path.
+// tryCompileFieldDeser returns a udeserfn for a field we can write directly
+// through unsafe, or nil for one that must take the reflect slow path.
 func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 	if f.meta != nil && (f.meta.hasCustomType || (f.meta.inner != nil && f.meta.inner.hasCustomType)) {
 		return nil
@@ -507,17 +517,18 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 			return nil
 		}
 		innerGoType := goType.Elem()
-		// A multi-level-pointer target (**…T) declines to the reflect path,
-		// mirroring the encode field-nullunion decline. udNullUnionRecord/
-		// udNullUnionPtr consume the outer pointer (the nullunion optional) via
-		// goType.Elem() and then indirectAlloc the remainder — peeling one level
-		// past the cap, so a **…T target would accept 1+maxIndirectDepth levels
-		// where the reflect deser (deserNullUnionAt hands the un-indirected
-		// target to the branch fn, whose single indirectAlloc caps the whole
-		// chain at maxIndirectDepth), the encode side, and every other context
-		// reject. (A primitive inner already declines below when
-		// tryCompileFieldDeser refuses the *…T innerGoType; the record inner has
-		// its own branch, so the guard must precede it.)
+		// A multi-level-pointer target (**...T) declines to reflect, mirroring
+		// the encode field-nullunion decline. udNullUnionRecord and
+		// udNullUnionPtr consume the outer pointer (the nullunion optional)
+		// via goType.Elem() and then indirectAlloc the remainder, peeling one
+		// level past the cap. So a **...T target would accept
+		// 1+maxIndirectDepth levels where the reflect deser (deserNullUnionAt
+		// hands the un-indirected target to the branch fn, whose single
+		// indirectAlloc caps the whole chain at maxIndirectDepth), the encode
+		// side, and every other context reject. A primitive inner already
+		// declines below, when tryCompileFieldDeser refuses the *...T
+		// innerGoType; the record inner has its own branch, so this guard must
+		// precede it.
 		if innerGoType.Kind() == reflect.Pointer {
 			return nil
 		}
@@ -546,15 +557,16 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		elemGoType := goType.Elem()
 		switch inner.avroType {
 		case "record":
-			// A multi-level-pointer element ([]**…record) declines to the safe
-			// path: it falls to default → tryCompileFieldDeser rejects the
-			// **record element (the record arm needs a struct, the generic
-			// pointer arm declines all pointers), so the field's reflect deser
-			// handles it with a single indirectAlloc budget. The fast
-			// udArrayPtrRecord peels one pointer level inline and rec.deser peels
-			// a FURTHER maxIndirectDepth, accepting 1+maxIndirectDepth — one past
-			// the cap every other path enforces. Mirrors the encode usArrayRecord
-			// decline; the fast path stays single-pointer only ([]*record).
+			// A multi-level-pointer element ([]**...record) declines to the
+			// safe path. It falls to default, where tryCompileFieldDeser
+			// rejects the **record element (the record arm needs a struct, the
+			// generic pointer arm declines all pointers), so the field's
+			// reflect deser handles it with a single indirectAlloc budget. The
+			// fast udArrayPtrRecord peels one pointer level inline and
+			// rec.deser peels a *further* maxIndirectDepth, accepting
+			// 1+maxIndirectDepth, one past the cap every other path enforces.
+			// Mirrors the encode usArrayRecord decline; we stay single-pointer
+			// only ([]*record).
 			if inner.deserRecord != nil && elemGoType.Kind() == reflect.Pointer && elemGoType.Elem().Kind() != reflect.Pointer {
 				return udArrayPtrRecord(inner.deserRecord, elemGoType.Elem(), goType, inner.minBytes)
 			}
@@ -577,11 +589,11 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		}
 		rec := f.meta.deserRecord
 		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			return deserRecordVia(src, rec.fastFor(goType), rec, goType, p, sl)
+			return deserRecordVia(src, rec.fastFor(goType, sl.skipUnknown), rec, goType, p, sl)
 		}
 	}
 
-	// Pointer fields need GC write barriers for allocation; use slow path.
+	// Pointer fields need GC write barriers to allocate, so we take reflect.
 	if k == reflect.Pointer {
 		return nil
 	}
@@ -607,10 +619,10 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 	case "string":
 		if k == reflect.String {
 			// json.Number and TextUnmarshaler string-kind types take the
-			// safe path: the unsafe *(*string)(p)=... store would bypass
+			// safe path. The unsafe *(*string)(p)=... store would bypass
 			// setStringValue's json.Number RFC 8259 guard and UnmarshalText
-			// arm — diverging a struct field from the scalar decode of the
-			// same target. See stringFastPathEligibleDecode.
+			// arm, so a struct field would diverge from the scalar decode of
+			// the same target. See stringFastPathEligibleDecode.
 			if !stringFastPathEligibleDecode(goType) {
 				return nil
 			}
@@ -627,9 +639,9 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 
 // ---- Logical type unsafe serializers ----
 
-// usTimestampLogicals maps the six long-typed timestamp logicals to
-// their time.Time-target unsafe serializer. Non-time.Time targets fall
-// back to usLong(kind) at the dispatch site below.
+// usTimestampLogicals maps the six long-typed timestamp logicals to their
+// time.Time-target unsafe serializer. A non-time.Time target falls back to
+// usLong(kind) at the dispatch site below.
 var usTimestampLogicals = map[string]userfn{
 	"timestamp-millis":       usTimestampMillis,
 	"timestamp-micros":       usTimestampMicros,
@@ -676,10 +688,10 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 	case "uuid":
 		if avroType == "fixed" {
 			if goType.Kind() == reflect.String {
-				// text-method (and json.Number) string-kind types take the
+				// Text-method (and json.Number) string-kind types take the
 				// safe path so serFixedUUIDReflect's text-before-string-kind
-				// order applies; json.Number reaches the same parseUUID
-				// outcome on either path. See stringFastPathEligibleEncode.
+				// order applies. json.Number reaches the same parseUUID
+				// outcome either way. See stringFastPathEligibleEncode.
 				if !stringFastPathEligibleEncode(goType) {
 					return nil
 				}
@@ -692,8 +704,8 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 		}
 		if goType.Kind() == reflect.String {
 			// json.Number/text string+uuid: usString would emit the raw
-			// underlying string as the wire UUID with no validation / no
-			// text-out; the safe path's serUUID → appendAvroString applies
+			// underlying string as the wire UUID, with no validation and no
+			// text-out. The safe path's serUUID into appendAvroString applies
 			// both. See stringFastPathEligibleEncode.
 			if !stringFastPathEligibleEncode(goType) {
 				return nil
@@ -704,10 +716,10 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 	return nil
 }
 
-// udTimestampLogicals maps the six long-typed timestamp logicals to
-// their time.Time-target unsafe deserializer (local-timestamp-* and
-// timestamp-* decode identically; the wire long is interpreted the same
-// way — see logical.go for the encode-side wall-clock vs instant note).
+// udTimestampLogicals maps the six long-typed timestamp logicals to their
+// time.Time-target unsafe deserializer. local-timestamp-* and timestamp-*
+// decode identically, since we read the wire long the same way either way;
+// see logical.go for the encode-side wall-clock vs instant note.
 var udTimestampLogicals = map[string]udeserfn{
 	"timestamp-millis":       udTimestampMillis,
 	"timestamp-micros":       udTimestampMicros,
@@ -757,7 +769,7 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 				return udFixedUUID
 			}
 			if goType.Kind() == reflect.String {
-				// Safe path enforces the json.Number guard and the
+				// The safe path enforces the json.Number guard and the
 				// TextUnmarshaler arm (deserFixedUUIDReflect tries
 				// UnmarshalText before the string-kind setStringTarget).
 				if !stringFastPathEligibleDecode(goType) {
@@ -771,7 +783,7 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 			return udUUID
 		}
 		if goType.Kind() == reflect.String {
-			// Safe path enforces the json.Number guard and the
+			// The safe path enforces the json.Number guard and the
 			// TextUnmarshaler arm.
 			if !stringFastPathEligibleDecode(goType) {
 				return nil
@@ -783,7 +795,7 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 }
 
 // usTimeAsLong is the shared body of the six unsafe time-logical "long"
-// serializers — direct *(*time.Time)(p) read, conv, SemanticError-wrap.
+// serializers: read *(*time.Time)(p), convert, wrap in a SemanticError.
 func usTimeAsLong(dst []byte, p unsafe.Pointer, conv func(time.Time) (int64, error)) ([]byte, error) {
 	n, err := conv(*(*time.Time)(p))
 	if err != nil {
@@ -834,9 +846,8 @@ func usTimeMillis(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	return appendVarint(dst, ms), nil
 }
 
-// usTimeMillisTime is the time.Time variant of usTimeMillis — extracts
-// time-of-day fields and encodes as time-millis, mirroring the
-// serTimeMillis(timeType) safe-path arm.
+// usTimeMillisTime is usTimeMillis for a time.Time: we take the time-of-day
+// fields and encode those, mirroring serTimeMillis's timeType arm.
 func usTimeMillisTime(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	ms, err := durationToTimeMillis(timeOfDay(*(*time.Time)(p)))
 	if err != nil {
@@ -854,7 +865,6 @@ func usTimeMicrosTime(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	return appendVarlong(dst, timeOfDay(*(*time.Time)(p)).Microseconds()), nil
 }
 
-// udTimeFromVarint reads a varint and stores conv(val) into *T.
 func udTimeFromVarint[T any](conv func(int32) T) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		val, src, err := readVarint(src)
@@ -866,7 +876,6 @@ func udTimeFromVarint[T any](conv func(int32) T) udeserfn {
 	}
 }
 
-// udTimeFromVarlong is udTimeFromVarint's varlong sibling.
 func udTimeFromVarlong[T any](conv func(int64) T) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		val, src, err := readVarlong(src)
@@ -878,7 +887,6 @@ func udTimeFromVarlong[T any](conv func(int64) T) udeserfn {
 	}
 }
 
-// udTimeFromVarlongChecked is udTimeFromVarlong for fallible converters.
 func udTimeFromVarlongChecked[T any](conv func(int64) (T, error)) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		val, src, err := readVarlong(src)
@@ -894,9 +902,9 @@ func udTimeFromVarlongChecked[T any](conv func(int64) (T, error)) udeserfn {
 	}
 }
 
-// *Time variants materialize the time-of-day count as a time.Time at
-// epoch midnight (UTC) — used when a struct field is typed as time.Time
-// but the schema is time-millis/time-micros.
+// The *Time variants materialize the time-of-day count as a time.Time at
+// epoch midnight (UTC). We use them when your struct field is a time.Time
+// but the schema is time-millis or time-micros.
 var (
 	udTimestampMillis = udTimeFromVarlong(timestampMillisToTime)
 	udTimestampMicros = udTimeFromVarlong(timestampMicrosToTime)
@@ -947,9 +955,9 @@ func udUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src[n:], nil
 }
 
-// readFixedUUID validates len(src) ≥ 16 and returns the next UUID bytes
-// plus the advanced source slice. Shared body of udFixedUUID (writes
-// [16]byte) and udFixedUUIDString (writes the canonical string form).
+// readFixedUUID checks that src holds 16 bytes and returns them with the
+// advanced source. Shared by udFixedUUID (writes [16]byte) and
+// udFixedUUIDString (writes the canonical string form).
 func readFixedUUID(src []byte) ([16]byte, []byte, error) {
 	if err := needLen(src, 16, "uuid"); err != nil {
 		return [16]byte{}, nil, err
@@ -957,8 +965,7 @@ func readFixedUUID(src []byte) ([16]byte, []byte, error) {
 	return [16]byte(src[:16]), src[16:], nil
 }
 
-// udFixedUUID reads 16 raw bytes from a fixed(16) UUID and writes a [16]byte.
-// Used when the target is [16]byte or any (interface).
+// udFixedUUID is the fixed(16) UUID decoder for a [16]byte or any target.
 func udFixedUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	u, src, err := readFixedUUID(src)
 	if err == nil {
@@ -967,8 +974,8 @@ func udFixedUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src, err
 }
 
-// udFixedUUIDString reads 16 raw bytes from a fixed(16) UUID and writes a
-// formatted UUID string (e.g. "550e8400-e29b-41d4-a716-446655440000").
+// udFixedUUIDString writes the formatted form,
+// "550e8400-e29b-41d4-a716-446655440000".
 func udFixedUUIDString(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	u, src, err := readFixedUUID(src)
 	if err == nil {
@@ -977,7 +984,6 @@ func udFixedUUIDString(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src, err
 }
 
-// usFixedUUIDString serializes a UUID string to 16 raw fixed bytes.
 func usFixedUUIDString(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	s := *(*string)(p)
 	u, err := parseUUID(s)
@@ -988,8 +994,8 @@ func usFixedUUIDString(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) 
 }
 
 // ---- Unsafe serializers ----
-// These read values directly via unsafe.Pointer. No string→[]byte
-// conversions; all reads go through typed pointer dereferences.
+// These read values directly through unsafe.Pointer. No string-to-[]byte
+// conversions: every read is a typed pointer dereference.
 
 func usBool(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	if *(*bool)(p) {
@@ -998,10 +1004,10 @@ func usBool(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-// usVarintFrom is udVarintTo's serialize-side mirror: reads a typed
-// integer via unsafe pointer, range-checks, writes as Avro int. t is the
-// Go field type, set on the SemanticError so the unsafe struct-field path
-// reports the same GoType as the reflect path (appendAvroInt in ser.go).
+// usVarintFrom is udVarintTo's serialize-side mirror: read a typed integer
+// through an unsafe pointer, range-check it, write it as an Avro int. t is the
+// Go field type, which we set on the SemanticError so the unsafe struct-field
+// path reports the same GoType as reflect does (appendAvroInt in ser.go).
 func usVarintFrom[T intLike](lo, hi int64, t reflect.Type) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		n := int64(*(*T)(p))
@@ -1012,7 +1018,6 @@ func usVarintFrom[T intLike](lo, hi int64, t reflect.Type) userfn {
 	}
 }
 
-// usVarlongFrom is usVarintFrom's varlong (Avro long) sibling.
 func usVarlongFrom[T intLike](lo, hi int64, t reflect.Type) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		n := int64(*(*T)(p))
@@ -1023,9 +1028,9 @@ func usVarlongFrom[T intLike](lo, hi int64, t reflect.Type) userfn {
 	}
 }
 
-// usVarlongFromUnsigned is usVarlongFrom for unsigned T. The upper
-// bound is checked in uint64 space since uint64 > MaxInt64 can't
-// round-trip through int64.
+// usVarlongFromUnsigned is usVarlongFrom for unsigned T. We check the upper
+// bound in uint64 space, since a uint64 above MaxInt64 cannot round-trip
+// through int64.
 func usVarlongFromUnsigned[T uint | uint8 | uint16 | uint32 | uint64](t reflect.Type) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		n := uint64(*(*T)(p))
@@ -1050,7 +1055,8 @@ func usInt(t reflect.Type) userfn {
 	case reflect.Int64:
 		return usVarintFrom[int64](math.MinInt32, math.MaxInt32, t)
 	case reflect.Uint:
-		// uint as int64 max — bound applies on 64-bit too (uint > MaxInt32 possible).
+		// uint as int64 max. The bound applies on 64-bit too, where a uint
+		// can exceed MaxInt32.
 		return usVarintFrom[uint](0, math.MaxInt32, t)
 	case reflect.Uint8:
 		return usVarintFrom[uint8](math.MinInt64, math.MaxInt64, t)
@@ -1059,9 +1065,9 @@ func usInt(t reflect.Type) userfn {
 	case reflect.Uint32:
 		return usVarintFrom[uint32](0, math.MaxInt32, t)
 	case reflect.Uint64:
-		// uint64 > MaxInt64 can't be represented as int64 — but the
-		// usVarintFrom int64 cast already truncates negative-when-
-		// reinterpreted values. Use the unsigned-aware bound directly.
+		// A uint64 above MaxInt64 has no int64 form, and usVarintFrom's int64
+		// cast already truncates values that reinterpret as negative, so we
+		// use the unsigned-aware bound directly.
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 			n := *(*uint64)(p)
 			if n > math.MaxInt32 {
@@ -1109,8 +1115,9 @@ func usFloat(k reflect.Kind) userfn {
 		}
 	case reflect.Float64:
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			// Lossy-destination: finite float64 → float32 silently narrows
-			// to ±Inf when out of range (matches appendAvroFloat32 / Java).
+			// Lossy by destination: a finite float64 narrowed to float32
+			// silently becomes ±Inf when out of range, matching
+			// appendAvroFloat32 and Java.
 			return appendUint32(dst, math.Float32bits(float32(*(*float64)(p)))), nil
 		}
 	default:
@@ -1133,12 +1140,10 @@ func usDouble(k reflect.Kind) userfn {
 	}
 }
 
-// usString reads the string header directly from memory.
 func usString(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	return doSerString(dst, *(*string)(p)), nil
 }
 
-// usBytes reads the slice header directly from memory.
 func usBytes(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	b := *(*[]byte)(p)
 	dst = appendVarlong(dst, int64(len(b)))
@@ -1146,10 +1151,10 @@ func usBytes(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 }
 
 // ---- Unsafe deserializers ----
-// For types without GC pointers (bool, ints, floats), write directly via
-// unsafe. For types containing GC pointers (string, []byte), typed pointer
-// stores trigger GC write barriers automatically. All decoded values are
-// freshly allocated copies; no aliasing of src.
+// For types without GC pointers (bool, ints, floats), we write directly
+// through unsafe. For types holding GC pointers (string, []byte), a typed
+// pointer store triggers the GC write barrier for us. Every decoded value is
+// a fresh copy: we never alias src.
 
 func udBool(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if len(src) < 1 {
@@ -1159,15 +1164,14 @@ func udBool(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src[1:], nil
 }
 
-// intLike covers all signed and unsigned integer kinds.
 type intLike interface {
 	~int | ~int8 | ~int16 | ~int32 | ~int64 |
 		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64
 }
 
-// udVarintTo reads a varint (int32 wire), range-checks against [lo, hi]
-// in int64 space, and stores the narrowed result into *T. lo=MinInt64 /
-// hi=MaxInt64 disables the range check.
+// udVarintTo reads a varint (int32 wire), range-checks it against [lo, hi] in
+// int64 space, and stores the narrowed result into *T. lo=MinInt64 and
+// hi=MaxInt64 turn the range check off.
 func udVarintTo[T intLike](lo, hi int64, avroType string, t reflect.Type) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		v, src, err := readVarint(src)
@@ -1182,7 +1186,6 @@ func udVarintTo[T intLike](lo, hi int64, avroType string, t reflect.Type) udeser
 	}
 }
 
-// udVarlongTo is udVarintTo's varlong (int64 wire) sibling.
 func udVarlongTo[T intLike](lo, hi int64, avroType string, t reflect.Type) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		v, src, err := readVarlong(src)
@@ -1211,9 +1214,8 @@ func udInt(t reflect.Type) udeserfn {
 	case reflect.Int64:
 		return udVarintTo[int64](math.MinInt64, math.MaxInt64, "int", t)
 	case reflect.Uint:
-		// Varint wire is int32; uint is always wide enough — only
-		// the lower-bound (v < 0) check matters. hi=MaxInt64 is
-		// effectively unbounded.
+		// The varint wire is int32 and uint is always wide enough, so only
+		// the lower bound (v < 0) matters. hi=MaxInt64 is unbounded here.
 		return udVarintTo[uint](0, math.MaxInt64, "int", t)
 	case reflect.Uint8:
 		return udVarintTo[uint8](0, math.MaxUint8, "int", t)
@@ -1231,9 +1233,8 @@ func udInt(t reflect.Type) udeserfn {
 func udLong(t reflect.Type) udeserfn {
 	switch t.Kind() {
 	case reflect.Int:
-		// On 64-bit int holds any int64; on 32-bit int is int32 so
-		// the bound check is real. math.MinInt/MaxInt resolve per
-		// platform.
+		// On 64-bit, int holds any int64. On 32-bit, int is int32, so the
+		// bound check is real. math.MinInt/MaxInt resolve per platform.
 		return udVarlongTo[int](math.MinInt, math.MaxInt, "long", t)
 	case reflect.Int8:
 		return udVarlongTo[int8](math.MinInt8, math.MaxInt8, "long", t)
@@ -1244,10 +1245,10 @@ func udLong(t reflect.Type) udeserfn {
 	case reflect.Int64:
 		return udVarlongTo[int64](math.MinInt64, math.MaxInt64, "long", t)
 	case reflect.Uint:
-		// On 64-bit uint = uint64 holds any non-negative int64; on
-		// 32-bit uint = uint32, so cap at MaxUint32. bits.UintSize
-		// is a compile-time constant so the branch resolves to
-		// dead code on the non-matching platform.
+		// On 64-bit, uint = uint64 holds any non-negative int64. On 32-bit,
+		// uint = uint32, so we cap at MaxUint32. bits.UintSize is a
+		// compile-time constant, so the branch is dead code on the
+		// non-matching platform.
 		hi := int64(math.MaxInt64)
 		if bits.UintSize == 32 {
 			hi = math.MaxUint32
@@ -1300,8 +1301,8 @@ func udDouble(t reflect.Type) udeserfn {
 				return nil, err
 			}
 			f := math.Float64frombits(u)
-			// Match deserDouble (safe path): reject silent narrowing of a
-			// finite float64 to ±Inf when the destination is float32.
+			// Match deserDouble, the safe path: we reject a silent narrowing
+			// of a finite float64 to ±Inf when the target is float32.
 			if finiteFloat32Overflows(f) {
 				return nil, &SemanticError{GoType: t, AvroType: "double", Err: fmt.Errorf("value %g overflows float32", f)}
 			}
@@ -1322,9 +1323,9 @@ func udDouble(t reflect.Type) udeserfn {
 	}
 }
 
-// udStringDeser writes the string directly via typed pointer store.
-// *(*string)(p) = s triggers GC write barriers automatically.
-// string(src[:n]) always copies, so the decoded string owns its memory.
+// udStringDeser stores the string through a typed pointer, so *(*string)(p) = s
+// triggers the GC write barrier for us. string(src[:n]) always copies, so the
+// decoded string owns its memory.
 func udStringDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	n, src, err := readLength(src, "string")
 	if err != nil {
@@ -1334,13 +1335,19 @@ func udStringDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src[n:], nil
 }
 
-// udBytesDeser writes the byte slice directly via typed pointer store.
-// *(*[]byte)(p) = b triggers GC write barriers automatically.
-// make+copy ensures the decoded slice owns its memory.
+// udBytesDeser stores the byte slice through a typed pointer, so
+// *(*[]byte)(p) = b triggers the GC write barrier for us. make+copy leaves the
+// decoded slice owning its memory, unless you took on [AliasInput]'s
+// never-modify-src contract. The reflect path we shadow (setBytesValue) makes
+// the same choice, and a fast path may not decide it differently.
 func udBytesDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	n, src, err := readLength(src, "bytes")
 	if err != nil {
 		return nil, err
+	}
+	if sl.aliases() {
+		*(*[]byte)(p) = sl.bytes(src, n)
+		return src[n:], nil
 	}
 	b := make([]byte, n)
 	copy(b, src[:n])
@@ -1350,10 +1357,10 @@ func udBytesDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 
 // ---- Null-union unsafe ser/deser ----
 
-// nullUnionBytes returns the single-byte varint-encoded union index for
-// the null and value branches. Zigzag varint: index 0 encodes as 0x00,
-// index 1 encodes as 0x02. So ["null",T] → null=0x00, val=0x02;
-// ["T","null"] → val=0x00, null=0x02.
+// nullUnionBytes returns the single-byte varint union index for the null and
+// value branches. Zigzag varint: index 0 encodes as 0x00, index 1 as 0x02. So
+// ["null",T] gives null=0x00, val=0x02, and ["T","null"] gives val=0x00,
+// null=0x02.
 func nullUnionBytes(nullSecond bool) (nullByte, valByte byte) {
 	if nullSecond {
 		return 2, 0
@@ -1361,11 +1368,10 @@ func nullUnionBytes(nullSecond bool) (nullByte, valByte byte) {
 	return 0, 2
 }
 
-// usNullUnionEnter is the encode-side mirror of udNullUnionEnter:
-// emits null-branch byte when *(*unsafe.Pointer)(p) is nil, value-
-// branch byte otherwise. Returns (pp, dst-after-tag, isNull). When
-// isNull is true the caller returns dst directly; otherwise pp is
-// the inner *T address the per-branch ser fn fills.
+// usNullUnionEnter is the encode-side mirror of udNullUnionEnter: we emit the
+// null-branch byte when *(*unsafe.Pointer)(p) is nil, the value-branch byte
+// otherwise. Returns (pp, dst-after-tag, isNull). On isNull you return dst
+// directly; otherwise pp is the inner *T address your branch ser fn fills.
 func usNullUnionEnter(dst []byte, p unsafe.Pointer, nullByte, valByte byte) (pp unsafe.Pointer, _ []byte, isNull bool) {
 	pp = *(*unsafe.Pointer)(p)
 	if pp == nil {
@@ -1374,14 +1380,14 @@ func usNullUnionEnter(dst []byte, p unsafe.Pointer, nullByte, valByte byte) (pp 
 	return pp, append(dst, valByte), false
 }
 
-// usNullUnionPtr handles null-union ser for *T where T has a primitive unsafe serializer.
-// nullByte/valByte are the varint-encoded index bytes for null and value branches.
+// usNullUnionPtr handles null-union ser for *T where T has a primitive unsafe
+// serializer.
 func usNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		// Guard at the union node, mirroring the decode-side udNullUnionPtr
-		// and the reflect serNullUnionAt: the union is a schema node and
-		// must both charge its edge (depth+1 into the branch below) AND
-		// guard. See the depth-uniformity invariant in deserNullUnionAt.
+		// and the reflect serNullUnionAt. The union is a schema node, so it
+		// must charge its edge (depth+1 into the branch below) and guard.
+		// See the depth-uniformity invariant in deserNullUnionAt.
 		if depth >= maxDepth {
 			return nil, errTooDeep
 		}
@@ -1397,11 +1403,11 @@ func usNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		// Guard at the union node, mirroring the decode-side
-		// udNullUnionRecord and the reflect serNullUnionAt. The union node
-		// is charged here (guard) and its edge to the inner record is
-		// charged by the depth+1 below; the record node self-charges on
-		// entry, so a ["null", Record] link costs two depth units on every
-		// path. See the depth-uniformity invariant in deserNullUnionAt.
+		// udNullUnionRecord and the reflect serNullUnionAt. This guard
+		// charges the union node, the depth+1 below charges its edge to the
+		// inner record, and the record node self-charges on entry, so a
+		// ["null", Record] link costs two depth units on every path. See the
+		// depth-uniformity invariant in deserNullUnionAt.
 		if depth >= maxDepth {
 			return nil, errTooDeep
 		}
@@ -1413,12 +1419,11 @@ func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte
 	}
 }
 
-// udNullUnionEnter is the shared preamble for udNullUnionPtr / udNullUnionRecord:
-// read the union index, nil-out *T on the null branch, allocate inner
-// storage on the value branch. Returns (pp, src, isNull, err). When
-// isNull is true the caller should return src directly (the pointer
-// field has already been zeroed). Otherwise pp points at freshly-
-// allocated inner storage that the caller's per-branch decoder fills.
+// udNullUnionEnter is the shared preamble for udNullUnionPtr and
+// udNullUnionRecord: read the union index, nil out *T on the null branch,
+// allocate inner storage on the value branch. On isNull you return src
+// directly, since we already zeroed the pointer field; otherwise pp points at
+// fresh inner storage for your branch decoder to fill.
 func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valIdx int, nullByte, valByte byte) (pp unsafe.Pointer, rest []byte, isNull bool, err error) {
 	isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
 	if err != nil {
@@ -1437,13 +1442,14 @@ func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valI
 	return pp, src, false, nil
 }
 
-// udNullUnionPtr handles null-union deser for *T where T has a primitive unsafe deserializer.
+// udNullUnionPtr handles null-union deser for *T where T has a primitive
+// unsafe deserializer.
 //
-// The union is a schema node and bumps sl.depth once, exactly like the
-// reflect deserNullUnionAt, the general deserUnion.deser, and the encode
-// side (usNullUnionPtr passes its branch at depth+1). See the depth-
-// uniformity invariant in deserNullUnionAt. The decrement is inline (not
-// deferred) for the same hot-path reason as udNullUnionRecord below.
+// The union is a schema node and bumps sl.depth once, exactly like the reflect
+// deserNullUnionAt, the general deserUnion.deser, and the encode side
+// (usNullUnionPtr passes its branch at depth+1). See the depth-uniformity
+// invariant in deserNullUnionAt. We decrement inline rather than defer, for the
+// same hot-path reason as udNullUnionRecord below.
 func udNullUnionPtr(inner udeserfn, innerType reflect.Type, valIdx int, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		if sl.depth >= maxDepth {
@@ -1467,10 +1473,10 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type, valIdx int, nullByte
 // entry, so a ["null", Record] link costs two depth units on every path. See
 // the depth-uniformity invariant in deserNullUnionAt.
 //
-// The decrement is inline rather than deferred, here and in udNullUnionPtr:
-// this is the recursive-decode hot path, and benchstat showed the open-coded
-// defer costs ~10% per link on BenchmarkDeserializeRecursive. Every post-bump
-// return decrements first, so depth is restored on success and error alike. The
+// We decrement inline rather than defer, here and in udNullUnionPtr. This is
+// the recursive-decode hot path, and benchstat showed the open-coded defer
+// costs ~10% per link on BenchmarkDeserializeRecursive. Every post-bump return
+// decrements first, so depth is restored on success and error alike, and the
 // over-bound abort returns before the bump.
 func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
@@ -1483,7 +1489,7 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nul
 			sl.depth--
 			return src, err
 		}
-		src, err = deserRecordVia(src, rec.fastFor(innerType), rec, innerType, pp, sl)
+		src, err = deserRecordVia(src, rec.fastFor(innerType, sl.skipUnknown), rec, innerType, pp, sl)
 		sl.depth--
 		return src, err
 	}
@@ -1491,26 +1497,25 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nul
 
 // ---- Array unsafe ser/deser ----
 //
-// The five per-element loops (depth-check + length-prefix + early-exit
-// + per-element body + terminator) are intentionally inlined rather
-// than factored into a generic helper. A usSliceFrame[Elem] factoring
-// regressed BenchmarkLargeArrayEncode (the []*Record hot path) by ~16%:
-// the extra closure call per slice combined with the Go compiler
-// declining to inline the generic at each call site costs measurable
+// We inline the five per-element loops (depth check, length prefix, early
+// exit, per-element body, terminator) rather than factor them into a generic
+// helper. A usSliceFrame[Elem] factoring regressed BenchmarkLargeArrayEncode,
+// the []*Record hot path, by ~16%: the extra closure call per slice, plus the
+// compiler declining to inline the generic at each call site, costs measurable
 // per-array work.
 
 // usArrayRecord handles array ser for []T or []*T where items are records.
 func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 	if elemGoType.Kind() == reflect.Pointer {
-		// A multi-level-pointer element ([]**…record) declines to the reflect
-		// path. usArrayPtrRecord peels one pointer level inline (the
+		// A multi-level-pointer element ([]**...record) declines to reflect.
+		// usArrayPtrRecord peels one pointer level inline (the
 		// []unsafe.Pointer element read) and then hands the remainder to
-		// rec.ser, whose indirect peels a FURTHER maxIndirectDepth levels — so
-		// the element would accept a chain 1+maxIndirectDepth deep, one past the
-		// cap the leaf encoder, the JSON encoder, top-level reflect, and the
-		// nullunion array arms all enforce. The reflect serArray hands the
+		// rec.ser, whose indirect peels a *further* maxIndirectDepth levels.
+		// The element would accept a chain 1+maxIndirectDepth deep, one past
+		// the cap the leaf encoder, the JSON encoder, top-level reflect, and
+		// the nullunion array arms all enforce. The reflect serArray hands the
 		// element to rec.ser with a single indirect budget, capping at
-		// maxIndirectDepth. (Mirrors the []**…record nullunion array decline.)
+		// maxIndirectDepth. Mirrors the []**...record nullunion array decline.
 		if elemGoType.Elem().Kind() == reflect.Pointer {
 			return nil
 		}
@@ -1550,7 +1555,6 @@ func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 	}
 }
 
-// usArrayPtrRecord handles array ser for []*T where items are records.
 func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		if depth >= maxDepth {
@@ -1586,17 +1590,18 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 	}
 }
 
-// usArrayNullUnionRecord handles array ser for []*T where items are ["null", Record].
+// usArrayNullUnionRecord handles array ser for []*T where items are
+// ["null", Record].
 //
-// The element type ["null", Record] is a union schema NODE between the
-// array and the record. It must cost one depth unit, exactly like the
-// decode path (udArrayDirect → udNullUnionRecord → record) and every JSON
-// path. The array node is entered at depth; each element's union node is
-// entered at depth+1 and the inner record at depth+2. The per-element
-// union guard (depth+1 >= maxDepth) is loop-invariant, so it is hoisted
-// before the loop — matching decode's udNullUnionRecord, which guards
-// before reading the index (so a null-branch element at the boundary
-// trips too); only the empty array (no element unions entered) escapes.
+// The element type ["null", Record] is a union schema node between the array
+// and the record. It must cost one depth unit, exactly like the decode path
+// (udArrayDirect into udNullUnionRecord into record) and every JSON path. We
+// enter the array node at depth, each element's union node at depth+1, and the
+// inner record at depth+2. The per-element union guard (depth+1 >= maxDepth) is
+// loop-invariant, so we hoist it before the loop. That matches decode's
+// udNullUnionRecord, which guards before reading the index, so a null-branch
+// element at the boundary trips too. Only the empty array, which enters no
+// element unions, escapes.
 func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		if depth >= maxDepth {
@@ -1608,7 +1613,7 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, va
 		if n == 0 {
 			return dst, nil
 		}
-		// Per-element union node entered at depth+1; charge it.
+		// We enter each element's union node at depth+1; charge it.
 		if depth+1 >= maxDepth {
 			return nil, errTooDeep
 		}
@@ -1634,14 +1639,15 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, va
 	}
 }
 
-// usArrayNullUnionPtr handles array ser for []*T where items are ["null", primitive].
+// usArrayNullUnionPtr handles array ser for []*T where items are
+// ["null", primitive].
 //
-// Like usArrayNullUnionRecord, the ["null", primitive] element type is a
-// union schema node between the array and the primitive; it costs one
-// depth unit. The array node is entered at depth, each element's union
-// node at depth+1, the inner primitive at depth+2. The loop-invariant
-// union guard is hoisted before the loop (mirrors decode's udNullUnionPtr,
-// which guards before reading the index); the empty array escapes.
+// Like usArrayNullUnionRecord, the ["null", primitive] element type is a union
+// schema node between the array and the primitive, and it costs one depth
+// unit. We enter the array node at depth, each element's union node at depth+1,
+// the inner primitive at depth+2. We hoist the loop-invariant union guard
+// before the loop, mirroring decode's udNullUnionPtr, which guards before
+// reading the index. The empty array escapes.
 func usArrayNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		if depth >= maxDepth {
@@ -1653,7 +1659,7 @@ func usArrayNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 		if n == 0 {
 			return dst, nil
 		}
-		// Per-element union node entered at depth+1; charge it.
+		// We enter each element's union node at depth+1; charge it.
 		if depth+1 >= maxDepth {
 			return nil, errTooDeep
 		}
@@ -1701,13 +1707,13 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 }
 
 // udArrayBlocks drives the outer block loop for the unsafe array
-// deserializers. onBlock fills slots [start, start+n) of v's backing
-// array; src→advancedSrc is returned. Shared by udArrayPtrRecord and
-// udArrayDirect so the depth bookkeeping, length overflow guard,
-// MakeSlice/SetLen growth, and block-bounds check live in one place.
+// deserializers. onBlock fills slots [start, start+n) of v's backing array and
+// returns the advanced src. udArrayPtrRecord and udArrayDirect share it, so the
+// depth bookkeeping, length overflow guard, MakeSlice/SetLen growth, and
+// block-bounds check live in one place.
 //
-// minItemBytes bounds block count to len(src)/minItemBytes, mirroring
-// deserArray.deser. Without it the loose count > len(src) check lets a hostile
+// minItemBytes bounds the block count to len(src)/minItemBytes, mirroring
+// deserArray.deser. Without it, the loose count > len(src) check lets a hostile
 // float-array stream drive a 4x MakeSlice allocation per wire byte before the
 // per-element readUint32 loop fails short.
 //
@@ -1732,10 +1738,11 @@ func udArrayBlocks(
 		}
 		src = rest
 		if end {
-			// Empty array → non-nil empty slice, matching deserArray.deser
-			// (the reflect path), the JSON array decoder, and the binary map
-			// decoder. Only the empty case reaches here with v still nil; a
-			// populated target already has a backing array. Once per array.
+			// An empty array gives you a non-nil empty slice, matching
+			// deserArray.deser (the reflect path), the JSON array decoder,
+			// and the binary map decoder. Only the empty case reaches here
+			// with v still nil; a populated target already has a backing
+			// array. Once per array.
 			if v.IsNil() {
 				v.Set(reflect.MakeSlice(sliceType, 0, 0))
 			}
@@ -1764,18 +1771,17 @@ func udArrayBlocks(
 	}
 }
 
-// udArrayPtrRecord handles array deser for []*T where items are records.
-// Uses reflect for slice management, unsafe for per-element record deser.
+// udArrayPtrRecord handles array deser for []*T where items are records. We
+// manage the slice with reflect and decode each element through unsafe.
 func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minItemBytes int) udeserfn {
 	innerSize := innerType.Size()
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,
 			func(src []byte, _ reflect.Value, p unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
 				s := *(*[]unsafe.Pointer)(p)
-				// Batch-allocate backing memory for nil pointer slots in
-				// one contiguous slice, then distribute pointers into the
-				// individual slots. This is much cheaper than allocating
-				// each element separately.
+				// We allocate the backing memory for all nil pointer slots as
+				// one contiguous slice, then hand the slots their pointers.
+				// Much cheaper than allocating each element on its own.
 				var need int
 				for i := range n {
 					if s[start+i] == nil {
@@ -1793,7 +1799,7 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minIt
 						}
 					}
 				}
-				fast := rec.fastFor(innerType)
+				fast := rec.fastFor(innerType, sl.skipUnknown)
 				useFast := fast != nil && fast.allFast
 				var err error
 				for i := range n {
@@ -1812,16 +1818,15 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minIt
 	}
 }
 
-// udArrayDirect handles array deser for []T where items are primitives.
-// Uses reflect for slice management, unsafe for per-element deser.
+// udArrayDirect handles array deser for []T where items are primitives. We
+// manage the slice with reflect and decode each element through unsafe.
 func udArrayDirect(inner udeserfn, elemSize uintptr, sliceType reflect.Type, minItemBytes int) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,
 			func(src []byte, v reflect.Value, _ unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
-				// Access data pointer after the slice growth in
-				// udArrayBlocks. v.UnsafePointer returns the slice's
-				// underlying-array pointer for any element type — avoids
-				// the type-pun via *(*[]byte)(p).
+				// Read the data pointer after udArrayBlocks grew the slice.
+				// v.UnsafePointer gives the underlying-array pointer for any
+				// element type, so we avoid the *(*[]byte)(p) type pun.
 				data := v.UnsafePointer()
 				var err error
 				for i := start; i < start+n; i++ {

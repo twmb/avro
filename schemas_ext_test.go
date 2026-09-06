@@ -3,7 +3,7 @@ package avro_test
 // Schema fixtures used by more than one test. Spelling them once means a
 // cell shows what it varies instead of burying it in near-identical JSON.
 
-// Node{value:int, next:[null,Node]} — a self-referential record.
+// Node{value:int, next:[null,Node]}. A self-referential record.
 const nodeRecursiveSchema = `{
 		"type": "record",
 		"name": "Node",
@@ -24,7 +24,7 @@ const recASchema = `{"type":"record","name":"R","fields":[
 			{"name":"a","type":"int"}
 		]}`
 
-// R{f: [A{x:int}, "A"]} — a union naming A inline then by reference.
+// R{f: [A{x:int}, "A"]}. A union naming A inline then by reference.
 const recUnionInlineThenRefSchema = `{"type":"record","name":"R","fields":[
 			{"name":"f","type":[
 				{"type":"record","name":"A","fields":[{"name":"x","type":"int"}]},

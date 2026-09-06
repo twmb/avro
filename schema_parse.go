@@ -7,20 +7,20 @@ import (
 	"reflect"
 )
 
-// parseSchemaTree decodes a schema JSON string into the aschema parse tree in a
-// single O(n) pass. A json.Unmarshaler on aschema/afield would instead make the
-// stdlib decoder re-scan each nested subtree to delimit it, O(depth*size);
-// decoding once into a generic tree and walking that is O(n).
+// parseSchemaTree decodes a schema JSON string into the aschema parse tree in
+// a single O(n) pass. A json.Unmarshaler on aschema/afield would instead make
+// the stdlib decoder re-scan each nested subtree to delimit it, O(depth*size).
+// We decode once into a generic tree and walk that, which is O(n).
 //
 // Scalar leaves (size, scale, precision, default) re-marshal their small
 // decoded value and reuse the stdlib decode, so their accept/reject behavior
 // matches the typed decode by construction. That re-marshal is O(leaf) and
 // stays O(n) summed.
 func parseSchemaTree(schema string) (*aschema, error) {
-	// decodeSchemaAnyStrict preserves every number as its literal, which is
-	// what the arms below re-marshal into o.Default / f.Default and what the
-	// size / precision / scale reads decode; see that decoder for the two
-	// silent failures a resolving decode produces here.
+	// decodeSchemaAnyStrict preserves every number as its literal. That is what
+	// the arms below re-marshal into o.Default / f.Default, and what the size /
+	// precision / scale reads decode. See that decoder for the two silent
+	// failures a resolving decode produces here.
 	v, err := decodeSchemaAnyStrict(schema)
 	if err != nil {
 		return nil, boundJSONErrorEcho(err)
@@ -33,9 +33,8 @@ func parseSchemaTree(schema string) (*aschema, error) {
 }
 
 // aschemaFromAny populates s from a generic JSON value: a string is a
-// primitive / name reference, an array is a union, an object is a complex
-// type. Mirrors the dispatch the former aschema.UnmarshalJSON did on the
-// first byte.
+// primitive or name reference, an array a union, an object a complex type.
+// Mirrors the dispatch the former aschema.UnmarshalJSON did on the first byte.
 func aschemaFromAny(v any, s *aschema, memo strayShapeMemo) error {
 	switch t := v.(type) {
 	case string:
@@ -69,14 +68,14 @@ func schemaTypeMismatch(key, want string) error {
 }
 
 func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err error) {
-	// memo is set ONLY on the metadata walker's stray-shape validity path
-	// (strayBodyShapeOKMemo), never on a real parse. There the caller
-	// discards the built aobject and only reads whether this subtree is a
-	// valid schema shape, so a subtree already validated returns its cached
-	// verdict without the O(subtree) rebuild — turning the walker's repeated
-	// per-ancestor-level checks over a nested schema from O(depth^2) back
-	// into one linear pass. The verdict is recorded by this same decode, so
-	// it is identical to a fresh strayBodyShapeOK.
+	// memo is set only on the metadata walker's stray-shape validity path
+	// (strayBodyShapeOKMemo), never on a real parse. There the caller discards
+	// the built aobject and reads only whether this subtree is a valid schema
+	// shape, so a subtree we already validated returns its cached verdict
+	// without the O(subtree) rebuild. That turns the walker's repeated
+	// per-ancestor-level checks over a nested schema from O(depth^2) back into
+	// one linear pass. This same decode records the verdict, so it is
+	// identical to a fresh strayBodyShapeOK.
 	if memo != nil {
 		p := reflect.ValueOf(m).Pointer()
 		if valid, ok := memo[p]; ok {
@@ -96,16 +95,15 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 		}
 		o.Type = ts
 	}
-	// Structural/naming keys shape-validate ONLY where the kind binds
-	// them. On a non-binding kind a malformed body cannot define, scope,
-	// or bind anything: the arm leaves the aobject field unset and the
-	// extra loop below routes the raw value to props verbatim
-	// (schemaReservedKeyForObject's shape-conditional arm) — the same
-	// treatment unconsumed precision/scale already get, and the same
-	// accept-and-ignore posture Java (SCHEMA_RESERVED skip,
-	// Schema.java:175-176) and fastavro take. A shape-OK body still
-	// parses into the aobject field even on a non-binding kind (the
-	// documented as-written structural surfacing).
+	// Structural/naming keys shape-validate only where the kind binds them. On
+	// a non-binding kind a malformed body cannot define, scope, or bind
+	// anything: the arm leaves the aobject field unset and the extra loop below
+	// routes the raw value to props verbatim (schemaReservedKeyForObject's
+	// shape-conditional arm). That is the treatment unconsumed precision/scale
+	// already get, and the accept-and-ignore posture Java (SCHEMA_RESERVED
+	// skip, Schema.java:175-176) and fastavro take. A shape-OK body still
+	// parses into the aobject field even on a non-binding kind (the documented
+	// as-written structural surfacing).
 	nameIsString := false
 	if v, ok := m["name"]; ok {
 		if ns, ok := v.(string); ok {
@@ -163,19 +161,18 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 			return nil, err
 		}
 	}
-	// logicalType is read only when string-typed. A non-string value can
-	// never name a logical, so it is inert metadata riding to props
-	// verbatim (schemaReservedKeyForObject's string-conditional arm) —
-	// matching Java (only textual logicalType props are read;
-	// LogicalTypes.fromSchemaImpl via Schema.getProp), fastavro, and
-	// goavro, and matching the treatment an unknown STRING logical
-	// already gets here (inert, surfaced as-written).
+	// We read logicalType only when it is string-typed. A non-string value can
+	// never name a logical, so it is inert metadata riding to props verbatim
+	// (schemaReservedKeyForObject's string-conditional arm). That matches Java
+	// (only textual logicalType props are read; LogicalTypes.fromSchemaImpl via
+	// Schema.getProp), fastavro, and goavro, and it matches the treatment an
+	// unknown *string* logical already gets here (inert, surfaced as-written).
 	if ls, ok := m["logicalType"].(string); ok {
 		o.Logical = ls
 	}
-	// precision/scale are consumed (and shape-validated) only on a
-	// recognized decimal carrier; everywhere else a malformed value is
-	// inert and rides to props like any other unconsumed placement.
+	// We consume (and shape-validate) precision/scale only on a recognized
+	// decimal carrier. Everywhere else a malformed value is inert and rides to
+	// props like any other unconsumed placement.
 	if p, err := intPtrFrom(m, "scale"); err != nil {
 		if decimalConsumesPrecisionScale(o.Type, o.Logical) {
 			return nil, err
@@ -221,7 +218,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 	// recognized decimal carrier, so a CustomType callback's SchemaNode
 	// surfaces a stray pair in Props exactly as Root() does.
 	//
-	// Route on the arms' RECORDED stray-body verdict, not a fresh check: the
+	// We route on the arms' recorded stray-body verdict, not a fresh check: the
 	// arms above set o.Items/o.Values/o.Fields exactly when the body parsed as
 	// the key's shape. A second decode re-enters aschemaFromAny, which routes
 	// its own stray keys, so two decodes per level compound to O(2^depth) on a
@@ -270,13 +267,13 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 	if ls, ok := m["logicalType"].(string); ok {
 		f.Logical = ls
 	}
-	// precision/scale shape verdicts are RECORDED here and decided after
-	// the type parses: whether the pair is consumed depends on the
-	// field-level logicalType and the lift target's kind (and a flat
-	// field routes the raw pair into the lifted type object, where the
-	// type-level gate rules) — none of which is known yet. An unconsumed
-	// malformed body is inert field metadata riding to props verbatim; a
-	// consumed one rejects loudly below, from these recorded errors.
+	// We record the precision/scale shape verdicts here and decide after the
+	// type parses. Whether the pair is consumed depends on the field-level
+	// logicalType and the lift target's kind. A flat field also routes the raw
+	// pair into the lifted type object, where the type-level gate rules. We know
+	// none of that yet. An unconsumed malformed body is inert field metadata
+	// riding to props verbatim; a consumed one rejects loudly below, from these
+	// recorded errors.
 	var scaleErr, precisionErr error
 	if p, err := intPtrFrom(m, "scale"); err != nil {
 		scaleErr = err
@@ -310,16 +307,15 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 	if f.Type != nil && f.Type.primitive != "" && flatFieldNeedsLift(m, f.Type.primitive) {
 		return f.liftFlatFieldType(m, f.Type.primitive)
 	}
-	// The decimal lift is the only field-level consumer of precision/
-	// scale. Where it consumes (logicalType "decimal" with a bytes/fixed
-	// lift target), a malformed body must reject LOUDLY rather than be
-	// treated as absent: scale is optional (spec default 0), so silently
-	// dropping a malformed scale beside a valid precision would parse as
-	// decimal(p,0) — a silent wire-semantics change. Everywhere else the
-	// pair is inert and the recorded error is deliberately dropped — the
-	// key rides to the field's metadata props verbatim, like any custom
-	// property (Java's FIELD_RESERVED excludes the pair, so its parser
-	// never validates them; fastavro preserves them verbatim).
+	// The decimal lift is the only field-level consumer of precision/scale.
+	// Where it consumes (logicalType "decimal" with a bytes/fixed lift target),
+	// a malformed body must reject loudly rather than read as absent. scale is
+	// optional (spec default 0), so silently dropping a malformed scale beside
+	// a valid precision would parse as decimal(p,0), a silent wire-semantics
+	// change. Everywhere else the pair is inert and we deliberately drop the
+	// recorded error. The key rides to the field's metadata props verbatim,
+	// like any custom property. (Java's FIELD_RESERVED excludes the pair, so
+	// its parser never validates them; fastavro preserves them verbatim.)
 	if f.fieldDecimalLiftConsumesPrecisionScale() {
 		if precisionErr != nil {
 			return fmt.Errorf("invalid record field %q: %w", "precision", precisionErr)
@@ -332,19 +328,18 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 	return nil
 }
 
-// flatFieldNeedsLift reports whether the field JSON object m, whose "type"
-// attribute is the bare string tp, is written in the flat (goavro-style)
-// field format: tp names a complex kind and that kind's defining key
-// (symbols / items / values / fields / size) sits alongside the field's own
-// keys. "error" is the record alias, defined by the "fields" key like
+// flatFieldNeedsLift reports whether the field JSON object m is written in the
+// flat (goavro-style) field format. Its "type" attribute is the bare string
+// tp: the format needs tp to name a complex kind, with that kind's defining
+// key (symbols / items / values / fields / size) sitting alongside the field's
+// own keys. "error" is the record alias, defined by the "fields" key like
 // "record".
 //
 // Shared by the wire parser (afieldFromAny) and, via walkNodeChildren
-// (schema_walk.go), every JSON-map walker — the SchemaCache
-// self-containment walkers and the Root() metadata tree: all must lift
-// the SAME fields, or a walker would describe a different schema than
-// the one that encodes — sharing the predicate makes the agreement
-// structural.
+// (schema_walk.go), every JSON-map walker: the SchemaCache self-containment
+// walkers and the Root() metadata tree. All must lift the same fields, or a
+// walker would describe a different schema than the one that encodes. Sharing
+// the predicate is what makes that agreement structural.
 func flatFieldNeedsLift(m map[string]any, tp string) bool {
 	switch tp {
 	case "enum", "array", "map", "record", "error", "fixed":
@@ -359,17 +354,17 @@ func flatFieldNeedsLift(m map[string]any, tp string) bool {
 	return false
 }
 
-// flatLiftTypeMap builds the nested type object's JSON map from a flat
-// field's own keys: "default" and "order" are field-only and never
-// propagate; "aliases" belongs to the field (flat-format aliases are field
-// aliases); "name" and "namespace" propagate only for named kinds;
-// everything else — the defining key, "type" itself, logicalType /
-// precision / scale, doc, and custom properties — moves into the type.
+// flatLiftTypeMap builds the nested type object's JSON map from a flat field's
+// own keys. "default" and "order" are field-only and never propagate.
+// "aliases" belongs to the field, since flat-format aliases are field aliases.
+// "name" and "namespace" propagate only for named kinds. Everything else moves
+// into the type: the defining key, "type" itself, logicalType / precision /
+// scale, doc, and custom properties.
 //
 // Shared by the wire parser (liftFlatFieldType) and the JSON-map walkers'
-// flatField callbacks (collectTreeDefs, metadataField's callers) so the
-// sides cannot drift on WHAT the lift routes; flatFieldNeedsLift is the
-// shared WHEN.
+// flatField callbacks (collectTreeDefs, metadataField's callers), so the sides
+// cannot drift on *what* the lift routes. flatFieldNeedsLift is the shared
+// *when*.
 func flatLiftTypeMap(m map[string]any, tp string) map[string]any {
 	named := isNamedKind(tp)
 	typeMap := make(map[string]any, len(m))
@@ -390,15 +385,15 @@ func flatLiftTypeMap(m map[string]any, tp string) map[string]any {
 	return typeMap
 }
 
-// liftFlatFieldType builds the field's nested type object from the field's
-// own JSON keys (excluding field-only keys), for the flat field format.
-// Mirrors the former afield.UnmarshalJSON flat-form branch. The key routing
-// lives in flatLiftTypeMap (shared with the metadata walker): logicalType /
-// precision / scale flow into the type object (they are not field-only),
-// so the field-level copies are cleared afterward.
+// liftFlatFieldType builds the field's nested type object from the field's own
+// JSON keys (excluding field-only keys), for the flat field format. Mirrors
+// the former afield.UnmarshalJSON flat-form branch. The key routing lives in
+// flatLiftTypeMap (shared with the metadata walker): logicalType / precision /
+// scale flow into the type object, since they are not field-only, so we clear
+// the field-level copies afterward.
 func (f *afield) liftFlatFieldType(m map[string]any, tp string) error {
-	// The lifted type is a freshly constructed map (flatLiftTypeMap), not a
-	// node of the caller's tree, so no shape memo applies — pass nil.
+	// The lifted type is a freshly built map (flatLiftTypeMap), not a node of
+	// the caller's tree, so no shape memo applies and we pass nil.
 	o, err := aobjectFromMap(flatLiftTypeMap(m, tp), nil)
 	if err != nil {
 		return err
@@ -409,8 +404,8 @@ func (f *afield) liftFlatFieldType(m map[string]any, tp string) error {
 }
 
 // stringSliceFrom reads m[key] as a []string. The second return reports
-// presence; a present non-array or non-string element is an error,
-// matching encoding/json's []string decode.
+// presence; a present non-array or non-string element is an error, matching
+// encoding/json's []string decode.
 func stringSliceFrom(m map[string]any, key string) ([]string, bool, error) {
 	v, ok := m[key]
 	if !ok {
@@ -436,33 +431,33 @@ func stringSliceFrom(m map[string]any, key string) ([]string, bool, error) {
 // null is the one body a typed decode accepts in silence: encoding/json
 // documents that unmarshaling it into a non-pointer, non-interface, non-map
 // destination "has no effect on the value and produces no error". A reader
-// deciding PRESENCE by whether the decode failed therefore reads a
-// present-but-unreadable attribute as ABSENT and keeps the zero.
+// deciding presence by whether the decode failed therefore reads a
+// present-but-unreadable attribute as absent and keeps the zero.
 //
 // That zero is not neutral. A fixed of size 0 is a usable schema and a decimal
 // of scale 0 changes what every wire value means, so coercing null into one
-// substitutes a schema nobody wrote. Every typed body read asks this first and
-// treats null as malformed, routing it like any wrong-typed body: hard reject
-// where the kind binds the key, verbatim to props where it does not.
+// substitutes a schema nobody wrote. We ask this first in every typed body
+// read and treat null as malformed, routing it like any wrong-typed body: hard
+// reject where the kind binds the key, verbatim to props where it does not.
 //
-// Keys read by type ASSERTION need no such guard — a JSON null is a nil any,
-// which satisfies no assertion.
+// Keys read by type assertion need no such guard, since a JSON null is a nil
+// any, which satisfies no assertion.
 func jsonNullBody(v any) bool {
 	return v == nil
 }
 
 // decodeLaxInt re-marshals a decoded JSON value and reads it back through
-// laxInt — the schema grammar's integer decode (plain integer syntax or
-// the quoted [INTEGERS] form, length-capped). This is the ONE integer
-// predicate for the "size" attribute, shared by the parse arm
-// (aobjectFromMap), the metadata capture (nodeFromJSONObject), and the
-// stray shape verdict (strayBodyShapeOK), so the surfaces cannot drift on
-// what counts as a size: a value that fails here rides to props verbatim
-// on every surface and never yields a coerced structural value.
+// laxInt, the schema grammar's integer decode (plain integer syntax or the
+// quoted [INTEGERS] form, length-capped). This is our one integer predicate for
+// the "size" attribute, shared by the parse arm (aobjectFromMap), the metadata
+// capture (nodeFromJSONObject), and the stray shape verdict (strayBodyShapeOK).
+// The surfaces cannot drift on what counts as a size: a value that fails here
+// rides to props verbatim on every surface and never yields a coerced
+// structural value.
 //
-// key names the attribute in the error, and is what makes the null verdict
-// readable: a body that names no integer is reported against the key that
-// was written, not as a decode of an anonymous value.
+// key names the attribute in the error, which is what makes the null verdict
+// readable. We report a body that names no integer against the key that was
+// written, not as a decode of an anonymous value.
 func decodeLaxInt(key string, v any) (laxInt, error) {
 	if jsonNullBody(v) {
 		return 0, schemaTypeMismatch(key, "integer")
@@ -479,16 +474,15 @@ func decodeLaxInt(key string, v any) (laxInt, error) {
 }
 
 // intPtrFrom reads m[key] as a *int by re-marshaling the small value and
-// reusing stdlib int decode, so the accept/reject behavior (rejecting
-// floats, strings, overflow) is identical to the former *int struct field —
-// with one shape the re-marshal cannot inherit. Unmarshaling into that
-// struct field handled null by setting the POINTER to nil (absent); the
-// re-marshal decodes into a plain int, where null is a no-op that would
-// hand back a pointer to zero. [jsonNullBody] restores the distinction by
-// rejecting the body outright, which is stricter than the struct field was
-// and is the right verdict for both callers: precision and scale are
-// consumed only on a decimal carrier, and a decimal whose parameter names
-// no number is not a decimal.
+// reusing stdlib int decode, so the accept/reject behavior (rejecting floats,
+// strings, overflow) is identical to the former *int struct field. One shape
+// the re-marshal cannot inherit. Unmarshaling into that struct field handled
+// null by setting the *pointer* to nil (absent). The re-marshal decodes into a
+// plain int, where null is a no-op that would hand back a pointer to zero.
+// [jsonNullBody] restores the distinction by rejecting the body outright.
+// That is stricter than the struct field was, and the right verdict for both
+// callers: we consume precision and scale only on a decimal carrier, and a
+// decimal whose parameter names no number is not a decimal.
 func intPtrFrom(m map[string]any, key string) (*int, error) {
 	v, ok := m[key]
 	if !ok {
@@ -508,19 +502,17 @@ func intPtrFrom(m map[string]any, key string) (*int, error) {
 	return &n, nil
 }
 
-// strayRoutedKeys are the structural/naming keys whose STRAY placements
-// (on a kind that does not bind them) get shape-conditional routing: a
-// body that parses as the key's schema shape surfaces on the matching
-// SchemaNode structural field (as-written), anything else rides in Props
-// verbatim — the same route unconsumed precision/scale already take.
-// Only the exact lowercase spelling is a reserved key; a case-variant
-// spelling is an ordinary custom property with no routing of its own.
+// strayRoutedKeys are the structural/naming keys whose stray placements (on a
+// kind that does not bind them) get shape-conditional routing. A body that
+// parses as the key's schema shape surfaces on the matching SchemaNode
+// structural field, as-written; anything else rides in Props verbatim, the
+// route unconsumed precision/scale already take. Only the exact lowercase
+// spelling is a reserved key: a case-variant spelling is an ordinary custom
+// property with no routing of its own.
 var strayRoutedKeys = [...]string{
 	"items", "values", "fields", "symbols", "size", "name", "namespace", "aliases",
 }
 
-// canonicalStrayKey returns k when it is one of the stray-routed keys
-// (exact lowercase spelling, like every reserved-key match), else "".
 func canonicalStrayKey(k string) string {
 	for _, key := range strayRoutedKeys {
 		if k == key {
@@ -530,16 +522,16 @@ func canonicalStrayKey(k string) string {
 	return ""
 }
 
-// strayKeyBinds reports whether a node of the given kind BINDS key — the
-// parser's kind-keyed grammar. A binding kind shape-validates the key's
-// value and consumes it; on any other kind the key is a stray the parse
-// never binds, so a malformed body there cannot be an attempt to define,
-// scope, or reference anything.
+// strayKeyBinds reports whether a node of the given kind binds key, the
+// parser's kind-keyed grammar. A binding kind shape-validates the key's value
+// and consumes it. On any other kind the key is a stray the parse never binds,
+// so a malformed body there cannot be an attempt to define, scope, or
+// reference anything.
 //
-// The keys whose binding also depends on the VALUE or on the logical type
-// (logicalType, precision/scale) are answered by [schemaKeyBinds], which
-// wraps this; every key whose binding is decided by the kind alone is
-// answered here, so the two are one question with one kind-keyed table.
+// [schemaKeyBinds] wraps this and answers the keys whose binding also depends
+// on the value or the logical type (logicalType, precision/scale). Every key
+// the kind alone decides is answered here, so the two are one question over
+// one kind-keyed table.
 func strayKeyBinds(typ, key string) bool {
 	switch key {
 	case "type", "doc":
@@ -559,9 +551,9 @@ func strayKeyBinds(typ, key string) bool {
 	case "name", "namespace", "aliases":
 		return isNamedKind(typ)
 	case "default":
-		// The enum evolution default is the ONLY type-level binding of
+		// The enum evolution default is the only type-level binding of
 		// "default" (Java's ENUM_RESERVED is SCHEMA_RESERVED plus this one
-		// key, Schema.java:178-180, applied at :1928). A record FIELD binds
+		// key, Schema.java:178-180, applied at :1928). A record field binds
 		// it too, but a field object is read by afieldFromAny against the
 		// field grammar, never by this kind-keyed one.
 		return typ == "enum"
@@ -574,13 +566,13 @@ func strayKeyBinds(typ, key string) bool {
 	return false
 }
 
-// strayBodyShapeOK reports whether v parses as key's schema shape. It
-// runs the SAME decodes the parser's own arms run (aschemaFromAny,
-// afieldFromAny, the string-slice and laxInt reads), so the wire parse
-// and the metadata walker cannot disagree on a stray body's surfacing
-// route: shape-OK bodies surface on the matching structural field,
-// anything else stays a Props entry, and the accept/reject boundary for
-// BINDING kinds is untouched (their arms still propagate the error).
+// strayBodyShapeOK reports whether v parses as key's schema shape. We run the
+// same decodes the parser's own arms run (aschemaFromAny, afieldFromAny, the
+// string-slice and laxInt reads), so the wire parse and the metadata walker
+// cannot disagree on a stray body's surfacing route. Shape-OK bodies surface on
+// the matching structural field, anything else stays a Props entry, and the
+// accept/reject boundary for binding kinds is untouched (their arms still
+// propagate the error).
 func strayBodyShapeOK(key string, v any) bool {
 	switch key {
 	case "name", "namespace":
@@ -619,23 +611,23 @@ func strayBodyShapeOK(key string, v any) bool {
 	return false
 }
 
-// strayShapeMemo caches, by subtree pointer, whether a schema-position
-// subtree parses as a valid schema shape. The metadata walker's stray gates
-// consult a stray body's shape once per node, and a nested-stray schema
-// nests those bodies, so without memoization each body is re-validated once
-// per enclosing level — O(depth^2). One memo shared across a Root() walk
-// makes it linear: the FIRST validation of a subtree records it and every
-// nested subtree it decodes (aobjectFromMap defers the record), so a later
-// level's check of an inner subtree is a cache hit. The recorded verdict is
-// produced by the SAME parser decodes strayBodyShapeOK runs, so it is
-// identical to a fresh check; the map is used only by the metadata walker,
-// and a nil memo (every other caller) takes the un-memoized path.
+// strayShapeMemo caches, by subtree pointer, whether a schema-position subtree
+// parses as a valid schema shape. The metadata walker's stray gates consult a
+// stray body's shape once per node, and a nested-stray schema nests those
+// bodies, so without memoization we re-validate each body once per enclosing
+// level: O(depth^2). One memo shared across a Root() walk makes it linear. The
+// first validation of a subtree records it and every nested subtree it decodes
+// (aobjectFromMap defers the record), so a later level's check of an inner
+// subtree is a cache hit. The same parser decodes strayBodyShapeOK runs produce
+// the recorded verdict, so it is identical to a fresh check. Only the metadata
+// walker uses the map; a nil memo (every other caller) takes the un-memoized
+// path.
 type strayShapeMemo map[uintptr]bool
 
-// errStrayShapeCached is the sentinel aobjectFromMap returns for a subtree
-// the memo already recorded as an invalid schema shape. It never escapes
-// the shape-validity path (the only caller that passes a non-nil memo reads
-// only whether the error is nil), so its text is never surfaced.
+// errStrayShapeCached is the sentinel aobjectFromMap returns for a subtree the
+// memo already recorded as an invalid schema shape. It never escapes the
+// shape-validity path (the only caller passing a non-nil memo reads only
+// whether the error is nil), so we never surface its text.
 var errStrayShapeCached = errors.New("avro: stray shape (cached invalid)")
 
 // strayBodyShapeOKMemo is strayBodyShapeOK with per-subtree memoization for
@@ -670,23 +662,23 @@ func strayBodyShapeOKMemo(memo strayShapeMemo, key string, v any) bool {
 }
 
 // strayShapeVerdict reports whether a stray-routed reserved key's body
-// (canonical key spelling, raw value v) parsed as that key's schema shape.
-// A caller that already decoded the body once passes its RECORDED verdict
-// here so the props-routing (schemaReservedKeyForObject) and the metadata
-// child-surfacing never re-decode a subtree the caller already walked —
-// the re-decode is what turns a nested-stray schema into O(2^depth) work.
+// (canonical key spelling, raw value v) parsed as that key's schema shape. A
+// caller that already decoded the body passes its recorded verdict here, so the
+// props routing (schemaReservedKeyForObject) and the metadata child-surfacing
+// never re-decode a subtree the caller already walked. That re-decode is what
+// turns a nested-stray schema into O(2^depth) work.
 type strayShapeVerdict func(canonKey string, v any) bool
 
 // strayShapeRecorded returns the aobject's own arm verdicts as a
-// strayShapeVerdict: a stray-routed body parsed as its schema shape iff the
-// matching arm set the aobject field (o.Items for "items", o.Values for
-// "values", o.Fields for "fields", and so on). The arms run aschemaFromAny/
-// afieldFromAny/the string-slice and laxInt reads — the SAME decodes
-// strayBodyShapeOK runs — so field-set is an exact mirror of the shape
-// check, and consulting it lets the extra-property loop skip a second
-// decode of every already-walked body. nameIsString carries the name arm's
-// string-ness (o.Name is a bare string with no present/absent flag of its
-// own; the empty short name "" is a valid name shape).
+// strayShapeVerdict. A stray-routed body parsed as its schema shape iff the
+// matching arm set the aobject field: o.Items for "items", o.Values for
+// "values", o.Fields for "fields", and so on. The arms run aschemaFromAny,
+// afieldFromAny, and the string-slice and laxInt reads, the same decodes
+// strayBodyShapeOK runs, so field-set is an exact mirror of the shape check.
+// Consulting it lets the extra-property loop skip a second decode of every
+// already-walked body. nameIsString carries the name arm's string-ness (o.Name
+// is a bare string with no present/absent flag of its own; the empty short
+// name "" is a valid name shape).
 func (o *aobject) strayShapeRecorded(nameIsString bool) strayShapeVerdict {
 	return func(canonKey string, _ any) bool {
 		switch canonKey {

@@ -9,9 +9,9 @@ import (
 )
 
 // The must* helpers below each run one library call and fail the test if it
-// errors, so a cell that only needs the successful result reads as one line
-// instead of four. Every one calls t.Helper(), so a failure is reported at the
-// caller's line.
+// errors. A cell that only needs the successful result then reads as one line,
+// not four. Every one calls t.Helper(), so a failure lands on the caller's
+// line.
 
 func mustNewWriter(t testing.TB, w io.Writer, s *avro.Schema, opts ...ocf.WriterOpt) *ocf.Writer {
 	t.Helper()

@@ -11,71 +11,69 @@ import (
 )
 
 // maxJSONValueNesting bounds how deeply decodeSchemaAny descends. It is the
-// depth the stdlib decoder this replaced accepted, kept exactly so a schema at
-// the boundary is decided the same way it always was: 10000 nested values
-// parse, 10001 do not.
+// depth the stdlib decoder we replaced accepted, kept exactly so a schema at
+// the boundary is decided the way it always was: 10000 nested values parse,
+// 10001 do not.
 //
-// Distinct from maxSchemaJSONDepth, which bounds the BRACKET nesting of schema
-// text in a pre-scan before any decode. That one exists to reject
-// pathologically deep input up front and is far tighter; this one is the
-// decoder's own stack guard, and it also covers the two callers that decode
-// text the pre-scan never saw (a preserved default, a struct tag).
+// Distinct from maxSchemaJSONDepth, which bounds the bracket nesting of schema
+// text in a pre-scan before any decode. That one rejects pathologically deep
+// input up front and is far tighter. This one is the decoder's own stack
+// guard, and it also covers the two callers that decode text the pre-scan
+// never saw (a preserved default, a struct tag).
 const maxJSONValueNesting = 10000
 
-// decodeSchemaAny decodes ONE JSON value out of schema text into the generic
+// decodeSchemaAny decodes one JSON value out of schema text into the generic
 // tree every schema surface is written against: map[string]any for objects,
-// []any for arrays, string, bool, nil, and json.Number for every number. It
-// returns how many bytes the value consumed, so each caller decides for itself
+// []any for arrays, string, bool, nil, and json.Number for every number. We
+// return how many bytes the value consumed, so each caller decides for itself
 // what trailing content means.
 //
-// This is the ONE decoder for schema JSON. Five sites used to hand-spell the
-// same json.NewDecoder + UseNumber + Decode(&v any) — the parse tree, the
+// This is our one decoder for schema JSON. Five sites used to hand-spell the
+// same json.NewDecoder + UseNumber + Decode(&v any): the parse tree, the
 // metadata tree, a preserved field default, the cache's input normalization,
-// and a struct-tag default — and three of them also hand-spelled their own
-// trailing-content rule. A hand-spelled decode is a snapshot of the rule at the
-// moment it was typed, and the sites had already begun to drift.
+// and a struct-tag default. Three also hand-spelled their own trailing-content
+// rule, and the sites had already begun to drift.
 //
 // [unmarshalAnyPreservePrecision] layers normalizeJSONValue over this for the
 // metadata surfaces. Nothing else does, and that split is deliberate:
 //
 // # Numbers come back verbatim as json.Number, and must stay that way
 //
-// Resolving numbers here — to int64 / float64 via normalizeJSONNumber — would
+// Resolving numbers here, to int64 / float64 via normalizeJSONNumber, would
 // pay for itself on the metadata path, which normalizes every number anyway.
-// It would also break the parse path in two ways that raise NO error and
+// It would also break the parse path in two ways that raise no error and
 // produce no diagnostic, only wrong output:
 //
-//   - A default is preserved as the bytes the author wrote: aobjectFromMap and
+//   - We preserve a default as the bytes the author wrote: aobjectFromMap and
 //     afieldFromAny re-marshal the decoded value into o.Default / f.Default,
 //     and the wire encoder parses those bytes much later. Integer-syntax "-0"
-//     resolved to a number loses its IEEE sign — an exact-integer rational has
-//     no signed zero — so the re-marshal writes "0" and a float field whose
-//     author wrote -0.0 silently encodes +0.0.
+//     resolved to a number loses its IEEE sign, since an exact-integer
+//     rational has no signed zero. The re-marshal then writes "0", and a float
+//     field whose author wrote -0.0 silently encodes +0.0.
 //
-//   - A resolved number re-marshals to its SHORTEST form, which can be
+//   - A resolved number re-marshals to its *shortest* form, which can be
 //     drastically shorter than the literal. "1." followed by 1021 zeros and
-//     "e3" is 1025 bytes, one past the float literal length cap that every
-//     other arm enforces; resolved, it is the exact integer 1000, whose
-//     re-marshal is four bytes. The cap then never sees an over-long literal
-//     and the parse accepts a default that encode, decode, and metadata all
-//     refuse.
+//     "e3" is 1025 bytes, one past the float literal length cap every other
+//     arm enforces. Resolved, it is the exact integer 1000, whose re-marshal is
+//     four bytes. The cap then never sees an over-long literal, and we accept a
+//     default that encode, decode, and metadata all refuse.
 //
 // Keeping the literal is what makes both the sign and the cap a property of
-// the INPUT rather than of how far the decode happened to resolve it.
+// the input, rather than of how far the decode happened to resolve it.
 //
 // # Strings share the input's memory
 //
-// A key or string value carrying no escapes is returned as a SUBSTRING of
-// schema rather than a copy, which is where most of the allocation saving comes
-// from. Nothing can be written through a string, so no aliasing SEMANTICS
-// follow — two [Schema.Root] trees stay mutually independent, and mutating one
-// is still invisible to the other — but the LIFETIME does change: a Go string
-// keeps its whole backing array alive, so any one of these substrings pins the
-// entire schema text.
+// We hand back a key or string value carrying no escapes as a substring of
+// schema rather than a copy, which is where most of the allocation saving
+// comes from. Nothing can be written through a string, so no aliasing
+// *semantics* follow: two [Schema.Root] trees stay mutually independent, and
+// mutating one is still invisible to the other. The *lifetime* does change. A
+// Go string keeps its whole backing array alive, so any one of these
+// substrings pins the entire schema text.
 //
-// Inside a [Schema] that costs nothing, since the text is already retained
-// verbatim for [Schema.String]. It costs something wherever a piece outlives
-// its schema: a [SchemaNode] kept after its *Schema is dropped, one short string
+// Inside a [Schema] that costs nothing: the text is already retained verbatim
+// for [Schema.String]. It costs you something wherever a piece outlives its
+// schema: a [SchemaNode] kept after its *Schema is dropped, one short string
 // pulled out of [SchemaNode.Props] and held, or a [SchemaCache], which retains
 // the definitions of every schema it parsed. The bound is one copy of the text
 // per schema, not per string.
@@ -83,13 +81,13 @@ func decodeSchemaAny(schema string) (any, int, error) {
 	d := &schemaDecoder{in: schema}
 	d.space()
 	if d.at >= len(d.in) {
-		// Text holding no value at all reports [io.EOF], and text that runs
-		// out PART WAY through one reports [io.ErrUnexpectedEOF] (see
+		// Text holding no value at all reports [io.EOF]; text that runs out
+		// part way through one reports [io.ErrUnexpectedEOF] (see
 		// schemaDecoder.eof). Both sentinels reach a caller of Parse
 		// unwrapped-through, because parse echoes a decode error rather than
-		// replacing it, so errors.Is on either keeps answering what it
-		// always did — the distinction is the only thing separating "you
-		// handed me nothing" from "you handed me a truncated schema".
+		// replacing it, so errors.Is on either keeps answering what it always
+		// did. That distinction is the only thing separating "you handed me
+		// nothing" from "you handed me a truncated schema".
 		return nil, 0, io.EOF
 	}
 	v, err := d.value(0)
@@ -99,11 +97,11 @@ func decodeSchemaAny(schema string) (any, int, error) {
 	return v, d.at, nil
 }
 
-// decodeSchemaAnyStrict is decodeSchemaAny plus the rule that the value must be
-// the WHOLE input: trailing whitespace is consumed, anything else is content
-// and rejects. Every schema-text caller wants this — a schema string with a
-// second value after it is not a schema — and stating it once keeps the callers
-// from spelling three different versions of "is there anything left".
+// decodeSchemaAnyStrict is decodeSchemaAny plus the rule that the value must
+// be the *whole* input: we consume trailing whitespace, anything else is
+// content and rejects. Every schema-text caller wants this, since a schema
+// string with a second value after it is not a schema. Stating it once keeps
+// the callers from spelling three versions of "is there anything left".
 func decodeSchemaAnyStrict(schema string) (any, error) {
 	v, n, err := decodeSchemaAny(schema)
 	if err != nil {
@@ -131,12 +129,12 @@ func (d *schemaDecoder) errorf(format string, args ...any) error {
 	return fmt.Errorf("invalid schema json: "+format, args...)
 }
 
-// eof reports text that ran out PART WAY through a value, which is a different
+// eof reports text that ran out part way through a value. That is a different
 // answer from text holding no value at all: the first is a truncated schema,
-// the second is an absent one. A decode into a generic tree has always drawn
-// that line with [io.ErrUnexpectedEOF] against [io.EOF], and parse echoes the
-// decode error rather than replacing it, so both sentinels are reachable by
-// errors.Is on what Parse returns.
+// the second an absent one. A decode into a generic tree has always drawn the
+// line with [io.ErrUnexpectedEOF] against [io.EOF]. Parse echoes the decode
+// error rather than replacing it, so you reach both sentinels with errors.Is
+// on what Parse returns.
 func (d *schemaDecoder) eof(what string) error {
 	return fmt.Errorf("invalid schema json: %s at offset %d: %w", what, d.at, io.ErrUnexpectedEOF)
 }
@@ -152,7 +150,6 @@ func (d *schemaDecoder) space() {
 	}
 }
 
-// literal consumes an expected bare token (true / false / null).
 func (d *schemaDecoder) literal(tok string, v any) (any, error) {
 	if d.at+len(tok) <= len(d.in) && d.in[d.at:d.at+len(tok)] == tok {
 		d.at += len(tok)
@@ -167,13 +164,13 @@ func (d *schemaDecoder) literal(tok string, v any) (any, error) {
 // value decodes one value at the cursor, which space() has already advanced to
 // a non-space byte. depth counts enclosing containers.
 //
-// The nesting bound is charged on the two CONTAINER arms, not here, because a
+// We charge the nesting bound on the two container arms, not here, because a
 // scalar costs no nesting: it is a leaf, it recurses no further, and a decode
 // into a generic tree pushes state for containers alone. Charging every value
 // spends the last unit of the budget on the innermost leaf, so a shape whose
-// innermost container is NON-EMPTY refuses one level early — [ x10000 holding a
-// number is 10000 containers and must parse, while [ x10000 holding nothing is
-// the same 10000 and always did. The empty-innermost shapes agree either way,
+// innermost container is non-empty refuses one level early. [ x10000 holding a
+// number is 10000 containers and must parse; [ x10000 holding nothing is the
+// same 10000 and always did. The empty-innermost shapes agree either way,
 // which is what makes the difference easy to miss.
 func (d *schemaDecoder) value(depth int) (any, error) {
 	if d.at >= len(d.in) {
@@ -289,10 +286,10 @@ func (d *schemaDecoder) array(depth int) (any, error) {
 	}
 }
 
-// str decodes a JSON string. It returns any so the value dispatch has one
+// str decodes a JSON string. We return any so the value dispatch has one
 // return shape; object() asserts the string back for a key.
 //
-// The common case — no escapes, valid UTF-8 — hands back a substring of the
+// The common case, no escapes and valid UTF-8, hands back a substring of the
 // input, so a schema's keys and string values cost no allocation at all.
 func (d *schemaDecoder) str() (any, error) {
 	d.at++ // opening quote
@@ -378,13 +375,13 @@ func (d *schemaDecoder) strEscaped(start int) (any, error) {
 }
 
 // unicodeEscape reads the four hex digits after \u, pairing a leading
-// surrogate with a trailing one when the next escape supplies it. An unpaired
-// surrogate becomes the replacement rune, as a decode into a Go string does —
-// UTF-8 cannot represent one.
+// surrogate with a trailing one when the next escape supplies it. UTF-8 cannot
+// represent an unpaired surrogate, so one becomes the replacement rune, as a
+// decode into a Go string does.
 func (d *schemaDecoder) unicodeEscape() (rune, error) {
 	// Left to right, one digit at a time, so a non-hex character reports
 	// itself and only genuinely running out of text reports truncation. The
-	// order matters: checking the remaining LENGTH first would call "\uX"
+	// order matters: checking the remaining length first would call "\uX"
 	// truncated when what is wrong with it is the X.
 	var r rune
 	for i := 0; i < 4; i++ {
@@ -402,8 +399,8 @@ func (d *schemaDecoder) unicodeEscape() (rune, error) {
 		return r, nil
 	}
 	// A leading surrogate pairs with a trailing one when the next escape
-	// supplies it. This is a LOOKAHEAD, so anything else here is not an
-	// error — it just leaves the surrogate unpaired.
+	// supplies it. This is a lookahead, so anything else here is not an error;
+	// it just leaves the surrogate unpaired.
 	if d.at+6 <= len(d.in) && d.in[d.at] == '\\' && d.in[d.at+1] == 'u' {
 		if lo, ok := hex4(d.in[d.at+2 : d.at+6]); ok {
 			if paired := utf16.DecodeRune(r, lo); paired != utf8.RuneError {
@@ -453,8 +450,8 @@ func (d *schemaDecoder) number() (any, error) {
 		return nil, d.eof("truncated number")
 	case d.in[d.at] == '0':
 		// RFC 8259: no leading zeros. A second digit here ends the number
-		// after the '0', which is what a decode does too — the leftover
-		// digit becomes trailing content for the caller to rule on.
+		// after the '0', which is what a decode does too: the leftover digit
+		// becomes trailing content for the caller to rule on.
 		d.at++
 	case d.in[d.at] >= '1' && d.in[d.at] <= '9':
 		for d.at < len(d.in) && isDigit(d.in[d.at]) {
@@ -495,8 +492,8 @@ func (d *schemaDecoder) number() (any, error) {
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
-// replaceInvalidUTF8 substitutes the replacement rune for each byte that is not
-// part of a valid encoding — one per BYTE, which is what decoding into a Go
+// replaceInvalidUTF8 substitutes the replacement rune for each byte that is
+// not part of a valid encoding: one per byte, which is what decoding into a Go
 // string produces, and not one per invalid run.
 func replaceInvalidUTF8(s string) string {
 	var b strings.Builder

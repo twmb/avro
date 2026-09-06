@@ -1,6 +1,6 @@
-// Package atype defines constants for Avro schema type names, logical
-// type names, and field sort orders. These are the string values used in
-// [avro.SchemaNode], [avro.SchemaField], and [avro.CustomType].
+// Package atype names the Avro schema types, logical types, and field sort
+// orders. These are the string values you see in [avro.SchemaNode],
+// [avro.SchemaField], and [avro.CustomType].
 package atype
 
 // Avro primitive types.

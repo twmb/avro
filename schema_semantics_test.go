@@ -28,56 +28,60 @@ import (
 // ---------- attribute_placement_census_test.go ----------
 
 // ---------------------------------------------------------------------------
-// The ATTRIBUTE x PLACEMENT acceptance census.
+// The attribute-by-placement acceptance census.
 //
-// Every attribute the Avro spec defines somewhere (precision, scale, items,
-// values, symbols, size, fields, order, default, aliases, namespace,
-// logicalType, and the enum-level default) placed on every OTHER kind, at both
-// levels (a type object and a record-field object), skipping only the placements
-// where the attribute is defined. Per accepted cell the census asserts the
-// routing, the String() reparse and Root().Schema() rebuild round trips, and
-// wire/Canonical()/Rabin identity with the stray-free twin — a stray attribute
-// must be INERT. Reject cells assert their documented policy (NOT_BUGS #63). The
-// fastavro differential arm executes every cell; the cisuite arm drives a
+// We take every attribute the Avro spec defines somewhere and place it on
+// every *other* kind. That list is precision, scale, items, values, symbols,
+// size, fields, order, default, aliases, namespace, logicalType, and the
+// enum-level default. Each placement happens at both levels, a type object and
+// a record-field object, and only the placements where the attribute is
+// defined are skipped. Per accepted cell we assert the routing, plus the
+// String() reparse and Root().Schema() rebuild round trips. Wire, Canonical(),
+// and Rabin identity with the stray-free twin hold too: a stray attribute
+// must be inert. Reject cells assert their documented policy (NOT_BUGS #63).
+// The fastavro differential arm executes every cell; the cisuite arm drives a
 // representative subset through the Java oracle.
 //
-// The routing rule — one rule, both parse surfaces, since aobjectFromMap extras
-// and the Root() metadata walker share schemaReservedKeyForObject:
+// One routing rule covers both parse surfaces, since aobjectFromMap extras and
+// the Root() metadata walker share schemaReservedKeyForObject:
 //
-//   - Reserved keys the node's kind CONSUMES are consumed (items on array,
-//     symbols on enum, size on fixed, fields on record/error, values on map,
-//     namespace/aliases on named kinds, default on enum — #54, precision/scale
-//     on recognized decimal carriers — #55).
+//   - Reserved keys the node's kind consumes are consumed: items on array,
+//     symbols on enum, size on fixed, fields on record/error, and values on
+//     map. The rule also covers namespace/aliases on named kinds, default on
+//     enum per #54, and precision/scale on recognized decimal carriers per
+//     #55.
 //   - precision/scale anywhere else are custom properties at both levels,
-//     including malformed bodies at the FIELD level when no decimal lift
-//     consumes them; the body-shape axis lives in the strayPS placement matrix
+//     including malformed bodies at the field level when no decimal lift
+//     consumes them. The body-shape axis lives in the strayPS placement matrix
 //     (NOT_BUGS #71).
-//   - Every OTHER reserved key on a kind that does not consume it is captured
-//     and surfaced AS-WRITTEN on the matching SchemaNode field where one exists,
-//     and rides to Props verbatim where none does (order on every kind, default
-//     on every kind but enum). Exactly one surface per key, never both and never
-//     neither. None reach the wire, the canonical form strips them, and the
-//     rebuild emits the defined-placement attributes plus the Props-routed ones
-//     — so the rebuild is canonical-identical, not text-identical.
-//   - A container kind carrying ANOTHER container kind's defining structural key
-//     hard-rejects — NOT_BUGS #63, the cache/metadata walkers' kind-keyed
-//     soundness premise; fastavro and Java accept these as props (the documented
-//     divergence). A stray "name" on an unnamed CONTAINER kind rejects for the
-//     same walker-parity reason; a stray "namespace" there is inert.
-//   - At the FIELD level every non-field-reserved key is a field custom property
-//     as written, and the field's type node stays clean. (The flat goavro-style
-//     lift consumes defining keys only when the field's "type" is a bare string
-//     naming the matching kind; the census spells field types nested or
-//     bare-primitive so no cell is lift-eligible.)
+//   - Every other reserved key on a kind that does not consume it is captured,
+//     and surfaces as written on the matching SchemaNode field where one
+//     exists. Where none exists it rides to Props verbatim (order on every
+//     kind, default on every kind but enum). Exactly one surface per key,
+//     never both and never neither. None reach the wire, and the canonical
+//     form strips them. The rebuild emits the defined-placement attributes
+//     plus the Props-routed ones, so the rebuild is canonical-identical, not
+//     text-identical.
+//   - A container kind carrying another container kind's defining structural
+//     key hard-rejects: that is NOT_BUGS #63, the cache/metadata walkers'
+//     kind-keyed soundness premise. fastavro and Java accept these as props,
+//     the documented divergence. A stray "name" on an unnamed container kind
+//     rejects for the same walker-parity reason; a stray "namespace" there is
+//     inert.
+//   - At the field level every non-field-reserved key is a field custom
+//     property as written, and the field's type node stays clean. (The flat
+//     goavro-style lift consumes defining keys only when the field's "type" is
+//     a bare string naming the matching kind. The census spells field types
+//     nested or bare-primitive, so no cell is lift-eligible.)
 //
-// Field-level order/default/aliases are DEFINED field attributes (skipped);
-// field-level logicalType is the #33 lift, netted by the harness's
+// Field-level order/default/aliases are defined field attributes (skipped).
+// Field-level logicalType is the #33 lift, netted by the harness's
 // field-logical rows.
 // ---------------------------------------------------------------------------
 
-// censusKinds are the type-level kinds; censusFieldKinds adds union (which
-// has no type-object form — a union is a JSON array and cannot carry
-// attributes at all, so its type-level placement is structurally skipped).
+// censusKinds are the type-level kinds; censusFieldKinds adds union. A union
+// has no type-object form: it is a JSON array and cannot carry attributes at
+// all, so we skip its type-level placement structurally.
 var censusKinds = []string{
 	"null", "boolean", "int", "long", "float", "double", "string", "bytes",
 	"fixed", "enum", "record", "error", "array", "map",
@@ -96,7 +100,7 @@ var censusNamedKinds = map[string]bool{
 type censusVerdict int
 
 const (
-	censusSkip     censusVerdict = iota // defined placement — not a stray
+	censusSkip     censusVerdict = iota // defined placement, not a stray
 	censusProps                         // accepted; key surfaces in Props
 	censusCaptured                      // accepted; key surfaces on the matching SchemaNode field (or nowhere), never Props
 	censusReject63                      // rejected: structural-key exclusivity (NOT_BUGS #63)
@@ -104,24 +108,24 @@ const (
 
 type censusAttr struct {
 	key string
-	// val returns the attribute's raw JSON value for a cell (kind-plausible
-	// where it matters; the value axis is held fixed-valid — value-shape
-	// acceptance is a different, already-netted axis: #41, #54, #55).
+	// val returns the attribute's raw JSON value for a cell, kind-plausible
+	// where it matters. The value axis is held fixed-valid: value-shape
+	// acceptance is a different, already-netted axis (#41, #54, #55).
 	val func(kind string) string
 	// verdict returns the type-level expectation for the kind.
 	verdict func(kind string) censusVerdict
-	// fieldLevel reports whether the attribute is stray at the field level
-	// (false = defined there, or covered by a dedicated net).
+	// fieldLevel reports whether the attribute is stray at the field level;
+	// false means defined there, or covered by a dedicated net.
 	fieldLevel bool
 	// surfaced asserts kind-specific as-written surfacing on the metadata
-	// node for censusCaptured cells (nil = key surfaces nowhere).
+	// node for censusCaptured cells; nil means the key surfaces nowhere.
 	surfaced func(t *testing.T, n *avro.SchemaNode, when string)
 	// propsVal is the normalized Props value expected for censusProps and
 	// field-level cells.
 	propsVal any
 	// propsValFor overrides propsVal per kind, for the attributes whose
-	// value axis is kind-plausible (a "default" body has to be a value the
-	// kind can take). nil falls back to propsVal.
+	// value axis is kind-plausible: a "default" body has to be a value the
+	// kind can take. A nil propsValFor falls back to propsVal.
 	propsValFor func(kind string) any
 }
 
@@ -135,8 +139,8 @@ func (a censusAttr) propsValue(kind string) any {
 }
 
 // structuralExclusive returns the #63 verdict table for one structural key:
-// defined on definedKind, captured-dropped on primitives, rejected on every
-// other container kind.
+// defined on definedKind, captured-dropped on primitives, and rejected on
+// every other container kind.
 func structuralExclusive(definedKinds ...string) func(string) censusVerdict {
 	defined := map[string]bool{}
 	for _, k := range definedKinds {
@@ -161,8 +165,8 @@ func censusAttrs() []censusAttr {
 		{
 			key: "precision", val: constVal(`3`),
 			// Bare precision (no decimal logical alongside) is stray on
-			// EVERY kind: consumption requires the recognized decimal
-			// carrier (decimalConsumesPrecisionScale), whose placement
+			// every kind: consumption requires the recognized decimal
+			// carrier, decimalConsumesPrecisionScale. Its placement
 			// matrix is TestMatrix_StrayPrecisionScalePlacement.
 			verdict: always(censusProps), fieldLevel: true, propsVal: int64(3),
 		},
@@ -222,21 +226,22 @@ func censusAttrs() []censusAttr {
 			},
 		},
 		{
-			// order is a FIELD attribute; no type-level kind consumes it and
-			// no SchemaNode field exists for it to land on, so Props is its
-			// only surface. Java keeps it as a schema property on every kind
-			// (SCHEMA_RESERVED omits it, Schema.java:175-176; ENUM_RESERVED
-			// adds only "default", :178-180) and fastavro 1.12.2 keeps it on
+			// order is a field attribute, and no type-level kind consumes it.
+			// No SchemaNode field exists for it to land on, so Props is its
+			// only surface. Java keeps it as a schema property on every kind:
+			// SCHEMA_RESERVED omits it (Schema.java:175-176), and ENUM_RESERVED
+			// adds only "default" (:178-180). fastavro 1.12.2 keeps it on
 			// every kind too (executed).
 			key: "order", val: constVal(`"ascending"`),
 			verdict: always(censusProps), fieldLevel: false, propsVal: "ascending",
 		},
 		{
-			// default is a FIELD attribute plus the enum-level evolution
-			// default (defined there, membership-validated — #54; that is
-			// the census's "enum-default" attribute). Every other type-level
-			// placement binds nothing and has no SchemaNode field, so it
-			// rides to Props — Java's ENUM_RESERVED is the same split.
+			// default is a field attribute plus the enum-level evolution
+			// default, defined there and membership-validated per #54;
+			// that is the census's "enum-default" attribute. Every other
+			// type-level placement binds nothing and has no SchemaNode
+			// field, so it rides to Props. Java's ENUM_RESERVED is the
+			// same split.
 			key: "default",
 			val: func(kind string) string {
 				switch kind {
@@ -290,8 +295,8 @@ func censusAttrs() []censusAttr {
 		},
 		{
 			// aliases are defined on named kinds (any string accepted, #27)
-			// and on fields; on unnamed kinds they are captured and surface
-			// as-written on SchemaNode.Aliases.
+			// and on fields. On unnamed kinds we capture them, and they
+			// surface as-written on SchemaNode.Aliases.
 			key: "aliases", val: constVal(`["CensusAlias"]`),
 			verdict: func(kind string) censusVerdict {
 				if censusNamedKinds[kind] {
@@ -308,14 +313,15 @@ func censusAttrs() []censusAttr {
 			},
 		},
 		{
-			// namespace is defined on named kinds. On primitives AND on the
-			// unnamed containers (array, map) it is inert metadata: accepted,
-			// surfaced as-written on SchemaNode.Namespace, never consulted
-			// for name scoping (children keep the ENCLOSING scope — the
-			// parser's rule, nodeChildScope's rule, and fastavro's executed
-			// behavior agree; TestMatrix_AttributePlacementNamespaceInert
-			// pins the scoping). Java treats it as reserved-and-ignored on
-			// every schema object (SCHEMA_RESERVED, Schema.java).
+			// namespace is defined on named kinds. On primitives and on the
+			// unnamed containers (array, map) it is inert metadata. It is
+			// accepted and surfaced as-written on SchemaNode.Namespace, never
+			// consulted for name scoping, and children keep the enclosing
+			// scope. The parser's rule, nodeChildScope's rule, and
+			// fastavro's executed behavior agree, and
+			// TestMatrix_AttributePlacementNamespaceInert pins the scoping.
+			// Java treats it as reserved-and-ignored on every schema object
+			// (SCHEMA_RESERVED, Schema.java).
 			key: "namespace", val: constVal(`"census.ns"`),
 			verdict: func(kind string) censusVerdict {
 				if censusNamedKinds[kind] {
@@ -333,7 +339,7 @@ func censusAttrs() []censusAttr {
 		},
 		{
 			// A recognized logical on a kind it is not valid for soft-drops
-			// off the wire codec (raw encoding) but the metadata keeps the
+			// off the wire codec (raw encoding), but the metadata keeps the
 			// as-written spelling. date is defined on int only.
 			key: "logicalType", val: constVal(`"date"`),
 			verdict: func(kind string) censusVerdict {
@@ -343,7 +349,7 @@ func censusAttrs() []censusAttr {
 				return censusCaptured
 			},
 			// Field-level logicalType is the #33 lift family, netted by the
-			// FEATURE x WALKER harness's field-logical rows.
+			// feature-by-walker harness's field-logical rows.
 			fieldLevel: false,
 			surfaced: func(t *testing.T, n *avro.SchemaNode, when string) {
 				t.Helper()
@@ -381,8 +387,8 @@ func censusTypeSchema(kind, key, val string, withAttr bool) string {
 }
 
 // censusFieldType spells the field's type for a field-level cell: bare
-// strings for primitives, nested objects for complex kinds, a JSON array
-// for union — never a lift-eligible flat spelling.
+// strings for primitives, nested objects for complex kinds, and a JSON array
+// for union. It never uses a lift-eligible flat spelling.
 func censusFieldType(kind string) string {
 	switch kind {
 	case "fixed":
@@ -566,14 +572,14 @@ func TestMatrix_AttributePlacementCensus(t *testing.T) {
 }
 
 // A stray "namespace" attribute on the unnamed container kinds parses as inert
-// metadata, exactly like every other non-consumed reserved attribute and like
-// the same key on primitive type objects: surfaced as-written on the metadata
-// node, never consulted for name scoping, invisible to the wire, the canonical
-// form, and the fingerprint. Java ignores it via SCHEMA_RESERVED
-// (Schema.java:175 — namespace is reserved on EVERY schema object); fastavro
-// 1.12.2 accepts it and resolves a named type defined under such an array in the
-// ENCLOSING scope (executed). Rejecting it made twmb disagree with both
-// references AND with itself across kinds.
+// metadata. It behaves exactly like every other non-consumed reserved
+// attribute, and like the same key on primitive type objects. It is surfaced
+// as-written on the metadata node, never consulted for name scoping, and
+// invisible to the wire, the canonical form, and the fingerprint. Java
+// ignores it via SCHEMA_RESERVED (Schema.java:175, where namespace is reserved
+// on every schema object). fastavro 1.12.2 accepts it and resolves a named type
+// defined under such an array in the enclosing scope (executed). Rejecting it
+// made us disagree with both references and with ourselves across kinds.
 func TestRegression_StrayNamespaceOnUnnamedComplexParses(t *testing.T) {
 	cases := []struct {
 		name string
@@ -607,16 +613,16 @@ func TestRegression_StrayNamespaceOnUnnamedComplexParses(t *testing.T) {
 	}
 }
 
-// A stray "name" attribute on the unnamed CONTAINER kinds keeps rejecting
-// ("only record, enum, and fixed can have a name") while primitives keep
-// their childless accept-and-surface posture. This is a deliberate,
-// documented acceptance divergence (fastavro and Java accept the key as
-// inert): the metadata walkers deliberately scope children by ANY non-empty
-// SchemaNode.Name (nsForChildren's hand-built-tree posture), so a PARSED
-// stray name on a kind that HAS children would make Root() scope named
-// descendants differently than the wire parser — the same walker-parity
-// soundness rationale as the #63 structural-key rejects. Primitives carry
-// no child positions, so their accept is safe.
+// A stray "name" attribute on the unnamed container kinds keeps rejecting
+// ("only record, enum, and fixed can have a name"). Primitives keep their
+// childless accept-and-surface posture. This is a deliberate, documented
+// acceptance divergence: fastavro and Java accept the key as inert. The
+// metadata walkers scope children by any non-empty SchemaNode.Name, which is
+// nsForChildren's hand-built-tree posture. So a parsed stray name on a kind
+// that has children would make Root() scope named descendants differently
+// than the wire parser. That is the same walker-parity soundness rationale as
+// the #63 structural-key rejects. Primitives carry no child positions, so
+// their accept is safe.
 func TestRegression_StrayNameOnUnnamedComplexKeepsRejecting(t *testing.T) {
 	for _, src := range []string{
 		`{"type":"array","items":"int","name":"strayName"}`,
@@ -641,12 +647,12 @@ func TestRegression_StrayNameOnUnnamedComplexKeepsRejecting(t *testing.T) {
 }
 
 // A stray "namespace" attribute on an array/map does NOT open a namespace
-// scope: named types defined under it register in the ENCLOSING scope, and
-// references resolve there — in the parser, in the SchemaCache splice
-// walkers, and in fastavro (executed: the same schema resolves top.Inner
-// and rejects x.Inner). The kind-keyed scope rule (nodeChildScope) and the
-// parser agree by construction; these cells prove the agreement holds for
-// the newly inert attribute.
+// scope. Named types defined under it register in the enclosing scope, and
+// references resolve there. That holds in the parser, in the SchemaCache
+// splice walkers, and in fastavro (executed: the same schema resolves
+// top.Inner and rejects x.Inner). The kind-keyed scope rule (nodeChildScope)
+// and the parser agree by construction; these cells prove the agreement holds
+// for the newly inert attribute.
 func TestMatrix_AttributePlacementNamespaceInert(t *testing.T) {
 	const defInner = `{"name":"f","type":{"type":"array","namespace":"x","items":
 		{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}}`
@@ -680,7 +686,7 @@ func TestMatrix_AttributePlacementNamespaceInert(t *testing.T) {
 		}
 	})
 	t.Run("stray-name-cannot-define", func(t *testing.T) {
-		// A stray "name" on a container cannot become a definition: the
+		// A stray "name" on a container cannot become a definition. The
 		// shape itself keeps rejecting at parse (see
 		// TestRegression_StrayNameOnUnnamedComplexKeepsRejecting), so no
 		// walker ever sees it.
@@ -691,13 +697,13 @@ func TestMatrix_AttributePlacementNamespaceInert(t *testing.T) {
 	})
 }
 
-// The primitive-object capture-drop family (#63): a named type spelled
-// INSIDE a captured-then-dropped structural subtree ({"type":"int","items":
-// {...record D...}}) is invisible to the parser — a same-parse reference
-// does not resolve — and the walkers agree: the metadata tree surfaces the
-// subtree as-written (Root().Items on the int node), the rebuild collapses
-// it, and the SchemaCache walkers never collect D for cross-parse splicing.
-// Walker-parity (the tombstoned B7 rule) holds for the dropped shape.
+// The primitive-object capture-drop family (#63). A named type spelled inside
+// a captured-then-dropped structural subtree ({"type":"int","items":
+// {...record D...}}) is invisible to the parser, so a same-parse reference
+// does not resolve. The walkers agree: the metadata tree surfaces the subtree
+// as-written (Root().Items on the int node). The rebuild collapses it, the
+// SchemaCache walkers never collect D for cross-parse splicing, and
+// walker-parity (the tombstoned B7 rule) holds for the dropped shape.
 func TestMatrix_AttributePlacementDroppedSubtreeAgreement(t *testing.T) {
 	const droppedDef = `{"name":"f","type":{"type":"int","items":
 		{"type":"record","name":"D","fields":[{"name":"d","type":"int"}]}}}`
@@ -728,11 +734,11 @@ func TestMatrix_AttributePlacementDroppedSubtreeAgreement(t *testing.T) {
 	})
 }
 
-// TestDifferentialFastavroAttributePlacement executes EVERY census cell
-// against fastavro's parser. fastavro accepts every placement — including
-// the structural-key cells twmb rejects (the #63 documented divergence,
-// asserted here so a fastavro release that starts rejecting flips this
-// calibration loudly) and the name/namespace-on-unnamed cells. Runs with
+// TestDifferentialFastavroAttributePlacement executes every census cell
+// against fastavro's parser, which accepts every placement, including the
+// structural-key cells we reject and the name/namespace-on-unnamed cells.
+// That is the #63 documented divergence, asserted here so a fastavro release
+// that starts rejecting flips this calibration loudly. Runs with
 // AVRO_FASTAVRO_PYTHON, like every differential.
 func TestDifferentialFastavroAttributePlacement(t *testing.T) {
 	o := startOracle(t)
@@ -768,7 +774,7 @@ func TestDifferentialFastavroAttributePlacement(t *testing.T) {
 	}
 
 	// Scoping calibration (executed): a stray namespace on an array does
-	// not scope in fastavro either — the enclosing-scope fullname resolves,
+	// not scope in fastavro either. The enclosing-scope fullname resolves,
 	// the attribute-scope one does not.
 	t.Run("namespace-scoping", func(t *testing.T) {
 		const def = `{"name":"f","type":{"type":"array","namespace":"x","items":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}}`
@@ -788,42 +794,43 @@ func TestDifferentialFastavroAttributePlacement(t *testing.T) {
 // ---------------------------------------------------------------------------
 // The reserved-attribute enumeration.
 //
-// The question is a CLASS, not a list of remembered cases: for a reserved
-// attribute A with body shape B at level L on kind K, what is the outcome on
-// every surface? The corpus is that cross product, and every expected value in
-// it was DERIVED FROM THE REFERENCE IMPLEMENTATIONS rather than read off this
-// package — an expectation copied from the code under test asserts only that
-// nothing changed, which is what let each of these families drift.
+// The question is a class, not a list of remembered cases. Take a reserved
+// attribute A with body shape B at level L on kind K: what is the outcome on
+// every surface? Our corpus is that cross product, and every expected value in
+// it came from the reference implementations, not from this package. An
+// expectation copied from the code under test asserts only that nothing
+// changed, which is what let each of these families drift.
 //
 // How each expectation was obtained, and how to redo it:
 //
-//   - Apache Avro (Java) is a SOURCE-DERIVED model of Schema.java on
-//     apache/avro:main, because the check runs without a JVM. Every rule carries
-//     the line it came from, and the model is validated against the
-//     already-adjudicated cells before any of its new answers are used. The
-//     rules that matter most are the EMISSION conditions, which differ per
-//     attribute: doc emits when non-null (:1039/:1154/:1367/:1062), aliases when
-//     non-empty (:886/:1070), order is decided on the JSON node (:1895-1897),
-//     and anything absent from SCHEMA_RESERVED (:175-176) survives through
-//     parseProperties (:1983).
-//   - fastavro 1.12.2 was EXECUTED per cell.
-//   - Where the two disagree, the expectation is one of THEIR answers and the
-//     provenance table records which. This package never invents a third.
-//   - Where neither can adjudicate — a stray structural key has no analogue in
-//     either — the standing rulings govern and the provenance says so.
-//   - Where NEITHER reference has the placement at all, PLACEMENT AUTHORITY
-//     decides: whichever reference actually HAS it governs, for the empty and
-//     the non-empty body alike. Where neither has it, this package's own
-//     adjudicated posture governs, and the provenance says so.
+//   - Apache Avro (Java) is a source-derived model of Schema.java on
+//     apache/avro:main, because the check runs without a JVM. Every rule
+//     carries the line it came from, and we validate the model against the
+//     already-adjudicated cells before using any of its new answers. The rules
+//     that matter most are the emission conditions, which differ per
+//     attribute: doc emits when non-null (:1039/:1154/:1367/:1062), and
+//     aliases when non-empty (:886/:1070). order is decided on the JSON node
+//     (:1895-1897), and anything absent from SCHEMA_RESERVED (:175-176)
+//     survives through parseProperties (:1983).
+//   - fastavro 1.12.2 was executed per cell.
+//   - Where the two disagree, the expectation is one of *their* answers and
+//     the provenance table records which. We never invent a third.
+//   - Where neither can adjudicate, the standing rulings govern and the
+//     provenance says so. The case in point is a stray structural key, which
+//     has no analogue in either.
+//   - Where neither reference has the placement at all, placement authority
+//     decides: whichever reference actually has it governs, for the empty and
+//     the non-empty body alike. Where neither has it, our own adjudicated
+//     posture governs, and the provenance says so.
 //
-// Every cell the enumeration produces is now settled. The UNRULED code stays in
-// the vocabulary because a later round widening an axis will produce cells
-// nothing rules yet; what may not happen is a cell quietly acquiring today's
+// Every cell the enumeration produces is now settled. The unruled code stays
+// in the vocabulary because a later round widening an axis will produce cells
+// nothing rules yet. What may not happen is a cell quietly acquiring today's
 // behavior as its expectation.
 //
-// The surfaces are read through the REBUILD (Root().Schema()), because that is
-// the one that loses things. String() is the schema's own source text and
-// carries every written key whatever the parse did, so asking it would report
+// We read the surfaces through the rebuild (Root().Schema()), because that is
+// the one that loses things. String() is the schema's own source text, and it
+// carries every written key whatever the parse did. Asking it would report
 // every accepted cell as preserved and prove nothing.
 // ---------------------------------------------------------------------------
 
@@ -1280,9 +1287,9 @@ var reservedCellTable = []reservedCellRow{
 
 // reservedProvenance records, per (attribute, body class, level), what settled
 // the expectation. It is data, not decoration: a cell whose provenance says
-// "unruled" must not be treated as pinned behavior, and a cell that says
-// "follows-fastavro" is one where this package chose the permissive side of a
-// reference disagreement and can be revisited on new evidence.
+// "unruled" must not be treated as pinned behavior. A cell that says
+// "follows-fastavro" is one where we chose the permissive side of a reference
+// disagreement, and new evidence can revisit it.
 type reservedProvRow struct {
 	Attr, Body, Level, By string
 }
@@ -1447,11 +1454,11 @@ var reservedProvenance = []reservedProvRow{
 }
 
 // reservedBody renders the attribute's body for one class, and reports
-// whether the class applies to this attribute at all. The ZERO body is the
-// JSON zero of the attribute's DESTINATION — "" for a string, [] for an
-// array, {} for an object, 0 for an int — which is the whole point of the
-// axis: an attribute written as its destination's zero is written, and a
-// reader that tests the value alone cannot see it.
+// whether the class applies to this attribute at all. The zero body is the
+// JSON zero of the attribute's destination. That is "" for a string, [] for
+// an array, {} for an object, 0 for an int. That zero is the whole point of
+// the axis. An attribute written as its destination's zero is still written,
+// and a reader that tests the value alone cannot see it.
 func reservedBody(attr, kind, class string) (string, bool) {
 	valid, zero, wrong, quoted := "", "", "", ""
 	switch attr {
@@ -1512,7 +1519,7 @@ func reservedLogicalFor(kind string) string {
 }
 
 // reservedDefaultFor gives a value the kind can take, the kind's zero value,
-// and a token of a JSON class it can never take.
+// and a token of a JSON class the kind can never take.
 func reservedDefaultFor(kind string) (valid, zero, wrong string) {
 	wrong = "[]"
 	switch kind {
@@ -1541,9 +1548,9 @@ func reservedDefaultFor(kind string) (valid, zero, wrong string) {
 }
 
 // reservedBaseKeys is the kind's own object, as an ordered key list so the
-// generated text is deterministic. The ABSENT body DELETES the attribute from
-// it: several of these keys are required by their kind, so leaving the base's
-// own copy in place would silently test the valid body twice.
+// generated text is deterministic. The absent body deletes the attribute from
+// it, since several of these keys are required by their kind. Leaving the
+// base's own copy in place would silently test the valid body twice.
 func reservedBaseKeys(kind string) [][2]string {
 	switch kind {
 	case "record", "error":
@@ -1561,9 +1568,9 @@ func reservedBaseKeys(kind string) [][2]string {
 	return [][2]string{{"type", `"` + kind + `"`}}
 }
 
-// reservedCellSchema builds the whole schema for one cell. Every cell is a
-// host record with one field whose type is the kind under test, so the
-// type-level and field-level spellings differ only in WHICH object carries
+// reservedCellSchema builds the whole schema for one cell, and every cell is
+// a host record with one field whose type is the kind under test. The
+// type-level and field-level spellings differ only in which object carries
 // the attribute.
 func reservedCellSchema(attr, kind, level, class string) (string, bool) {
 	body, applies := reservedBody(attr, kind, class)
@@ -1602,8 +1609,8 @@ func reservedCellSchema(attr, kind, level, class string) (string, bool) {
 		return b.String()
 	}
 	// The field's "type" key is the field's schema, so a field-level cell
-	// writing "type" REPLACES it rather than adding a second attribute —
-	// which is the real question at that level.
+	// writing "type" replaces it rather than adding a second attribute.
+	// That replacement is the real question at that level.
 	inner := obj(typeKeys)
 	hasOwnType := false
 	for _, kv := range fieldKeys {
@@ -1640,7 +1647,7 @@ func reservedCellOutcome(t *testing.T, attr, level, src, class string) byte {
 }
 
 // reservedCarrierHasKey walks a rendered schema down to the object the cell
-// wrote its attribute on and reports whether that object still carries it.
+// wrote its attribute on. It reports whether that object still carries it.
 func reservedCarrierHasKey(text, attr, level string) bool {
 	var host map[string]any
 	if json.Unmarshal([]byte(text), &host) != nil {
@@ -1657,8 +1664,8 @@ func reservedCarrierHasKey(text, attr, level string) bool {
 	obj := f
 	if level == "type" {
 		if _, bare := f["type"].(string); bare {
-			// The type object collapsed to its bare name: that IS the type
-			// attribute surviving, and nothing else did.
+			// The type object collapsed to its bare name: that is the
+			// type attribute surviving, and nothing else did.
 			return attr == "type"
 		}
 		obj, _ = f["type"].(map[string]any)
@@ -1697,9 +1704,9 @@ func TestMatrix_ReservedAttributeEnumeration(t *testing.T) {
 			got := reservedCellOutcome(t, row.Attr, row.Level, src, class)
 			if want == outUnruled {
 				unruled++
-				// Recorded, not asserted: the cell is real and its answer is
-				// open. Pinning today's behavior would convert a question
-				// nothing settles into a decision nobody made.
+				// Recorded, not asserted: the cell is real and its answer
+				// is open. Pinning today's behavior would convert a
+				// question nothing settles into a decision nobody made.
 				continue
 			}
 			checked++
@@ -1719,8 +1726,8 @@ func TestMatrix_ReservedAttributeEnumeration(t *testing.T) {
 }
 
 // TestMatrix_ReservedAttributeEnumerationIsNotVacuous fails when the corpus
-// stops spanning the axes, or when its outcomes collapse toward one answer —
-// either would let an implementation pass by never being asked.
+// stops spanning the axes, or when its outcomes collapse toward one answer.
+// Either would let an implementation pass by never being asked.
 func TestMatrix_ReservedAttributeEnumerationIsNotVacuous(t *testing.T) {
 	attrs, kinds, levels := map[string]int{}, map[string]int{}, map[string]int{}
 	codes := map[byte]int{}
@@ -1741,17 +1748,17 @@ func TestMatrix_ReservedAttributeEnumerationIsNotVacuous(t *testing.T) {
 	if len(levels) != 2 {
 		t.Errorf("corpus covers %d levels, want both", len(levels))
 	}
-	// Every outcome must be REACHED. A table that only ever expects "keep"
+	// Every outcome must be reached: a table that only ever expects "keep"
 	// would pass against an implementation that accepted and preserved
-	// everything, which is exactly the failure this enumeration exists to
+	// everything. That is exactly the failure this enumeration exists to
 	// catch on the other side.
 	for _, c := range []byte{outReject, outKeep, outDropped, outAbsent} {
 		if codes[c] < 50 {
 			t.Errorf("outcome %q appears %d times; the table has collapsed toward one answer", string(c), codes[c])
 		}
 	}
-	// Every cell is settled. A table that grew an unruled one has produced a
-	// question, which is fine — but it must be answered rather than left, so
+	// Every cell is settled, and a table that grew an unruled one has produced
+	// a question. That is fine, but it must be answered rather than left, so
 	// the driver above reports it.
 	if codes[outUnruled] != 0 {
 		t.Errorf("%d cells carry the unruled code", codes[outUnruled])
@@ -1776,24 +1783,26 @@ func TestMatrix_ReservedAttributeEnumerationIsNotVacuous(t *testing.T) {
 
 // ---------- reserved_dup_matrix_test.go ----------
 
-// Reserved keys match ONLY their exact lowercase spelling, so a case-variant
-// ("ITEMS" beside "items") is an ordinary custom property — two distinct JSON
-// keys with no contention over the reserved slot. The routing invariant: the
-// exact spelling alone is consulted for structural binding and consumed, and
-// EVERY other raw map key rides to Props verbatim with no branching on its body,
-// so Props == all raw keys minus the consumed exact-lowercase ones. Both reading
-// surfaces — the parse-side props handed to CustomType callbacks and the Root()
-// metadata walk — apply the same rule and must agree. Java's reserved sets are
-// exact-lowercase HashSets, and fastavro and goavro read known keys by exact name.
+// Reserved keys match only their exact lowercase spelling. A case-variant
+// ("ITEMS" beside "items") is therefore an ordinary custom property: two
+// distinct JSON keys with no contention over the reserved slot. The routing
+// invariant has two halves: the exact spelling alone is consulted for
+// structural binding, and it is consumed. Every other raw map key rides
+// to Props verbatim with no branching on its body. So Props == all raw keys
+// minus the consumed exact-lowercase ones. Both reading surfaces apply the
+// same rule and must agree: the parse-side props handed to CustomType
+// callbacks, and the Root() metadata walk. Java's reserved sets are
+// exact-lowercase HashSets, and fastavro and goavro read known keys by
+// exact name.
 
-// propsCaptureCustom returns a match-all CustomType whose Encode records
-// the Props of the node matching typ (+ name, when non-empty) and then
-// falls through to the built-in encoder, plus the capture destination.
+// propsCaptureCustom returns a match-all CustomType, plus the capture
+// destination. Its Encode records the Props of the node matching typ
+// (+ name, when non-empty), then falls through to the built-in encoder.
 func propsCaptureCustom(typ, name string, dst *map[string]any) avro.CustomType {
 	return avro.CustomType{
 		Encode: func(v any, schema *avro.SchemaNode) (any, error) {
 			// The callback node's Name may be the short name or the
-			// namespace-qualified fullname; match either.
+			// namespace-qualified fullname, so match either.
 			if schema.Type == typ && (name == "" || schema.Name == name || strings.HasSuffix(schema.Name, "."+name)) {
 				*dst = schema.Props
 			}
@@ -1851,7 +1860,7 @@ type reservedDupRow struct {
 	carriers []reservedDupCarrier
 	// variant bodies: one valid for the key's shape, one malformed
 	// container/content, one wrong-JSON-kind scalar. The variant
-	// spelling's routing must be IDENTICAL for all three.
+	// spelling's routing must be identical for all three.
 	bodies []string
 }
 
@@ -1903,12 +1912,12 @@ func reservedDupRows() []reservedDupRow {
 	}
 }
 
-// checkReservedDupCell parses cell, asserts the three reading surfaces
-// agree on Props, and (when wantKey is non-empty) that Props carries
-// wantKey with wantVal on all of: Root().Props, the CustomType-callback
-// node's Props, and the Root().Schema() rebuild's Props. When wantKey is
-// "", asserts Props carries NO spelling of dropKey on any surface (the
-// consumed-exact-key control).
+// checkReservedDupCell parses cell and asserts the three reading surfaces
+// agree on Props. When wantKey is non-empty, we also assert Props carries
+// wantKey with wantVal. That must hold on all three: Root().Props, the
+// CustomType-callback node's Props, and the Root().Schema() rebuild's
+// Props. When wantKey is "", we instead assert that no surface carries any
+// spelling of dropKey (the consumed-exact-key control).
 func checkReservedDupCell(t *testing.T, cell string, carrier reservedDupCarrier, wantKey string, wantVal any, dropKey string) {
 	t.Helper()
 	var captured map[string]any
@@ -1988,14 +1997,14 @@ func findNodeByType(n *avro.SchemaNode, typ, name string) *avro.SchemaNode {
 }
 
 // TestMatrix_ReservedKeyDuplicateSpellings crosses every reserved key that
-// has a structural consumption arm × spellings-present {exact-only,
-// exact+case-variant} × the variant's body {valid for the key's shape,
-// malformed, non-schema scalar} × carrier {binding kind, non-binding
-// stray placement} × reading surface {parse-side callback Props, Root()
-// Props, Root().Schema() rebuild}. The variant spelling must ride to
-// Props verbatim in every cell — its body's shape must not change the
-// routing — and the exact-only controls prove the consumed exact key
-// never leaks into Props.
+// has a structural consumption arm. The first two axes are
+// spellings-present {exact-only, exact+case-variant} × the variant's body
+// {valid for the key's shape, malformed, non-schema scalar}. Those cross
+// with carrier {binding kind, non-binding stray placement} × reading
+// surface {parse-side callback Props, Root() Props, Root().Schema()
+// rebuild}. The variant spelling must ride to Props verbatim in every cell,
+// since its body's shape must not change the routing. The exact-only
+// controls prove the consumed exact key never leaks into Props.
 func TestMatrix_ReservedKeyDuplicateSpellings(t *testing.T) {
 	t.Parallel()
 	for _, row := range reservedDupRows() {
@@ -2015,9 +2024,9 @@ func TestMatrix_ReservedKeyDuplicateSpellings(t *testing.T) {
 }
 
 // The variant-spelling rule is body-independent in the other direction
-// too: when the EXACT key's body is malformed on a non-binding kind (so
-// the exact key itself rides to Props), the variant's valid body still
-// rides to Props — nothing is silently dropped and nothing is promoted
+// too. Here the exact key's body is malformed on a non-binding kind, so
+// the exact key itself rides to Props. The variant's valid body rides to
+// Props all the same: nothing is silently dropped, and nothing is promoted
 // to the structural field.
 func TestMatrix_ReservedKeyDuplicateExactMalformed(t *testing.T) {
 	t.Parallel()
@@ -2036,7 +2045,7 @@ func TestMatrix_ReservedKeyDuplicateExactMalformed(t *testing.T) {
 }
 
 // A malformed body under a case-variant spelling must ride to Props on
-// every surface; the exact key's shape-OK verdict must never leak onto
+// every surface. The exact key's shape-OK verdict must never leak onto
 // it.
 func TestRegression_ReservedDupMalformedVariantPreserved(t *testing.T) {
 	t.Parallel()
@@ -2046,10 +2055,10 @@ func TestRegression_ReservedDupMalformedVariantPreserved(t *testing.T) {
 	checkReservedDupCell(t, carrier.build(`,"ITEMS":12`), carrier, "ITEMS", int64(12), "")
 }
 
-// A case-variant spelling whose body is ITSELF a valid schema shape also
-// rides to Props: only the exact spelling is consulted for structural
+// A case-variant spelling whose body is itself a valid schema shape also
+// rides to Props. Only the exact spelling is consulted for structural
 // surfacing, and the single structural slot is the exact key's. Uniform
-// preservation is the rule — a valid-shaped variant body must not be
+// preservation is the rule, so a valid-shaped variant body must not be
 // silently dropped or promoted.
 func TestRegression_ReservedDupValidVariantPreserved(t *testing.T) {
 	t.Parallel()
@@ -2066,7 +2075,7 @@ func TestRegression_ReservedDupValidVariantPreserved(t *testing.T) {
 }
 
 // The parse-side props (surfaced to CustomType callbacks) and the Root()
-// metadata walk must apply the identical routing rule — including for the
+// metadata walk must apply the identical routing rule. That includes the
 // reserved keys with non-recursive bodies (name/namespace/symbols/size/
 // aliases), where the two surfaces have historically used separate code.
 func TestRegression_ReservedDupParseMetadataPropsParity(t *testing.T) {
@@ -2085,8 +2094,8 @@ func TestRegression_ReservedDupParseMetadataPropsParity(t *testing.T) {
 }
 
 // Field-level reserved keys follow the same rule: the exact spelling is
-// consumed into the SchemaField attribute, every other spelling is an
-// ordinary field property preserved in SchemaField.Props and by the
+// consumed into the SchemaField attribute. Every other spelling is an
+// ordinary field property, preserved in SchemaField.Props and by the
 // rebuild.
 func TestRegression_FieldReservedDupVariantPreserved(t *testing.T) {
 	t.Parallel()
@@ -2107,9 +2116,9 @@ func TestRegression_FieldReservedDupVariantPreserved(t *testing.T) {
 }
 
 // TestMatrix_FieldReservedKeyDuplicateSpellings is the field-level arm of
-// the duplicate-spelling matrix: every field reserved key × {exact-only,
-// exact+case-variant} × {valid-shaped, non-schema} variant bodies, on
-// SchemaField.Props and its rebuild.
+// the duplicate-spelling matrix. Here we cross every field reserved key ×
+// {exact-only, exact+case-variant} × {valid-shaped, non-schema} variant
+// bodies, on SchemaField.Props and its rebuild.
 func TestMatrix_FieldReservedKeyDuplicateSpellings(t *testing.T) {
 	t.Parallel()
 	base := `"name":"f","type":"int","doc":"d","default":1,"aliases":["fa"],"order":"ascending"`
@@ -2166,7 +2175,7 @@ func TestMatrix_FieldReservedKeyDuplicateSpellings(t *testing.T) {
 }
 
 // TestDifferentialFastavroReservedDupSpellings drives every matrix cell
-// through fastavro's parser: fastavro reads reserved keys by exact
+// through fastavro's parser. fastavro reads reserved keys by exact
 // (lowercase) name and preserves unknown keys, so each duplicate-spelling
 // cell must parse there too.
 func TestDifferentialFastavroReservedDupSpellings(t *testing.T) {
@@ -2197,17 +2206,17 @@ func TestDifferentialFastavroReservedDupSpellings(t *testing.T) {
 }
 
 // The cache splice-merge applies the same rule when a props-carrying
-// wrapped reference is replaced by its definition: the wrapper's
-// exact-lowercase reserved spellings die (consumed; Java drops usage-site
-// extras at reference sites entirely), while case-variant spellings —
-// ordinary custom properties — and exact stray spellings with non-shape
-// bodies merge onto the spliced definition as ordinary props.
-// Definition-wins is an exact-key presence check, so the merge is
-// order-independent: map keys are unique and merging one wrapper prop can
-// never change another's verdict.
+// wrapped reference is replaced by its definition. The wrapper's
+// exact-lowercase reserved spellings die: they are consumed, and Java
+// drops usage-site extras at reference sites entirely. Case-variant
+// spellings are ordinary custom properties, so they merge onto the spliced
+// definition as ordinary props. Exact stray spellings with non-shape
+// bodies merge the same way. Definition-wins is an exact-key presence
+// check, so the merge is order-independent. Map keys are unique, and
+// merging one wrapper prop can never change another's verdict.
 func TestRegression_CacheSpliceWrapperVariantPropsPreserved(t *testing.T) {
 	t.Parallel()
-	// Repeat to shake out map-iteration-order dependence: every parse of
+	// We repeat to shake out map-iteration-order dependence: every parse of
 	// the same input must produce the identical spliced surface.
 	for range 8 {
 		var c avro.SchemaCache
@@ -2248,22 +2257,23 @@ func TestRegression_CacheSpliceWrapperVariantPropsPreserved(t *testing.T) {
 
 // ---------- reserved_exactcase_test.go ----------
 
-// Reserved Avro attribute names match ONLY their exact lowercase spelling, on
-// every reading surface: a key differing only by letter case is an ordinary
-// custom property, never bound, never consumed, preserved verbatim in Props.
-// This matches the spec — attribute names are literal JSON keys — and the three
-// executed references: Java's reserved-key sets are exact-lowercase HashSets and
-// its structural reads use exact Jackson lookups; fastavro 1.12.2 reads known
-// keys by exact name and preserves the rest; goavro reads exact keys. hamba/avro
-// is the one case-folding implementation, so a schema that parsed there but
-// fails here has a miscased reserved key — a miscased STRUCTURAL key fails
-// loudly at parse, a miscased non-structural key is a harmless custom property.
+// Reserved Avro attribute names match only their exact lowercase spelling, on
+// every reading surface. A key differing only by letter case is an ordinary
+// custom property: never bound, never consumed, preserved verbatim in Props.
+// This matches the spec, where attribute names are literal JSON keys, and the
+// three executed references. Java's reserved-key sets are exact-lowercase
+// HashSets, and its structural reads use exact Jackson lookups. fastavro
+// 1.12.2 reads known keys by exact name and preserves the rest, and goavro
+// reads exact keys. hamba/avro is the one case-folding implementation, so a
+// schema that parsed there but fails here has a miscased reserved key. A
+// miscased structural key fails loudly at parse; a miscased non-structural
+// key is a harmless custom property.
 
 // TestMatrix_CaseVariantStructuralKeyRejects pins the consequence of
-// exact-case matching for structural keys: a case-variant spelling does
-// NOT bind, so the real structural attribute is absent and the parse fails
-// with the kind's ordinary missing-attribute error — loudly, at parse
-// time, never as a silently different schema.
+// exact-case matching for structural keys. A case-variant spelling does
+// NOT bind, so the real structural attribute is absent. The parse then
+// fails with the kind's ordinary missing-attribute error, loudly and at
+// parse time, never as a silently different schema.
 func TestMatrix_CaseVariantStructuralKeyRejects(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -2291,10 +2301,10 @@ func TestMatrix_CaseVariantStructuralKeyRejects(t *testing.T) {
 }
 
 // TestRegression_CaseVariantNamingKeyInert pins exact-case matching for the
-// naming and logical-annotation keys: a case-variant of name / namespace /
-// aliases / logicalType is an ordinary custom property — it never renames,
-// re-scopes, aliases, or annotates the type — and it is preserved verbatim
-// on Root().Props, the parse-side CustomType-callback Props, and the
+// naming and logical-annotation keys. A case-variant of name / namespace /
+// aliases / logicalType is an ordinary custom property. It never renames,
+// re-scopes, aliases, or annotates the type, and it rides verbatim to
+// Root().Props, the parse-side CustomType-callback Props, and the
 // Root().Schema() rebuild.
 func TestRegression_CaseVariantNamingKeyInert(t *testing.T) {
 	t.Parallel()
@@ -2341,8 +2351,8 @@ func TestRegression_CaseVariantNamingKeyInert(t *testing.T) {
 		t.Errorf(`Props["LOGICALTYPE"] = %#v; want the variant preserved verbatim`, got)
 	}
 
-	// ALIASES variant on a named type: no alias is registered (resolution
-	// via the variant spelling fails), the key is a preserved prop.
+	// ALIASES variant on a named type: no alias is registered, so resolution
+	// via the variant spelling fails. The key is a preserved prop.
 	s3, err := avro.Parse(`{"type":"record","name":"New","ALIASES":["Old"],"fields":[{"name":"f","type":"int"}]}`)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -2360,11 +2370,11 @@ func TestRegression_CaseVariantNamingKeyInert(t *testing.T) {
 }
 
 // TestRegression_CaseVariantStrayBodyStaysProp pins the boundary against
-// the stray-key routing (an exact-lowercase reserved key on a kind that
-// does not bind it keeps its shape-conditional structural surfacing): a
-// CASE-VARIANT spelling gets no shape routing at all — even a body that
-// parses perfectly as the key's schema shape rides to Props verbatim,
-// because the key is simply not a reserved key.
+// the stray-key routing. Under that routing, an exact-lowercase reserved
+// key on a kind that does not bind it keeps its shape-conditional
+// structural surfacing. A case-variant spelling gets no shape routing at
+// all. Even a body that parses perfectly as the key's schema shape rides
+// to Props verbatim, because the key is simply not a reserved key.
 func TestRegression_CaseVariantStrayBodyStaysProp(t *testing.T) {
 	t.Parallel()
 	s := mustParse(t, `{"type":"int","ITEMS":"long"}`)
@@ -2388,10 +2398,10 @@ func TestRegression_CaseVariantStrayBodyStaysProp(t *testing.T) {
 	}
 }
 
-// TestRegression_FieldCaseVariantKeyInert pins the field level: a
-// case-variant of a field reserved key (default here) is an ordinary field
-// property — the field has no default — preserved on SchemaField.Props and
-// by the rebuild.
+// TestRegression_FieldCaseVariantKeyInert pins the field level. A case-variant
+// of a field reserved key (default here) is an ordinary field property, so the
+// field gets no default. We keep the variant on SchemaField.Props and in the
+// rebuild.
 func TestRegression_FieldCaseVariantKeyInert(t *testing.T) {
 	t.Parallel()
 	s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"f","type":"int","DEFAULT":7}]}`)
@@ -2412,10 +2422,10 @@ func TestRegression_FieldCaseVariantKeyInert(t *testing.T) {
 	}
 }
 
-// TestRegression_CaseVariantTypeKeyRejects pins the dispatch key itself: an
-// object whose "type" exists only as a case-variant has no type attribute
-// at all and must reject (executed parity: fastavro KeyError 'type';
-// goavro "missing type"; hamba rejects this shape too).
+// TestRegression_CaseVariantTypeKeyRejects pins the dispatch key itself. An
+// object whose "type" exists only as a case-variant has no type attribute at
+// all, so it must reject. Executed parity: fastavro KeyError 'type'; goavro
+// "missing type"; hamba rejects this shape too.
 func TestRegression_CaseVariantTypeKeyRejects(t *testing.T) {
 	t.Parallel()
 	if _, err := avro.Parse(`{"tYpe":"record","name":"R","fields":[{"name":"f","type":"int"}]}`); err == nil {
@@ -2427,18 +2437,18 @@ func TestRegression_CaseVariantTypeKeyRejects(t *testing.T) {
 }
 
 // exactCaseVariantOnlyRows enumerate the discriminating spelling axis of the
-// exact-case contract: a reserved key present ONLY as a case-variant. Because
-// the variant is an ordinary custom property, the reserved attribute is absent —
-// a REQUIRED attribute's absence rejects with the kind's ordinary
+// exact-case contract: a reserved key present only as a case-variant. The
+// variant is an ordinary custom property, so the reserved attribute is absent.
+// A required attribute's absence rejects with the kind's ordinary
 // missing-attribute error, and an optional attribute's absence leaves it unset
-// with the variant riding to Props. The exact+variant-both-present axis is
-// TestMatrix_ReservedKeyDuplicateSpellings, where the exact-only controls live
-// too.
+// with the variant riding to Props. The exact+variant-both-present axis lives
+// in TestMatrix_ReservedKeyDuplicateSpellings, alongside the exact-only
+// controls.
 //
-// Each row records the executed fastavro verdict. Two cells diverge for reasons
-// that predate and outlive the case rule: fastavro accepts a fields-less record
-// as zero fields, and a precision-less decimal by dropping the logical, where
-// twmb requires both.
+// Each row records the executed fastavro verdict. Two cells diverge for
+// reasons that predate and outlive the case rule: fastavro accepts a
+// fields-less record as zero fields, and a precision-less decimal by dropping
+// the logical. We require both.
 type exactCaseVariantOnlyRow struct {
 	label   string
 	schema  string
@@ -2454,7 +2464,7 @@ type exactCaseVariantOnlyRow struct {
 
 func exactCaseVariantOnlyRows() []exactCaseVariantOnlyRow {
 	return []exactCaseVariantOnlyRow{
-		// Required structural keys: absent → the kind's loud reject.
+		// Required structural keys: absent means the kind's loud reject.
 		{label: "items/binding", schema: `{"type":"array","ITEMS":"int"}`, wantErr: "array is missing items schema"},
 		{label: "items/binding-mixed", schema: `{"type":"array","Items":"int"}`, wantErr: "array is missing items schema"},
 		{label: "values/binding", schema: `{"type":"map","VALUES":"int"}`, wantErr: "map is missing values schema"},
@@ -2465,7 +2475,8 @@ func exactCaseVariantOnlyRows() []exactCaseVariantOnlyRow {
 		{label: "type/binding", schema: `{"TYPE":"int"}`, wantErr: `unknown primitive ""`},
 		{label: "precision/decimal", schema: `{"type":"fixed","name":"D","size":16,"logicalType":"decimal","PRECISION":6,"scale":2}`, wantErr: "decimal logical type requires precision", favroOK: true},
 
-		// Optional attributes: absent → unset, variant → Props.
+		// Optional attributes: absent leaves them unset, variant rides
+		// to Props.
 		{label: "namespace/named", schema: `{"type":"record","name":"NR","NAMESPACE":"zed","fields":[{"name":"f","type":"int"}]}`, favroOK: true,
 			variantKey: "NAMESPACE", wantVal: "zed", check: func(t *testing.T, root avro.SchemaNode) {
 				if root.Namespace != "" || root.Name != "NR" {
@@ -2504,9 +2515,9 @@ func exactCaseVariantOnlyRows() []exactCaseVariantOnlyRow {
 			}},
 
 		// Non-binding carriers: the same variant keys on an int host are
-		// plain props with no structural surfacing — the boundary against
-		// the exact-lowercase stray routing, which surfaces shape-OK
-		// bodies structurally on these hosts.
+		// plain props with no structural surfacing. These cells draw the
+		// boundary against the exact-lowercase stray routing, which surfaces
+		// shape-OK bodies structurally on these hosts.
 		{label: "items/nonbinding", schema: `{"type":"int","ITEMS":"long"}`, favroOK: true,
 			variantKey: "ITEMS", wantVal: "long", check: func(t *testing.T, root avro.SchemaNode) {
 				if root.Items != nil {
@@ -2558,16 +2569,16 @@ func exactCaseVariantOnlyRows() []exactCaseVariantOnlyRow {
 	}
 }
 
-// TestMatrix_ReservedKeyVariantOnly drives the variant-only spelling axis:
-// reserved key × carrier {binding/required, optional-attribute, non-binding
-// host} × surface {Parse verdict, Root() attributes + Props, the
+// TestMatrix_ReservedKeyVariantOnly drives the variant-only spelling axis,
+// crossing reserved key × carrier {binding/required, optional-attribute,
+// non-binding host} × surface {Parse verdict, Root() attributes + Props, the
 // Root().Schema() rebuild, self-resolution}. Reject cells pin the loud
-// missing-attribute error; accept cells pin the attribute NOT binding, the
-// variant preserved verbatim on Root().Props and the rebuild, and Resolve
-// succeeding with the variant riding along (props never obstruct
-// resolution). Parse-side callback Props parity for variant keys is pinned
-// by TestMatrix_ReservedKeyDuplicateSpellings and
-// TestRegression_CaseVariantNamingKeyInert.
+// missing-attribute error; accept cells pin the attribute NOT binding, and the
+// variant preserved verbatim on Root().Props and the rebuild. They also pin
+// Resolve succeeding with the variant riding along; props never obstruct
+// resolution. TestMatrix_ReservedKeyDuplicateSpellings and
+// TestRegression_CaseVariantNamingKeyInert pin the parse-side callback Props
+// parity for variant keys.
 func TestMatrix_ReservedKeyVariantOnly(t *testing.T) {
 	t.Parallel()
 	for _, row := range exactCaseVariantOnlyRows() {
@@ -2607,9 +2618,10 @@ func TestMatrix_ReservedKeyVariantOnly(t *testing.T) {
 }
 
 // TestMatrix_FieldReservedKeyVariantOnly is the field-level arm: a field
-// reserved key present only as a case-variant. name and type are required
-// (loud reject); default/doc/aliases/order are optional (attribute unset,
-// variant preserved on SchemaField.Props and the rebuild).
+// reserved key present only as a case-variant. name and type are required, so
+// their absence is a loud reject. default/doc/aliases/order are optional: the
+// attribute stays unset, and the variant rides to SchemaField.Props and the
+// rebuild.
 func TestMatrix_FieldReservedKeyVariantOnly(t *testing.T) {
 	t.Parallel()
 	rejects := []struct{ label, schema, wantErr string }{
@@ -2676,12 +2688,12 @@ func TestMatrix_FieldReservedKeyVariantOnly(t *testing.T) {
 	}
 }
 
-// TestDifferentialFastavroReservedExactCase executes every variant-only
-// cell through fastavro's parser and asserts the recorded verdict:
-// fastavro reads reserved keys by exact lowercase name (rejecting when a
-// required one is thereby absent, preserving the variant otherwise), so
-// twmb's verdicts match except the two per-cell-documented laxities
-// (fields-less record; precision-less decimal).
+// TestDifferentialFastavroReservedExactCase executes every variant-only cell
+// through fastavro's parser, and we assert the recorded verdict. fastavro
+// reads reserved keys by exact lowercase name, rejecting when a required one
+// is thereby absent and preserving the variant otherwise. So our verdicts
+// match, except for the two per-cell-documented laxities (fields-less record;
+// precision-less decimal).
 func TestDifferentialFastavroReservedExactCase(t *testing.T) {
 	o := startOracle(t)
 	for _, row := range exactCaseVariantOnlyRows() {
@@ -2713,29 +2725,30 @@ func TestDifferentialFastavroReservedExactCase(t *testing.T) {
 // ---------- stray_precision_scale_test.go ----------
 
 // Stray "precision"/"scale" schema attributes are inert metadata, not parse
-// errors. Per the spec ("Attributes not defined in this document are permitted
-// as metadata", Specification/_index.md:43), an attribute the parser does not
-// consume is a plain custom property. twmb consumes precision/scale as decimal
-// parameters exactly when the node is a recognized decimal carrier — logicalType
-// "decimal" on bytes or fixed, where NOT_BUGS #55 validates them — and every
-// other placement surfaces them in Props, matching the field level and both
-// references (fastavro 1.12.2 executed 9/9 accepts; Java's
-// LogicalTypes.fromSchemaImpl returns null when logicalType is absent so
-// precision is never consulted, LogicalTypes.java:127-130).
+// errors. The spec says "Attributes not defined in this document are permitted
+// as metadata" (Specification/_index.md:43), so an attribute the parser does
+// not consume is a plain custom property. We consume precision/scale as
+// decimal parameters exactly when the node is a recognized decimal carrier,
+// meaning logicalType "decimal" on bytes or fixed, where NOT_BUGS #55
+// validates them. Every other placement surfaces them in Props, matching the
+// field level and both references (fastavro 1.12.2 executed 9/9 accepts).
+// Java's LogicalTypes.fromSchemaImpl returns null when logicalType is absent,
+// so precision is never consulted (LogicalTypes.java:127-130).
 //
-// The FIELD level follows the same consumed-conditional rule with the consumer
-// being the decimal lift: the pair is consumed exactly when the field declares
-// logicalType "decimal" and the lift target is a bytes/fixed carrier as-written,
-// where a malformed body rejects loudly naming the key (treating it as absent
-// would silently parse as decimal(p,0), scale being optional); everywhere else
-// any body shape is an ordinary SchemaField.Props property (NOT_BUGS #71; Java's
-// FIELD_RESERVED never includes the pair, Schema.java:503-504). The matrix below
-// crosses a BODY-SHAPE axis over every placement for exactly this reason.
+// The field level follows the same consumed-conditional rule, with the decimal
+// lift as the consumer. The pair is consumed exactly when the field declares
+// logicalType "decimal" and the lift target is a bytes/fixed carrier
+// as-written. There a malformed body rejects loudly, naming the key; treating
+// it as absent would silently parse as decimal(p,0), scale being optional.
+// Everywhere else any body shape is an ordinary SchemaField.Props property
+// (NOT_BUGS #71; Java's FIELD_RESERVED never includes the pair,
+// Schema.java:503-504). The matrix below crosses a body-shape axis over every
+// placement for exactly this reason.
 //
 // Pre-fix, validateLogical's tail rejected any leftover precision/scale exactly
-// when NO logical — or a valid non-decimal logical — accompanied them, while the
-// SAME stray keys parsed when the logical placement was invalid, and the field
-// level already treated them as inert props: twmb disagreed with itself across
+// when no logical, or a valid non-decimal logical, accompanied them. The same
+// stray keys parsed when the logical placement was invalid, and the field level
+// already treated them as inert props. So we disagreed with ourselves across
 // levels and across placements.
 func TestMatrix_StrayPrecisionScaleParses(t *testing.T) {
 	cases := []struct {
@@ -2768,13 +2781,13 @@ func TestMatrix_StrayPrecisionScaleParses(t *testing.T) {
 }
 
 // The today-accepted invalid-logical placements (unknown logical,
-// decimal-on-a-wrong-carrier — including via a named reference) used to
-// consume stray precision/scale into SchemaNode.Precision/Scale — fields
-// documented as validated decimal parameters — without any validation
-// (precision -5 surfaced there), leaving Props empty. Under the uniform
-// routing rule they are plain Props like every other non-consumed
-// placement, on the Root() metadata surface AND the CustomType callback
-// surface; Precision/Scale hold only #55-validated decimal parameters.
+// decimal-on-a-wrong-carrier, including via a named reference) used to consume
+// stray precision/scale into SchemaNode.Precision/Scale. Those fields are
+// documented as validated decimal parameters, yet nothing validated these:
+// precision -5 surfaced there, and Props was left empty. Under the uniform
+// routing rule they are plain Props like every other non-consumed placement,
+// on the Root() metadata surface and the CustomType callback surface.
+// Precision/Scale hold only #55-validated decimal parameters.
 func TestMatrix_BogusLogicalStrayKeysSurfaceAsProps(t *testing.T) {
 	type want struct {
 		precision, scale int
@@ -2851,11 +2864,11 @@ func TestMatrix_BogusLogicalStrayKeysSurfaceAsProps(t *testing.T) {
 	})
 
 	// Policy pin (green by construction): the Resolve surface follows the
-	// inert rule too. A CustomType-resurrected decimal on a wrong carrier
-	// no longer carries stray precision into the internal node, so
-	// checkCompat's decimal precision/scale comparison sees 0/0 on both
-	// sides and differing STRAY values cannot fail a resolve; consumed
-	// decimals with differing parameters keep rejecting.
+	// inert rule too. A CustomType-resurrected decimal on a wrong carrier no
+	// longer carries stray precision into the internal node. So checkCompat's
+	// decimal precision/scale comparison sees 0/0 on both sides, and differing
+	// stray values cannot fail a resolve; consumed decimals with differing
+	// parameters keep rejecting.
 	t.Run("resolve-inert-vs-consumed", func(t *testing.T) {
 		ct := avro.CustomType{
 			LogicalType: "decimal",
@@ -2909,13 +2922,13 @@ func TestMatrix_BogusLogicalStrayKeysSurfaceAsProps(t *testing.T) {
 // Field-level pins: malformed precision/scale bodies.
 
 // A field-level "precision"/"scale" whose body fails the int shape is an inert
-// custom property wherever the pair is UNCONSUMED — no field logicalType, a
-// non-decimal one, or a decimal whose lift target is not a bytes/fixed carrier —
-// riding to SchemaField.Props verbatim, exactly like a valid-int unconsumed
-// pair. Java never validates field-level precision/scale (FIELD_RESERVED omits
-// them, Schema.java:503-504, so parseProperties preserves them) and fastavro
-// 1.12.2 accepts and preserves them verbatim. Only a CONSUMED placement keeps
-// the loud shape reject.
+// custom property wherever the pair is unconsumed. That means no field
+// logicalType, a non-decimal one, or a decimal whose lift target is not a
+// bytes/fixed carrier. It rides to SchemaField.Props verbatim, exactly like a
+// valid-int unconsumed pair. Java never validates field-level precision/scale
+// (FIELD_RESERVED omits them, Schema.java:503-504, so parseProperties
+// preserves them), and fastavro 1.12.2 accepts and preserves them verbatim.
+// Only a consumed placement keeps the loud shape reject.
 func TestMatrix_FieldPrecisionScaleMalformedUnconsumedInert(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -2982,13 +2995,13 @@ func TestMatrix_FieldPrecisionScaleMalformedUnconsumedInert(t *testing.T) {
 	}
 }
 
-// Flat (goavro-style) complex fields MEAN their lifted nested form (#56), so
-// the malformed-pair verdict must equal the nested twin's on every cell: the
-// pair flows into the lifted type object (flatLiftTypeMap routes it) and the
-// TYPE-level consumed gate rules there — inert on a non-decimal lifted kind,
+// Flat (goavro-style) complex fields mean their lifted nested form (#56), so
+// the malformed-pair verdict must equal the nested twin's on every cell. The
+// pair flows into the lifted type object, routed by flatLiftTypeMap, and the
+// type-level consumed gate rules there: inert on a non-decimal lifted kind,
 // reject on a lifted decimal carrier. The field arms must not pre-empt the
-// lift. fastavro rejects the flat spelling outright (UnknownType), so the
-// nested twin is the cross-impl anchor.
+// lift. fastavro rejects the flat spelling outright (UnknownType), so we
+// anchor the cross-impl comparison on the nested twin.
 func TestRegression_FlatFieldMalformedPrecisionMatchesNestedTwin(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -3015,9 +3028,9 @@ func TestRegression_FlatFieldMalformedPrecisionMatchesNestedTwin(t *testing.T) {
 			if ferr != nil {
 				return
 			}
-			// Accepted: the pair surfaces on the lifted TYPE node's Props on
-			// both spellings (#56: flat surfaces post-lift; the defining keys
-			// and the routed pair never sit in SchemaField.Props).
+			// Accepted: the pair surfaces on the lifted type node's Props on
+			// both spellings. Per #56 flat surfaces post-lift, and neither the
+			// defining keys nor the routed pair sit in SchemaField.Props.
 			for who, s := range map[string]*avro.Schema{"flat": fs, "nested": ns} {
 				tp := s.Root().Fields[0].Type
 				if got := tp.Props["precision"]; got != "x" {
@@ -3031,15 +3044,16 @@ func TestRegression_FlatFieldMalformedPrecisionMatchesNestedTwin(t *testing.T) {
 	}
 }
 
-// Consumed placements keep the loud shape reject, fired from the recorded per-key
-// shape error and naming the key. The scale cell is the guard against "treat
-// malformed as absent": scale is OPTIONAL, so silently dropping a malformed one
-// beside a valid precision would parse as decimal(p,0), a silent wire-semantics
-// change (#55 anti-silent-drop). Consumption follows what the lift LANDS, not
-// where it points: the pair is consumed exactly where the target's EFFECTIVE
-// logical — its own when it has one, else the field's — is "decimal" on a
-// bytes/fixed carrier, and the own-logical-is-decimal cells keep that rule from
-// being loosened into "any annotation of its own is inert".
+// Consumed placements keep the loud shape reject, fired from the recorded
+// per-key shape error and naming the key. The scale cell is the guard against
+// "treat malformed as absent". Because scale is optional, dropping a malformed
+// one beside a valid precision would silently parse as decimal(p,0), a silent
+// wire-semantics change (#55 anti-silent-drop). Consumption follows what
+// the lift lands on, not where it points. The pair is consumed exactly where
+// the target's effective logical is "decimal" on a bytes/fixed carrier; that
+// logical is the target's own when it has one, else the field's. The
+// own-logical-is-decimal cells keep that rule from being loosened into
+// "any annotation of its own is inert".
 func TestMatrix_FieldDecimalConsumedMalformedParamReject(t *testing.T) {
 	cases := []struct{ name, src, key string }{
 		{
@@ -3063,9 +3077,10 @@ func TestMatrix_FieldDecimalConsumedMalformedParamReject(t *testing.T) {
 			"precision",
 		},
 		{
-			// DISCRIMINATOR: the target's OWN logical is decimal, so the
-			// field's parameters land on a real decimal carrier and are
-			// genuinely consumed. Proven by wire below, not assumed.
+			// The discriminating cell: the target's own logical is
+			// decimal, so the field's parameters land on a real decimal
+			// carrier and are genuinely consumed. We prove that by wire
+			// below rather than assume it.
 			"target-own-logical-decimal-precision",
 			`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"bytes","logicalType":"decimal"},"logicalType":"decimal","precision":"x","scale":2}]}`,
 			"precision",
@@ -3094,8 +3109,9 @@ func TestMatrix_FieldDecimalConsumedMalformedParamReject(t *testing.T) {
 	}
 }
 
-// Valid-int unconsumed pair: observable on SchemaField.Props, the String()
-// render, and the rebuild — the surfaces the malformed forms must match.
+// Valid-int unconsumed pair: it is observable on SchemaField.Props, the
+// String() render, and the rebuild, the surfaces the malformed forms must
+// match.
 func TestRegression_FieldPrecisionValidUnconsumedSurfacesInProps(t *testing.T) {
 	s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"f","type":"int","precision":3}]}`)
 	f := s.Root().Fields[0]
@@ -3115,30 +3131,31 @@ func TestRegression_FieldPrecisionValidUnconsumedSurfacesInProps(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Class matrix: stray-precision/scale placement x level x kind.
 //
-// Locks the whole class the stray-precision fix belongs to, not just the filed
-// instance: for every placement, at both levels, across every kind class the
-// parser routes differently. Per accepted cell it asserts the verdict, the
-// Props-vs-Precision/Scale routing, the B15 axes-3&4 round trips, and — for
-// cells whose precision/scale are inert — that the wire bytes and the
-// Canonical()/Rabin fingerprint are identical to the stray-free twin, asserted
-// rather than assumed and calibrated against fastavro's PCF by execution in
-// TestMatrix_StrayPrecisionScaleFastavroPCF. Reject cells are the #55 controls:
-// recognized-decimal carriers with invalid parameters keep hard-rejecting.
+// Here we lock the whole class the stray-precision fix belongs to, not just
+// the filed instance: every placement, at both levels, across every kind class
+// the parser routes differently. Per accepted cell it asserts the verdict, the
+// Props-vs-Precision/Scale routing, and the B15 axes-3&4 round trips. For cells
+// whose precision/scale are inert it also asserts that the wire bytes and the
+// Canonical()/Rabin fingerprint are identical to the stray-free twin. That is
+// asserted rather than assumed, and calibrated against fastavro's PCF by
+// execution in TestMatrix_StrayPrecisionScaleFastavroPCF. Reject cells are the
+// #55 controls: recognized-decimal carriers with invalid parameters keep
+// hard-rejecting.
 
 type strayPSCell struct {
 	placement string // no-logical | unknown-logical | valid-logical | decimal-valid | decimal-invalid
 	kind      string // int | bytes | string | long | fixed | record | array
 	level     string // type | field | union-field
-	body      string // valid | quoted | float | nonnum | overflow | array — the params' JSON shape
+	body      string // the params' JSON shape: valid | quoted | float | nonnum | overflow | array
 }
 
 // strayPSBodies are the JSON shapes injected for each param value: the valid
-// int form plus every malformed class a lax reader could coerce — quoted
-// digits (a string), a non-integral float (truncation bait), a non-numeric
-// string, an int64-overflow literal, and an array. Where the pair is
-// unconsumed, every shape is an inert custom property surfacing verbatim;
-// where it is consumed, every malformed shape hard-rejects (#41's quoted
-// form included).
+// int form plus every malformed class a lax reader could coerce. Those classes
+// are quoted digits (a string), a non-integral float (truncation bait), a
+// non-numeric string, an int64-overflow literal, and an array. Where the pair
+// is unconsumed, every shape is an inert custom property surfacing verbatim;
+// where it is consumed, every malformed shape hard-rejects (#41's quoted form
+// included).
 var strayPSBodies = []string{"valid", "quoted", "float", "nonnum", "overflow", "array"}
 
 const strayPSOverflowLit = "99999999999999999999"
@@ -3164,9 +3181,10 @@ func strayPSBodyJSON(body string, n int) string {
 }
 
 // strayPSBodyProps is the Props image of the injected body under the
-// documented numeric normalization (value-based: int64 for whole numbers
-// in range, json.Number for pure-digit integers beyond int64, float64 for
-// non-integers; everything else the natural Go type, verbatim).
+// documented numeric normalization. That normalization is value-based: int64
+// for whole numbers in range, json.Number for pure-digit integers beyond
+// int64, float64 for non-integers; everything else is the natural Go type,
+// verbatim.
 func strayPSBodyProps(body string, n int) any {
 	switch body {
 	case "valid":
@@ -3200,7 +3218,7 @@ func strayPSAttrs(placement, kind string) (logical string, params [][2]any) {
 			"string": "uuid",
 			"bytes":  "big-decimal",
 			"fixed":  "duration",
-			// No logical is valid on record/array: the KNOWN name
+			// No logical is valid on record/array: the known name
 			// soft-drops off the wrong carrier, keys stay stray.
 			"record": "timestamp-millis",
 			"array":  "timestamp-millis",
@@ -3209,10 +3227,10 @@ func strayPSAttrs(placement, kind string) (logical string, params [][2]any) {
 		return "decimal", [][2]any{{"precision", 2}, {"scale", 1}}
 	case "decimal-invalid":
 		if kind == "fixed" {
-			// Over fixed(1) capacity — the #55 capacity arm.
+			// Over fixed(1) capacity: the #55 capacity arm.
 			return "decimal", [][2]any{{"precision", 99}}
 		}
-		// precision must be positive — the #55 positivity arm.
+		// precision must be positive: the #55 positivity arm.
 		return "decimal", [][2]any{{"precision", 0}}
 	}
 	panic("unknown placement " + placement)
@@ -3235,24 +3253,25 @@ func (c strayPSCell) carrier() bool { return c.kind == "bytes" || c.kind == "fix
 func (c strayPSCell) malformed() bool { return c.body != "valid" }
 
 // consumedPlacement reports whether this cell's placement/kind make
-// precision/scale decimal-CONSUMED: logicalType "decimal" on a bytes/fixed
-// carrier. At the type level the carrier is the node's own kind; at the
-// field levels it is the lift target's kind — the same rule
+// precision/scale decimal-consumed: logicalType "decimal" on a bytes/fixed
+// carrier. At the type level the carrier is the node's own kind; at the field
+// levels it is the lift target's kind, the same rule
 // (fieldDecimalLiftConsumesPrecisionScale mirrors
-// decimalConsumesPrecisionScale), which is what makes the field verdict
-// equal the type verdict on every cell.
+// decimalConsumesPrecisionScale). That is what makes the field verdict equal
+// the type verdict on every cell.
 func (c strayPSCell) consumedPlacement() bool {
 	return (c.placement == "decimal-valid" || c.placement == "decimal-invalid") && c.carrier()
 }
 
-// consumed reports whether the params land in Precision/Scale (validated
-// decimal parameters): a consumed placement holding well-shaped values.
+// consumed reports whether the params land in Precision/Scale, the validated
+// decimal parameters, which happens on a consumed placement holding
+// well-shaped values.
 func (c strayPSCell) consumed() bool {
 	return c.placement == "decimal-valid" && c.carrier() && !c.malformed()
 }
 
-// rejects reports whether the cell must hard-reject at parse: the #55
-// semantic rejects (well-shaped but invalid parameters) and the
+// rejects reports whether the cell must hard-reject at parse. That covers the
+// #55 semantic rejects (well-shaped but invalid parameters) and the
 // consumed-placement shape rejects (malformed bodies where consumed).
 func (c strayPSCell) rejects() bool {
 	return c.consumedPlacement() && (c.malformed() || c.placement == "decimal-invalid")
@@ -3303,7 +3322,7 @@ func (c strayPSCell) schemaJSON(twin bool) string {
 		typ = `{"type":"array","items":"int"}`
 	}
 	if c.level == "union-field" {
-		// The attrs sit on the FIELD beside a ["null", T] union type: the
+		// The attrs sit on the field beside a ["null", T] union type. The
 		// lift's union arm targets the first non-null branch, so the
 		// consumed rule follows that branch's kind.
 		return fmt.Sprintf(`{"type":"record","name":"Host","fields":[{"name":"a","type":["null",%s]%s}]}`, typ, attrs)
@@ -3311,9 +3330,9 @@ func (c strayPSCell) schemaJSON(twin bool) string {
 	return fmt.Sprintf(`{"type":"record","name":"Host","fields":[{"name":"a","type":%s%s}]}`, typ, attrs)
 }
 
-// value returns a wire-encodable value for the cell, compatible with
-// whichever logical actually applies (uuid wants UUID-format text,
-// big-decimal and consumed decimal want *big.Rat, duration wants Duration).
+// value returns a wire-encodable value for the cell, compatible with whichever
+// logical actually applies: uuid wants UUID-format text, big-decimal and
+// consumed decimal want *big.Rat, duration wants Duration.
 func (c strayPSCell) value() any {
 	if c.consumed() {
 		v := any(big.NewRat(3, 2)) // 1.5: precision 2, scale 1
@@ -3354,9 +3373,9 @@ func (c strayPSCell) value() any {
 }
 
 // paramsPropsMap converts the injected params to the exact Props content
-// expected on the surfaced node, per the injected body shape (whole numbers
-// are int64 per the Props contract; other shapes surface as their natural
-// Go type, verbatim).
+// expected on the surfaced node, per the injected body shape. Whole numbers
+// are int64 per the Props contract; other shapes surface as their natural Go
+// type, verbatim.
 func strayPSParamsProps(params [][2]any, body string) map[string]any {
 	m := make(map[string]any, len(params))
 	for _, p := range params {
@@ -3393,9 +3412,9 @@ func (c strayPSCell) assertRouting(t *testing.T, s *avro.Schema, when string) {
 		return
 	}
 	// Field levels (plain and union-typed): every attribute stays in the
-	// FIELD's Props as written (the wire lift is a codec concession, never
-	// extended into the metadata API), and the field's TYPE node — the
-	// concrete type or the union node — never consumes them.
+	// field's Props as written, the wire lift being a codec concession never
+	// extended into the metadata API. The field's type node, the concrete type
+	// or the union node, never consumes them.
 	f := root.Fields[0]
 	want := strayPSParamsProps(params, c.body)
 	if logical != "" {
@@ -3479,7 +3498,7 @@ func TestMatrix_StrayPrecisionScalePlacement(t *testing.T) {
 						c.assertRouting(t, s2, "String() reparse")
 
 						// B15 axis 4: the metadata rebuild must produce a schema
-						// that parses — the newly accepted shapes must rebuild.
+						// that parses; the newly accepted shapes must rebuild.
 						root := s.Root()
 						rb, err := root.Schema()
 						if err != nil {
@@ -3496,13 +3515,13 @@ func TestMatrix_StrayPrecisionScalePlacement(t *testing.T) {
 	}
 }
 
-// TestMatrix_StrayPrecisionScaleFastavroPCF drives every twmb-ACCEPTED cell of
-// the placement x kind x level x body grid through fastavro by execution:
-// fastavro must parse the same spelling — it validates decimal parameters only
-// where they are consumed — and its to_parsing_canonical_form must equal twmb's
-// Canonical(), PCF stripping attributes it does not define, which is also why
-// the Rabin fingerprints agree cross-impl. Reject cells are not driven: they are
-// the documented keep-strict side. The flat field spelling is likewise absent —
+// TestMatrix_StrayPrecisionScaleFastavroPCF drives every cell we accept of the
+// placement x kind x level x body grid through fastavro by execution. fastavro
+// must parse the same spelling: it validates decimal parameters only where they
+// are consumed. Its to_parsing_canonical_form must equal our Canonical(), since
+// PCF strips attributes it does not define, which is also why the Rabin
+// fingerprints agree cross-impl. Reject cells are not driven: they are the
+// documented keep-strict side. The flat field spelling is likewise absent, since
 // fastavro rejects it outright, so its cross-impl anchor is the nested twin.
 func TestMatrix_StrayPrecisionScaleFastavroPCF(t *testing.T) {
 	o := startOracle(t)
@@ -3527,14 +3546,14 @@ func TestMatrix_StrayPrecisionScaleFastavroPCF(t *testing.T) {
 	} {
 		check(t, src)
 	}
-	// fastavro validates decimal parameters on ANY type-level object carrying
-	// logicalType "decimal", carrier kind or not, and its validation demands
-	// numeric values (a truthiness gate skips falsy ones, which is why 0 and huge
-	// positive ints pass). Java instead drops the whole logical on a non-carrier
-	// via fromSchemaIgnoreInvalid without ever reading the params, so it accepts
-	// these spellings — twmb follows Java and the general unconsumed-is-inert
-	// rule. The divergence is pinned by DIRECTION: these cells must keep rejecting
-	// in fastavro, so a release that relaxes flips this loudly.
+	// fastavro validates decimal parameters on any type-level object carrying
+	// logicalType "decimal", carrier kind or not. Its validation demands numeric
+	// values, and a truthiness gate skips falsy ones, which is why 0 and huge
+	// positive ints pass. Java instead drops the whole logical on a non-carrier
+	// via fromSchemaIgnoreInvalid, never reading the params, so it accepts these
+	// spellings. We follow Java and the general unconsumed-is-inert rule. The
+	// divergence is pinned by direction: these cells must keep rejecting in
+	// fastavro, so a release that relaxes flips this loudly.
 	fastavroRejects := func(c strayPSCell) bool {
 		if c.level != "type" || c.carrier() {
 			return false
@@ -3572,17 +3591,18 @@ func TestMatrix_StrayPrecisionScaleFastavroPCF(t *testing.T) {
 	}
 }
 
-// The stray-"fields" shape verdict IS afieldFromAny's acceptance (one
-// predicate defines shape-OK), so the consumed-conditional rule propagates
-// into stray routing: a stray fields body whose element carries an
-// UNCONSUMED malformed precision parses as fields and surfaces structurally
-// as-written (the element pair in the element field's Props), while an
-// element with a CONSUMED malformed pair keeps the whole body malformed —
-// Props verbatim is its only surface.
+// The stray-"fields" shape verdict is afieldFromAny's acceptance: one
+// predicate defines shape-OK. So the consumed-conditional rule propagates
+// into stray routing. A stray fields body whose element carries an unconsumed
+// malformed precision parses as fields. It surfaces structurally as-written,
+// with the element pair in the element field's Props. An element with a
+// consumed malformed pair instead keeps the whole body malformed, and Props
+// verbatim is its only surface.
 func TestRegression_StrayFieldsElementPrecisionRouting(t *testing.T) {
 	t.Run("unconsumed-element-shape-ok", func(t *testing.T) {
-		// Carrier is a PRIMITIVE: a container kind carrying another kind's
-		// defining key is the exclusivity hard-reject, a different rule.
+		// Carrier is a primitive, and a container kind carrying another
+		// kind's defining key is the exclusivity hard-reject, a different
+		// rule.
 		s := mustParse(t, `{"type":"int","fields":[{"name":"f","type":"int","precision":"x"}]}`)
 		n := s.Root()
 		if _, ok := n.Props["fields"]; ok {
@@ -3607,15 +3627,16 @@ func TestRegression_StrayFieldsElementPrecisionRouting(t *testing.T) {
 	})
 }
 
-// A field-level "decimal" whose lift TARGET already carries its own logical type
-// never lands: closer-to-the-type wins, so the target keeps its own annotation
-// and the field's precision/scale annotate nothing. The pair is therefore inert
-// metadata and rides to Props like any custom property, malformed or not.
+// A field-level "decimal" whose lift target already carries its own logical
+// type never lands. Closer-to-the-type wins: the target keeps its own
+// annotation, and the field's precision/scale annotate nothing. The pair is
+// therefore inert metadata, and rides to Props like any custom property,
+// malformed or not.
 //
-// Inertness is PROVEN on the wire rather than asserted: the encoding is
+// We prove inertness on the wire rather than assert it: the encoding is
 // byte-identical with scale 0, with scale 2, and with no field-level logical at
-// all. The discriminator is the sibling case where the target's own logical IS
-// decimal — there the parameters DO land and scale 0 versus 2 diverges, which is
+// all. Our discriminator is the sibling case where the target's own logical is
+// decimal. There the parameters do land, and scale 0 versus 2 diverges. That is
 // what keeps this from being loosened into "a target with any annotation of its
 // own is inert".
 func TestRegression_FieldDecimalNotLandingIsInert(t *testing.T) {
@@ -3689,16 +3710,16 @@ func TestRegression_FieldDecimalNotLandingIsInert(t *testing.T) {
 }
 
 // A field-level logicalType annotation reaches its target through one
-// navigation, and the target is written in one of four spellings: a bare
-// primitive, a type object, a bare primitive as the first non-null union branch,
-// or an object as that branch. All four describe the same post-lift schema, so
-// all four must reach the same verdict and the same wire.
+// navigation. The target is written in one of four spellings: bare primitive,
+// type object, bare primitive as the first non-null union branch, or object as
+// that branch. All four describe the same post-lift schema, so all four must
+// reach the same verdict and the same wire.
 //
 // The arms disagreed before: the object arm completed missing precision/scale
-// onto a target that already declared its own logicalType while the union arm
-// declined, so a bytes+decimal with field-level parameters built and its
-// ["null", ...] twin rejected. Annotation and parameters are separate questions
-// — closer to the type wins the annotation, and the field still completes
+// onto a target that already declared its own logicalType, while the union arm
+// declined. So a bytes+decimal with field-level parameters built while its
+// ["null", ...] twin rejected. Annotation and parameters are separate questions:
+// closer to the type wins the annotation, and the field still completes
 // parameters where the effective logical is decimal.
 func TestRegression_FieldLogicalLiftSpellingParity(t *testing.T) {
 	const fieldAttrs = `,"logicalType":"decimal","precision":4,"scale":2`
@@ -3719,8 +3740,8 @@ func TestRegression_FieldLogicalLiftSpellingParity(t *testing.T) {
 
 	// Group 1: the target declares its own "decimal" and the field supplies
 	// the parameters. Every spelling must build, and the two union spellings
-	// must agree with each other (they carry a branch index the nested forms
-	// do not).
+	// must agree with each other. They carry a branch index the nested forms
+	// do not.
 	t.Run("target declares decimal, field supplies params", func(t *testing.T) {
 		nested, err := build(t, `{"type":"bytes","logicalType":"decimal"}`)
 		if err != nil {
@@ -3768,12 +3789,12 @@ func TestRegression_FieldLogicalLiftSpellingParity(t *testing.T) {
 
 // Completing precision/scale only where the effective logical is "decimal" also
 // stops them being written into a type whose logical is something else. That is
-// unobservable, and this pins the claim rather than reasoning about it: the
+// unobservable, so this pins the claim rather than reasoning about it. The
 // parameters are absent from the canonical form either way, and the wire is
-// byte-identical, because nothing but the decimal codec reads them. The pin
-// cannot fail by neutering the gate — both behaviors produce the same bytes,
-// which is precisely what it asserts — but it WOULD fail if some future consumer
-// started reading precision/scale off a non-decimal type.
+// byte-identical, because nothing but the decimal codec reads them. Neutering
+// the gate cannot fail this pin: both behaviors produce the same bytes, which
+// is precisely what it asserts. It *would* fail if some future consumer started
+// reading precision/scale off a non-decimal type.
 func TestMatrix_FieldParamsOnNonDecimalTargetAreUnobservable(t *testing.T) {
 	for _, c := range []struct{ name, fieldType, logical string }{
 		{"bare-primitive-uuid", `"string"`, "uuid"},
@@ -3795,7 +3816,7 @@ func TestMatrix_FieldParamsOnNonDecimalTargetAreUnobservable(t *testing.T) {
 			if !bytes.Equal(with.Canonical(), without.Canonical()) {
 				t.Errorf("canonical form differs with/without the parameters:\n with: %s\n  w/o: %s", with.Canonical(), without.Canonical())
 			}
-			// Same for the scale, which is the parameter that would change a
+			// Same for the scale, the parameter that would change a
 			// decimal encoding if it were ever read here.
 			other := mk(`,"precision":4,"scale":0`)
 			if !bytes.Equal(with.Canonical(), other.Canonical()) {
@@ -3808,21 +3829,21 @@ func TestMatrix_FieldParamsOnNonDecimalTargetAreUnobservable(t *testing.T) {
 // ---------- straykey_routing_matrix_test.go ----------
 
 // strayRouteCase enumerates one reserved key's shape battery: a body that
-// parses as the key's schema shape (structural surfacing), malformed
-// bodies (Props verbatim), and the key's binding kind (whose shape errors
-// must keep rejecting).
+// parses as the key's schema shape (structural surfacing) and malformed
+// bodies (Props verbatim). It also names the key's binding kind, whose shape
+// errors must keep rejecting.
 type strayRouteCase struct {
 	key       string
 	okBody    string   // shape-OK body (structural route on a non-binding kind)
 	malformed []string // non-schema-shaped bodies (Props route)
-	binding   string   // a carrier that BINDS the key (malformed must reject)
+	binding   string   // a carrier that binds the key (malformed must reject)
 }
 
-// The malformed bodies deliberately include shapes that pass a LAX capture
-// but fail the key's schema shape — a mixed-type array is a []any (a lax
-// []any assert accepts it) but not a []string; 3.7 is a JSON number (a lax
-// numeric read truncates it) but not an integer. These wedge bodies pin
-// that the capture predicate and the shape verdict are the SAME predicate.
+// The malformed bodies deliberately include shapes that pass a lax capture
+// but fail the key's schema shape. A lax []any assert accepts a mixed-type
+// array, which is not a []string. A lax numeric read truncates the JSON
+// number 3.7, which is not an integer. These wedge bodies pin that the
+// capture predicate and the shape verdict are one predicate.
 var strayRouteCases = []strayRouteCase{
 	{"items", `"int"`, []string{`3`, `{"type":3}`}, `{"type":"array","items":%s}`},
 	{"values", `"int"`, []string{`true`, `[3]`}, `{"type":"map","values":%s}`},
@@ -3837,11 +3858,11 @@ var strayRouteCases = []strayRouteCase{
 }
 
 // assertStrayStructuralZero asserts the structural surface for key is the
-// zero value on n: a malformed stray body's ONLY surface is Props verbatim.
+// zero value on n: a malformed stray body's only surface is Props verbatim.
 // The metadata walker's capture and the Props routing share one shape
-// verdict, so a body that rides to Props can never also surface a coerced
-// image on the structural field (structural-field-set ⟺ consumed-out-of-
-// Props).
+// verdict. So a body that rides to Props can never also surface a coerced
+// image on the structural field. The structural field is set exactly when
+// the key was consumed out of Props.
 func assertStrayStructuralZero(t *testing.T, key string, n avro.SchemaNode, when string) {
 	t.Helper()
 	zero := true
@@ -3874,14 +3895,14 @@ func assertStrayStructuralZero(t *testing.T, key string, n avro.SchemaNode, when
 }
 
 // TestMatrix_StrayBodyShapeRouting crosses reserved key × body shape ×
-// carrier against the surfacing route: on a kind that does not bind the
-// key, a schema-shaped body surfaces structurally (as-written) and a
-// non-schema-shaped body rides in Props exactly like a custom property
-// (verbatim — asserted against a twin schema carrying the same value
-// under a non-reserved key); on the binding kind the shape error keeps
+// carrier against the surfacing route. On a kind that does not bind the
+// key, a schema-shaped body surfaces structurally (as-written). A
+// non-schema-shaped body rides in Props exactly like a custom property,
+// verbatim, asserted against a twin schema carrying the same value under a
+// non-reserved key. On the binding kind the shape error keeps
 // rejecting. Wire codecs ignore both stray routes; the metadata rebuild
 // round-trips them. fastavro accepts every accept cell (executed when
-// AVRO_FASTAVRO_PYTHON is set); Java skips reserved keys wholesale on
+// AVRO_FASTAVRO_PYTHON is set). Java skips reserved keys wholesale on
 // non-binding kinds (SCHEMA_RESERVED, Schema.java:175-176).
 func TestMatrix_StrayBodyShapeRouting(t *testing.T) {
 	t.Parallel()
@@ -3987,7 +4008,7 @@ func TestMatrix_StrayBodyShapeRouting(t *testing.T) {
 }
 
 // TestDifferentialFastavroStrayBodyShapes drives every accept cell of the
-// shape-routing matrix through fastavro's parser: fastavro ignores
+// shape-routing matrix through fastavro's parser. fastavro ignores
 // reserved keys on kinds that do not consume them, so each cell must
 // parse there too.
 func TestDifferentialFastavroStrayBodyShapes(t *testing.T) {
@@ -4000,8 +4021,8 @@ func TestDifferentialFastavroStrayBodyShapes(t *testing.T) {
 		for _, body := range bodies {
 			cell := host(`{"type":"int","` + c.key + `":` + body + `}`)
 			if _, err := avro.Parse(cell); err != nil {
-				// Cells twmb rejects are covered by the routing matrix;
-				// the differential asserts agreement on accepts only.
+				// The routing matrix covers the cells we reject; this
+				// differential asserts agreement on accepts only.
 				continue
 			}
 			resp := o.call(oracleJob{Op: "parse", Schema: json.RawMessage(cell)})
@@ -4013,12 +4034,12 @@ func TestDifferentialFastavroStrayBodyShapes(t *testing.T) {
 }
 
 // The three pins below lock the malformed-stray single-surface invariant at
-// the top level (no host record): a body that does not parse as the reserved
-// key's schema shape rides in Props verbatim and sets NO structural field.
-// The wedge bodies are exactly the shapes a lax capture would coerce — a
-// mixed-type array type-asserts as []any (element-wise assert fabricates ""
-// for non-strings), and a non-integral number truncates under a plain
-// numeric conversion — so a fabricated value here means the capture
+// the top level, with no host record. A body that does not parse as the
+// reserved key's schema shape rides in Props verbatim and sets NO structural
+// field. The wedge bodies are exactly the shapes a lax capture would coerce.
+// A mixed-type array type-asserts as []any, where an element-wise assert
+// fabricates "" for non-strings, and a non-integral number truncates under a
+// plain numeric conversion. So a fabricated value here means the capture
 // predicate has drifted from the shape verdict.
 
 func TestRegression_StrayAliasesMalformedNotStructurallySurfaced(t *testing.T) {
@@ -4060,25 +4081,25 @@ func TestRegression_StraySizeMalformedNotStructurallySurfaced(t *testing.T) {
 // ---------- written_zero_test.go ----------
 
 // ---------------------------------------------------------------------------
-// An attribute WRITTEN AS ITS DESTINATION'S ZERO is written.
+// An attribute written as its destination's zero is written.
 //
 // A schema attribute read into a plain string or int has no companion saying
-// whether the key appeared, so `x != ""` means two things at once: "the caller
+// whether the key appeared. So `x != ""` means two things at once: "the caller
 // chose a value" and "the caller chose the value that happens to be my zero".
-// Every reader guarded that way is silently wrong for exactly one input, and
-// which way it is wrong depends on what the reader does with the answer — a
-// validator SKIPS the zero, an emitter DROPS it.
+// Every reader guarded that way is silently wrong for exactly one input. Which
+// way it is wrong depends on what the reader does with the answer: a validator
+// skips the zero, an emitter drops it.
 //
-// Apache Avro has no such gap, because it decides on the JSON NODE rather than
-// on the parsed value, and its emission condition DIFFERS PER ATTRIBUTE:
+// Apache Avro has no such gap: it decides on the JSON node rather than on the
+// parsed value. Its emission condition differs per attribute:
 //
-//   - doc emits when non-NULL (:1039 record, :1154 enum, :1367 fixed, :1062
-//     field), so a doc written as "" survives;
-//   - aliases emits when non-EMPTY (:886 named, :1070 field), so an alias list
-//     written as [] is dropped;
-//   - order is decided on the node — `if (orderNode != null)
-//     Order.valueOf(node.textValue().toUpperCase())` (:1895-1897) — so an order
-//     written as "" reaches valueOf and throws;
+//   - doc emits when non-null (:1039 record, :1154 enum, :1367 fixed, :1062
+//     field), so a doc written as "" survives.
+//   - aliases emits when non-empty (:886 named, :1070 field), so an alias list
+//     written as [] is dropped.
+//   - order is decided on the node, `if (orderNode != null)
+//     Order.valueOf(node.textValue().toUpperCase())` (:1895-1897), so an order
+//     written as "" reaches valueOf and throws.
 //   - logicalType is not reserved at all (:175-176), so parseProperties keeps it
 //     as an ordinary schema property whatever its content, "" included.
 //
@@ -4088,13 +4109,13 @@ func TestRegression_StraySizeMalformedNotStructurallySurfaced(t *testing.T) {
 //
 // fastavro 1.12.2 preserves every one of these bodies verbatim (executed), so
 // where Java and fastavro disagree the entry naming the deciding rule is the
-// authority, and the cases this package deliberately keeps dropping are pinned
-// as such rather than left to look like oversights.
+// authority. The cases we deliberately keep dropping are pinned as such, rather
+// than left to look like oversights.
 // ---------------------------------------------------------------------------
 
-// TestMatrix_EmptyOrderRejected pins the validator half: presence and
-// validity are one question, so an order written as the empty string is a
-// written order that is not one of the three the spec defines.
+// TestMatrix_EmptyOrderRejected pins the validator half. Presence and
+// validity are one question. An order written as the empty string is a
+// written order, and not one of the three the spec defines.
 func TestMatrix_EmptyOrderRejected(t *testing.T) {
 	const host = `{"type":"record","name":"R","fields":[{"name":"f","type":"int"%s}]}`
 	if _, err := avro.Parse(strings.Replace(host, "%s", `,"order":""`, 1)); err == nil {
@@ -4103,8 +4124,8 @@ func TestMatrix_EmptyOrderRejected(t *testing.T) {
 		t.Errorf("the reject does not name the offending attribute: %v", err)
 	}
 
-	// The three legal orders keep parsing, and an ABSENT order stays legal —
-	// the check must key on written-ness, not on non-emptiness, or it would
+	// The three legal orders keep parsing, and an absent order stays legal.
+	// The check must key on written-ness, not on non-emptiness, or it would
 	// reject every field that does not spell one.
 	for _, ok := range []string{`,"order":"ascending"`, `,"order":"descending"`, `,"order":"ignore"`, ``} {
 		if _, err := avro.Parse(strings.Replace(host, "%s", ok, 1)); err != nil {
@@ -4113,9 +4134,9 @@ func TestMatrix_EmptyOrderRejected(t *testing.T) {
 	}
 
 	// Case variants stay rejected. Apache Avro upper-cases before its own
-	// lookup, but reserved attribute VALUES are matched by exact spelling
-	// here: a variant is a different string, not a different case of the
-	// same one.
+	// lookup, but we match reserved attribute *values* by exact spelling.
+	// A variant is a different string, not a different case of the same
+	// one.
 	for _, bad := range []string{`,"order":"ASCENDING"`, `,"order":"Ignore"`, `,"order":"asc"`} {
 		if _, err := avro.Parse(strings.Replace(host, "%s", bad, 1)); err == nil {
 			t.Errorf("%q parsed; the order comparison is exact-case", bad)
@@ -4124,8 +4145,8 @@ func TestMatrix_EmptyOrderRejected(t *testing.T) {
 }
 
 // TestMatrix_EmptyDocSurvivesWhereJavaEmitsOne pins the five placements
-// Apache Avro carries a doc on — the four named kinds and the record field —
-// where an empty doc is a doc and is emitted.
+// Apache Avro carries a doc on: the four named kinds and the record field.
+// There an empty doc is a doc and is emitted.
 func TestMatrix_EmptyDocSurvivesWhereJavaEmitsOne(t *testing.T) {
 	cases := []struct{ name, src string }{
 		{"record", `{"type":"record","name":"R","doc":"","fields":[]}`},
@@ -4148,8 +4169,8 @@ func TestMatrix_EmptyDocSurvivesWhereJavaEmitsOne(t *testing.T) {
 			if !strings.Contains(rb.String(), `"doc":""`) {
 				t.Errorf("the rebuild dropped a written empty doc: %s", rb)
 			}
-			// A second pass must keep it, or the attribute survives one
-			// rebuild and dies on the next.
+			// A second pass must keep it, or the attribute survives
+			// one rebuild and dies on the next.
 			rbRoot := rb.Root()
 			rb2, err := rbRoot.Schema()
 			if err != nil {
@@ -4158,7 +4179,7 @@ func TestMatrix_EmptyDocSurvivesWhereJavaEmitsOne(t *testing.T) {
 			if rb2.String() != rb.String() {
 				t.Errorf("emission is not a fixpoint:\n first %s\nsecond %s", rb, rb2)
 			}
-			// Nothing on the wire side may move: neither the canonical form
+			// Nothing on the wire side may move. Neither the canonical form
 			// nor the fingerprint carries doc at all.
 			twin := avro.MustParse(strings.Replace(c.src, `"doc":"",`, "", 1))
 			if !bytes.Equal(s.Canonical(), twin.Canonical()) {
@@ -4173,9 +4194,9 @@ func TestMatrix_EmptyDocSurvivesWhereJavaEmitsOne(t *testing.T) {
 
 // TestMatrix_EmptyLogicalTypeSurvives pins the other preserved attribute.
 // logicalType is absent from Apache Avro's reserved set, so it is an ordinary
-// schema property there and survives on every kind whatever its content —
-// including on a primitive, which is the node the bare-emission shortcut
-// collapses and therefore the one that has to consult presence.
+// schema property there. It survives on every kind whatever its content, a
+// primitive included. The primitive is the node the bare-emission shortcut
+// collapses, so it is the one that has to consult presence.
 func TestMatrix_EmptyLogicalTypeSurvives(t *testing.T) {
 	for _, src := range []string{
 		`{"type":"int","logicalType":""}`,
@@ -4211,12 +4232,12 @@ func TestMatrix_EmptyLogicalTypeSurvives(t *testing.T) {
 
 // TestMatrix_EmptyAliasesStayDropped is the other side of the per-attribute
 // rule, and the reason a blanket presence mechanism would be wrong. An alias
-// list written as [] is EMPTY, and Apache Avro's emission condition for aliases
-// is non-EMPTY rather than non-null (Schema.java:886 for a named type, :1070 for
-// a field), so where a kind BINDS the key, this package and Apache Avro agree on
-// dropping it; fastavro 1.12.2 preserves it, and two of three drop. The scope is
-// the BINDING placement — on a kind that does not bind aliases there is no
-// Apache Avro condition to follow and the stray-routing posture governs.
+// list written as [] is empty. Apache Avro's emission condition for aliases is
+// non-empty rather than non-null (Schema.java:886 for a named type, :1070 for
+// a field). So where a kind binds the key, we and Apache Avro agree on dropping
+// it. fastavro 1.12.2 preserves it, and two of three drop. The scope is the
+// binding placement. On a kind that does not bind aliases there is no Apache
+// Avro condition to follow, so the stray-routing posture governs.
 func TestMatrix_EmptyAliasesStayDropped(t *testing.T) {
 	drops := []struct{ name, src string }{
 		{"type-level", `{"type":"record","name":"R","aliases":[],"fields":[]}`},
@@ -4232,7 +4253,7 @@ func TestMatrix_EmptyAliasesStayDropped(t *testing.T) {
 			}
 		})
 	}
-	// The control: a non-empty list survives, so the drop is about the BODY
+	// The control: a non-empty list survives, so the drop is about the body
 	// and not about the attribute being unsupported.
 	keeps := []struct{ name, src string }{
 		{"type-level", `{"type":"record","name":"R","aliases":["X"],"fields":[]}`},
@@ -4252,12 +4273,12 @@ func TestMatrix_EmptyAliasesStayDropped(t *testing.T) {
 
 // TestMatrix_PrimitiveDocSurvivesEitherWay pins the placement-authority rule,
 // which is what decides a cell no single reference can. Apache Avro has no doc
-// slot on a primitive or a container at all — parseDoc is called from
-// parseRecord/parseEnum/parseFixed and parseField and nowhere else — so it
-// neither keeps nor drops one; fastavro does have the placement and preserves
-// the attribute. This package already followed fastavro there for a NON-EMPTY
-// doc, so the empty twin follows the same authority: deriving it from Apache
-// Avro's absence would split one placement between two references and make the
+// slot on a primitive or a container at all. parseDoc is called from
+// parseRecord/parseEnum/parseFixed and parseField and nowhere else, so Java
+// neither keeps nor drops one. fastavro does have the placement and preserves
+// the attribute. We already followed fastavro there for a non-empty doc, so
+// the empty twin follows the same authority. Deriving it from Apache Avro's
+// absence would split one placement between two references. It would make the
 // two bodies of one attribute disagree for no reason a caller could name.
 func TestMatrix_PrimitiveDocSurvivesEitherWay(t *testing.T) {
 	for _, kind := range []string{`{"type":"int"%s}`, `{"type":"string"%s}`,
@@ -4294,22 +4315,21 @@ func TestMatrix_PrimitiveDocSurvivesEitherWay(t *testing.T) {
 }
 
 // TestMatrix_StrayZeroBodySurvivesTheRebuild covers the placements no reference
-// can adjudicate: a structural key written as its destination's ZERO on a kind
+// can adjudicate: a structural key written as its destination's zero on a kind
 // that does not bind it. Apache Avro skips every stray key as reserved and keeps
 // none; fastavro keeps every stray key as a property and drops none. Neither is
-// answering the question this package's metadata tree poses, so its own
-// stray-routing posture governs — the same basis the field-lift and
-// consumed-parameter rulings rest on — and that posture says as-written is the
-// key's ONLY surface.
+// answering the question our metadata tree poses, so our own stray-routing
+// posture governs. That is the same basis the field-lift and consumed-parameter
+// rulings rest on, and the posture says as-written is the key's only surface.
 //
-// The trap this pins, and why each cell asserts the EMITTED FORM's round trip
-// rather than only the field's survival: the exclusivity rule is decided on the
-// VALUE, so `symbols:["A"]` on an array rejects while `symbols:[]` is accepted.
+// Here is the trap, and why each cell asserts the emitted form's round trip
+// rather than only the field's survival. The exclusivity rule is decided on the
+// value, so `symbols:["A"]` on an array rejects while `symbols:[]` is accepted.
 // Preserving the empty body therefore emits a schema whose own re-parse has to
-// be checked — if exclusivity ever became presence-decided, the rebuild would
-// start emitting schemas this package rejects.
+// be checked. If exclusivity ever became presence-decided, the rebuild would
+// start emitting schemas we reject.
 func TestMatrix_StrayZeroBodySurvivesTheRebuild(t *testing.T) {
-	// Each cell: a kind that does NOT bind the key, and the key written as
+	// Each cell: a kind that does not bind the key, and the key written as
 	// its destination's zero.
 	cells := []struct{ name, src, key string }{
 		{"name/int", `{"type":"int","name":""}`, "name"},
@@ -4344,9 +4364,9 @@ func TestMatrix_StrayZeroBodySurvivesTheRebuild(t *testing.T) {
 			}
 			// The trap, in three legs. SchemaNode.Schema() parses the tree
 			// it marshals, so an emitted body the parser rejects already
-			// fails ABOVE, at the rebuild — that leg is why the error check
+			// fails above, at the rebuild. That is why the error check
 			// there is a Fatalf and not a skip. What the re-parse adds is
-			// the RENDERED TEXT: String() is written independently of the
+			// the rendered text. String() is written independently of the
 			// tree Schema() handed the parser, so a divergence between them
 			// shows up only here.
 			back, err := avro.Parse(rb.String())
@@ -4373,10 +4393,10 @@ func TestMatrix_StrayZeroBodySurvivesTheRebuild(t *testing.T) {
 }
 
 // TestMatrix_StrayReadableBodyStillRejectsOnExclusivity is the boundary
-// the preservation above must not cross: a stray defining key that parsed as
-// a REAL definition still hard-rejects on a kind that binds another one. The
+// the preservation above must not cross. A stray defining key that parsed as
+// a real definition still hard-rejects on a kind that binds another one. The
 // exclusivity rule is about a key that defines something, and an empty body
-// defines nothing — which is exactly why the two verdicts differ.
+// defines nothing. That is exactly why the two verdicts differ.
 func TestMatrix_StrayReadableBodyStillRejectsOnExclusivity(t *testing.T) {
 	for _, src := range []string{
 		`{"type":"array","items":"int","symbols":["A"]}`,
@@ -4419,23 +4439,23 @@ func stripKey(src, key string) string {
 }
 
 // TestMatrix_NamespaceStrictnessIsUniform records why a non-string namespace
-// rejecting here — where Apache Avro silently ignores it and fastavro keeps it —
+// rejecting here, where Apache Avro silently ignores it and fastavro keeps it,
 // is coherence rather than an accidental third answer.
 //
-// The tempting analogy is the non-string logicalType, which this package routes
-// to Props instead of rejecting. That analogy fails, and the reason is visible in
-// one probe: this package also rejects garbage STRING namespaces. A rule that
-// accepted every string and rejected every non-string would be judging the JSON
-// token type while ignoring the content, which is the shape that made the
-// logicalType case incoherent to reject. Here the content is judged too.
+// The tempting analogy is the non-string logicalType, which we route to Props
+// instead of rejecting. That analogy fails, and one probe shows why: we also
+// reject garbage *string* namespaces. A rule that accepted every string and
+// rejected every non-string would judge the JSON token type while ignoring the
+// content. That is the shape that made the logicalType case incoherent to
+// reject; here the content is judged too.
 //
 // Names and namespaces are the one part of the grammar that stays strictly
-// validated; only ALIASES relax, because a reader has to be able to alias a
+// validated. Only aliases relax, because a reader has to be able to alias a
 // writer's illegal legacy name.
 func TestMatrix_NamespaceStrictnessIsUniform(t *testing.T) {
 	const host = `{"type":"record","name":"R","namespace":%s,"fields":[]}`
 
-	// The coherence proof: garbage STRINGS reject too, so the strictness is
+	// The coherence proof: garbage strings reject too. The strictness is
 	// about what a namespace can be, not about the JSON token class.
 	for _, ns := range []string{`"123bad"`, `"has space"`, `"a..b"`, `"weird!"`} {
 		if _, err := avro.Parse(fmt.Sprintf(host, ns)); err == nil {
@@ -4458,9 +4478,9 @@ func TestMatrix_NamespaceStrictnessIsUniform(t *testing.T) {
 		}
 	}
 
-	// And the contrast that makes the rule a rule: an ALIAS accepts any
-	// string, so the strictness is scoped to names and namespaces rather
-	// than applied to every string attribute.
+	// And the contrast that makes the rule a rule: an alias accepts any
+	// string. The strictness is scoped to names and namespaces, not
+	// applied to every string attribute.
 	if _, err := avro.Parse(`{"type":"record","name":"R","aliases":["123bad","has space"],"fields":[]}`); err != nil {
 		t.Errorf("aliases must stay unvalidated — a reader has to be able to alias a writer's illegal name: %v", err)
 	}
@@ -4469,34 +4489,34 @@ func TestMatrix_NamespaceStrictnessIsUniform(t *testing.T) {
 // ---------- type_level_binding_routing_test.go ----------
 
 // ---------------------------------------------------------------------------
-// "default" and "order" at the TYPE level.
+// "default" and "order" at the type level.
 //
-// Both keys are FIELD attributes: a record field binds each of them, and the
-// spec's only type-level binding of either is the enum evolution default. A type
-// object of any other kind binds neither, so neither has a structural field to
-// land on — and the routing rule the reserved-key rulings share is a
-// biconditional: the structural field is set IFF the key was consumed, and Props
-// holds exactly the raw keys that were not.
+// Both keys are field attributes: a record field binds each of them, and the
+// spec's only type-level binding of either is the enum evolution default. A
+// type object of any other kind binds neither, so neither has a structural
+// field to land on. The routing rule the reserved-key rulings share is a
+// biconditional: the structural field is set if and only if the key was
+// consumed, and Props holds exactly the raw keys that were not.
 //
 // Both references agree on preserving them where the kind does not bind:
 //
-//   - Java's SCHEMA_RESERVED (Schema.java:175-176) omits BOTH keys, so
-//     parsePropertiesAndLogicalType keeps each as a schema PROPERTY on
+//   - Java's SCHEMA_RESERVED (Schema.java:175-176) omits both keys, so
+//     parsePropertiesAndLogicalType keeps each as a schema property on
 //     primitives (:1857), records (:1880), arrays (:1940), maps (:1950) and
 //     fixed (:1963). ENUM_RESERVED (:178-180) is SCHEMA_RESERVED plus "default"
-//     alone, applied at :1928 — so an enum consumes "default" and keeps "order".
+//     alone, applied at :1928, so an enum consumes "default" and keeps "order".
 //   - fastavro 1.12.2 keeps both keys on the parsed schema of every kind
 //     (executed; TestDifferentialFastavroTypeLevelBindingRouting drives the
 //     matrix through it per accepted cell).
 //
-// The FIELD level is the boundary this must not cross: Java's FIELD_RESERVED
-// (:503-504) binds both, and so does twmb — a field's "default" and "order" are
-// consumed into SchemaField.Default / SchemaField.Order and must never appear in
-// SchemaField.Props. The matrix crosses the binding axis precisely so that
+// The field level is the boundary this must not cross: Java's FIELD_RESERVED
+// (:503-504) binds both, and so do we. A field's "default" and "order" are
+// consumed into SchemaField.Default / SchemaField.Order, and must never appear
+// in SchemaField.Props. The matrix crosses the binding axis precisely so that
 // boundary is asserted rather than assumed.
 //
 // Neither key reaches the wire, the Parsing Canonical Form, or the fingerprint
-// on either side of the change: PCF keeps only
+// on either side of the change. PCF keeps only
 // type/name/fields/symbols/items/values/size, and no codec reads an unconsumed
 // attribute. Every cell asserts that identity against a twin spelled without the
 // key.
@@ -4524,7 +4544,7 @@ type bindingCell struct {
 	level bindingLevel
 }
 
-// binds states, from the RULINGS rather than from the code, whether the
+// binds states, from the rulings rather than from the code, whether the
 // placement consumes the attribute into a structural field. A cell that binds
 // must keep the key out of Props; a cell that does not must put it there.
 func (c bindingCell) binds() bool {
@@ -4535,8 +4555,8 @@ func (c bindingCell) binds() bool {
 }
 
 // body is the attribute's JSON value: a legal sort order for "order", and for
-// "default" a value the kind can actually take, so a BINDING cell reaches the
-// consumer's validation instead of failing for an unrelated reason.
+// "default" a value the kind can actually take. That way a binding cell reaches
+// the consumer's validation instead of failing for an unrelated reason.
 func (c bindingCell) body() string {
 	if c.key == "order" {
 		return `"ignore"`
@@ -4603,7 +4623,7 @@ func bindingValue(kind string) any {
 
 // schema returns the cell's schema source, with the attribute present or
 // absent. Every cell is wrapped in a host record so the type-level and
-// field-level spellings differ only in WHICH object carries the key.
+// field-level spellings differ only in which object carries the key.
 func (c bindingCell) schema(withAttr bool) string {
 	typeAttr, fieldAttr := "", ""
 	if withAttr {
@@ -4634,8 +4654,8 @@ func bindingCells() []bindingCell {
 }
 
 // bindingStructuralSurface reads the structural field the attribute lands on
-// when it IS consumed, so "consumed" is measured off the metadata API rather
-// than inferred from the routing predicate the test is checking.
+// when it is consumed. That measures "consumed" off the metadata API, not off
+// the routing predicate the test is checking.
 func bindingStructuralSurface(f avro.SchemaField, c bindingCell) bool {
 	switch {
 	case c.level == levelField && c.key == "default":
@@ -4646,7 +4666,7 @@ func bindingStructuralSurface(f avro.SchemaField, c bindingCell) bool {
 		return f.Type.HasEnumDefault
 	default:
 		// No type-level kind binds "order": there is no structural field
-		// for it to reach, which is exactly why it must ride to Props.
+		// for it to reach. That is exactly why it must ride to Props.
 		return false
 	}
 }
@@ -4660,9 +4680,9 @@ func bindingProps(f avro.SchemaField, c bindingCell) map[string]any {
 }
 
 // TestMatrix_TypeLevelBindingRouting crosses {default, order} x every kind x
-// {type object, record field} and asserts the biconditional on both surfaces,
-// plus the inertness of the attribute on every representation that is not the
-// metadata tree.
+// {type object, record field}. We assert the biconditional on both surfaces,
+// and the attribute must also be inert on every representation that is not
+// the metadata tree.
 func TestMatrix_TypeLevelBindingRouting(t *testing.T) {
 	for _, c := range bindingCells() {
 		t.Run(c.name(), func(t *testing.T) {
@@ -4677,8 +4697,8 @@ func TestMatrix_TypeLevelBindingRouting(t *testing.T) {
 			props := bindingProps(f, c)
 			_, inProps := props[c.key]
 
-			// The biconditional: consumed IFF structural, and Props is
-			// exactly the raw keys that were not consumed.
+			// The biconditional: consumed if and only if structural, and
+			// Props is exactly the raw keys that were not consumed.
 			if structural != c.binds() {
 				t.Errorf("structural field set = %v, want %v (schema %s)", structural, c.binds(), src)
 			}
@@ -4701,7 +4721,7 @@ func TestMatrix_TypeLevelBindingRouting(t *testing.T) {
 					t.Errorf("Props[%q] = %#v, want the as-written %#v", c.key, got, want)
 				}
 			}
-			// The other object must stay clean: a type-level key must not
+			// The other object must stay clean. A type-level key must not
 			// leak onto the field, and a field-level key must not leak onto
 			// the type.
 			other := f.Props
@@ -4719,9 +4739,9 @@ func TestMatrix_TypeLevelBindingRouting(t *testing.T) {
 
 // bindingValueEqual compares a Props value against the JSON literal it was
 // written as. Integer literals come back as int64 from the precision-
-// preserving decode where a plain json.Unmarshal produces float64, at every
-// depth, so both sides are numerically normalized before comparison rather
-// than pinning one Go type per nesting level.
+// preserving decode, at every depth, where a plain json.Unmarshal produces
+// float64. So both sides are normalized numerically before comparison, not
+// pinned to one Go type per nesting level.
 func bindingValueEqual(got, want any) bool {
 	return reflect.DeepEqual(bindingNumNorm(got), bindingNumNorm(want))
 }
@@ -4754,11 +4774,11 @@ func bindingNumNorm(v any) any {
 	return v
 }
 
-// assertBindingInert holds the attribute to the metadata tree: the wire bytes,
+// assertBindingInert holds the attribute to the metadata tree. The wire bytes,
 // the Avro-JSON encoding, the canonical form and the fingerprint must equal
-// the twin spelled without it, and String() / Root().Schema() must stay
-// canonical-stable. The comparisons are made non-vacuous by requiring both
-// sides to be non-empty for the surfaces that can be.
+// the twin spelled without it. String() / Root().Schema() must stay
+// canonical-stable, and the comparisons stay non-vacuous: both sides must be
+// non-empty for the surfaces that can be.
 func assertBindingInert(t *testing.T, s *avro.Schema, c bindingCell) {
 	t.Helper()
 	twinSrc := c.schema(false)
@@ -4843,8 +4863,8 @@ func assertBindingInert(t *testing.T, s *avro.Schema, c bindingCell) {
 }
 
 // TestMatrix_TypeLevelBindingRoutingIsNotVacuous fails when the corpus stops
-// spanning the axes the rule distinguishes, so a routing that ignored one of
-// them could not pass by never being asked.
+// spanning the axes the rule distinguishes. A routing that ignored one of
+// them then cannot pass by never being asked.
 func TestMatrix_TypeLevelBindingRoutingIsNotVacuous(t *testing.T) {
 	var binding, nonBinding, typeLevel, fieldLevel int
 	keys := map[string]int{}
@@ -4872,7 +4892,7 @@ func TestMatrix_TypeLevelBindingRoutingIsNotVacuous(t *testing.T) {
 	if len(keys) != 2 || len(kinds) != len(censusKinds) {
 		t.Errorf("corpus misses a key or a kind: keys=%v kinds=%d", keys, len(kinds))
 	}
-	// The one type-level BINDING cell is the enum default; without it the
+	// The one type-level binding cell is the enum default; without it the
 	// matrix would never exercise a type-level consumer at all.
 	var enumDefault bool
 	for _, c := range bindingCells() {
@@ -4886,12 +4906,12 @@ func TestMatrix_TypeLevelBindingRoutingIsNotVacuous(t *testing.T) {
 }
 
 // TestMatrix_TypeLevelDefaultOrderSurviveTheRebuild pins the specific
-// as-written loss the routing rule closes: a type-level attribute the kind
-// does not bind has Props as its ONLY metadata surface, so a tree that drops
+// as-written loss the routing rule closes. A type-level attribute the kind
+// does not bind has Props as its only metadata surface. A tree that drops
 // it makes Root().Schema() describe a different schema than the input.
 //
-// Recursive and diamond type graphs are included because a named type's
-// SECOND occurrence is a reference rather than a definition, and a reference
+// We include recursive and diamond type graphs because a named type's
+// second occurrence is a reference rather than a definition. A reference
 // carrying the attribute reaches the metadata splice rather than the plain
 // object emitter.
 func TestMatrix_TypeLevelDefaultOrderSurviveTheRebuild(t *testing.T) {
@@ -4928,7 +4948,7 @@ func TestMatrix_TypeLevelDefaultOrderSurviveTheRebuild(t *testing.T) {
 			key:  "order", val: "ignore",
 		},
 		{
-			// A recursive definition: the attribute sits on the DEFINITION,
+			// A recursive definition: the attribute sits on the definition,
 			// which the rebuild emits once and references thereafter.
 			name: "order-on-recursive-definition",
 			src: `{"type":"record","name":"Node","order":"ignore","fields":[
@@ -4975,7 +4995,7 @@ func TestMatrix_TypeLevelDefaultOrderSurviveTheRebuild(t *testing.T) {
 // TestRegression_FieldLevelDefaultOrderStayConsumed is the boundary control:
 // a record field binds both attributes, so they are consumed into
 // SchemaField.Default / SchemaField.Order and must never reach
-// SchemaField.Props — matching Java's FIELD_RESERVED (Schema.java:503-504,
+// SchemaField.Props. That matches Java's FIELD_RESERVED (Schema.java:503-504,
 // {default, doc, name, order, type, aliases}). Without this the type-level
 // routing could be "fixed" by routing everywhere.
 func TestRegression_FieldLevelDefaultOrderStayConsumed(t *testing.T) {
@@ -4997,34 +5017,33 @@ func TestRegression_FieldLevelDefaultOrderStayConsumed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// "doc" is the one reserved key that BINDS on every kind while its capture
-// silently declines a non-string body — so a non-string doc reaches neither
-// structural field nor Props, the single documented exception to the "never
+// "doc" is the one reserved key that binds on every kind, while its capture
+// silently declines a non-string body. So a non-string doc reaches neither
+// structural field nor Props: the single documented exception to the "never
 // neither" half of the reserved-key routing rule.
 //
-// This is exact Apache Avro behavior, and the two tests pin both directions so
-// neither can drift alone. Java reads doc ONLY through parseDoc
-// (Schema.java:1996-1998, called at :1864/:1912/:1956 and, for a field, :1888),
-// which is getOptionalText (:2039-2042) = jsonNode.textValue(), null for ANY
-// non-text node including an explicit JSON null; and doc is a member of
+// This is exact Apache Avro behavior, and the two tests pin both directions,
+// so neither can drift alone. Java reads doc only through parseDoc
+// (Schema.java:1996-1998, called at :1864/:1912/:1956 and, for a field, :1888).
+// parseDoc is getOptionalText (:2039-2042) = jsonNode.textValue(), null for any
+// non-text node including an explicit JSON null. And doc is a member of
 // SCHEMA_RESERVED (:176) and FIELD_RESERVED (:504), so parseProperties skips it
 // at every call site.
 //
-// The same membership fact makes a non-string logicalType behave the OPPOSITE
-// way: logicalType is absent from SCHEMA_RESERVED, so parseProperties keeps it
+// The same membership fact makes a non-string logicalType behave the opposite
+// way. logicalType is absent from SCHEMA_RESERVED, so parseProperties keeps it
 // as an ordinary property. One reserved-set membership test predicts both
 // routings, which is why the two must not be "made consistent" with each other.
 //
 // fastavro 1.12.2 preserves a non-string doc verbatim at both levels; the
-// references disagree and this package follows Java. Nothing observable on the
-// wire depends on it, which each case asserts against a doc-free twin.
+// references disagree and we follow Java. Nothing observable on the wire
+// depends on it, and each case asserts that against a doc-free twin.
 // ---------------------------------------------------------------------------
 
-// docBodiesNonString spans the JSON token classes a doc can be written as
-// while not being a string. An explicit null is included because it is the
-// one shape where a lenient reader could plausibly treat the key as absent
-// rather than as present-and-unusable, and Java's textValue() maps both to
-// the same null.
+// docBodiesNonString spans the non-string JSON token classes a doc can be
+// written as. An explicit null is in the list because it is the one shape
+// where a lenient reader could plausibly read the key as absent rather than
+// as present-and-unusable. Java's textValue() maps both to the same null.
 var docBodiesNonString = []string{`5`, `[]`, `null`, `{"a":1}`, `true`}
 
 func TestMatrix_NonStringDocDroppedAtBothLevels(t *testing.T) {
@@ -5075,16 +5094,16 @@ func TestMatrix_NonStringDocDroppedAtBothLevels(t *testing.T) {
 	}
 }
 
-// TestMatrix_StringDocConsumedAndSurfaced is the other direction, and the
-// control that keeps the drop above from being "fixed" by never reading doc at
-// all: with a string body the key is consumed into the structural field on
-// every level and kind that has one, stays out of Props, and survives the
+// TestMatrix_StringDocConsumedAndSurfaced is the other direction, the control
+// that keeps the drop above from being "fixed" by never reading doc at all.
+// With a string body the key is consumed into the structural field, on every
+// level and kind that has one. It stays out of Props and survives the
 // metadata rebuild.
 //
 // The body is deliberately non-empty. SchemaNode.Doc has no present/absent
-// companion, so an EMPTY doc string is indistinguishable from an absent one
-// on the structural field — a separate question about the zero value of a
-// string field, not about the token type this pair of tests fixes.
+// companion, so an empty doc string is indistinguishable from an absent one
+// on the structural field. That is a separate question about the zero value
+// of a string field, not about the token type this pair of tests fixes.
 func TestMatrix_StringDocConsumedAndSurfaced(t *testing.T) {
 	cases := []struct {
 		name string
@@ -5165,16 +5184,16 @@ func TestMatrix_StringDocConsumedAndSurfaced(t *testing.T) {
 }
 
 // TestDifferentialFastavroTypeLevelBindingRouting executes every accepted cell
-// against fastavro and asserts the PRESERVATION claim rather than mere
-// acceptance: fastavro 1.12.2 keeps both keys on the parsed schema of every
-// kind, which is what makes routing them to Props the cross-implementation
-// answer rather than a twmb invention. A release that starts dropping them
+// against fastavro, asserting the preservation claim rather than mere
+// acceptance. fastavro 1.12.2 keeps both keys on the parsed schema of every
+// kind. That is what makes routing them to Props the cross-implementation
+// answer rather than an invention of ours. A release that starts dropping them
 // flips these cells loudly.
 func TestDifferentialFastavroTypeLevelBindingRouting(t *testing.T) {
 	o := startOracle(t)
 	for _, c := range bindingCells() {
 		if c.level != levelType {
-			continue // fastavro's parsed FIELD objects are not top-level dicts
+			continue // fastavro's parsed field objects are not top-level dicts
 		}
 		t.Run(c.name(), func(t *testing.T) {
 			src := bindingTypeSchema(c.kind, fmt.Sprintf(`,%q:%s`, c.key, c.body()))
@@ -5199,11 +5218,11 @@ func TestDifferentialFastavroTypeLevelBindingRouting(t *testing.T) {
 
 // ---------- logicaltype_value_test.go ----------
 
-// A logicalType attribute whose JSON value is not a string is inert metadata,
-// preserved verbatim in Props — the same treatment an unknown STRING logical
+// A logicalType attribute whose JSON value is not a string is inert metadata.
+// It rides verbatim in Props, the same treatment an unknown *string* logical
 // already gets. No reference rejects the spelling: Java reads only textual
 // logicalType props, so a non-text value yields no logical and the prop is
-// preserved; fastavro parses and preserves the key verbatim (executed below);
+// preserved. fastavro parses and preserves the key verbatim (executed below);
 // goavro switches on the value and falls through to the plain type. Only a
 // string activates the logical dispatch, so anything else can never name a
 // logical and its only coherent reading is a custom property.
@@ -5227,13 +5246,13 @@ func TestMatrix_NonStringLogicalTypeInert(t *testing.T) {
 }
 
 // TestMatrix_LogicalTypeValueTypes crosses the logicalType attribute's
-// VALUE type (valid string / unknown string / numeric / null) with its
-// placement (type object, record field object) and asserts the routing:
+// value type (valid string / unknown string / numeric / null) with its
+// placement (type object, record field object). The routing it asserts:
 // a valid string activates the logical (LogicalType field, wire codec
-// engaged); an unknown string is inert but still surfaces as-written on
-// LogicalType; a non-string is inert and rides in Props (type level) or
+// engaged). An unknown string is inert but still surfaces as-written on
+// LogicalType. A non-string is inert and rides in Props (type level) or
 // SchemaField.Props (field level) verbatim, exactly like a custom
-// property, and never activates a codec — the wire bytes match the
+// property. It never activates a codec, so the wire bytes match the
 // logical-free twin. Root().Schema() rebuilds preserve every form.
 func TestMatrix_LogicalTypeValueTypes(t *testing.T) {
 	t.Parallel()
@@ -5307,9 +5326,9 @@ func TestMatrix_LogicalTypeValueTypes(t *testing.T) {
 			f := s.Root().Fields[0]
 			// Field-level logicalType always rides in SchemaField.Props
 			// as-written on the metadata surface (the wire-side lift onto
-			// the field's type is a separate, string-only concession); a
+			// the field's type is a separate, string-only concession). A
 			// non-string spelling takes the identical Props route and lifts
-			// nothing — the field's type node stays a plain int.
+			// nothing, so the field's type node stays a plain int.
 			if c.wantField == "" && c.wantProps != nil {
 				if got := f.Props["logicalType"]; !reflect.DeepEqual(got, c.wantProps) {
 					t.Errorf("field Props[logicalType] = %#v, want %#v", got, c.wantProps)
@@ -5349,10 +5368,10 @@ func TestDifferentialFastavroLogicalTypeValueTypes(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────────
 // A nil *Schema is invalid and methods panic on it (programming error,
-// idiomatic Go). This pins that the panic is CONSISTENT across the exported
-// method set. The three methods that validate an argument BEFORE touching the
-// receiver are exercised twice — once with a valid argument, which must panic
-// reaching the receiver deref, and once with the bad argument, which returns the
+// idiomatic Go). Here we pin that the panic is consistent across the exported
+// method set. Three methods validate an argument BEFORE touching the receiver,
+// and each is exercised twice. Once with a valid argument, which must panic
+// reaching the receiver deref. Once with the bad argument, which returns the
 // arg-validation error, correctly about the argument rather than the receiver.
 // See BUG_AUDIT.md §Known intentional divergences.
 // ─────────────────────────────────────────────────────────────────────────
@@ -5394,7 +5413,7 @@ func TestRegression_NilSchemaPanicsConsistently(t *testing.T) {
 	good := avro.MustParse(`"int"`)
 
 	// Receiver-dereferencing methods: every one panics on a nil receiver
-	// when given otherwise-valid arguments.
+	// when the arguments are otherwise valid.
 	mustPanic(t, "AppendEncode", func() error { _, e := s.AppendEncode(nil, 1); return e })
 	mustPanic(t, "Encode", func() error { _, e := s.Encode(1); return e })
 	mustPanic(t, "EncodeJSON", func() error { _, e := s.EncodeJSON(1); return e })
@@ -5405,10 +5424,10 @@ func TestRegression_NilSchemaPanicsConsistently(t *testing.T) {
 	mustPanic(t, "Root", func() error { _ = s.Root(); return nil })
 	mustPanic(t, "AppendSingleObject", func() error { _, e := s.AppendSingleObject(nil, 1); return e })
 
-	// Decode / DecodeJSON / DecodeSingleObject validate the ARGUMENT first.
-	// With a VALID argument they reach the receiver deref and panic; with the
-	// BAD argument they surface the arg-validation error (correct — about the
-	// argument, not the receiver).
+	// Decode / DecodeJSON / DecodeSingleObject validate the argument first: with
+	// a valid argument they reach the receiver deref and panic. With a bad
+	// argument they surface the arg-validation error, which is correctly about
+	// the argument rather than the receiver.
 	mustPanic(t, "Decode(valid target)", func() error { _, e := s.Decode([]byte{0}, validPtr); return e })
 	mustErrorNotPanic(t, "Decode(nil target)", "non-nil pointer", func() error { _, e := s.Decode([]byte{0}, nil); return e })
 
@@ -5419,7 +5438,7 @@ func TestRegression_NilSchemaPanicsConsistently(t *testing.T) {
 	mustPanic(t, "DecodeSingleObject(valid header)", func() error { _, e := s.DecodeSingleObject(validHeader, validPtr); return e })
 	mustErrorNotPanic(t, "DecodeSingleObject(short header)", "too short", func() error { _, e := s.DecodeSingleObject([]byte{0x01}, validPtr); return e })
 
-	// Resolve / CheckCompatibility panic when EITHER *Schema argument is nil
+	// Resolve / CheckCompatibility panic when either *Schema argument is nil
 	// (each dereferences writer.node / reader.node before any guard runs).
 	mustPanic(t, "Resolve(nil writer)", func() error { _, e := avro.Resolve(nil, good); return e })
 	mustPanic(t, "Resolve(nil reader)", func() error { _, e := avro.Resolve(good, nil); return e })
@@ -5437,13 +5456,13 @@ func TestRegression_NilSchemaPanicsConsistently(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────────
 // Quoted "size" / "precision" / "scale" at parse, mirroring Apache Avro. Java
-// REJECTS all three when quoted: size via `!sizeNode.isInt()`, and
-// precision/scale via Decimal.getInt's `obj instanceof Integer`, a quoted value
-// deserializing to a String. twmb mirrors Java on precision/scale and is
-// intentionally MORE lenient on size, accepting a quoted one per the spec's
-// [INTEGERS] Parsing-Canonical-Form rule ("Eliminate quotes around ... JSON
-// integer literals (which appear in the size attributes of fixed schemas)"), via
-// laxInt. This pins the exact accept/reject at BOTH parse and Root()
+// rejects all three when quoted: size via `!sizeNode.isInt()`. precision and
+// scale go via Decimal.getInt's `obj instanceof Integer`, where a quoted value
+// deserializes to a String. We mirror Java on precision/scale, and on size we
+// are deliberately more lenient, accepting a quoted one via laxInt. That
+// follows the spec's [INTEGERS] Parsing-Canonical-Form rule ("Eliminate quotes
+// around ... JSON integer literals (which appear in the size attributes of
+// fixed schemas)"). This pins the exact accept/reject at both parse and Root()
 // metadata-read. See BUG_AUDIT.md §Known intentional divergences.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -5461,13 +5480,13 @@ func TestRegression_QuotedSizePrecisionScaleMirrorsJava(t *testing.T) {
 		}
 	}
 
-	// size: numeric accepted; quoted accepted (twmb is more lenient than
+	// size: numeric accepted; quoted accepted (we are more lenient than
 	// Java here, per spec [INTEGERS]).
 	accept("size numeric", `{"type":"fixed","name":"F","size":16}`)
 	accept("size quoted", `{"type":"fixed","name":"F","size":"16"}`)
 	accept("size quoted leading-zero", `{"type":"fixed","name":"F","size":"016"}`)
 
-	// precision/scale: numeric accepted; quoted REJECTED (mirrors Java).
+	// precision/scale: numeric accepted; quoted rejected (mirrors Java).
 	accept("decimal numeric prec/scale", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
 	reject("decimal quoted precision", `{"type":"bytes","logicalType":"decimal","precision":"10","scale":2}`)
 	reject("decimal quoted scale", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":"2"}`)
@@ -5477,7 +5496,7 @@ func TestRegression_QuotedSizePrecisionScaleMirrorsJava(t *testing.T) {
 	// Root() metadata-read agrees with parse for the accepted shapes: a
 	// quoted size reads back as the numeric Size, and a numeric decimal
 	// surfaces Precision/Scale. (Quoted precision/scale never reach Root()
-	// because parse rejects them first — there is no parsed schema to read.)
+	// because parse rejects them first: there is no parsed schema to read.)
 	sQuotedSize := avro.MustParse(`{"type":"fixed","name":"F","size":"16"}`)
 	if got := sQuotedSize.Root().Size; got != 16 {
 		t.Errorf("Root().Size for quoted size: got %d, want 16", got)
@@ -5489,15 +5508,15 @@ func TestRegression_QuotedSizePrecisionScaleMirrorsJava(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Under TagLogicalTypes, a NAMED fixed carrying a logical type tags its
-// tagged-union branch under the fixed's fully-qualified NAME, not
-// "fixed.<logicalType>" — matching linkedin/goavro, where the envelope key is
-// the branch codec's typeName.fullName, and Apache Avro's JsonEncoder, which
-// uses getFullName(). The "<kind>.<logicalType>" qualifier is retained ONLY for
-// primitive-backed logicals, which is goavro's convention and the reason
-// TagLogicalTypes exists. The encoding stays binary/JSON uniform, round-trips,
-// and the decoder still ACCEPTS the legacy form. See BUG_AUDIT.md §Known
-// intentional divergences.
+// Under TagLogicalTypes, a named fixed carrying a logical type tags its
+// tagged-union branch under the fixed's fully-qualified name. The tag is not
+// "fixed.<logicalType>", which matches linkedin/goavro, where the envelope key
+// is the branch codec's typeName.fullName. It matches Apache Avro's
+// JsonEncoder too, which uses getFullName(). We keep the
+// "<kind>.<logicalType>" qualifier only for primitive-backed logicals, which
+// is goavro's convention and the reason TagLogicalTypes exists. The encoding
+// stays binary/JSON uniform and round-trips, and the decoder still accepts the
+// legacy form. See BUG_AUDIT.md §Known intentional divergences.
 // ─────────────────────────────────────────────────────────────────────────
 
 func TestMatrix_NamedFixedLogicalTaggedUnionName(t *testing.T) {
@@ -5555,8 +5574,8 @@ func TestMatrix_NamedFixedLogicalTaggedUnionName(t *testing.T) {
 				t.Errorf("EncodeJSON tagged key: got %q, want %q (%s)", got, c.wantKey, jb)
 			}
 
-			// Binary decode into *any wraps under the SAME key — binary↔JSON
-			// uniformity for the tagged-union name.
+			// Binary decode into *any wraps under the same key: binary and
+			// JSON are uniform for the tagged-union name.
 			wire := mustEncode(t, s, c.input)
 			var decoded any
 			mustDecode(t, s, wire, &decoded, opts...)
@@ -5576,7 +5595,7 @@ func TestMatrix_NamedFixedLogicalTaggedUnionName(t *testing.T) {
 		})
 	}
 
-	// Backward compatibility: the decoder still ACCEPTS the legacy
+	// Backward compatibility: the decoder still accepts the legacy
 	// "fixed.<logicalType>" tagged key even though it is no longer emitted.
 	t.Run("legacy fixed.uuid still decodes", func(t *testing.T) {
 		s := avro.MustParse(`["null",{"type":"fixed","name":"F","size":16,"logicalType":"uuid"}]`)
@@ -5602,47 +5621,46 @@ func mapKeys(m map[string]any) []string {
 // ---------- null_body_presence_test.go ----------
 
 // ---------------------------------------------------------------------------
-// An explicit JSON null is a PRESENT attribute whose body names no value, and it
-// is the one body shape a typed decode accepts in silence.
+// An explicit JSON null is a present attribute whose body names no value, and
+// it is the one body shape a typed decode accepts in silence.
 //
 // encoding/json documents it: unmarshaling null into a pointer sets the pointer
 // to nil, and into any non-pointer destination "has no effect on the value and
 // produces no error". So a reader that decides presence by asking "did the
-// decode fail" reads a present-but-undecodable attribute as ABSENT and hands
+// decode fail" reads a present-but-undecodable attribute as absent and hands
 // back the destination's zero.
 //
-// That zero is not neutral for Avro schema attributes. A fixed's size 0 is a
-// legal, distinct schema, and a decimal's scale 0 is a legal, distinct scale
-// that changes the wire meaning of every value written against it. Coercing a
-// null body to either silently substitutes a different schema for the one
-// written.
+// That zero is not neutral for Avro schema attributes: a fixed's size 0 is a
+// legal, distinct schema. A decimal's scale 0 is a legal, distinct scale that
+// changes the wire meaning of every value written against it. Coercing a null
+// body to either silently substitutes a different schema for the one written.
 //
 // The references never produce those schemas:
 //
-//   - Java REJECTS a null size outright: parseFixed requires sizeNode.isInt()
+//   - Java rejects a null size outright: parseFixed requires sizeNode.isInt()
 //     (Schema.java:1957-1960), and NullNode.isInt() is false.
 //   - Java never builds decimal(p,0) from a null scale either: the Decimal
-//     logical reads each parameter through getInt, which throws unless the prop
-//     is an Integer (LogicalTypes.java:414-421), and parse calls
+//     logical reads each parameter through getInt. getInt throws unless the
+//     prop is an Integer (LogicalTypes.java:414-421), and parse calls
 //     fromSchemaIgnoreInvalid (Schema.java:1979), which swallows the throw and
 //     drops the logical, leaving plain bytes. Silently dropping a decimal
-//     annotation is the hazard this package declined to copy, so it rejects
-//     loudly where Java soft-drops — but neither produces decimal(p,0).
-//   - fastavro 1.12.2 accepts these at parse and then FAILS every write against
-//     the result (executed). Its accept is not a usable accept, so the
+//     annotation is the hazard we declined to copy, so we reject loudly where
+//     Java soft-drops, but neither produces decimal(p,0).
+//   - fastavro 1.12.2 accepts these at parse and then fails every write
+//     against the result (executed). Its accept is not a usable accept, so the
 //     permissive lean has nothing to lean toward.
 //     TestDifferentialFastavroNullBodyIsNotUsable executes that calibration.
 //
-// The rule: a null body is a MALFORMED body, never an absent one, so it reaches
-// exactly the verdict its wrong-typed siblings reach at every key and placement.
-// The boundary that must NOT move: a written 0 is a value, not a null, and every
-// zero-valued attribute keeps parsing.
+// The rule: a null body is a malformed body, never an absent one. It reaches
+// exactly the verdict its wrong-typed siblings reach at every key and
+// placement. The boundary that must NOT move: a written 0 is a value, not a
+// null, and every zero-valued attribute keeps parsing.
 // ---------------------------------------------------------------------------
 
 // TestRegression_NullSizeRejectedOnFixed holds the fixed-size boundary from
-// both sides: an explicit null size is rejected because it names no width,
-// while the written zero width that Java, fastavro and avro-rs all accept
-// keeps parsing and keeps encoding.
+// both sides: an explicit null size is rejected because it names no width.
+// The written zero width keeps parsing and keeps encoding, and Java, fastavro
+// and avro-rs all accept that width.
 func TestRegression_NullSizeRejectedOnFixed(t *testing.T) {
 	if _, err := avro.Parse(`{"type":"fixed","name":"F","size":null}`); err == nil {
 		t.Error("a null size parsed; it names no width, so there is no fixed to build")
@@ -5650,7 +5668,7 @@ func TestRegression_NullSizeRejectedOnFixed(t *testing.T) {
 		t.Errorf("the reject does not name the offending key: %v", err)
 	}
 
-	// A written zero is a VALUE, and a legal one: a zero-width fixed is
+	// A written zero is a value, and a legal one: a zero-width fixed is
 	// reference-legal and usable. The reject above must not reach it.
 	zero, err := avro.Parse(`{"type":"fixed","name":"F","size":0}`)
 	if err != nil {
@@ -5678,7 +5696,7 @@ func TestRegression_NullSizeRejectedOnFixed(t *testing.T) {
 		t.Errorf(`quoted "0" must stay accepted, it is the same width as 0: %v`, err)
 	}
 
-	// A quoted null is a STRING whose content is not an integer, so it fails
+	// A quoted null is a string whose content is not an integer, so it fails
 	// for the ordinary reason and not through the null path.
 	if _, err := avro.Parse(`{"type":"fixed","name":"F","size":"null"}`); err == nil {
 		t.Error(`"size":"null" parsed; the string "null" is not an integer`)
@@ -5686,9 +5704,9 @@ func TestRegression_NullSizeRejectedOnFixed(t *testing.T) {
 }
 
 // TestMatrix_NullDecimalParamsRejectedWhereConsumed pins the decimal
-// parameters at the placements that consume them. A null scale must not become
-// scale 0: the two schemas encode different bytes for the same value, so
-// accepting one as the other silently rewrites the wire contract.
+// parameters at the placements that consume them. A null scale must not
+// become scale 0: the two schemas encode different bytes for the same value.
+// Accepting one as the other silently rewrites the wire contract.
 func TestMatrix_NullDecimalParamsRejectedWhereConsumed(t *testing.T) {
 	carriers := []struct {
 		name string
@@ -5729,8 +5747,8 @@ func TestMatrix_NullDecimalParamsRejectedWhereConsumed(t *testing.T) {
 			// precision is the sibling, and its reject must come from the
 			// null itself. A zero precision is separately illegal (it can
 			// hold no digits), so a guard that only checked positivity would
-			// mask a missing null check here: the error must name the key as
-			// a JSON-shape problem rather than report a precision of 0.
+			// mask a missing null check here. The error must name the key as
+			// a JSON-shape problem, not report a precision of 0.
 			_, err = avro.Parse(c.src("null", "2"))
 			if err == nil {
 				t.Fatal("a null precision parsed")
@@ -5758,7 +5776,7 @@ func TestMatrix_NullDecimalParamsRejectedWhereConsumed(t *testing.T) {
 }
 
 // TestRegression_NullScaleWouldChangeTheWire is the consequence that makes the
-// reject above a correctness matter rather than a strictness preference: the
+// reject above a correctness matter rather than a strictness preference. The
 // same value encodes to different bytes at scale 2 and scale 0, and at scale 0
 // a two-decimal value cannot be represented at all.
 func TestRegression_NullScaleWouldChangeTheWire(t *testing.T) {
@@ -5782,9 +5800,9 @@ func TestRegression_NullScaleWouldChangeTheWire(t *testing.T) {
 			"or the null-scale reject would be arbitrary")
 	}
 
-	// With the null rejected at parse there is no schema to encode against,
-	// which is the point: the caller learns at parse time instead of holding
-	// a schema whose scale nobody wrote.
+	// We reject the null at parse, so there is no schema to encode against.
+	// That is the point: the caller learns at parse time instead of holding a
+	// schema whose scale nobody wrote.
 	if _, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":` +
 		`{"type":"bytes","logicalType":"decimal","precision":4,"scale":null}}]}`); err == nil {
 		t.Error("a null scale parsed inside a nested field type")
@@ -5793,12 +5811,12 @@ func TestRegression_NullScaleWouldChangeTheWire(t *testing.T) {
 
 // TestMatrix_NullStrayBodyRidesToProps is the other half of the rule. At a
 // placement the kind does not bind, a malformed body is inert metadata whose
-// ONLY surface is Props, as-written — so a null must land there like every
+// only surface is Props, as-written. So a null must land there like every
 // other malformed body instead of vanishing from both surfaces.
 //
-// The container and named hosts also exercise the exclusivity rule, which
-// rejects a kind carrying ANOTHER kind's defining key only when that key
-// parsed as a real definition; a body that names no value defines nothing, so
+// The container and named hosts also exercise the exclusivity rule. That rule
+// rejects a kind carrying another kind's defining key only when that key
+// parsed as a real definition. A body that names no value defines nothing, so
 // it must route like the other malformed bodies rather than trip exclusivity.
 func TestMatrix_NullStrayBodyRidesToProps(t *testing.T) {
 	hosts := []struct{ name, src string }{
@@ -5836,7 +5854,7 @@ func TestMatrix_NullStrayBodyRidesToProps(t *testing.T) {
 				t.Errorf("the rebuild lost the as-written null: %s", rb)
 			}
 			// The malformed sibling must reach the same place, or "null" is
-			// being treated as a body class of its own.
+			// a body class of its own.
 			sib, err := avro.Parse(strings.Replace(h.src, `"size":null`, `"size":[]`, 1))
 			if err != nil {
 				t.Fatalf("the malformed sibling stopped parsing: %v", err)
@@ -5845,10 +5863,10 @@ func TestMatrix_NullStrayBodyRidesToProps(t *testing.T) {
 				t.Errorf("the malformed sibling did not ride to Props: %#v", sib.Root().Props)
 			}
 
-			// The boundary on the other side: a READABLE size is a real
-			// width, and a container or named kind carrying another kind's
-			// defining key as a real definition still hard-rejects. Routing
-			// the unreadable bodies to Props must not soften that.
+			// The boundary on the other side: a readable size is a real
+			// width. A container or named kind still hard-rejects when it
+			// carries another kind's defining key as a real definition.
+			// Routing the unreadable bodies to Props must not soften that.
 			readable := strings.Replace(h.src, `"size":null`, `"size":2`, 1)
 			switch h.name {
 			case "int", "string":
@@ -5870,9 +5888,9 @@ func TestMatrix_NullStrayBodyRidesToProps(t *testing.T) {
 	}
 }
 
-// TestMatrix_NullUnconsumedDecimalParamsRideToProps is the same rule for
-// the decimal parameters: where no decimal consumes them they are ordinary
-// metadata, so a null body rides through verbatim rather than rejecting.
+// TestMatrix_NullUnconsumedDecimalParamsRideToProps is the same rule for the
+// decimal parameters: where no decimal consumes them they are ordinary
+// metadata. A null body rides through verbatim rather than rejecting.
 func TestMatrix_NullUnconsumedDecimalParamsRideToProps(t *testing.T) {
 	for _, src := range []string{
 		`{"type":"int","scale":null,"precision":null}`,
@@ -5901,7 +5919,7 @@ func TestMatrix_NullUnconsumedDecimalParamsRideToProps(t *testing.T) {
 
 // TestRegression_NullDefaultIsAValue holds the boundary the matrix below
 // excludes: a default's body is kept as raw JSON rather than decoded into a
-// typed destination, so a null default is the null VALUE and must stay
+// typed destination. So a null default is the null *value*, and it must stay
 // accepted and distinguishable from an absent default.
 func TestRegression_NullDefaultIsAValue(t *testing.T) {
 	s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":["null","int"],"default":null}]}`)
@@ -5915,19 +5933,19 @@ func TestRegression_NullDefaultIsAValue(t *testing.T) {
 	if f.Default != nil {
 		t.Errorf("Default = %#v, want the null value", f.Default)
 	}
-	// The enum-LEVEL default is the one place a default's body IS read into
-	// a typed destination, and it decides by token type before membership, so
-	// a null rejects there. That check is the shape every other typed read
-	// has to match.
+	// The enum-level default is the one place a default's body is read into
+	// a typed destination. It decides by token type before membership, so a
+	// null rejects there. That check is the shape every other typed read has
+	// to match.
 	if _, err := avro.Parse(`{"type":"enum","name":"E","symbols":["A"],"default":null}`); err == nil {
 		t.Error("a null enum-level default parsed; it names no symbol")
 	}
 }
 
 // TestRegression_NullBodyRejectIsBounded keeps the reject off the cost path a
-// hostile schema could exploit: a null body is four bytes, so the decision
-// must not depend on the size of the rest of the schema, and the error must
-// not echo it.
+// hostile schema could exploit: a null body is four bytes. The decision must
+// not depend on the size of the rest of the schema, and the error must not
+// echo it.
 func TestRegression_NullBodyRejectIsBounded(t *testing.T) {
 	pad := strings.Repeat("a", 1<<20)
 	src := `{"type":"fixed","name":"F","size":null,"pad":"` + pad + `"}`
@@ -5943,15 +5961,16 @@ func TestRegression_NullBodyRejectIsBounded(t *testing.T) {
 // ---------------------------------------------------------------------------
 // The matrix.
 //
-// Every reserved key whose body is decoded into a TYPED destination, crossed
-// with the body classes a caller can write, at both levels, read off every
-// surface. The rule it drives: for a given key and placement, a NULL body
-// reaches the same verdict as a body of the wrong JSON type. Equality with the
-// wrong-typed twin is what stops null from being its own body class; the valid
-// twin's differing verdict is what keeps the equality from holding vacuously.
+// Here we cross every reserved key whose body is decoded into a typed
+// destination with the body classes a caller can write. We do that at both
+// levels, and read off every surface. The rule it drives: for a given key and
+// placement, a null body reaches the same verdict as a body of the wrong JSON
+// type. Equality with the wrong-typed twin stops null from being its own body
+// class; the valid twin's differing verdict keeps that equality from holding
+// vacuously.
 //
 // "default" is deliberately absent: its body is kept as raw JSON rather than
-// decoded into a typed destination, so a null default is a VALUE, not an
+// decoded into a typed destination. So a null default is a value, not an
 // undecodable body.
 // ---------------------------------------------------------------------------
 
@@ -5963,15 +5982,15 @@ const (
 	// routeReject: the kind binds the key and its read is strict, so an
 	// unreadable body fails the parse.
 	routeReject malformedRoute = iota
-	// routeProps: the kind does not bind the key (or binds it only for a
-	// body of the right JSON type), so an unreadable body is inert metadata
+	// routeProps: the kind does not bind the key, or binds it only for a
+	// body of the right JSON type. An unreadable body is then inert metadata,
 	// riding to Props verbatim as its only surface.
 	routeProps
-	// routeDrop: the key is bound on every kind but its capture is a
-	// silently-declining read, so an unreadable body reaches NEITHER
-	// surface. Exactly one key behaves this way ("doc"), matching Apache
-	// Avro, and it is spelled as an outcome here so it stays counted and
-	// cannot widen unnoticed.
+	// routeDrop: the key is bound on every kind, but its capture is a
+	// silently-declining read, so an unreadable body reaches neither surface.
+	// Exactly one key behaves this way ("doc"), matching Apache Avro, and it
+	// is spelled as an outcome here so it stays counted and cannot widen
+	// unnoticed.
 	routeDrop
 )
 
@@ -5993,13 +6012,13 @@ type presenceCell struct {
 	host func(attr string) string
 	// route is where a body this placement cannot read must end up.
 	route malformedRoute
-	// validStructural states whether a READABLE body lands on a structural
+	// validStructural states whether a readable body lands on a structural
 	// field. It is false for the two keys a non-binding kind surfaces only
 	// through Props (precision/scale, which have no stray structural route).
 	validStructural bool
 	// validRejects marks the exclusivity cells: a container kind carrying
-	// another kind's DEFINING key rejects when that key parsed as a real
-	// definition, so there the readable body is the one that fails and the
+	// another kind's defining key rejects when that key parsed as a real
+	// definition. There the readable body is the one that fails, and the
 	// unreadable one rides to Props. Stating it keeps the rule visible
 	// instead of steering the corpus around it.
 	validRejects bool
@@ -6022,7 +6041,7 @@ func (c presenceCell) name() string {
 func pcFieldTypeProps(n avro.SchemaNode) map[string]any { return n.Fields[0].Type.Props }
 func pcFieldProps(n avro.SchemaNode) map[string]any     { return n.Fields[0].Props }
 
-// pcTypeHost puts the attribute clause on the field's TYPE object.
+// pcTypeHost puts the attribute clause on the field's type object.
 func pcTypeHost(typeSrc string) func(string) string {
 	return func(attr string) string {
 		return fmt.Sprintf(`{"type":"record","name":"PHost","fields":[{"name":"a","type":%s}]}`,
@@ -6030,7 +6049,7 @@ func pcTypeHost(typeSrc string) func(string) string {
 	}
 }
 
-// pcFieldHost puts the attribute clause on the record FIELD object.
+// pcFieldHost puts the attribute clause on the record field object.
 func pcFieldHost(typeSrc string) func(string) string {
 	return func(attr string) string {
 		return fmt.Sprintf(`{"type":"record","name":"PHost","fields":[{"name":"a","type":%s%s}]}`,
@@ -6065,8 +6084,8 @@ func presenceCells() []presenceCell {
 			props:      pcFieldTypeProps,
 		},
 		// The flat ("linkedin/goavro") field form writes the defining key
-		// beside the field's own keys, so the lift carries the body into the
-		// type object it builds — the field-level reach of the same decode.
+		// beside the field's own keys. The lift carries the body into the type
+		// object it builds: the field-level reach of the same decode.
 		{
 			key: "size", level: "field", host: pcFieldHost(`"fixed","name":"PFF"`),
 			route: routeReject, validStructural: true,
@@ -6133,7 +6152,7 @@ func presenceCells() []presenceCell {
 			props:      pcFieldTypeProps,
 		},
 		{
-			// logicalType binds only for a STRING body: a non-string can
+			// logicalType binds only for a string body. A non-string can
 			// name no logical type, so it is an ordinary property.
 			key: "logicalType", level: "type", host: pcTypeHost(`{"type":"int"%s}`),
 			route: routeProps, validStructural: true,
@@ -6221,7 +6240,7 @@ func presenceCells() []presenceCell {
 			props:      pcFieldTypeProps,
 		},
 		// ---- doc: bound on every kind, with the declining read that keeps
-		// an unreadable body off BOTH surfaces ----
+		// an unreadable body off both surfaces ----
 		{
 			key: "doc", level: "type", host: pcTypeHost(`{"type":"int"%s}`),
 			route: routeDrop, validStructural: true,
@@ -6239,8 +6258,8 @@ func presenceCells() []presenceCell {
 	}
 }
 
-// pcFieldHostNoName spells the field WITHOUT its own name key, so a cell can
-// write the "name" attribute itself.
+// pcFieldHostNoName spells the field without its own name key. A cell can
+// then write the "name" attribute itself.
 func pcFieldHostNoName(typeSrc string) func(string) string {
 	return func(attr string) string {
 		return fmt.Sprintf(`{"type":"record","name":"PHost","fields":[{"type":%s%s}]}`, typeSrc, attr)
@@ -6272,8 +6291,8 @@ func (b bodyClass) String() string {
 	return "quoted"
 }
 
-// body renders the attribute clause for one body class, and reports whether
-// the class applies to this cell at all.
+// body renders the attribute clause for one body class. It also reports
+// whether the class applies to this cell at all.
 func (c presenceCell) body(b bodyClass) (string, bool) {
 	switch b {
 	case bodyAbsent:
@@ -6294,9 +6313,9 @@ func (c presenceCell) body(b bodyClass) (string, bool) {
 }
 
 // presenceOutcome is what one cell produced, read off every surface. Every
-// field is a comparable scalar so two outcomes can be compared directly; the
-// Props value is carried as its JSON rendering so an array or object body
-// does not make the struct uncomparable.
+// field is a comparable scalar, so two outcomes compare directly. The Props
+// value is carried as its JSON rendering, so an array or object body cannot
+// make the struct uncomparable.
 type presenceOutcome struct {
 	rejected   bool
 	structural bool
@@ -6314,10 +6333,10 @@ func (o presenceOutcome) String() string {
 		o.structural, o.inProps, o.propJSON, o.canonical, o.wire)
 }
 
-// presenceRouting is the outcome WITHOUT the attribute's value: which surface
+// presenceRouting is the outcome without the attribute's value: which surface
 // the body reached, and what the schema compiled to. Two bodies of different
-// JSON types must route identically while still riding through as-written, so
-// the value is what distinguishes them and the routing is what must match.
+// JSON types must route identically while still riding through as-written. The
+// value is what distinguishes them; the routing is what must match.
 type presenceRouting struct {
 	rejected   bool
 	structural bool
@@ -6337,7 +6356,7 @@ func (o presenceOutcome) routing() presenceRouting {
 }
 
 // run parses one cell and reads every surface. The wire column encodes a value
-// against the schema when it can, so a routing change that altered the
+// against the schema when it can. So a routing change that altered the
 // compiled codec shows up as a different (or newly failing) encoding rather
 // than only as different metadata.
 func (c presenceCell) run(t *testing.T, b bodyClass) (presenceOutcome, string) {
@@ -6372,9 +6391,10 @@ func (c presenceCell) run(t *testing.T, b bodyClass) (presenceOutcome, string) {
 	return out, src
 }
 
-// presenceWireValue produces a value the compiled field type accepts, chosen
-// off the metadata so it follows whatever the cell's routing produced. A
-// decimal is deliberately not fed a value: its error text is the observable.
+// presenceWireValue produces a value the compiled field type accepts, and we
+// choose it off the metadata so it follows whatever the cell's routing
+// produced. A decimal is deliberately not fed a value: its error text is the
+// observable.
 func presenceWireValue(n avro.SchemaNode) any {
 	switch n.Type {
 	case "fixed":
@@ -6404,7 +6424,7 @@ func presenceWireValue(n avro.SchemaNode) any {
 }
 
 // TestMatrix_ReservedKeyBodyPresence drives the rule over the whole
-// cross-product: a null body reaches the same verdict as a wrong-typed body,
+// cross-product. A null body reaches the same verdict as a wrong-typed body,
 // on every surface, for every reserved key with a typed destination.
 func TestMatrix_ReservedKeyBodyPresence(t *testing.T) {
 	for _, c := range presenceCells() {
@@ -6414,9 +6434,9 @@ func TestMatrix_ReservedKeyBodyPresence(t *testing.T) {
 			validOut, validSrc := c.run(t, bodyValid)
 			absentOut, absentSrc := c.run(t, bodyAbsent)
 
-			// The rule: same ROUTING. The value each body rides through with
-			// is necessarily different — that is the as-written contract —
-			// so it is asserted separately below and excluded here.
+			// The rule: same routing. The value each body rides through
+			// with is necessarily different, since that is the as-written
+			// contract, so we assert it separately below and exclude it here.
 			if nullOut.routing() != wrongOut.routing() {
 				t.Errorf("a null body reached a different verdict than a wrong-typed body:\n"+
 					"  null  %s\n        %s\n  wrong %s\n        %s",
@@ -6472,9 +6492,9 @@ func TestMatrix_ReservedKeyBodyPresence(t *testing.T) {
 
 			// Absence is its own verdict. Where the placement reads the key,
 			// a written null must not be indistinguishable from having
-			// written nothing — that confusion is the whole point of the
-			// rule. The one exception is the declining read, whose ruling IS
-			// that the two coincide, so it is stated rather than silent.
+			// written nothing. That confusion is the whole point of the rule.
+			// The one exception is the declining read, whose ruling is that
+			// the two coincide, so we state that rather than leave it silent.
 			if c.route != routeDrop && !absentOut.rejected && absentOut == nullOut {
 				t.Errorf("a written null is indistinguishable from an absent attribute: %s (%s vs %s)",
 					nullOut, nullSrc, absentSrc)
@@ -6485,7 +6505,7 @@ func TestMatrix_ReservedKeyBodyPresence(t *testing.T) {
 			}
 
 			// Quoting is a spelling of a value, so wherever it applies the
-			// verdict must be the key's own policy and never the null one.
+			// verdict must be the key's own policy, never the null one.
 			if quotedOut, quotedSrc := c.run(t, bodyQuoted); quotedSrc != "" {
 				if !quotedOut.rejected && quotedOut == nullOut {
 					t.Errorf("a quoted body collapsed into the null verdict: %s (%s)", quotedOut, quotedSrc)
@@ -6497,7 +6517,7 @@ func TestMatrix_ReservedKeyBodyPresence(t *testing.T) {
 
 // TestMatrix_ReservedKeyBodyPresenceIsNotVacuous fails when the corpus stops
 // spanning the axes the rule distinguishes, so an implementation that ignored
-// one of them could not pass by never being asked.
+// one of them cannot pass by never being asked.
 func TestMatrix_ReservedKeyBodyPresenceIsNotVacuous(t *testing.T) {
 	routes := map[malformedRoute]int{}
 	levels := map[string]int{}
@@ -6546,7 +6566,7 @@ func TestMatrix_ReservedKeyBodyPresenceIsNotVacuous(t *testing.T) {
 		t.Fatalf("the quoted-body class is barely exercised: %d cells", quoted)
 	}
 	// Every typed destination the parser decodes into must appear: the
-	// hazard belongs to the DESTINATION's decode, not to the key.
+	// hazard belongs to the destination's decode, not to the key.
 	for _, d := range []string{"int", "string", "[]string", "schema"} {
 		if dests[d] == 0 {
 			t.Fatalf("no cell decodes into a %s destination; the hazard is per-destination", d)
@@ -6558,15 +6578,15 @@ func TestMatrix_ReservedKeyBodyPresenceIsNotVacuous(t *testing.T) {
 }
 
 // TestDifferentialFastavroNullBodyIsNotUsable records the reference
-// calibration this posture rests on: fastavro ACCEPTS a null-bodied size or
-// decimal scale at parse and then fails every write against the result, so its
+// calibration this posture rests on: fastavro accepts a null-bodied size or
+// decimal scale at parse, then fails every write against the result. Its
 // acceptance is not an acceptance the permissive lean can follow.
 func TestDifferentialFastavroNullBodyIsNotUsable(t *testing.T) {
 	o := startOracle(t)
 	cases := []struct {
 		name string
 		// nullSchema carries the null body; twinSchema is the same schema
-		// with a written value in its place. The twin runs the IDENTICAL
+		// with a written value in its place. The twin runs the identical
 		// value plumbing, so a write that fails for both would be a broken
 		// probe rather than evidence about the null.
 		nullSchema string
@@ -6609,9 +6629,8 @@ func TestDifferentialFastavroNullBodyIsNotUsable(t *testing.T) {
 					"this package declined", enc.Hex)
 			}
 
-			// twmb rejects at parse, which is the difference that matters:
-			// the caller learns before it holds a schema, not at the first
-			// write.
+			// We reject at parse, which is the difference that matters: the
+			// caller learns before it holds a schema, not at the first write.
 			if _, err := avro.Parse(c.nullSchema); err == nil {
 				t.Errorf("twmb accepted %s at parse", c.name)
 			}
@@ -6624,22 +6643,22 @@ func TestDifferentialFastavroNullBodyIsNotUsable(t *testing.T) {
 
 // ---------- null_branch_spelling_test.go ----------
 
-// Avro spells a union's null branch two ways — the bare `"null"` primitive and
-// the wrapped object `{"type":"null"}` — and the two are the same type:
-// identical wire bytes, identical decoded values. Every decision made by
-// matching a branch's WRITTEN spelling must therefore reach the same verdict for
-// both, or semantically identical schemas take different code paths in the
-// places that spelling feeds: which ser/deser arm is selected, the field
-// metadata driving the omitzero and missing-key fills, where a field-level
-// logicalType lifts, whether a field-level precision/scale pair is consumed, and
-// the encode-error identity each wire surfaces. Wire bytes are identical BY
-// CONSTRUCTION, so these assert the DERIVED artifacts.
+// Avro spells a union's null branch two ways: the bare `"null"` primitive and
+// the wrapped object `{"type":"null"}`. The two are the same type, with
+// identical wire bytes and identical decoded values. Every decision made by
+// matching a branch's written spelling must reach the same verdict for both.
+// Otherwise semantically identical schemas take different code paths in the
+// places that spelling feeds. Those places: which ser/deser arm is selected,
+// the field metadata driving the omitzero and missing-key fills, where a
+// field-level logicalType lifts, whether a field-level precision/scale pair is
+// consumed, and the encode-error identity each wire surfaces. Wire bytes are
+// identical by construction, so we assert the derived artifacts.
 
 // wrapNullBranches rewrites every bare `"null"` union branch in a schema into
-// the wrapped `{"type":"null"}` object, structurally (decode → rewrite →
-// re-encode) rather than textually, so a `"null"` appearing anywhere that is
-// not a union branch is left alone. extra, when non-nil, is merged into each
-// wrapped null object so the props / logicalType carriers can be driven
+// the wrapped `{"type":"null"}` object. The rewrite is structural (decode,
+// rewrite, re-encode) rather than textual, so a `"null"` appearing anywhere
+// that is not a union branch is left alone. extra, when non-nil, is merged
+// into each wrapped null object, driving the props / logicalType carriers
 // through the same helper.
 func wrapNullBranches(t *testing.T, schema string, extra map[string]any) string {
 	t.Helper()
@@ -6682,9 +6701,9 @@ func wrapNullBranches(t *testing.T, schema string, extra map[string]any) string 
 
 // nullSpellings are the spellings of a union's null branch that must all be
 // treated as a null branch. Props and a logicalType are inert metadata on a
-// null (there is no null logical type in the spec, and neither key changes
-// the branch's type or its wire form), so a carrier-bearing wrapped null is
-// still a null branch.
+// null. There is no null logical type in the spec, and neither key changes the
+// branch's type or its wire form. So a carrier-bearing wrapped null is still a
+// null branch.
 func nullSpellings() []struct {
 	label string
 	extra map[string]any
@@ -6693,7 +6712,7 @@ func nullSpellings() []struct {
 		label string
 		extra map[string]any
 	}{
-		{"bare", nil}, // extra==nil AND handled by the caller as "leave as written"
+		{"bare", nil}, // extra==nil, and the caller leaves it as written
 		{"wrapped", map[string]any{}},
 		{"wrapped+props", map[string]any{"mine": "keepme"}},
 		{"wrapped+logicalType", map[string]any{"logicalType": "nope"}},
@@ -6714,13 +6733,13 @@ type omitRec struct {
 	A string `avro:"a,omitzero"`
 }
 
-// TestMatrix_OmitzeroNullBranchSpellingAgnostic pins the wire bytes and
-// the decoded nullness, not merely that the encode succeeded: under the
-// wrapped spelling the field previously encoded the VALUE branch (an empty
-// string), which is indistinguishable on the wire from an explicit "".
+// TestMatrix_OmitzeroNullBranchSpellingAgnostic pins the wire bytes and the
+// decoded nullness, not merely that the encode succeeded. Under the wrapped
+// spelling the field previously encoded the value branch (an empty string),
+// which is indistinguishable on the wire from an explicit "".
 //
 // doc.go, "Struct tags": "a zero value encodes the field's default, or null
-// for a nullable field that has no default"; and the documented single
+// for a nullable field that has no default". The documented single
 // difference from map fill is precisely this [T, "null"] shape, where
 // "omitzero encodes null where map fill instead errors on the missing key".
 func TestMatrix_OmitzeroNullBranchSpellingAgnostic(t *testing.T) {
@@ -6768,9 +6787,9 @@ func TestMatrix_OmitzeroNullBranchSpellingAgnostic(t *testing.T) {
 }
 
 // TestMatrix_FieldLogicalLiftNullBranchSpellingAgnostic: the field-level
-// logicalType lifts onto the first NON-null branch. A wrapped null branch is
-// still a null branch, so it must be skipped exactly like the bare one —
-// otherwise the annotation lands on null and the intended branch never gets
+// logicalType lifts onto the first non-null branch. A wrapped null branch is
+// still a null branch, so it must be skipped exactly like the bare one.
+// Otherwise the annotation lands on null and the intended branch never gets
 // it, so a time.Time no longer encodes at all.
 func TestMatrix_FieldLogicalLiftNullBranchSpellingAgnostic(t *testing.T) {
 	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -6813,8 +6832,8 @@ func TestMatrix_FieldLogicalLiftNullBranchSpellingAgnostic(t *testing.T) {
 }
 
 // TestMatrix_FieldDecimalLiftNullBranchSpellingAgnostic is the
-// precision/scale twin: whether the field-level pair is CONSUMED by the
-// decimal lift is decided by the same first-non-null-branch scan.
+// precision/scale twin: the same first-non-null-branch scan decides whether
+// the decimal lift consumes the field-level pair.
 func TestMatrix_FieldDecimalLiftNullBranchSpellingAgnostic(t *testing.T) {
 	rat := big.NewRat(12345, 100)
 	for _, branches := range []string{`["null","bytes"]`, `["bytes","null"]`} {
@@ -6858,10 +6877,10 @@ func encodeErrIdentity(err error) string {
 }
 
 // TestMatrix_UnionNoMatchIdentityNullBranchSpellingAgnostic: the union
-// no-match error identity is arity-split — a 2-branch null union surfaces the
+// no-match error identity is arity-split. A 2-branch null union surfaces the
 // value branch's own error, every other shape wraps in the union's
-// *SemanticError. The binary and JSON encoders must reach the same verdict,
-// and the split must not depend on how the null branch is spelled.
+// *SemanticError. The binary and JSON encoders must reach the same verdict.
+// The split must not depend on how the null branch is spelled.
 func TestMatrix_UnionNoMatchIdentityNullBranchSpellingAgnostic(t *testing.T) {
 	bases := []string{
 		`["null","string"]`,
@@ -6900,9 +6919,10 @@ func TestMatrix_UnionNoMatchIdentityNullBranchSpellingAgnostic(t *testing.T) {
 	}
 }
 
-// TestMatrix_MissingKeyFillNullBranchSpellingAgnostic: the implicit null
-// default for the canonical ["null", T] nullable pattern, and the loud
-// missing-key error for [T, "null"], must both be spelling-agnostic.
+// TestMatrix_MissingKeyFillNullBranchSpellingAgnostic: two behaviors must both
+// be spelling-agnostic. One is the implicit null default for the canonical
+// ["null", T] nullable pattern; the other is the loud missing-key error for
+// [T, "null"].
 func TestMatrix_MissingKeyFillNullBranchSpellingAgnostic(t *testing.T) {
 	for _, branches := range []string{`["null","string"]`, `["string","null"]`} {
 		base := fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"a","type":%s}]}`, branches)
@@ -6932,8 +6952,8 @@ func TestMatrix_MissingKeyFillNullBranchSpellingAgnostic(t *testing.T) {
 }
 
 // respellNulls is wrapNullBranches plus a "did anything change" verdict,
-// derived by re-normalizing the input through the same marshal round trip so
-// key ordering cannot masquerade as a change.
+// derived by re-normalizing the input through the same marshal round trip.
+// Key ordering then cannot masquerade as a change.
 func respellNulls(t *testing.T, schema string, extra map[string]any) (string, bool) {
 	t.Helper()
 	normalized := wrapNullBranches(t, schema, nil /* rewrite nothing */)
@@ -6942,10 +6962,10 @@ func respellNulls(t *testing.T, schema string, extra map[string]any) (string, bo
 }
 
 // TestMatrix_NullBranchSpellingParity is the class net for the bare-vs-wrapped
-// null spelling axis: it crosses that axis into the existing combinatorial
-// tables rather than forking them, and asserts on every union-bearing cell that
-// the spellings agree on every DERIVED artifact — the selected ser/deser arm,
-// the field metadata, the JSON form, the canonical form and fingerprint, and the
+// null spelling axis. We cross that axis into the existing combinatorial
+// tables rather than forking them. On every union-bearing cell the spellings
+// must agree on every derived artifact: the selected ser/deser arm, the field
+// metadata, the JSON form, the canonical form and fingerprint, and the
 // encode-error identity. Wire bytes are identical by construction, which is
 // exactly why the derived artifacts are what a spelling-sensitive predicate
 // corrupts. Non-vacuity: reverting isNullBranch to `s.primitive == "null"`
@@ -7039,7 +7059,7 @@ func TestMatrix_NullBranchSpellingParity(t *testing.T) {
 				}
 
 				// A value no branch accepts: the encode-error identity must
-				// agree across wires AND across spellings.
+				// agree across wires and across spellings.
 				bBin := encodeErrIdentity(mustErr(baseSchema.Encode(cx.wrap(noBranchValue{X: 1}))))
 				aBin := encodeErrIdentity(mustErr(alt.Encode(cx.wrap(noBranchValue{X: 1}))))
 				bJSON := encodeErrIdentity(mustErr(baseSchema.EncodeJSON(cx.wrap(noBranchValue{X: 1}))))
@@ -7070,11 +7090,11 @@ func mustErr(_ []byte, err error) error { return err }
 
 // The namespace attribute is a dot-separated sequence of names and must satisfy
 // the same grammar as a name. Strict mode validated only the (possibly bare)
-// name attribute, so a namespace spelled via the attribute skipped validation
-// entirely while the identical fullname spelled inline was rejected — an
-// incoherence made worse because the parsing canonical form inlines the
-// namespace into the fullname, so the accepted schema's Canonical() could not
-// re-parse in the same mode.
+// name attribute. A namespace spelled via the attribute skipped validation
+// entirely, while the identical fullname spelled inline was rejected. The
+// parsing canonical form inlines the namespace into the fullname, which made
+// the incoherence worse: the accepted schema's Canonical() could not re-parse
+// in the same mode.
 func TestRegression_NamespaceAttributeValidatedLikeFullname(t *testing.T) {
 	// Both spellings of the same illegal fullname must be rejected uniformly.
 	if _, err := avro.Parse(`{"type":"record","name":"bad ns.R","fields":[]}`); err == nil {
@@ -7089,7 +7109,7 @@ func TestRegression_NamespaceAttributeValidatedLikeFullname(t *testing.T) {
 		t.Fatal("dotted namespace with an illegal component must be rejected")
 	}
 
-	// A valid namespace still parses AND its Canonical() re-parses in strict
+	// A valid namespace still parses and its Canonical() re-parses in strict
 	// mode (the coherence the bug broke).
 	s, err := avro.Parse(`{"type":"record","name":"R","namespace":"a.b","fields":[{"name":"f","type":"int"}]}`)
 	if err != nil {
@@ -7109,7 +7129,7 @@ func TestRegression_NamespaceAttributeValidatedLikeFullname(t *testing.T) {
 }
 
 // WithLaxNames documents that its validator fn is "called for each name
-// component". Namespace attribute components route through it now too — without
+// component". Namespace attribute components route through it now too; without
 // the validation site they were never offered to the fn.
 func TestRegression_LaxNamesValidatorSeesNamespaceComponents(t *testing.T) {
 	var seen []string
@@ -7134,9 +7154,9 @@ func TestRegression_LaxNamesValidatorSeesNamespaceComponents(t *testing.T) {
 }
 
 // SemanticError.Field is built from parsed (registry/remote-controlled) schema
-// field names and is length-unbounded. Error() must render-truncate it so a
-// hostile field name cannot amplify into an equally large error string on every
-// type-mismatched datum — while the public Field keeps its full value.
+// field names and is length-unbounded. Error() must render-truncate it. A
+// hostile field name cannot then amplify into an equally large error string on
+// every type-mismatched datum, while the public Field keeps its full value.
 func TestRegression_SemanticErrorFieldRenderBounded(t *testing.T) {
 	bigName := "F" + strings.Repeat("A", 1<<20)
 	schema := `{"type":"record","name":"R","fields":[{"name":"` + bigName + `","type":"int"}]}`
@@ -7169,29 +7189,30 @@ func TestRegression_SemanticErrorFieldRenderBounded(t *testing.T) {
 // ---------- empty_name_component_test.go ----------
 
 // ---------------------------------------------------------------------------
-// The empty string is a legal NAME COMPONENT.
+// The empty string is a legal name component.
 //
 // [avro.WithLaxNames] takes a caller-supplied validator called per name
-// component; one that accepts "" makes the empty string a legal record name,
-// field name, namespace component, enum symbol, or alias. The package relies on
-// that being carriable: its own internal re-parses of library-produced schema
-// text use an accept-everything validator precisely so a name the caller's
+// component. One that accepts "" makes the empty string a legal record name,
+// field name, namespace component, enum symbol, or alias. We rely on that being
+// carriable: our own internal re-parses of library-produced schema text use an
+// accept-everything validator. That is precisely so a name the caller's
 // validator accepted cannot be rejected later.
 //
-// That makes "" a value like any other, and it forbids a common shortcut: using
-// a name string's ZERO VALUE as an absence sentinel. A guard written as
+// So "" is a value like any other, and that forbids a common shortcut: using
+// a name string's zero value as an absence sentinel. A guard written as
 // `claimedName[i] != ""` cannot tell "no one claimed slot i" from "the field
 // named "" claimed slot i", so it silently skips its own check. Presence and
 // identity have to be separate variables.
 //
-// The nets put "" in every name-shaped position and hold the package to
-// invariants needing no reference implementation:
+// Our nets put "" in every name-shaped position and hold us to invariants
+// needing no reference implementation:
 //
-//   - CheckCompatibility and Resolve must AGREE. They are two independent
-//     implementations of the same rules, so they are each other's oracle. Resolve
-//     calls CheckCompatibility first, so the only reachable disagreement is
-//     "CheckCompatibility accepts, Resolve rejects" — a caller using it as an
-//     admission gate is told a pair is fine and then fails at Resolve.
+//   - CheckCompatibility and Resolve must agree. They are two independent
+//     implementations of the same rules, so they are each other's oracle.
+//     Resolve calls CheckCompatibility first, so the only reachable
+//     disagreement is "CheckCompatibility accepts, Resolve rejects". There a
+//     caller using it as an admission gate is told a pair is fine and then
+//     fails at Resolve.
 //   - A schema's own String() must re-parse, and Root().Schema() must rebuild,
 //     to the same canonical form and fingerprint.
 //
@@ -7226,7 +7247,7 @@ func emptyNamePositions() []struct{ name, schema string } {
 }
 
 // TestMatrix_EmptyNameComponentSelfConsistency holds each position to the two
-// self-consistency invariants: the emitted text and the rebuilt metadata tree
+// self-consistency invariants. The emitted text and the rebuilt metadata tree
 // are the schema's own claims about itself, so both must reproduce it.
 func TestMatrix_EmptyNameComponentSelfConsistency(t *testing.T) {
 	for _, p := range emptyNamePositions() {
@@ -7298,13 +7319,13 @@ func TestMatrix_EmptyNameComponentCompatResolveAgree(t *testing.T) {
 }
 
 // TestMatrix_EmptyFieldNameAliasClaimAgreement is the shape that a name-valued
-// absence sentinel hides. Two writer fields resolve to ONE reader slot — one
-// by the reader field's name, one by its alias — which both the resolver and
-// the compatibility check must refuse. Crossing the reader field's name with
-// the empty string, and crossing the DECLARATION ORDER of the two writer
-// fields, is what separates a real presence flag from a sentinel: with the
-// sentinel, the collision is detected only when the ""-named writer field
-// comes second, because by then some other name has overwritten the slot.
+// absence sentinel hides. Two writer fields resolve to one reader slot, one
+// by the reader field's name and one by its alias, which both the resolver and
+// the compatibility check must refuse. We cross the reader field's name with
+// the empty string, and the declaration order of the two writer fields. That
+// is what separates a real presence flag from a sentinel. With the sentinel,
+// the collision is detected only when the ""-named writer field comes second,
+// because by then some other name has overwritten the slot.
 func TestMatrix_EmptyFieldNameAliasClaimAgreement(t *testing.T) {
 	var cells int
 	for _, readerName := range []string{"", "a"} {
@@ -7350,7 +7371,7 @@ func TestMatrix_EmptyFieldNameAliasClaimAgreement(t *testing.T) {
 }
 
 // TestMatrix_EmptyFieldNameNonCollidingControl is the boundary: the same
-// shapes with only ONE writer field claiming the reader slot must be ACCEPTED,
+// shapes with only one writer field claiming the reader slot must be accepted
 // by both APIs. Without this, refusing every writer that mentions an empty
 // name would satisfy the matrix above.
 func TestMatrix_EmptyFieldNameNonCollidingControl(t *testing.T) {
@@ -7385,18 +7406,20 @@ func TestMatrix_EmptyFieldNameNonCollidingControl(t *testing.T) {
 
 // ---------- enum_default_token_test.go ----------
 
-// The enum-LEVEL "default" attribute must be a JSON STRING token naming a member
-// symbol, and the token-type verdict is decided BEFORE the membership check: a
-// non-string body can never name a symbol, and deciding by membership alone
-// would let the json.Unmarshal zero value "" flow into the membership test —
-// under a WithLaxNames validator accepting empty name components, a schema whose
-// symbols legitimately include "" would then silently BIND the garbage default
-// to it while the metadata surface reports no default at all.
+// The enum-level "default" attribute must be a JSON string token naming a
+// member symbol. The token-type verdict is decided BEFORE the membership
+// check, since a non-string body can never name a symbol. Deciding by
+// membership alone would let the json.Unmarshal zero value "" flow into the
+// membership test. Take a WithLaxNames validator accepting empty name
+// components. A schema whose symbols legitimately include "" would then
+// silently bind the garbage default to it, while the metadata surface
+// reports no default at all.
 //
 // References: fastavro rejects every non-member (hence every non-string) enum
-// default at parse; Java binds NO default for a non-text token
-// (Schema.java:1921-1925 — textValue() is null for non-text nodes, skipping the
-// containment check). Neither ever binds a default from a non-string token.
+// default at parse. Java binds no default for a non-text token
+// (Schema.java:1921-1925, where textValue() is null for non-text nodes,
+// skipping the containment check). Neither binds a default from a non-string
+// token.
 
 func laxAllEnumNames(string) error { return nil }
 
@@ -7423,7 +7446,7 @@ func enumResolutionFill(t *testing.T, r *avro.Schema) (string, error) {
 }
 
 // A non-string enum default under a lax-name validator with "" in symbols
-// must reject by token type — never parse and bind the "" symbol.
+// must reject by token type, never parse and bind the "" symbol.
 func TestRegression_EnumDefaultLaxPhantomBindRejected(t *testing.T) {
 	s, err := avro.Parse(
 		`{"type":"enum","name":"E","symbols":["","A"],"default":5}`,
@@ -7434,17 +7457,17 @@ func TestRegression_EnumDefaultLaxPhantomBindRejected(t *testing.T) {
 		}
 		return
 	}
-	// Parse accepted: demonstrate the full phantom bind — metadata denies
-	// the default while resolution fills it.
+	// Parse accepted: demonstrate the full phantom bind, where metadata
+	// denies the default while resolution fills it.
 	root := s.Root()
 	filled, ferr := enumResolutionFill(t, s)
 	t.Fatalf("non-string enum default parsed under lax names: HasEnumDefault=%v EnumDefault=%q, resolution filled %q (err=%v) — must reject (default is not a string)",
 		root.HasEnumDefault, root.EnumDefault, filled, ferr)
 }
 
-// An explicit null default is a non-string token like any other — it must
-// reject in BOTH modes, even though json.Unmarshal(null, *string) is a
-// no-error no-op that leaves the zero value in place.
+// An explicit null default is a non-string token like any other, so it must
+// reject in both modes. That holds even though json.Unmarshal(null, *string)
+// is a no-error no-op leaving the zero value in place.
 func TestRegression_EnumDefaultExplicitNullRejected(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -7469,7 +7492,7 @@ func TestRegression_EnumDefaultExplicitNullRejected(t *testing.T) {
 }
 
 // The strict-mode reject of a non-string default must name the offending
-// token — not echo the empty string the failed Unmarshal left behind.
+// token, not echo the empty string the failed Unmarshal left behind.
 func TestRegression_EnumDefaultNonStringEchoNamesToken(t *testing.T) {
 	_, err := avro.Parse(`{"type":"enum","name":"E","symbols":["A"],"default":5}`)
 	if err == nil {
@@ -7486,7 +7509,7 @@ func TestRegression_EnumDefaultNonStringEchoNamesToken(t *testing.T) {
 
 // Boundary controls for the token-type check.
 func TestEnumDefaultEmptySymbolBoundary(t *testing.T) {
-	// An explicit "" default is a legal STRING token; with "" a member
+	// An explicit "" default is a legal string token; with "" a member
 	// (lax names) it binds, both surfaces agree, and resolution fills it.
 	t.Run("explicit-empty-binds", func(t *testing.T) {
 		s, err := avro.Parse(
@@ -7504,7 +7527,7 @@ func TestEnumDefaultEmptySymbolBoundary(t *testing.T) {
 			t.Fatalf("resolution fill = %q, %v; want \"\"", filled, err)
 		}
 	})
-	// The same "" default WITHOUT "" in symbols is a membership reject —
+	// The same "" default without "" in symbols is a membership reject:
 	// the string token passes the type check and fails containment.
 	t.Run("empty-not-member-rejects", func(t *testing.T) {
 		for _, c := range []struct {
@@ -7523,7 +7546,7 @@ func TestEnumDefaultEmptySymbolBoundary(t *testing.T) {
 }
 
 // enumDefaultToken is one default-token cell of the class-elimination
-// matrix: its JSON spelling, whether it is a JSON string token, and (for
+// matrix: the JSON spelling, whether it is a JSON string token, and (for
 // strings) the symbol it names.
 type enumDefaultToken struct {
 	name     string
@@ -7567,11 +7590,11 @@ func enumDefaultCellSchema(sym enumDefaultSymbols, tok enumDefaultToken) string 
 	return fmt.Sprintf(`{"type":"enum","name":"E","symbols":%s,"default":%s}`, sym.json, tok.raw)
 }
 
-// enumDefaultCellExpect derives the cell's verdict from the RULE, not the
-// implementation: the schema parses iff the symbol set is legal in the
-// mode AND the default is a string token naming a member. Reject class:
-// symbol-set failures reject on the symbol; string non-members reject on
-// membership; every non-string token rejects on token type.
+// enumDefaultCellExpect derives the cell's verdict from the rule, not the
+// implementation. The schema parses exactly when the symbol set is legal in
+// the mode and the default is a string token naming a member. Symbol-set
+// failures reject on the symbol; string non-members reject on membership;
+// every non-string token rejects on token type.
 func enumDefaultCellExpect(mode enumDefaultMode, sym enumDefaultSymbols, tok enumDefaultToken) (accept bool, rejectContains string) {
 	if sym.containsEmpty && !mode.lax {
 		return false, "symbol"
@@ -7586,11 +7609,11 @@ func enumDefaultCellExpect(mode enumDefaultMode, sym enumDefaultSymbols, tok enu
 }
 
 // TestMatrix_EnumDefaultTokenClassElimination crosses default token type
-// x name mode x symbol set and checks the parse verdict plus, for
-// accepted cells: metadata parity (HasEnumDefault/EnumDefault), the
-// render round-trip (Root().Schema() re-parse preserves the default),
-// canonical stripping (PCF never carries "default"), and the resolution
-// fill (an unknown writer symbol resolves to the default).
+// x name mode x symbol set. We check the parse verdict plus, for accepted
+// cells, metadata parity (HasEnumDefault/EnumDefault), the render
+// round-trip (Root().Schema() re-parse preserves the default), canonical
+// stripping (PCF never carries "default"), and the resolution fill (an
+// unknown writer symbol resolves to the default).
 func TestMatrix_EnumDefaultTokenClassElimination(t *testing.T) {
 	for _, mode := range enumDefaultModes {
 		for _, sym := range enumDefaultSymbolSets {
@@ -7646,12 +7669,12 @@ func TestMatrix_EnumDefaultTokenClassElimination(t *testing.T) {
 	}
 }
 
-// FIELD-level enum defaults go through the record default pipeline, whose
+// Field-level enum defaults go through the record default pipeline, whose
 // enum arm requires a string (validateLeaf) and validates membership at
-// parse — deliberately stricter than the references (a non-member default
-// can never encode; fastavro parses non-member field defaults outright,
-// Java's isValidDefault ENUM arm is isTextual-only). The token classes
-// eliminate the same way at this second consumption site.
+// parse. That is deliberately stricter than the references, since a
+// non-member default can never encode: fastavro parses non-member field
+// defaults outright, and Java's isValidDefault enum arm is isTextual-only.
+// The token classes eliminate the same way at this second consumption site.
 func TestMatrix_EnumFieldDefaultTokenTypes(t *testing.T) {
 	cells := []struct {
 		name    string
@@ -7686,17 +7709,17 @@ func TestMatrix_EnumFieldDefaultTokenTypes(t *testing.T) {
 	}
 }
 
-// A "default" key riding a WRAPPER around an enum REFERENCE never BINDS: the
-// enum-level default is read only at the definition site, and a reference
-// wrapper's own kind is the referenced NAME, which binds nothing. The key is
-// therefore an ordinary custom property of the usage site for EVERY token type —
-// it rides in Props as its only surface, the rebuild preserves it as written,
+// A "default" key riding a wrapper around an enum reference never binds: the
+// enum-level default is read only at the definition site. A reference
+// wrapper's own kind is the referenced name, which binds nothing. The key is
+// therefore an ordinary custom property of the usage site for every token type.
+// It rides in Props as its only surface, the rebuild preserves it as written,
 // and the enum it names still declares no default. Binding is decided by
 // placement, never by the body.
 //
 // The SchemaCache cross-parse spelling differs by design, and the difference is
-// the splice rather than the routing: the cache materializes the DEFINITION in
-// place of the reference, and the merge is definition-wins on consumed-ness, so
+// the splice rather than the routing: the cache materializes the definition in
+// place of the reference. The merge is definition-wins on consumed-ness, so
 // an enum definition swallows the wrapper's "default".
 func TestRegression_EnumRefWrapperDefaultInert(t *testing.T) {
 	for _, tok := range []struct {
@@ -7758,7 +7781,7 @@ func TestRegression_EnumRefWrapperDefaultInert(t *testing.T) {
 		root := s.Root()
 		f := root.Fields[0].Type
 		// The splice replaced the reference with the enum definition, which
-		// CONSUMES "default" — definition-wins, so the usage-site copy does
+		// consumes "default". Definition-wins, so the usage-site copy does
 		// not ride along and does not become the definition's default.
 		if f.HasEnumDefault || f.EnumDefault != "" || len(f.Props) != 0 {
 			t.Fatalf("spliced wrapper default leaked: HasEnumDefault=%v EnumDefault=%q Props=%v",
@@ -7774,16 +7797,16 @@ func TestRegression_EnumRefWrapperDefaultInert(t *testing.T) {
 	})
 }
 
-// TestDifferentialFastavroEnumDefaultToken drives every enum-LEVEL matrix cell
-// through fastavro's parser and asserts VERDICT parity wherever fastavro can
-// parse the cell's schema shape at all — self-calibrated: a cell whose
+// TestDifferentialFastavroEnumDefaultToken drives every enum-level matrix cell
+// through fastavro's parser, asserting verdict parity wherever fastavro can
+// parse the cell's schema shape at all. It is self-calibrated: a cell whose
 // no-default twin fastavro rejects is schema-blocked and skipped. fastavro
 // rejects every non-member default, which subsumes every non-string token, so
 // parity holds cell-for-cell on the parseable shapes.
 //
-// The FIELD-level cells pin fastavro's LAXER observed verdict instead: 1.12.2
-// parses non-member and non-string enum FIELD defaults outright, a calibrated
-// divergence where twmb is deliberately stricter. A release that starts
+// The field-level cells pin fastavro's laxer observed verdict instead. 1.12.2
+// parses non-member and non-string enum field defaults outright, a calibrated
+// divergence where we are deliberately stricter. A release that starts
 // rejecting flips these cells and forces recalibration.
 func TestDifferentialFastavroEnumDefaultToken(t *testing.T) {
 	o := startOracle(t)
@@ -7812,12 +7835,12 @@ func TestDifferentialFastavroEnumDefaultToken(t *testing.T) {
 		}
 	}
 
-	// Field-level calibration, executed 1.12.2: fastavro TYPE-checks a
+	// Field-level calibration, executed 1.12.2: fastavro type-checks a
 	// field default against the enum (number/null reject: "Default value
-	// <5> must match schema type: enum") but does NOT check MEMBERSHIP
-	// (a non-member string parses outright). twmb rejects all three —
-	// stricter only on the membership half. A fastavro release changing
-	// either half flips its cell and forces recalibration.
+	// <5> must match schema type: enum"). It does not check membership:
+	// a non-member string parses outright. We reject all three, stricter
+	// only on the membership half. A fastavro release changing either half
+	// flips its cell and forces recalibration.
 	for _, c := range []struct {
 		name   string
 		raw    string
@@ -7841,11 +7864,11 @@ func TestDifferentialFastavroEnumDefaultToken(t *testing.T) {
 	}
 
 	// Wrapper-reference calibration, executed 1.12.2: fastavro rejects
-	// the WRAPPED named-reference form itself (UnknownType for
-	// {"type":"E"} with or without extra keys), so the inert-default
-	// posture is untestable there — the shape is fastavro-blocked. twmb
-	// and Java both accept the wrapped form (Java TestUnionSelfReference)
-	// and neither consumes the riding "default".
+	// the wrapped named-reference form itself (UnknownType for
+	// {"type":"E"} with or without extra keys). The inert-default posture
+	// is untestable there, the shape being fastavro-blocked. We and Java
+	// both accept the wrapped form (Java TestUnionSelfReference) and
+	// neither consumes the riding "default".
 	t.Run("wrapper-ref", func(t *testing.T) {
 		clean := `{"type":"record","name":"R","fields":[
 			{"name":"a","type":{"type":"enum","name":"E","symbols":["A","B"]}},
@@ -7867,20 +7890,20 @@ func TestDifferentialFastavroEnumDefaultToken(t *testing.T) {
 
 // ---------- union_default_order_test.go ----------
 
-// Per Avro 1.12 (AVRO-3649) a union-field default may match ANY branch, so
-// whether a schema PARSES — and which branch its default selects — must not
+// Per Avro 1.12 (AVRO-3649) a union-field default may match any branch, so
+// whether a schema parses, and which branch its default selects, must not
 // depend on the textual order the branches are written in. Java's isValidDefault
 // is anyMatch over an immutable JsonNode (Schema.java:1786), strictly
 // order-independent.
 //
 // The branch matcher selects via validateDefault, whose container arms coerce
-// record/array/map fields IN PLACE (the documented outer-float carveout). If each
-// branch trial observes the SAME value a prior FAILED branch already coerced, a
-// later string-typed branch rejects a float64 it should never have seen, making
-// acceptance order-dependent. These pin order-independence of both the parse
-// result and the selected branch. Generative: cross every branch-order
-// permutation with leak shapes whose earlier record branch coerces a field and
-// then fails.
+// record/array/map fields in place (the documented outer-float carveout). If
+// each branch trial observes the same value a prior failed branch already
+// coerced, a later string-typed branch rejects a float64 it should never have
+// seen, making acceptance order-dependent. Here we pin order-independence
+// of both the parse result and the selected branch. Generative: cross every
+// branch-order permutation with leak shapes whose earlier record branch coerces
+// a field and then fails.
 func TestGenerative_UnionDefaultBranchOrderIndependent(t *testing.T) {
 	type shape struct {
 		name      string
@@ -7935,7 +7958,7 @@ func TestGenerative_UnionDefaultBranchOrderIndependent(t *testing.T) {
 						t.Fatalf("order %d %v: parse FAILED (order-dependent acceptance): %v\nschema=%s", oi, order, err, schema)
 					}
 					// Selected branch: auto-fill the absent field, decode, and
-					// compare the value across every ordering — selection must
+					// compare the value across every ordering. Selection must
 					// be identical regardless of branch order.
 					wire, err := s.Encode(map[string]any{})
 					if err != nil {
@@ -8007,18 +8030,19 @@ func permuteStrings(in []string) [][]string {
 // ---------- union_fixed_size_select_test.go ----------
 
 // Per the Avro spec, a reader-union branch matches a writer fixed only when "both
-// schemas are fixed whose sizes and (unqualified) names match", and resolution
-// selects "the first schema in the reader's union that matches" — so fixed SIZE
-// is part of the match predicate, and a wrong-size same-name branch does NOT match
-// and selection must continue to a later size-matching branch. fastavro implements
-// this; branch selection that matched on name alone and only rejected on size
-// afterward let a wrong-size branch MASK a correct-size one, erroring on a value
-// that is fully decodable. This pins that size is folded into selection for both
-// Resolve and CheckCompatibility, both wires.
+// schemas are fixed whose sizes and (unqualified) names match". Resolution then
+// selects "the first schema in the reader's union that matches", so fixed size is
+// part of the match predicate. A wrong-size same-name branch does NOT match, and
+// selection must continue to a later size-matching branch. fastavro implements
+// this. Branch selection that matched on name alone, rejecting on size only
+// afterward, let a wrong-size branch mask a correct-size one. That errors on a
+// value that is fully decodable. This pins that size is folded into selection
+// for both Resolve and CheckCompatibility, both wires.
 func TestRegression_UnionFixedSizeFoldedIntoSelection(t *testing.T) {
 	writer := avro.MustParse(`{"type":"fixed","name":"F","namespace":"ns0","size":4}`)
-	// The wrong-size branch (size 8) is declared BEFORE the correct-size (size 4):
-	// it must be skipped, not select-then-reject and mask the size-4 branch.
+	// The wrong-size branch (size 8) is declared BEFORE the correct-size one
+	// (size 4). It must be skipped, not selected and then rejected in a way
+	// that masks the size-4 branch.
 	reader := avro.MustParse(`["null",{"type":"fixed","name":"F","namespace":"ns1","size":8},{"type":"fixed","name":"F","namespace":"ns2","size":4}]`)
 
 	if err := avro.CheckCompatibility(writer, reader); err != nil {
@@ -8063,7 +8087,7 @@ func TestRegression_UnionFixedSizeFoldedIntoSelection(t *testing.T) {
 		t.Fatalf("Resolve (size-4 first) unexpectedly rejected: %v", err)
 	}
 
-	// Boundary: NO size-matching branch present must still reject (no silent
+	// Boundary: no size-matching branch present must still reject (no silent
 	// wrong-branch selection).
 	readerNoMatch := avro.MustParse(`["null",{"type":"fixed","name":"F","namespace":"ns1","size":8}]`)
 	if _, err := avro.Resolve(writer, readerNoMatch); err == nil {
@@ -8084,32 +8108,33 @@ func fixedBytesEqual(v any, want []byte) bool {
 // ---------- union_tag_table_test.go ----------
 
 // ---------------------------------------------------------------------------
-// Union tag tables — one namespace, three consumers, one precedence rule.
+// Union tag tables: one namespace, three consumers, one precedence rule.
 //
-// A union branch is addressed on the tagged wires by a NAME, and two different
-// spellings can produce the same one: the "<kind>.<logicalType>" qualifier
-// TagLogicalTypes emits for a primitive-backed logical branch, and the
-// "<namespace>.<name>" fullname of a named type. "bytes.decimal" is both the
-// qualifier of a decimal-on-bytes branch and the fullname of a fixed named
-// "decimal" in namespace "bytes"; every name involved is valid under the strict
-// Avro name regex, and the union is legal Avro that the references parse.
+// A union branch is addressed on the tagged wires by a name, and two different
+// spellings can produce the same one. One is the "<kind>.<logicalType>"
+// qualifier TagLogicalTypes emits for a primitive-backed logical branch, and
+// the other is the "<namespace>.<name>" fullname of a named type.
+// "bytes.decimal" is both the qualifier of a decimal-on-bytes branch and the
+// fullname of a fixed named "decimal" in namespace "bytes". Every name
+// involved is valid under the strict Avro name regex, and the union is legal
+// Avro that the references parse.
 //
-// Three tables read that one namespace — the JSON emitter, the decoder's
-// tagged-map wrap, and the encoder's tagged-map lookup — so all three must agree
-// on which branch owns a tag. The oracle is calibration-free: A VALUE'S JSON
-// TAGGED ROUND TRIP MUST LAND ON THE BRANCH IT LEFT FROM. The binary branch
-// index is the observable, read straight off the wire, so a tag resolving to a
-// different branch shows up as a changed index rather than being inferred from a
-// Go type.
+// Three tables read that one namespace: the JSON emitter, the decoder's
+// tagged-map wrap, and the encoder's tagged-map lookup. All three must agree
+// on which branch owns a tag. The oracle is calibration-free: a value's JSON
+// tagged round trip must land on the branch it left from. The binary branch
+// index is the observable, and we read it straight off the wire. A tag
+// resolving to a different branch shows up as a changed index, never inferred
+// from a Go type.
 //
-// The second half is the over-correction guard: dropping the qualifier
+// The second half is the over-correction guard. Dropping the qualifier
 // everywhere would satisfy the round trip too, and silently undo
-// TagLogicalTypes. So the unambiguous case is pinned to still emit the qualified
-// form.
+// TagLogicalTypes. So the unambiguous case is pinned to still emit the
+// qualified form.
 // ---------------------------------------------------------------------------
 
-// unionBranchIndexOf reads the leading zig-zag varint of an Avro union wire,
-// which is the selected branch index.
+// unionBranchIndexOf reads the leading zig-zag varint of an Avro union wire.
+// That varint is the selected branch index.
 func unionBranchIndexOf(t *testing.T, wire []byte) int64 {
 	t.Helper()
 	if len(wire) == 0 {
@@ -8131,9 +8156,9 @@ func unionBranchIndexOf(t *testing.T, wire []byte) int64 {
 }
 
 // A collision family is a logical branch whose qualifier is spelled exactly
-// like a named branch's fullname, given in both declaration orders because
-// the tables are built by iterating branches and a last-write-wins map made
-// the answer depend on that order.
+// like a named branch's fullname. It is given in both declaration orders: the
+// tables are built by iterating branches, and a last-write-wins map made the
+// answer depend on that order.
 type tagCollisionFamily struct {
 	name      string
 	logical   string // the logical-carrying branch, whose qualifier collides
@@ -8178,8 +8203,8 @@ var tagOptionCombos = []struct {
 
 // TestMatrix_UnionTagRoundTripPreservesBranch crosses the collision families
 // with branch declaration order, the tag-affecting option combinations, and
-// the values that reach each branch — including the tagged-map form, which is
-// the only way a caller addresses the named branch explicitly.
+// the values that reach each branch. The tagged-map form is in the value list
+// too: it is the only way a caller addresses the named branch explicitly.
 func TestMatrix_UnionTagRoundTripPreservesBranch(t *testing.T) {
 	var cells int
 	for _, fam := range tagCollisionFamilies() {
@@ -8194,8 +8219,8 @@ func TestMatrix_UnionTagRoundTripPreservesBranch(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s/%s: this union is legal Avro and must parse: %v", fam.name, order.name, err)
 			}
-			// The tagged-map form addressing the NAMED branch by its exact
-			// fullname is part of the value domain: it is the caller's only
+			// The tagged-map form addressing the named branch by its exact
+			// fullname is part of the value domain. It is the caller's only
 			// handle on that branch, and it is the input the encoder's tag
 			// lookup resolves.
 			values := append([]any{}, fam.values...)
@@ -8236,12 +8261,12 @@ func TestMatrix_UnionTagRoundTripPreservesBranch(t *testing.T) {
 							fam.name, order.name, vi, combo.name, before, got, j)
 					}
 
-					// The BINARY decode wrap is a SEPARATE consumer of the tag
-					// namespace: it reads a table built at parse time rather
+					// The binary decode wrap is a separate consumer of the tag
+					// namespace. It reads a table built at parse time rather
 					// than computing the tag per value, so the JSON round trip
 					// above cannot see it. Its envelope has to name the same
-					// branch, because the value it produces is a tagged map a
-					// caller hands straight back to Encode.
+					// branch: the value it produces is a tagged map a caller
+					// hands straight back to Encode.
 					var wrapped any
 					if _, err := s.Decode(wire, &wrapped, combo.opts...); err != nil {
 						t.Errorf("%s/%s/value#%d/%s: binary decode of the schema's own wire: %v",
@@ -8267,12 +8292,11 @@ func TestMatrix_UnionTagRoundTripPreservesBranch(t *testing.T) {
 }
 
 // TestMatrix_UnionQualifiedTagStillEmittedWhenUnambiguous is the
-// over-correction guard. Dropping the "<kind>.<logicalType>" qualifier
+// over-correction guard: dropping the "<kind>.<logicalType>" qualifier
 // unconditionally would satisfy the round-trip matrix above while silently
-// disabling TagLogicalTypes, so the unambiguous case is pinned: with no
-// branch owning the qualified spelling as its exact name, the qualified form
-// is what gets emitted, and the unqualified form is what gets emitted without
-// the option.
+// disabling TagLogicalTypes. So we pin the unambiguous case: with no branch
+// owning the qualified spelling as its exact name, the qualified form is what
+// gets emitted. Without the option the unqualified form is what gets emitted.
 func TestMatrix_UnionQualifiedTagStillEmittedWhenUnambiguous(t *testing.T) {
 	cells := []struct {
 		name       string
@@ -8324,11 +8348,11 @@ func TestMatrix_UnionQualifiedTagStillEmittedWhenUnambiguous(t *testing.T) {
 }
 
 // TestInvariant_UnionTagOwnerIsUniquePerSchema states the property the tables
-// exist to hold, over every union any other cell in this file builds plus the
-// ordinary shapes: no two branches may EMIT the same tag under the same
-// options. This is the table-level statement of the round-trip property, and
-// it fails on a schema for which no value happens to be in the value domain
-// above.
+// exist to hold: no two branches may emit the same tag under the same options.
+// We check it over every union any other cell in this file builds, plus the
+// ordinary shapes. This is the table-level statement of the round-trip
+// property, and it fails on a schema for which no value happens to be in the
+// value domain above.
 func TestInvariant_UnionTagOwnerIsUniquePerSchema(t *testing.T) {
 	var schemas []string
 	for _, fam := range tagCollisionFamilies() {
@@ -8369,7 +8393,7 @@ func TestInvariant_UnionTagOwnerIsUniquePerSchema(t *testing.T) {
 }
 
 // unionEmitTagForTest recovers the tag a branch emits using only the public
-// API: encode a value onto that branch and read the key of the tagged
+// API. It encodes a value onto that branch and reads the key of the tagged
 // envelope. Branches no probe value reaches report "".
 func unionEmitTagForTest(t *testing.T, s *avro.Schema, branch int, tagLogical bool) string {
 	t.Helper()
@@ -8402,16 +8426,16 @@ func unionEmitTagForTest(t *testing.T, s *avro.Schema, branch int, tagLogical bo
 	return ""
 }
 
-// TestMatrix_UnionNamedTypeSpelledLikeAKindIsRejected pins the sibling ruling:
-// the DUPLICATE-BRANCH check keys a named branch by its fullname and an unnamed
-// one by its kind, in one namespace, so a null-namespace named type spelled like
-// an unnamed complex kind collides with a branch of that kind. The rejection is
-// deliberate and NOT the same question as the tag tables above: Apache Avro
-// rejects the identical shape for the identical reason — UnionSchema keys
-// indexByName by getFullName(), which for an unnamed schema returns the kind
-// string — and the Avro JSON encoding would give both branches the same envelope
-// name. A logical qualifier colliding with a named branch's fullname is the
-// OTHER case: legal Avro that stays accepted, with only the emitted tag
+// TestMatrix_UnionNamedTypeSpelledLikeAKindIsRejected pins the sibling ruling.
+// The duplicate-branch check keys a named branch by its fullname and an unnamed
+// one by its kind, in one namespace. So a null-namespace named type spelled
+// like an unnamed complex kind collides with a branch of that kind. The
+// rejection is deliberate and NOT the same question as the tag tables above.
+// Apache Avro rejects the identical shape for the identical reason: UnionSchema
+// keys indexByName by getFullName(), which for an unnamed schema returns the
+// kind string. The Avro JSON encoding would then give both branches the same
+// envelope name. A logical qualifier colliding with a named branch's fullname
+// is the other case: legal Avro that stays accepted, with only the emitted tag
 // degrading.
 func TestMatrix_UnionNamedTypeSpelledLikeAKindIsRejected(t *testing.T) {
 	reject := []string{
@@ -8429,7 +8453,7 @@ func TestMatrix_UnionNamedTypeSpelledLikeAKindIsRejected(t *testing.T) {
 			t.Errorf("refused for the wrong reason (%v):\n  %s", err, sc)
 		}
 	}
-	// Controls. A NAMESPACE keeps the fullname off the kind's spelling, and a
+	// Controls. A namespace keeps the fullname off the kind's spelling, and a
 	// name spelled like a kind is fine when no branch of that kind is present.
 	accept := []string{
 		`[{"type":"record","name":"map","namespace":"ns","fields":[{"name":"x","type":"int"}]},{"type":"map","values":"int"}]`,
@@ -8446,13 +8470,13 @@ func TestMatrix_UnionNamedTypeSpelledLikeAKindIsRejected(t *testing.T) {
 
 // TestRegression_ResolvedWriterUnionEmitsNoTag is the pinned control behind
 // the one site that still builds its wrap tables from the raw branch names
-// rather than the collision-aware tag: a writer-only union resolved against a
-// NON-union reader. Its tables are never read, because the reader has no union
-// to dispatch through and the wrap is suppressed outright — so leaving them
-// raw is safe only for as long as that suppression holds, which is what this
-// asserts. If the wrap is ever enabled there, the decoded value gains an
-// envelope and this fails, which is the signal to route that site through the
-// same tag rule as the others.
+// rather than the collision-aware tag. That site is a writer-only union
+// resolved against a non-union reader. Its tables are never read, because the
+// reader has no union to dispatch through and the wrap is suppressed outright.
+// Leaving them raw is safe only for as long as that suppression holds, and
+// that is what we assert here. If the wrap is ever enabled there, the decoded
+// value gains an envelope and this fails. That failure is the signal to route
+// that site through the same tag rule as the others.
 func TestRegression_ResolvedWriterUnionEmitsNoTag(t *testing.T) {
 	writer := avro.MustParse(`["int","long"]`)
 	reader := avro.MustParse(`"long"`)
@@ -8478,10 +8502,10 @@ func TestRegression_ResolvedWriterUnionEmitsNoTag(t *testing.T) {
 
 // TestMatrix_UnionTagTierAcrossConsumers crosses every tier of the tag
 // namespace with every consumer that reads it. Three consumers resolve a
-// caller-written tag — the binary tagged-map encoder, the JSON tagged-map
-// encoder, and the JSON tagged decoder — and a tier honored by some of them
-// and not others is precisely the shape that let the legacy
-// "<kind>.<logicalType>" spelling work on JSON and fail on binary.
+// caller-written tag: the binary tagged-map encoder, the JSON tagged-map
+// encoder, and the JSON tagged decoder. A tier honored by some of them and not
+// others is precisely the shape that let the legacy "<kind>.<logicalType>"
+// spelling work on JSON and fail on binary.
 //
 // The oracle is agreement plus an explicit verdict per cell, so "all three
 // reject everything" cannot pass.
@@ -8520,9 +8544,9 @@ func TestMatrix_UnionTagTierAcrossConsumers(t *testing.T) {
 
 			_, binErr := s.Encode(tagged)
 			_, jsonEncErr := s.EncodeJSON(tagged)
-			// The JSON DECODER is driven from the JSON encoder's own output
-			// when there is one, so the body shape is always right for the
-			// branch; when the encoder refused, the tag is what is under test
+			// The JSON decoder runs on the JSON encoder's own output when
+			// there is one, so the body shape is always right for the
+			// branch. When the encoder refused, the tag is what is under test,
 			// and a minimal body is enough to see the routing verdict.
 			jsonDecErr := error(nil)
 			jsonBody, jerr := s.EncodeJSON(c.value)
@@ -8550,11 +8574,11 @@ func TestMatrix_UnionTagTierAcrossConsumers(t *testing.T) {
 // A record/array/map field may carry a default whose type (or its
 // element/value/nested-field type) is a forward reference to a named type
 // declared later in the same schema. Such schemas parse fine without a
-// default, so adding a default must not turn Parse into a nil-pointer panic:
-// the default-encode pipeline must run only after every forward-referenced
-// child node is wired. Both the build-time deferral (container items/values)
-// and the finalize-time ordering (nested record fields) are exercised, and
-// the encoded default value is verified — not just the absence of a panic.
+// default, so adding a default must not turn Parse into a nil-pointer panic.
+// The default-encode pipeline must run only after every forward-referenced
+// child node is wired. Here we drive both the build-time deferral (container
+// items/values) and the finalize-time ordering (nested record fields), and the
+// check covers the encoded default value, not just the absence of a panic.
 func TestMatrix_ForwardRefFieldDefaultEncodes(t *testing.T) {
 	t.Run("array_items_forward_ref", func(t *testing.T) {
 		s, err := avro.Parse(`{"type":"record","name":"R","fields":[
@@ -8602,10 +8626,10 @@ func TestMatrix_ForwardRefFieldDefaultEncodes(t *testing.T) {
 
 	// Chained forward references: a's default {} must fill x with its default
 	// {}, which must fill y with its default 7. This only works if every
-	// field's default VALUE is resolved before any default's bytes are
-	// encoded (encodeDefault fills an absent nested field from its resolved
-	// f.defaultVal); resolving + encoding in a single pass would read x's
-	// not-yet-set default and mis-encode.
+	// field's default *value* is resolved before any default's bytes are
+	// encoded, since encodeDefault fills an absent nested field from its
+	// resolved f.defaultVal. Resolving and encoding in a single pass would
+	// read x's not-yet-set default and mis-encode.
 	t.Run("nested_chained_forward_refs", func(t *testing.T) {
 		s, err := avro.Parse(`{"type":"record","name":"Outer","fields":[
 			{"name":"a","type":"Inner","default":{}},
@@ -8635,9 +8659,9 @@ func TestMatrix_ForwardRefFieldDefaultEncodes(t *testing.T) {
 		}
 	})
 
-	// Boundary: the forward-referenced shape WITHOUT a default must keep
-	// parsing — proves the forward reference itself is accepted and that the
-	// default is the only thing the fix changed.
+	// Boundary: the forward-referenced shape without a default must keep
+	// parsing. That proves the forward reference itself is accepted, and that
+	// the default is the only thing the fix changed.
 	t.Run("forward_ref_without_default_still_parses", func(t *testing.T) {
 		if _, err := avro.Parse(`{"type":"record","name":"R","fields":[
 			{"name":"arr","type":{"type":"array","items":"Inner"}},
@@ -8648,8 +8672,8 @@ func TestMatrix_ForwardRefFieldDefaultEncodes(t *testing.T) {
 	})
 
 	// A forward-referenced default and the equivalent backward-referenced
-	// default (named type declared first) must produce identical results —
-	// the backward-ref path is the long-standing, already-correct one.
+	// default (named type declared first) must produce identical results.
+	// The backward-ref path is the long-standing, already-correct one.
 	t.Run("forward_matches_backward_ref", func(t *testing.T) {
 		fwd := avro.MustParse(`{"type":"record","name":"R","fields":[
 			{"name":"m","type":{"type":"map","values":"Inner"},"default":{"k":{"v":3}}},
@@ -8671,19 +8695,20 @@ func TestMatrix_ForwardRefFieldDefaultEncodes(t *testing.T) {
 	})
 }
 
-// A field default whose type subtree references a record still under construction
-// — a self- or mutual-recursive reference — must encode its binary defaultBytes
-// against the COMPLETE record node, not the partial node that exists while the
-// enclosing record's field loop is still running. Encoding inline at build time
-// sees only the fields declared before the current one and silently drops the
-// rest, producing truncated wire the same schema cannot decode, so the
-// default-encode defers to finalize exactly as a not-yet-wired forward-ref child
-// already does. EncodeJSON re-encodes the default at runtime against the complete
-// node and was already correct, so it is the parity oracle.
+// A field default whose type subtree references a record still under
+// construction, a self- or mutual-recursive reference, must encode its binary
+// defaultBytes against the complete record node. The partial node that exists
+// while the enclosing record's field loop is still running will not do.
+// Encoding inline at build time sees only the fields declared before the
+// current one and silently drops the rest. That produces truncated wire the
+// same schema cannot decode, so the default-encode defers to finalize, exactly
+// as a not-yet-wired forward-ref child already does. EncodeJSON re-encodes the
+// default at runtime against the complete node and was already correct, so we
+// take it as the parity oracle.
 func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
-	// roundTrip encodes a record that omits the defaulted field (triggering
-	// binary default-fill from the precomputed bytes) and asserts the bytes
-	// decode back via the same schema. Returns the decoded value.
+	// roundTrip encodes a record that omits the defaulted field, which triggers
+	// binary default-fill from the precomputed bytes. It asserts the bytes
+	// decode back via the same schema and returns the decoded value.
 	roundTrip := func(t *testing.T, s *avro.Schema, present map[string]any) map[string]any {
 		t.Helper()
 		buf, err := s.AppendEncode(nil, present)
@@ -8743,7 +8768,7 @@ func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
 
 	// Two-level nesting: the inner kids [{tag:8,kids:[]}] must survive. The
 	// pre-fix bug encoded the item against the partial record (tag only), so
-	// the 1- and 2-level defaults produced IDENTICAL truncated bytes; this
+	// the 1- and 2-level defaults produced identical truncated bytes. This
 	// subtest fails on the buggy code for a reason the 1-level case can't show.
 	t.Run("self_array_two_levels", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[
@@ -8767,8 +8792,8 @@ func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
 		}
 	})
 
-	// The recursive field is FIRST, so the record has NO prior fields when the
-	// default is processed — the partial node is entirely empty.
+	// The recursive field is first, so the record has no prior fields when the
+	// default is processed: the partial node is entirely empty.
 	t.Run("self_array_recursive_field_first", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[
 			{"name":"kids","type":{"type":"array","items":"R"},"default":[{"kids":[]}]}]}`)
@@ -8779,9 +8804,9 @@ func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
 	})
 
 	// Mutual recursion: Inner is built while Outer is still under construction,
-	// and Inner.outers' default references Outer. This exercises the shared
-	// in-construction set across the nested builder (Inner is built by a nested
-	// builder; Outer lives in the parent's set).
+	// and Inner.outers' default references Outer. This reaches the shared
+	// in-construction set across the nested builder: Inner is built by a
+	// nested builder, and Outer lives in the parent's set.
 	t.Run("mutual_recursion", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"record","name":"Outer","fields":[
 			{"name":"tag","type":"int"},
@@ -8798,7 +8823,7 @@ func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
 		}
 	})
 
-	// Controls — shapes the deferral must NOT break:
+	// Controls: shapes the deferral must NOT break.
 	t.Run("self_array_empty_default", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[
 			{"name":"tag","type":"int"},
@@ -8820,7 +8845,7 @@ func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
 	})
 
 	// Non-recursive array-of-record default (a backward reference to a complete
-	// type) must still round-trip — it was correct before and after the fix.
+	// type) must still round-trip. It was correct before and after the fix.
 	t.Run("non_recursive_still_works", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[
 			{"name":"tag","type":"int"},
@@ -8836,13 +8861,13 @@ func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
 	})
 }
 
-// A default with no finite encoding — a required field whose default recurses
-// into its own type — must be rejected at Parse, not stack-overflow and not
-// silently produce truncated bytes. encodeDefault fills absent nested fields from
-// their own defaults (unlike validateDefault, which skips absent fields and
-// terminates vacuously), so without a recursion bound such a default recurses
-// until the goroutine stack overflows and the process dies; the maxDepth ceiling
-// turns it into an errTooDeep parse error instead.
+// A default with no finite encoding, a required field whose default recurses
+// into its own type, must be rejected at Parse. It must not stack-overflow and
+// must not silently produce truncated bytes. encodeDefault fills absent nested
+// fields from their own defaults, unlike validateDefault, which skips absent
+// fields and terminates vacuously. So without a recursion bound such a default
+// recurses until the goroutine stack overflows and the process dies. The
+// maxDepth ceiling turns it into an errTooDeep parse error instead.
 func TestMatrix_InfiniteRecursiveDefaultRejected(t *testing.T) {
 	cases := []struct{ name, schema string }{
 		{"self_record", `{"type":"record","name":"R","fields":[
@@ -8858,7 +8883,7 @@ func TestMatrix_InfiniteRecursiveDefaultRejected(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			// The recursion is infinite by construction, so an unbounded
-			// encodeDefault does not run slowly here — it overflows the
+			// encodeDefault does not run slowly here. It overflows the
 			// goroutine stack and takes the process with it. Reaching a
 			// rejection at all is the whole property.
 			if _, err := avro.Parse(c.schema); err == nil {
@@ -8868,20 +8893,20 @@ func TestMatrix_InfiniteRecursiveDefaultRejected(t *testing.T) {
 	}
 }
 
-// SchemaField.Default's documented contract: "Union defaults pick the first
-// branch that accepts the value; the Go type tells you which branch was
-// chosen." For a union whose first branch is a NAME-REFERENCED enum followed
-// by a bytes branch, a valid-member string default must surface as a Go
-// string (enum branch) — matching the wire encoder/decoder, which fills the
-// enum branch — not as []byte (bytes branch). An inline enum already behaves
-// correctly; the name-referenced enum must too.
+// SchemaField.Default's documented contract: union defaults pick the first
+// branch that accepts the value, and the Go type names the branch that was
+// chosen. Take a union whose first branch is a name-referenced enum followed
+// by a bytes branch. A valid-member string default must surface as a Go
+// string (the enum branch), not as []byte (the bytes branch). That matches
+// the wire encoder/decoder, which fills the enum branch. An inline enum
+// already behaves correctly, and the name-referenced enum must too.
 func TestRegression_NameRefEnumUnionDefaultMetadata(t *testing.T) {
 	// wireBranchByte encodes a record omitting the union field so its default
 	// fills, then returns the union branch index byte the wire chose.
 	wireBranchByte := func(t *testing.T, s *avro.Schema, omitField string, present map[string]any) byte {
 		buf := mustAppendEncode(t, s, nil, present)
 		// The enum-typed "def" field encodes first as a single ordinal byte
-		// (0x00 for symbol "A"); the union field's default follows.
+		// (0x00 for symbol "A"). The union field's default follows.
 		return buf[1]
 	}
 
@@ -8898,8 +8923,8 @@ func TestRegression_NameRefEnumUnionDefaultMetadata(t *testing.T) {
 		}
 	})
 
-	// Boundary: a NON-member default ("Z") is rejected by the enum branch on
-	// both surfaces, so both pick the later bytes branch — metadata []byte.
+	// Boundary: a non-member default ("Z") is rejected by the enum branch on
+	// both surfaces, so both pick the later bytes branch: metadata []byte.
 	t.Run("name_ref_enum_non_member_default_picks_bytes", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[
 			{"name":"def","type":{"type":"enum","name":"E","symbols":["A","B"]}},
@@ -8928,15 +8953,14 @@ func TestRegression_NameRefEnumUnionDefaultMetadata(t *testing.T) {
 func isStr(v any) bool   { _, ok := v.(string); return ok }
 func isBytes(v any) bool { _, ok := v.([]byte); return ok }
 
-// A union branch may be a forward reference to a named type declared later
-// in the same schema (a shape twmb deliberately accepts and round-trips on
-// the binary path). The builder leaves node.branches[i] nil for such a
-// branch and patches only the ser/deser function tables in finalize; every
-// path that walks node.branches directly — JSON encode, JSON decode, schema
-// resolution, and union-default validation — must still see the resolved
-// branch node, not the nil placeholder. These pin that finalize writes the
-// resolved node back into the union's branch slice so none of those paths
-// dereferences nil.
+// A union branch may be a forward reference to a named type declared later in
+// the same schema, a shape we deliberately accept and round-trip on the binary
+// path. The builder leaves node.branches[i] nil for such a branch and patches
+// only the ser/deser function tables in finalize. Every path that walks
+// node.branches directly must still see the resolved branch node, not the nil
+// placeholder: JSON encode, JSON decode, schema resolution, and union-default
+// validation. These pin that finalize writes the resolved node back into the
+// union's branch slice, so none of those paths dereferences nil.
 func TestRegression_ForwardRefUnionBranchAllPaths(t *testing.T) {
 	type later struct {
 		V int32 `avro:"v"`
@@ -8999,11 +9023,11 @@ func TestRegression_ForwardRefUnionBranchAllPaths(t *testing.T) {
 	}
 }
 
-// A union field whose first branch is a forward reference can carry a
-// default that matches that branch. The default validator walks
-// node.branches; a nil forward-ref branch made it report "no branch
-// matched" and reject a schema that is byte-equivalent to a backward-ordered
-// one that parses. Pins that field order does not change acceptance.
+// A union field whose first branch is a forward reference can carry a default
+// that matches that branch. The default validator walks node.branches, and a
+// nil forward-ref branch made it report "no branch matched". That rejected a
+// schema byte-equivalent to a backward-ordered one that parses. Here we pin
+// that field order does not change acceptance.
 func TestRegression_ForwardRefUnionDefaultParses(t *testing.T) {
 	const forward = `{"type":"record","name":"R","fields":[
 	  {"name":"u","type":["E","string"],"default":"A"},
@@ -9040,13 +9064,13 @@ func doubleDefaultWireSignbit(t *testing.T, s *avro.Schema) bool {
 	return wire[7]&0x80 != 0 // little-endian double: sign bit in the top byte
 }
 
-// A negative zero written in FLOAT syntax ("-0.0", "-0e0") must keep its IEEE
+// A negative zero written in float syntax ("-0.0", "-0e0") must keep its IEEE
 // sign coherently across the wire, the metadata API (Root().Fields[].Default),
 // and a Root().Schema() rebuild. Before the fix the metadata pipeline collapsed
-// "-0.0" to int64(0) (a big.Rat has no signed zero), so Default reported +0.0
-// while the wire wrote -0.0, and the rebuild re-emitted +0.0 (Go's json.Marshal
-// renders -0.0 as the integer token "-0"). The fix preserves the sign in
-// normalizeJSONNumber and re-emits float syntax ("-0.0") on rebuild.
+// "-0.0" to int64(0), since a big.Rat has no signed zero. So Default reported
+// +0.0 while the wire wrote -0.0, and the rebuild re-emitted +0.0. Go's
+// json.Marshal renders -0.0 as the integer token "-0". The fix preserves the
+// sign in normalizeJSONNumber and re-emits float syntax ("-0.0") on rebuild.
 func TestRegression_NegativeZeroFloatSyntaxDefaultCoherence(t *testing.T) {
 	for _, lit := range []string{"-0.0", "-0e0"} {
 		t.Run(lit, func(t *testing.T) {
@@ -9079,8 +9103,8 @@ func TestRegression_NegativeZeroFloatSyntaxDefaultCoherence(t *testing.T) {
 	}
 }
 
-// Positive zero (either syntax) is unsigned everywhere — the control that the
-// fix's negative-zero detection does not over-trigger.
+// Positive zero (either syntax) is unsigned everywhere. We keep this as the
+// control that the fix's negative-zero detection does not over-trigger.
 func TestNegativeZeroPositiveControls(t *testing.T) {
 	for _, lit := range []string{"0.0", "0"} {
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"d","type":"double","default":` + lit + `}]}`)
@@ -9094,15 +9118,16 @@ func TestNegativeZeroPositiveControls(t *testing.T) {
 	}
 }
 
-// Documented residual: a negative zero written in INTEGER syntax ("-0") is the
-// integer 0. twmb's wire pipeline parses it via strconv.ParseFloat, which keeps
-// the sign to -0.0 on both wires, while the metadata pipeline collapses it to
-// int64(0) → +0.0 and the rebuild re-emits that. The references treat "-0" as
-// sign-less 0 everywhere. Reconciling the wire to +0.0 would require changing
-// the shared json.Number→float parser, which also drives runtime json.Number
-// encode/decode and JSON float formatting, rippling into round-trip stability
-// for genuine -0.0. twmb keeps the wire internally consistent and accepts the
-// metadata-vs-wire divergence on this degenerate literal.
+// Documented residual: a negative zero written in integer syntax ("-0") is the
+// integer 0. Our wire pipeline parses it via strconv.ParseFloat, which keeps
+// the sign to -0.0 on both wires. The metadata pipeline collapses it to
+// int64(0), giving +0.0, and the rebuild re-emits that. The references treat
+// "-0" as sign-less 0 everywhere. Reconciling the wire to +0.0 would require
+// changing the shared json.Number-to-float parser. That parser also drives
+// runtime json.Number encode/decode and JSON float formatting, so the change
+// ripples into round-trip stability for genuine -0.0. We keep the wire
+// internally consistent and accept the metadata-vs-wire divergence on this
+// degenerate literal.
 func TestNegativeZeroIntegerLiteralResidual(t *testing.T) {
 	s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"d","type":"double","default":-0}]}`)
 	if !doubleDefaultWireSignbit(t, s) {
@@ -9112,7 +9137,7 @@ func TestNegativeZeroIntegerLiteralResidual(t *testing.T) {
 	if math.Signbit(def) {
 		t.Error("integer -0: metadata is expected to be +0.0 (int64 collapse) today")
 	}
-	// Binary and JSON wire must agree (the invariant twmb protects).
+	// Binary and JSON wire must agree (the invariant we protect).
 	binWire, _ := s.Encode(map[string]any{})
 	jsonWire, _ := s.AppendEncodeJSON(nil, map[string]any{})
 	var got map[string]any
@@ -9125,8 +9150,8 @@ func TestNegativeZeroIntegerLiteralResidual(t *testing.T) {
 
 // The float32 field arm and the Props metadata arm carry the same float-syntax
 // rule. A "-0.0" default on a float field surfaces as float32(-0.0), and a
-// "-0.0" property surfaces as float64(-0.0) (Java's Jackson DoubleNode), each
-// stable through a Root().Schema() rebuild.
+// "-0.0" property surfaces as float64(-0.0) (Java's Jackson DoubleNode). Each
+// stays stable through a Root().Schema() rebuild.
 func TestRegression_NegativeZeroFloat32AndProps(t *testing.T) {
 	t.Run("float32_field", func(t *testing.T) {
 		s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":-0.0}]}`)
@@ -9163,23 +9188,24 @@ func TestRegression_NegativeZeroFloat32AndProps(t *testing.T) {
 
 // ---------- flat_field_lift_test.go ----------
 
-// The flat (goavro-style) field format puts a complex kind's defining key
-// (symbols / items / values / fields / size) on the FIELD object alongside a
-// bare string type. The wire parser lifts those keys into a nested type
-// definition (liftFlatFieldType), and the metadata walker applies the same lift
-// through the same shared helpers, so Root() describes the post-lift schema. The
-// tests here drive that contract as a matrix:
+// The flat (goavro-style) field format puts a complex kind's defining key on
+// the field object alongside a bare string type. The defining key is one of
+// symbols / items / values / fields / size. The wire parser lifts those keys
+// into a nested type definition (liftFlatFieldType). The metadata walker
+// applies the same lift through the same shared helpers, so Root() describes
+// the post-lift schema. Here we drive that contract as a matrix:
 //
-//   - TestMatrix_FlatFieldLift: kind x namespace-mode. Per cell the flat form
-//     and its handwritten nested twin are wire-identical (Canonical + Rabin —
-//     the lift lives entirely in the parser, so the metadata walk must not
-//     affect the wire tree); Root()'s type node carries the name and defining
-//     content; routed keys do NOT appear in SchemaField.Props; Root().Schema()
-//     rebuilds canonical-identically; and the rebuild's wire matches.
+//   - TestMatrix_FlatFieldLift: kind x namespace-mode. Per cell, the flat form
+//     and its handwritten nested twin are wire-identical, Canonical + Rabin
+//     alike. The lift lives entirely in the parser, so the metadata walk must
+//     not affect the wire tree. Root()'s type node carries the name and the
+//     defining content, and routed keys do NOT appear in SchemaField.Props.
+//     Root().Schema() rebuilds canonical-identically, and the rebuild's wire
+//     matches.
 //   - TestMatrix_FlatFieldLiftLogicals: logicalType / precision / scale route
 //     into the lifted type.
 //   - TestMatrix_FlatFieldLiftNameRefDefaults: a lifted named type is registered
-//     in the metadata name table, so name-referencing fields' defaults coerce
+//     in the metadata name table. Name-referencing fields' defaults then coerce
 //     per the SchemaField.Default contract, across sibling / cross-record
 //     diamond / recursive / SchemaCache cross-parse shapes.
 //   - TestMatrix_FlatFieldLiftNoLiftParity: the boundary cases where the lift
@@ -9280,8 +9306,8 @@ func TestMatrix_FlatFieldLift(t *testing.T) {
 		for _, m := range modes {
 			if m.fieldNS != "" && !c.named {
 				// An explicit namespace on an unnamed flat kind is not
-				// propagated by the lift (the wire parser drops it); the
-				// as-written-fidelity half is pinned separately in
+				// propagated by the lift (the wire parser drops it). We pin
+				// the as-written-fidelity half separately in
 				// TestMatrix_FlatFieldLiftNoLiftParity.
 				continue
 			}
@@ -9295,9 +9321,9 @@ func TestMatrix_FlatFieldLift(t *testing.T) {
 					fieldAttr = fmt.Sprintf(`"namespace":%q,`, m.fieldNS)
 					twinTypeNS = fieldAttr
 				}
-				// Every flat cell carries a doc and a custom property so the
-				// cell also pins their routing (both belong to the TYPE, as
-				// the wire lift routes them).
+				// Every flat cell carries a doc and a custom property, so the
+				// cell also pins their routing. Both belong to the type, as
+				// the wire lift routes them.
 				flat := fmt.Sprintf(
 					`{"type":"record","name":"R",%s"fields":[{"name":%q,"type":%q,%s%s,"doc":"d","x-tag":"v"}]}`,
 					rootAttr, c.fieldName, c.kind, fieldAttr, c.flatAttrs)
@@ -9321,8 +9347,8 @@ func TestMatrix_FlatFieldLift(t *testing.T) {
 					t.Fatalf("Parse nested twin: %v", err)
 				}
 
-				// Wire-tree guard: the lift is a parse-time transform, so the
-				// flat form and the handwritten nested twin are one schema —
+				// Wire-tree guard: the lift is a parse-time transform. The
+				// flat form and the handwritten nested twin are one schema,
 				// canonical form and Rabin fingerprint byte-identical.
 				if !bytes.Equal(sFlat.Canonical(), sNested.Canonical()) {
 					t.Fatalf("canonical(flat) != canonical(nested):\n %s\n %s",
@@ -9346,7 +9372,7 @@ func TestMatrix_FlatFieldLift(t *testing.T) {
 					}
 				}
 				c.check(t, f)
-				// Routed keys belong to the type, not the field: the doc and
+				// Routed keys belong to the type, not the field. The doc and
 				// the custom property surface on the type node, and the
 				// field's own Props are empty.
 				if f.Doc != "" {
@@ -9388,8 +9414,8 @@ func TestMatrix_FlatFieldLift(t *testing.T) {
 }
 
 // logicalType / precision / scale on a flat fixed field route into the
-// lifted type definition (they are type attributes, exactly as the wire
-// lift routes them), and the logical is live on both the original and the
+// lifted type definition. They are type attributes, exactly as the wire
+// lift routes them, and the logical is live on both the original and the
 // rebuilt schema.
 func TestMatrix_FlatFieldLiftLogicals(t *testing.T) {
 	t.Run("duration", func(t *testing.T) {
@@ -9463,13 +9489,13 @@ func TestMatrix_FlatFieldLiftLogicals(t *testing.T) {
 }
 
 // A lifted named type carries the field's name, so it registers in the
-// metadata name table exactly like a nested-form definition: fields that
+// metadata name table exactly like a nested-form definition. Fields that
 // reference it by name coerce their defaults per the SchemaField.Default
 // contract ("bytes and fixed schemas give []byte"; enum defaults stay the
 // member string). Reference shapes: same-record sibling, cross-record
 // diamond, recursive self-reference, and a SchemaCache cross-parse
-// reference (which travels via the cache's self-containment splice in
-// nested form).
+// reference. That last one travels via the cache's self-containment splice
+// in nested form.
 func TestMatrix_FlatFieldLiftNameRefDefaults(t *testing.T) {
 	t.Run("sibling-fixed", func(t *testing.T) {
 		s := mustParse(t, `{"type":"record","name":"R","fields":[
@@ -9482,7 +9508,7 @@ func TestMatrix_FlatFieldLiftNameRefDefaults(t *testing.T) {
 	})
 	t.Run("sibling-enum", func(t *testing.T) {
 		// Contract row: an enum default is already the member string on
-		// both surfaces; the lift must leave it exactly as written.
+		// both surfaces, and the lift must leave it exactly as written.
 		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"E","type":"enum","symbols":["A","B"]},
 			{"name":"E2","type":"E","default":"A"}]}`)
@@ -9511,7 +9537,7 @@ func TestMatrix_FlatFieldLiftNameRefDefaults(t *testing.T) {
 	})
 	t.Run("recursive", func(t *testing.T) {
 		// A flat-defined record that references itself through a union
-		// branch: the lifted definition must be whole so the self-reference
+		// branch. The lifted definition must be whole, so the self-reference
 		// re-binds on the rebuilt schema.
 		s, err := avro.Parse(`{"type":"record","name":"R","fields":[
 			{"name":"Node","type":"record","fields":[
@@ -9596,13 +9622,14 @@ func TestMatrix_FlatFieldLiftNameRefDefaults(t *testing.T) {
 
 // The boundary cases where the flat lift must NOT fire. The wire parser and
 // the metadata walker share one predicate (flatFieldNeedsLift), so each cell
-// asserts the two sides agree: either the schema rejects at parse (neither
-// side ever lifts) or it parses with the field's stray keys preserved
-// as-written in SchemaField.Props and the rebuild canonical-stable.
+// asserts the two sides agree. One arm: the schema rejects at parse, so
+// neither side ever lifts. The other: it parses with the field's stray keys
+// preserved as-written in SchemaField.Props, and the rebuild is
+// canonical-stable.
 func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 	t.Run("defining-key-absent", func(t *testing.T) {
-		// A bare "enum" type with no defining key is not the flat format;
-		// it is an (undefined) name reference and rejects at parse.
+		// A bare "enum" type with no defining key is not the flat format:
+		// it is an (undefined) name reference, and rejects at parse.
 		_, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"e","type":"enum"}]}`)
 		if err == nil {
 			t.Fatal("Parse accepted a bare complex-kind type with no defining key")
@@ -9617,7 +9644,7 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 		}
 	})
 	t.Run("object-type-never-lifts", func(t *testing.T) {
-		// A nested type OBJECT is already a definition; a stray field-level
+		// A nested type object is already a definition. A stray field-level
 		// defining key alongside it is a custom field property on both
 		// sides, never a lift input.
 		s := mustParse(t, `{"type":"record","name":"R","fields":[
@@ -9637,7 +9664,7 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 	})
 	t.Run("name-ref-type-never-lifts", func(t *testing.T) {
 		// A name reference with a stray defining key is a reference plus a
-		// custom field property on both sides — "MyEnum" is not a liftable
+		// custom field property on both sides. "MyEnum" is not a liftable
 		// kind name.
 		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"d","type":{"type":"enum","name":"MyEnum","symbols":["B"]}},
@@ -9672,10 +9699,10 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 		}
 	})
 	t.Run("unnamed-explicit-namespace-stays-on-field", func(t *testing.T) {
-		// The lift propagates "namespace" only for named kinds; on an
+		// The lift propagates "namespace" only for named kinds. On an
 		// unnamed flat kind the wire parser drops it, and the metadata
-		// walker preserves it as-written in the field's Props (the parser
-		// ignores it on re-parse, so the rebuild is canonical-stable).
+		// walker preserves it as-written in the field's Props. The parser
+		// ignores it on re-parse, so the rebuild is canonical-stable.
 		s := mustParse(t, `{"type":"record","name":"R","fields":[
 			{"name":"a","type":"array","items":"int","namespace":"x.y"}]}`)
 		f := s.Root().Fields[0]
@@ -9693,9 +9720,9 @@ func TestMatrix_FlatFieldLiftNoLiftParity(t *testing.T) {
 	})
 }
 
-// Degenerate-cardinality content lifts like any other: an empty symbols
-// list is parseable (degenerate types parse; no value of the enum can ever
-// encode, but the schema itself round-trips), and the lifted node plus its
+// Degenerate-cardinality content lifts like any other. An empty symbols
+// list is parseable: degenerate types parse, and no value of the enum can
+// ever encode, but the schema itself round-trips. The lifted node plus its
 // rebuild carry the empty list faithfully.
 func TestMatrix_FlatFieldLiftDegenerate(t *testing.T) {
 	s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"E","type":"enum","symbols":[]}]}`)
@@ -9713,10 +9740,10 @@ func TestMatrix_FlatFieldLiftDegenerate(t *testing.T) {
 // ---------- tag_contract_test.go ----------
 
 // This file is the doc-contract net for doc.go's "# Struct tags" section: one
-// oracle test per documented claim, so the documented behavior and the
-// implementation cannot drift — the class that produced the omitzero and embed
-// bugs. The oracle for the encode/decode claims is map[string]any, the
-// separately-tested documented record encoding, plus a reflect/unsafe parity
+// oracle test per documented claim. That way the documented behavior and the
+// implementation cannot drift, the class that produced the omitzero and embed
+// bugs. Our oracle for the encode/decode claims is map[string]any, the
+// separately-tested documented record encoding. We add a reflect/unsafe parity
 // check, the unsafe path having its own field handling.
 //
 //   - avro:"name" / empty-name      -> TestTagContract_FieldNameMapping
@@ -9727,8 +9754,8 @@ func TestMatrix_FlatFieldLiftDegenerate(t *testing.T) {
 //   - IsZero()                      -> ser_test.go / deser_test.go
 //   - SchemaFor inference options   -> TestTagContract_SchemaForOptions
 
-// encodeBoth returns the reflect-path wire (R value) and asserts the unsafe
-// path (&R, addressable) produces the identical wire — catching a path that
+// encodeBoth returns the reflect-path wire (R value). It asserts the unsafe
+// path (&R, addressable) produces the identical wire, catching a path that
 // handles a tag differently (as the unsafe omitzero emit did).
 func encodeBoth[T any](t *testing.T, s *avro.Schema, v T) []byte {
 	t.Helper()
@@ -9747,8 +9774,9 @@ func encodeBoth[T any](t *testing.T, s *avro.Schema, v T) []byte {
 }
 
 // TestTagContract_FieldNameMapping: avro:"name" maps the Go field to that Avro
-// field name; an empty tag uses the Go field name. Oracle: a map[string]any
-// keyed by the Avro names encodes to the same wire, and decode round-trips.
+// field name, and an empty tag uses the Go field name. Oracle: a
+// map[string]any keyed by the Avro names encodes to the same wire, and decode
+// round-trips.
 func TestTagContract_FieldNameMapping(t *testing.T) {
 	type R struct {
 		Renamed int32 `avro:"actualName"` // explicit name
@@ -9807,7 +9835,7 @@ func TestTagContract_ExcludeField(t *testing.T) {
 	}
 }
 
-// TestTagContract_Inline: avro:",inline" on a NAMED nested-struct field
+// TestTagContract_Inline: avro:",inline" on a named nested-struct field
 // flattens its fields into the parent record (like anonymous embedding).
 // Oracle: a map with the flattened keys, and SchemaFor produces a flat record.
 func TestTagContract_Inline(t *testing.T) {
@@ -9925,17 +9953,17 @@ func TestTagContract_SchemaForOptions(t *testing.T) {
 
 // ---------- tag_grammar_runtime_test.go ----------
 
-// The runtime field mapper must tokenize the avro struct tag with the SAME
-// grammar SchemaFor uses: a default= value takes the rest of the tag verbatim,
+// The runtime field mapper must tokenize the avro struct tag with the same
+// grammar SchemaFor uses. A default= value takes the rest of the tag verbatim,
 // and a bracketed alias=[...] value is not split on its internal commas. A
-// naive comma split mis-reads a comma inside such a value as a separate option,
-// so a chunk that happens to equal "omitzero"/"inline" spuriously activates
-// that option — corrupting the zero value's wire form or making SchemaFor's own
-// schema unencodable for the type that produced it.
+// naive comma split mis-reads a comma inside such a value as a separate option.
+// A chunk that happens to equal "omitzero"/"inline" then spuriously activates
+// that option. That corrupts the zero value's wire form, or makes SchemaFor's
+// own schema unencodable for the type that produced it.
 
 type tagDefaultWithKeyword struct {
 	// Per doc.go's grammar, default= takes the rest of the tag, so the default
-	// value is the literal string "red,omitzero" — there is NO omitzero option.
+	// value is the literal string "red,omitzero": there is no omitzero option.
 	F string `avro:"f,default=red,omitzero"`
 }
 
@@ -9953,8 +9981,8 @@ func TestRegression_RuntimeTagDefaultValueWithKeyword(t *testing.T) {
 		{"json", func(v any) ([]byte, error) { return s.AppendEncodeJSON(nil, v) }, func(b []byte, v any) error { return s.DecodeJSON(b, v) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// omitzero is NOT a real option here, so the zero value must encode
-			// as itself ("") and survive the round-trip, not be replaced by the
+			// omitzero is not a real option here. The zero value must encode as
+			// itself ("") and survive the round-trip, not be replaced by the
 			// default.
 			wire, err := tc.encode(&tagDefaultWithKeyword{F: ""})
 			if err != nil {
@@ -9975,9 +10003,9 @@ type tagAliasSub struct {
 	A int32 `avro:"a"`
 }
 
-// The alias list contains "inline" as an element. Aliases accept any string, so
-// this is legal; the runtime must not treat the alias element as an inline
-// option (which would flatten the field's subfields and make field "f" missing).
+// The alias list contains "inline" as an element. Aliases accept any string,
+// so this is legal. The runtime must not treat the alias element as an inline
+// option, which would flatten the field's subfields and make field "f" missing.
 type tagAliasListWithKeyword struct {
 	F tagAliasSub `avro:"f,alias=[x,inline,y]"`
 }
@@ -9996,22 +10024,24 @@ func TestRegression_RuntimeTagAliasListWithKeyword(t *testing.T) {
 	}
 }
 
-// A MALFORMED tag (unbalanced bracket) whose comma-separated tail happens to
+// A malformed tag (unbalanced bracket) whose comma-separated tail happens to
 // contain "inline"/"omitzero" must not fire that option. splitTag's grammar
 // cannot tokenize an unbalanced bracket, so the runtime mapper falls back to a
-// lenient form that maps the field by name with NO options — a hand-written-
-// schema user's malformed tag stays usable (no new error) but a bracket typo
-// never silently flips a field between nested-record and inline-flattened (or
-// toggles omitzero). The only difference from the well-formed alias=[x,inline]
-// case above is the missing ']'; the wire shape must be identical.
+// lenient form that maps the field by name with no options. A hand-written-
+// schema user's malformed tag stays usable, with no new error. A bracket typo
+// never silently flips a field between nested-record and inline-flattened, and
+// never toggles omitzero. The only difference from the well-formed
+// alias=[x,inline] case above is the missing ']', so the wire shape must be
+// identical.
 type tagMalformedInlineSub struct {
 	X int32 `avro:"x"`
 	Y int32 `avro:"y"`
 }
 
 func TestRegression_RuntimeMalformedTagFiresNoOption(t *testing.T) {
-	// Field "f" is a nested record in the hand-written schema; the runtime must
-	// map it as such, never flatten its subfields by spuriously firing inline.
+	// Field "f" is a nested record in the hand-written schema. The runtime must
+	// map it as such, and never flatten its subfields by spuriously firing
+	// inline.
 	nested := `{"type":"record","name":"Outer","fields":[
 		{"name":"f","type":{"type":"record","name":"Inner","fields":[
 			{"name":"x","type":"int"},{"name":"y","type":"int"}]}}]}`
@@ -10057,9 +10087,9 @@ func TestRegression_RuntimeMalformedTagFiresNoOption(t *testing.T) {
 	}
 }
 
-// Controls: the documented options must still work when they ARE present, and a
-// plain default= value (no embedded keyword) must round-trip the zero value to
-// the default it actually fills only under omitzero.
+// Controls: the documented options must still work when they *are* present.
+// A plain default= value (no embedded keyword) must round-trip the zero
+// value to the default it actually fills only under omitzero.
 func TestRuntimeTagOptionsStillFire(t *testing.T) {
 	t.Run("omitzero_active_fills_default", func(t *testing.T) {
 		type R struct {
@@ -10069,11 +10099,11 @@ func TestRuntimeTagOptionsStillFire(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SchemaFor: %v", err)
 		}
-		// omitzero IS a real option here. SchemaFor gives the field no
-		// default, so a nullable... actually no default → omitzero on a
-		// non-nullable no-default field encodes the zero value itself. Just
-		// assert it encodes without error on both formats (option recognized,
-		// no spurious behavior change).
+		// omitzero is a real option here. SchemaFor gives the field no
+		// default, and omitzero on a non-nullable no-default field encodes
+		// the zero value itself. We just assert it encodes without error on
+		// both formats: the option is recognized, with no spurious behavior
+		// change.
 		if _, err := s.Encode(&R{}); err != nil {
 			t.Fatalf("binary encode with omitzero: %v", err)
 		}
@@ -10101,15 +10131,15 @@ func TestRuntimeTagOptionsStillFire(t *testing.T) {
 // ---------- schemafor_oneway_text_test.go ----------
 
 // SchemaFor infers a "string" schema for a Go type that implements a text
-// interface only when a string schema ROUND-TRIPS for that type: a string-kind
-// or []byte-slice type round-trips via its kind regardless of which text
-// methods it has, but any OTHER type round-trips only if it implements BOTH an
-// encode-side method (TextMarshaler/AppendText) AND TextUnmarshaler. A
+// interface only when a string schema round-trips for that type. A string-kind
+// or []byte-slice type round-trips via its kind, regardless of which text
+// methods it has. Any other type round-trips only if it implements both an
+// encode-side method (TextMarshaler/AppendText) and TextUnmarshaler. A
 // non-string type implementing exactly one direction would yield a one-
 // directional "string" schema whose unsupported direction fails at Encode or
-// Decode far from the SchemaFor call; SchemaFor cannot guess which direction
-// the caller wants, so it refuses at build time (the same strict-reject posture
-// as logical-type tags on incompatible Go types).
+// Decode, far from the SchemaFor call. SchemaFor cannot guess which direction
+// the caller wants, so it refuses at build time: the same strict-reject posture
+// as logical-type tags on incompatible Go types.
 
 // --- refused: non-string types with exactly one text direction ---
 
@@ -10128,11 +10158,11 @@ type sfTextBoth struct{ S string }
 func (c sfTextBoth) MarshalText() ([]byte, error)  { return []byte(c.S), nil }
 func (c *sfTextBoth) UnmarshalText(b []byte) error { c.S = string(b); return nil }
 
-type sfStrEncodeOnly string // string KIND: round-trips via the reflect.String fallback
+type sfStrEncodeOnly string // string kind: round-trips via the reflect.String fallback
 
 func (s sfStrEncodeOnly) MarshalText() ([]byte, error) { return []byte("v:" + string(s)), nil }
 
-type sfBytesDecodeOnly []byte // []byte KIND: round-trips via the []byte fallback
+type sfBytesDecodeOnly []byte // []byte kind: round-trips via the []byte fallback
 
 func (b *sfBytesDecodeOnly) UnmarshalText(t []byte) error { *b = append((*b)[:0], t...); return nil }
 
@@ -10170,7 +10200,7 @@ func TestRegression_SchemaForOneWayTextRefused(t *testing.T) {
 }
 
 func TestMatrix_SchemaForRoundTrippableTextStillBuilds(t *testing.T) {
-	// Boundary-1: every type for which a string schema DOES round-trip must
+	// Boundary-1: every type for which a string schema does round-trip must
 	// still build and encode/decode. These must not regress when the
 	// one-directional refusal above is added.
 	t.Run("both-directions-struct", func(t *testing.T) {
@@ -10241,19 +10271,19 @@ func assertStringField(t *testing.T, s *avro.Schema) {
 
 // ---------- json_escape_position_test.go ----------
 
-// The Avro-JSON scanner is hand-rolled (json_scan.go), not encoding/json, so its
-// string grammar is a second implementation of one thing and can drift from the
-// stdlib's in either direction. The escape half was pinned by nothing: the
-// rejection table in the conformance suite carried a COMMENT saying this package
-// accepted unknown escapes and left the row out on that basis. The comment was
-// false — every unknown escape is rejected — so the table had no row for correct
+// The Avro-JSON scanner is hand-rolled (json_scan.go), not encoding/json. Its
+// string grammar is a second implementation of one thing, and can drift from
+// the stdlib's in either direction. Nothing pinned the escape half: the
+// conformance suite's rejection table carried a comment saying we accepted
+// unknown escapes, and left the row out on that basis. The comment was false,
+// since every unknown escape is rejected, so the table had no row for correct
 // behavior, and a regression that started accepting them would have passed.
 //
-// This is the class rather than the instance. The axes are the ESCAPE and the
-// POSITION the string occupies, because the scanner is entered from many places
-// and a single top-level probe cannot tell whether they share one string reader.
-// The expectation per cell comes from encoding/json on the same escape in the
-// same JSON string, so no verdict is read off current behavior.
+// This is the class rather than the instance. The axes are the escape and the
+// position the string occupies, because the scanner is entered from many
+// places, and a single top-level probe cannot tell whether they share one
+// string reader. The expectation per cell comes from encoding/json on the same
+// escape in the same JSON string, so no verdict is read off current behavior.
 type jsonEscapeCase struct {
 	name   string
 	escape string // the two-character escape as it appears in the JSON text
@@ -10267,7 +10297,7 @@ var jsonEscapeCases = []jsonEscapeCase{
 	{"c-style-vtab", `\v`},
 	{"c-style-nul", `\0`},
 	{"escaped-space", `\ `},
-	// Legal escapes, so the matrix pins the boundary in BOTH directions: a
+	// Legal escapes, so the matrix pins the boundary in both directions. A
 	// scanner made strict enough to reject the six above must still accept
 	// these, or the fix is a new rejection bug.
 	{"newline", `\n`},
@@ -10321,26 +10351,26 @@ func TestMatrix_JSONEscapeRejectedAtEveryStringPosition(t *testing.T) {
 			t.Run(pos.name+"/"+esc.name, func(t *testing.T) {
 				doc := pos.doc(esc.escape)
 
-				// The oracle: encoding/json's verdict on the SAME escape in a
-				// string, decided outside this package. A bare string literal
-				// is used rather than the whole document so the oracle answers
-				// only the grammar question and not a schema question.
+				// The oracle: encoding/json's verdict on the same escape in a
+				// string, decided outside this package. We use a bare string
+				// literal rather than the whole document, so the oracle answers
+				// only the grammar question, not a schema question.
 				var probe string
 				wantReject := json.Unmarshal([]byte(`"a`+esc.escape+`b"`), &probe) != nil
 
 				var out any
 				err := s.DecodeJSON([]byte(doc), &out)
 
-				// The verdict compared is the ESCAPE GRAMMAR's, not the
-				// document's. Some positions reject a perfectly well-escaped
-				// string for a SCHEMA reason — no enum symbol may contain an
-				// escape at all, a field named `a\nb` is not the field the
-				// record declares — so comparing overall accept/reject would
-				// make those cells measure the schema and score a correct
-				// grammar as a divergence. What the oracle knows is whether
-				// the escape is legal, so that is what is asked of both sides:
-				// an illegal escape must produce an ESCAPE error, and a legal
-				// one must not, whatever the schema then decides.
+				// We compare the escape grammar's verdict, not the document's.
+				// Some positions reject a perfectly well-escaped string for a
+				// schema reason. No enum symbol may contain an escape at all,
+				// and a field named `a\nb` is not the field the record
+				// declares. Comparing overall accept/reject would make those
+				// cells measure the schema and score a correct grammar as a
+				// divergence. What the oracle knows is whether the escape is
+				// legal, so that is what we ask of both sides. An illegal
+				// escape must produce an escape error, and a legal one must
+				// not, whatever the schema then decides.
 				gotEscapeErr := err != nil && strings.Contains(err.Error(), "escape")
 				if gotEscapeErr != wantReject {
 					verb := map[bool]string{true: "an escape error", false: "no escape error"}
@@ -10353,10 +10383,10 @@ func TestMatrix_JSONEscapeRejectedAtEveryStringPosition(t *testing.T) {
 	}
 }
 
-// The matrix above asks whether the verdicts AGREE. Agreement alone is blind to
-// a change that moves both sides, and one side is a stdlib this package does not
-// control — so the count of rejecting escapes is pinned absolutely as well. If
-// the scanner started accepting the unknown six, agreement would break; if some
+// The matrix above asks whether the verdicts agree. Agreement alone is blind
+// to a change that moves both sides, and one side is a stdlib we do not
+// control, so the count of rejecting escapes is pinned absolutely too. If the
+// scanner started accepting the unknown six, agreement would break; if some
 // future stdlib accepted them too, agreement would hold and this would not.
 func TestInvariant_JSONEscapeRejectionCountIsAbsolute(t *testing.T) {
 	const wantRejected = 6
@@ -10381,14 +10411,14 @@ func TestInvariant_JSONEscapeRejectionCountIsAbsolute(t *testing.T) {
 // ---------- json_skip_strict_test.go ----------
 
 // TestMatrix_JSONSkipUnknownFieldRejectsMalformed pins that DecodeJSON
-// validates malformed JSON in UNKNOWN (skipped) record fields, matching its
+// validates malformed JSON in unknown (skipped) record fields, matching its
 // own value path, Java, fastavro, and encoding/json. The skip path
-// (skipValue/skipCompound) was a SECOND hand-rolled parser that delimited but
-// did not validate — the framework's "a hand-rolled parser that replaced a
-// stdlib parser silently dropped the stdlib's rejections" class: the number
-// arm accepted 1.2.3/1e/5., the string arm skipped escapes blindly so \q
-// passed, and skipCompound counted only bracket depth so [}]/{"a" 1}/[1,2,]
-// balanced. The same bytes in a KNOWN field reject.
+// (skipValue/skipCompound) was a second hand-rolled parser that delimited but
+// did not validate. That is the framework's "a hand-rolled parser that
+// replaced a stdlib parser silently dropped the stdlib's rejections" class.
+// The number arm accepted 1.2.3/1e/5., the string arm skipped escapes blindly
+// so \q passed, and skipCompound counted only bracket depth so
+// [}]/{"a" 1}/[1,2,] balanced. The same bytes in a known field reject.
 func TestMatrix_JSONSkipUnknownFieldRejectsMalformed(t *testing.T) {
 	reader := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"known","type":"long"}]}`)
 
@@ -10424,8 +10454,9 @@ func TestMatrix_JSONSkipUnknownFieldRejectsMalformed(t *testing.T) {
 }
 
 // TestMatrix_JSONSkipUnknownFieldAcceptsValid is the control: well-formed
-// JSON in skipped fields must STILL skip cleanly (the strict validator must
-// not reject valid input), including nesting, escapes, and whitespace.
+// JSON in skipped fields must still skip cleanly, and the strict validator
+// must not reject valid input. The cells cover nesting, escapes, and
+// whitespace.
 func TestMatrix_JSONSkipUnknownFieldAcceptsValid(t *testing.T) {
 	reader := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"known","type":"long"}]}`)
 	valid := []string{
@@ -10449,7 +10480,7 @@ func TestMatrix_JSONSkipUnknownFieldAcceptsValid(t *testing.T) {
 }
 
 // TestRegression_JSONSkipDepthBounded confirms the strict (now recursive)
-// skip validator keeps the old iterative skipCompound's DoS resistance: a
+// skip validator keeps the old iterative skipCompound's DoS resistance. A
 // pathologically deep skipped value errors rather than overflowing the stack.
 func TestRegression_JSONSkipDepthBounded(t *testing.T) {
 	reader := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"known","type":"long"}]}`)
@@ -10465,17 +10496,18 @@ func TestRegression_JSONSkipDepthBounded(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Reader-grammar boundary matrices: hand-framed wire for the index and
-// block-header productions, driven through every consuming path — natural
-// decode, resolved decode, and the resolution SKIP path. The framing matrix
-// covers the spec's legal container framings; these cover the index VALUE space
-// and the hostile block-header values that no twmb writer produces.
+// block-header productions. Each matrix drives that wire through every
+// consuming path: natural decode, resolved decode, and the resolution skip
+// path. The framing matrix covers the spec's legal container framings; these
+// cover the index value space and the hostile block-header values no writer of
+// ours produces.
 //
-// The invariant per cell: a loud error or a value-faithful accept — never a
+// The invariant per cell: a loud error or a value-faithful accept, never a
 // silent truncation, silent wrong value, or panic. Accept cells re-encode
-// canonically. The skip path may be MORE lenient than the value path only where
+// canonically. The skip path may be more lenient than the value path only where
 // the discarded content does not affect framing, and that leniency must match
-// the references: Java's ResolvingDecoder skips an enum via readEnum() =
-// readInt() with no symbol check, and fastavro's skip_enum is a bare
+// the references. Java's ResolvingDecoder skips an enum via readEnum() =
+// readInt(), with no symbol check, and fastavro's skip_enum is a bare
 // read_long(). Union indices DO affect framing, so the skip path validates them
 // exactly like the value path.
 // ---------------------------------------------------------------------------
@@ -10535,7 +10567,7 @@ func censusAssertSkipErr(t *testing.T, res *avro.Schema, wire []byte, wantErr st
 }
 
 // putVarintWidthOverflow returns a 5-byte varint whose final byte carries
-// value bits beyond 32 (0x10 > 0x0f) — the width-overflow form readUvarint
+// value bits beyond 32 (0x10 > 0x0f), the width-overflow form readUvarint
 // rejects ("uvarint overflows 32 bits"). Both int-typed productions (enum
 // index, union index) read through readVarint, so the same bytes probe both.
 func putVarintWidthOverflow() []byte {
@@ -10544,15 +10576,15 @@ func putVarintWidthOverflow() []byte {
 
 // TestMatrix_EnumIndexWireGrammar drives the enum-index production's value space
 // through natural decode, resolved-identity decode, and the skip path. The value
-// paths validate the index against the symbol table; the SKIP path deliberately
-// does not, a discarded enum's index being a self-contained varint that cannot
-// affect framing, and neither reference validates it on skip. Width-overflow and
-// truncated varints reject on EVERY path: they are varint-grammar errors, not
-// value errors.
+// paths validate the index against the symbol table. The skip path deliberately
+// does not: a discarded enum's index is a self-contained varint that cannot
+// affect framing, and neither reference validates it on skip. Width-overflow
+// and truncated varints reject on every path: they are varint-grammar errors,
+// not value errors.
 //
-// fastavro calibration (executed, 1.12.2): its VALUE path rejects out-of-range
-// but silently ACCEPTS a negative index via Python list wraparound — an
-// accidental leniency twmb does not copy, Java rejecting and wraparound being
+// fastavro calibration (executed, 1.12.2): its value path rejects out-of-range,
+// but silently accepts a negative index via Python list wraparound. That is an
+// accidental leniency we do not copy, Java rejecting and wraparound being
 // silent wrong output.
 func TestMatrix_EnumIndexWireGrammar(t *testing.T) {
 	const enumSchema = `{"type":"enum","name":"E","symbols":["A","B","C"]}`
@@ -10632,7 +10664,7 @@ func TestMatrix_EnumIndexWireGrammar(t *testing.T) {
 			default:
 				// Varint-grammar errors stay loud through skip. The
 				// "ShortBuffer" sentinel asserts the typed error on the value
-				// paths; on the skip path match its rendered message.
+				// paths; on the skip path, match its rendered message.
 				wantErr := c.wantErr
 				if wantErr == "ShortBuffer" {
 					wantErr = "short buffer"
@@ -10644,13 +10676,13 @@ func TestMatrix_EnumIndexWireGrammar(t *testing.T) {
 }
 
 // TestMatrix_UnionIndexWireGrammar drives the union-index production's value
-// space through natural decode, resolved decode (writer union resolved
-// against a wider reader union, so the resolved deserializer indexes the
-// WRITER's branch table), and the skip path. Unlike enum indices, a union
-// index selects the branch (de)serializer — it affects framing — so ALL
-// three paths validate it identically (skipUnion carries the same
-// [0, branches) guard as deserUnion; fastavro's skip_union likewise indexes
-// writer_schema[index] and rejects out-of-range).
+// space through natural decode, resolved decode, and the skip path. The
+// resolved leg pits the writer union against a wider reader union, so the
+// resolved deserializer indexes the writer's branch table. Unlike enum
+// indices, a union index selects the branch (de)serializer, so it affects
+// framing and all three paths validate it identically. skipUnion carries the
+// same [0, branches) guard as deserUnion, and fastavro's skip_union likewise
+// indexes writer_schema[index] and rejects out-of-range.
 func TestMatrix_UnionIndexWireGrammar(t *testing.T) {
 	const unionSchema = `["int","string","boolean"]`
 	s := avro.MustParse(unionSchema)
@@ -10740,18 +10772,18 @@ func TestMatrix_UnionIndexWireGrammar(t *testing.T) {
 	}
 }
 
-// TestMatrix_NullUnionIndexWireGrammar is the union-SHAPE arm of the index
-// grammar above. That matrix drives one shape — a three-branch union of non-null
-// types — and a two-branch null union does not merely take a narrower version of
-// the same code: it takes a DIFFERENT decoder, with its own single-byte fast
-// path for the two canonical spellings and its own varint fallback. The grammar
-// was proved on the general path and the specialization's copy of it was never
-// read.
+// TestMatrix_NullUnionIndexWireGrammar is the union-shape arm of the index
+// grammar above. That matrix drives one shape, a three-branch union of
+// non-null types. A two-branch null union does not merely take a narrower
+// version of the same code: it takes a different decoder. That decoder has its
+// own single-byte fast path for the two canonical spellings, and its own
+// varint fallback. The grammar was proved on the general path, and the
+// specialization's copy of it was never read.
 //
-// Crossed with the null POSITION, because the specialized decoder does not store
-// which index means null; it stores the VALUE branch's index and derives the
-// other by subtraction, so a cell that only ever put null first cannot tell a
-// correct derivation from one that ignores the position. The cells mirror the
+// We cross with the null position, because the specialized decoder does not
+// store which index means null. It stores the value branch's index and derives
+// the other by subtraction. So a cell that only ever put null first cannot tell
+// a correct derivation from one that ignores the position. The cells mirror the
 // general matrix's names one for one, and the guard below fails if the two drift
 // apart.
 func TestMatrix_NullUnionIndexWireGrammar(t *testing.T) {
@@ -10792,18 +10824,17 @@ func TestMatrix_NullUnionIndexWireGrammar(t *testing.T) {
 				want: int32(7), canonical: canonicalVal},
 			// The two spellings the fast path cannot serve: an overlong
 			// varint has no single byte, so both branches fall through to
-			// the varint arm — the null branch being the one the value
-			// index does not name.
+			// the varint arm. The null branch is the one the value index
+			// does not name.
 			{name: "overlong-null", wire: putZigzagOverlong(nil, sh.nullIdx),
 				isNull: true, canonical: canonicalNull},
 			{name: "overlong-value", wire: append(putZigzagOverlong(nil, sh.valIdx), intPayload...),
 				want: int32(7), canonical: canonicalVal},
-			// A single-byte out-of-range index is rejected by the FAST
-			// path, which reports the offending byte; the overlong
-			// spelling of the same index reaches the varint arm and
-			// reports the decoded index. Two arms, two messages, and the
-			// pair is what shows the fast path is not simply falling
-			// through to the general one.
+			// The fast path rejects a single-byte out-of-range index and
+			// reports the offending byte. The overlong spelling of the
+			// same index reaches the varint arm and reports the decoded
+			// index. Two arms, two messages: the pair shows the fast path
+			// is not simply falling through to the general one.
 			{name: "index-eq-branch-count", wire: putZigzag(nil, 2), wantErr: "invalid null-union index byte"},
 			{name: "negative-index", wire: putZigzag(nil, -1), wantErr: "invalid null-union index byte"},
 			{name: "overlong-index-eq-branch-count", wire: putZigzagOverlong(nil, 2), wantErr: "union index 2 out of range"},
@@ -10861,13 +10892,13 @@ func TestMatrix_NullUnionIndexWireGrammar(t *testing.T) {
 }
 
 // TestMatrix_SkipHostileBlockFraming drives hostile array/map block-header
-// values through the resolution SKIP path (and, where the natural path has
-// no cell of its own, through natural decode too). The skip path has its own
-// block walker (skipBlocks) with two arms the framing matrix's legal
-// variants never stress: the validateByteSize guard on size-prefixed blocks
-// (the skip walker jumps by the wire's byte size, so a negative or
-// over-buffer size must reject loudly BEFORE the jump) and the shared
-// count-vs-buffer / zero-byte-item bounds (checkArrayBlockBounds /
+// values through the resolution skip path. Where the natural path has no
+// cell of its own, the same payload goes through natural decode too. The
+// skip path has its own block walker (skipBlocks), with two arms the framing
+// matrix's legal variants never stress. First, the validateByteSize guard on
+// size-prefixed blocks. The skip walker jumps by the wire's byte size, so a
+// negative or over-buffer size must reject loudly BEFORE the jump. Second,
+// the shared count-vs-buffer / zero-byte-item bounds (checkArrayBlockBounds /
 // checkMapBlockBounds, the same helpers the value path uses).
 func TestMatrix_SkipHostileBlockFraming(t *testing.T) {
 	minInt64 := int64(-1) << 63
@@ -10888,7 +10919,7 @@ func TestMatrix_SkipHostileBlockFraming(t *testing.T) {
 				// MinInt64's negation is itself: readBlockHeader's double-
 				// negative guard must reject before the count is used. The
 				// negative-count grammar says a byte size follows, but the
-				// reject fires first — the payload deliberately ends here.
+				// reject fires first, so the payload deliberately ends here.
 				name:        "minint64-count",
 				payload:     putZigzag(nil, minInt64),
 				wantErr:     "invalid array block count",
@@ -10916,7 +10947,7 @@ func TestMatrix_SkipHostileBlockFraming(t *testing.T) {
 				wantErr: "short buffer for array",
 			},
 			{
-				// A negative string length INSIDE a skipped block: the
+				// A negative string length inside a skipped block: the
 				// per-item skip shares readLength with the value path.
 				name:    "negative-item-length-in-block",
 				payload: putZigzag(putZigzag(nil, 1), -1),
@@ -10963,10 +10994,10 @@ func TestMatrix_SkipHostileBlockFraming(t *testing.T) {
 	})
 
 	t.Run("array-of-null-zero-byte-cap", func(t *testing.T) {
-		// Zero-byte items make the count the only cost driver; the absolute
+		// Zero-byte items make the count the only cost driver. The absolute
 		// cap (maxZeroByteItems = 4096) must hold on the skip path exactly
-		// as on the value path — a foreign writer's wire, since twmb's own
-		// encoder refuses to produce an over-cap array.
+		// as on the value path. This is a foreign writer's wire, since our
+		// own encoder refuses to produce an over-cap array.
 		res := censusResolve(t, `{"type":"array","items":"null"}`)
 		natural := avro.MustParse(`{"type":"array","items":"null"}`)
 
@@ -10984,7 +11015,7 @@ func TestMatrix_SkipHostileBlockFraming(t *testing.T) {
 			t.Fatalf("natural over-cap: err=%v", err)
 		}
 
-		// The cap is CUMULATIVE across blocks: 4096 in one block plus 1 in
+		// The cap is cumulative across blocks: 4096 in one block plus 1 in
 		// the next must reject (a per-block check would pass both).
 		cumulative := putZigzag(putZigzag(putZigzag(nil, 4096), 1), 0)
 		censusAssertSkipErr(t, res, censusSkipWire(cumulative), "zero-byte items exceeds")
@@ -10992,18 +11023,19 @@ func TestMatrix_SkipHostileBlockFraming(t *testing.T) {
 }
 
 // TestMatrix_SkipByteSizeAuthority pins which authority each path trusts when a
-// size-prefixed block's byte size DISAGREES with its items — an inconsistency
-// only a corrupt or adversarial writer produces, where the spec's dual framing
-// genuinely diverges. twmb's VALUE path decodes |count| items and ignores the
-// size, like Java's readArrayStart/arrayNext and fastavro's read path; its SKIP
+// size-prefixed block's byte size disagrees with its items, an inconsistency
+// only a corrupt or adversarial writer produces. There the spec's dual framing
+// genuinely diverges. Our value path decodes |count| items and ignores the
+// size, like Java's readArrayStart/arrayNext and fastavro's read path. Our skip
 // path jumps the declared size and ignores the items, like Java's skip
-// (BinaryDecoder.java:436-444) and compiled fastavro's (whose PURE-PYTHON
-// fallback is instead item-driven, so a no-C-extension install lands where the
-// items end).
+// (BinaryDecoder.java:436-444) and compiled fastavro's. That reference's
+// pure-Python fallback is instead item-driven, so a no-C-extension install
+// lands where the items end.
 //
-// On a lying-size wire each authority lands at a different offset, so the two
-// twmb paths read DIFFERENT trailing fields — pinned so a future "fix" aligning
-// one onto the other trips this cell and forces the cross-impl discussion.
+// On a lying-size wire each authority lands at a different offset, so our two
+// paths read different trailing fields. That is pinned, so a future "fix"
+// aligning one onto the other trips this cell and forces the cross-impl
+// discussion.
 func TestMatrix_SkipByteSizeAuthority(t *testing.T) {
 	item, err := avro.MustParse(`"string"`).AppendEncode(nil, "x")
 	if err != nil {
@@ -11011,7 +11043,7 @@ func TestMatrix_SkipByteSizeAuthority(t *testing.T) {
 	}
 	const keepA, keepB = int32(7), int32(9)
 
-	// Block: count -1, size = len(item)+1+1 — the size annexes the item,
+	// Block: count -1, size = len(item)+1+1, so the size annexes the item,
 	// the array terminator, and keepA's byte.
 	//
 	//   [-1][size][item "x"][0x00 terminator][keepA][0x00 terminator][keepB]
@@ -11030,7 +11062,7 @@ func TestMatrix_SkipByteSizeAuthority(t *testing.T) {
 		{"name":"drop","type":{"type":"array","items":"string"}},
 		{"name":"keep","type":"int"}]}`)
 
-	// Value path (writer schema): items are the authority → keep = keepA.
+	// Value path (writer schema): items are the authority, so keep = keepA.
 	var full map[string]any
 	rest, err := w.Decode(payload, &full)
 	if err != nil {
@@ -11048,8 +11080,8 @@ func TestMatrix_SkipByteSizeAuthority(t *testing.T) {
 		t.Fatal("value path consumed the skip-authority tail")
 	}
 
-	// Skip path (resolved, drop dropped): the size is the authority → the
-	// jump lands past keepA, and the walker reads the SECOND terminator and
+	// Skip path (resolved, drop dropped): the size is the authority. The
+	// jump lands past keepA, and the walker reads the second terminator and
 	// keepB.
 	r := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
 	res, err := avro.Resolve(w, r)
@@ -11066,12 +11098,12 @@ func TestMatrix_SkipByteSizeAuthority(t *testing.T) {
 }
 
 // TestMatrix_SkipNestedContainerFraming extends the flat skip-framing net
-// (TestMatrix_ForeignFramingThroughSkip) to NESTED containers: every legal
+// (TestMatrix_ForeignFramingThroughSkip) to nested containers. Every legal
 // outer framing of an array<array<map<string>>> the reader drops must be
 // consumed exactly, with the trailing field intact. The nested walkers
-// (skipArray → skipArray → skipMap → skipString) each re-enter the shared
-// block grammar, so a framing mishandled at any depth mis-positions every
-// byte after it.
+// (skipArray to skipArray to skipMap to skipString) each re-enter the shared
+// block grammar. A framing mishandled at any depth mis-positions every byte
+// after it.
 func TestMatrix_SkipNestedContainerFraming(t *testing.T) {
 	inner := avro.MustParse(`{"type":"array","items":{"type":"map","values":"string"}}`)
 	items := make([][]byte, 3)
@@ -11096,9 +11128,9 @@ func TestMatrix_SkipNestedContainerFraming(t *testing.T) {
 }
 
 // TestDifferentialFastavroReaderGrammar executes the fastavro side of the
-// census matrices' calibrated claims — each cell pins fastavro's OBSERVED
-// verdict (1.12.2) so an upgrade that changes it flips the cell and forces a
-// deliberate recalibration rather than a silently rotting comment.
+// census matrices' calibrated claims. Each cell pins fastavro's observed
+// verdict (1.12.2). An upgrade that changes it flips the cell and forces a
+// deliberate recalibration, rather than a silently rotting comment.
 func TestDifferentialFastavroReaderGrammar(t *testing.T) {
 	o := startOracle(t)
 
@@ -11126,10 +11158,10 @@ func TestDifferentialFastavroReaderGrammar(t *testing.T) {
 	})
 
 	t.Run("enum value path wraps negative index (calibration)", func(t *testing.T) {
-		// fastavro's read_enum indexes the Python symbol list, so -1 WRAPS to
-		// the last symbol — an accidental leniency twmb does not copy (Java
-		// rejects; silent wraparound is wrong output under cross-impl rule 1).
-		// Pinned at the observed verdict: if a fastavro release starts
+		// fastavro's read_enum indexes the Python symbol list, so -1 wraps to
+		// the last symbol. That is an accidental leniency we do not copy:
+		// Java rejects, and silent wraparound is wrong output under cross-impl
+		// rule 1. Pinned at the observed verdict: if a fastavro release starts
 		// rejecting, this cell flips and the census comments recalibrate.
 		resp := o.call(oracleJob{Op: "decode", Schema: json.RawMessage(enumSchema),
 			Hex: hexOf(putZigzag(nil, -1))})
@@ -11141,8 +11173,8 @@ func TestDifferentialFastavroReaderGrammar(t *testing.T) {
 	})
 
 	t.Run("enum skip path discards out-of-range and negative", func(t *testing.T) {
-		// fastavro's skip_enum is read_long with no symbol lookup — the
-		// reference behavior twmb's skipEnum mirrors.
+		// fastavro's skip_enum is read_long with no symbol lookup: the
+		// reference behavior our skipEnum mirrors.
 		for _, idx := range []int64{3, -1} {
 			wire := censusSkipWire(putZigzag(nil, idx))
 			resp := o.call(oracleJob{Op: "readresolve", Schema: json.RawMessage(writerRec),
@@ -11159,8 +11191,8 @@ func TestDifferentialFastavroReaderGrammar(t *testing.T) {
 	})
 
 	t.Run("union skip path rejects out-of-range", func(t *testing.T) {
-		// fastavro's skip_union indexes writer_schema[index] — same loud
-		// reject as twmb's skipUnion.
+		// fastavro's skip_union indexes writer_schema[index]: the same loud
+		// reject as our skipUnion.
 		writerU := `{"type":"record","name":"R","fields":[
 			{"name":"drop","type":["int","string","boolean"]},
 			{"name":"keep","type":"int"}]}`
@@ -11173,11 +11205,11 @@ func TestDifferentialFastavroReaderGrammar(t *testing.T) {
 	})
 
 	t.Run("bytesize-lie: fastavro compiled skip is size-driven (calibration)", func(t *testing.T) {
-		// The TestMatrix_SkipByteSizeAuthority wire: fastavro's COMPILED
+		// The TestMatrix_SkipByteSizeAuthority wire: fastavro's compiled
 		// skip (_read.pyx skip_array) jumps the declared size exactly like
-		// twmb's skip and Java's doSkipItems, landing on keep=9. (Its
-		// pure-Python fallback would read keep=7 — item-driven; this cell
-		// pins the compiled implementation every normal install runs.)
+		// our skip and Java's doSkipItems, landing on keep=9. Its
+		// pure-Python fallback is item-driven and would read keep=7; this
+		// cell pins the compiled implementation every normal install runs.
 		item, _ := avro.MustParse(`"string"`).AppendEncode(nil, "x")
 		var payload []byte
 		payload = putZigzag(payload, -1)
@@ -11203,9 +11235,9 @@ func TestDifferentialFastavroReaderGrammar(t *testing.T) {
 	})
 
 	t.Run("zero-byte over-cap: fastavro reads uncapped (calibration)", func(t *testing.T) {
-		// fastavro has no zero-byte-item cap — it reads 4097 nulls happily.
-		// twmb's reject is the documented DOS-resistance divergence
-		// (maxZeroByteItems); this cell witnesses the reference's accept so
+		// fastavro has no zero-byte-item cap: it reads 4097 nulls happily.
+		// Our reject is the documented DOS-resistance divergence
+		// (maxZeroByteItems); this cell witnesses the reference's accept, so
 		// the divergence stays an executed fact, not a stale claim.
 		writerN := `{"type":"record","name":"R","fields":[
 			{"name":"drop","type":{"type":"array","items":"null"}},
@@ -11226,19 +11258,19 @@ func TestDifferentialFastavroReaderGrammar(t *testing.T) {
 
 // TestDifferentialFastavroPromotion executes every spec promotion pair, plus the
 // two value-level resolution features, against fastavro's resolved read. Per
-// cell the writer wire is byte-parity-checked, then the SAME wire is
+// cell the writer wire is byte-parity-checked, then the same wire is
 // resolved-read by both and the values compared. A third leg drives the
-// WRITER-SHAPED JSON through the resolved schema's DecodeJSON, which must land
-// exactly where the binary resolved read lands — the wire format cannot change
+// writer-shaped JSON through the resolved schema's DecodeJSON. It must land
+// exactly where the binary resolved read lands: the wire format cannot change
 // resolution semantics.
 //
-// Mantissa-boundary values make the reader-width contract observable: twmb
-// converts through the reader's width, matching Java's ResolvingDecoder
-// readDouble(), while fastavro (observed 1.12.2) returns the writer's value at
-// full precision. That divergence and the bytes→string one — twmb preserves the
-// raw bytes in the Go string as Java's Utf8 does, fastavro's strict utf-8 decode
-// rejects — are pinned at the observed verdicts so a release that changes either
-// forces a deliberate recalibration.
+// Mantissa-boundary values make the reader-width contract observable: we
+// convert through the reader's width, matching Java's ResolvingDecoder
+// readDouble(). fastavro (observed 1.12.2) returns the writer's value at full
+// precision. The bytes-to-string cell is the other divergence: we preserve
+// the raw bytes in the Go string as Java's Utf8 does, and fastavro's strict
+// utf-8 decode rejects. Both are pinned at the observed verdicts, so a release
+// that changes either forces a deliberate recalibration.
 func TestDifferentialFastavroPromotion(t *testing.T) {
 	o := startOracle(t)
 
@@ -11254,23 +11286,23 @@ func TestDifferentialFastavroPromotion(t *testing.T) {
 		kind    string // oracle Kind tag ("bytes" for base64 transport)
 		wJSON   string // the writer-SHAPED Avro-JSON text of val (bytes are codepoint strings)
 		want    any    // twmb resolved-decode expectation (into an any target)
-		// wantF64: non-nil for float-reader cells — ALSO decode into a
-		// float64 target and assert this value. An any target materializes
-		// the reader's float32 and re-rounds at assignment, which would MASK
-		// a conversion arm that lost the float32 narrowing; the float64
-		// target observes the intermediate directly.
+		// wantF64: non-nil for float-reader cells, meaning we also decode
+		// into a float64 target and assert this value. An any target
+		// materializes the reader's float32 and re-rounds at assignment,
+		// which would mask a conversion arm that lost the float32 narrowing.
+		// The float64 target observes the intermediate directly.
 		wantF64 any
 
 		// fastavro's resolved read, exactly one of:
-		//   fastWant  — assert values[0] equals this (JSON-decoded form:
-		//               numbers arrive as float64, records as map[string]any)
-		//   fastBytes — the datum is Python bytes: resolution ACCEPT is
-		//               classified via the oracle's "not JSON serializable"
-		//               transport error (schemaless_reader returned; a
-		//               resolution reject raises before the response dumps)
-		//   fastErr   — assert NOT ok and the error contains this (a
-		//               calibrated divergence: fastavro rejects wire twmb
-		//               and Java accept)
+		//   fastWant:  assert values[0] equals this (JSON-decoded form:
+		//              numbers arrive as float64, records as map[string]any).
+		//   fastBytes: the datum is Python bytes, so a resolution accept is
+		//              classified via the oracle's "not JSON serializable"
+		//              transport error. schemaless_reader returned; a
+		//              resolution reject raises before the response dumps.
+		//   fastErr:   assert NOT ok and the error contains this. A
+		//              calibrated divergence: fastavro rejects wire we and
+		//              Java accept.
 		fastWant  any
 		fastBytes bool
 		fastErr   string
@@ -11291,14 +11323,14 @@ func TestDifferentialFastavroPromotion(t *testing.T) {
 			fastWant: float64(f32b + 1)}, // twmb+Java float32-round; fastavro full precision
 		{name: "long-to-double-mantissa", writer: `"long"`, reader: `"double"`,
 			val: int64(f64b + 1), valJSON: `9007199254740993`, wJSON: `9007199254740993`,
-			// 2^53+1 rounds to 2^53 at the float64 mantissa on BOTH sides
-			// (twmb converts; fastavro's raw int collapses identically in
-			// the JSON transport), so the cell agrees while still proving
+			// 2^53+1 rounds to 2^53 at the float64 mantissa on both sides.
+			// We convert, and fastavro's raw int collapses identically in
+			// the JSON transport. So the cell agrees, while still proving
 			// the wire carried the unrounded long.
 			want: float64(f64b), fastWant: float64(f64b)},
 		{name: "float-to-double", writer: `"float"`, reader: `"double"`,
 			// 0.1 is not float32-exact: the widened double must be the
-			// float32 value 0.10000000149011612, not 0.1 — both impls widen
+			// float32 value 0.10000000149011612, not 0.1. Both impls widen
 			// the wire's float32 bit pattern.
 			val: float32(0.1), valJSON: `0.1`, wJSON: `0.1`,
 			want: float64(float32(0.1)), fastWant: float64(float32(0.1))},
@@ -11307,7 +11339,7 @@ func TestDifferentialFastavroPromotion(t *testing.T) {
 			want: []byte("h✓i"), fastBytes: true},
 		{name: "bytes-to-string-valid-utf8", writer: `"bytes"`, reader: `"string"`,
 			val: []byte("ok✓"), valJSON: `"b2vinJM="`, kind: "bytes",
-			// bytes as Avro-JSON: each BYTE codepoint-mapped (utf-8 e2 9c 93).
+			// bytes as Avro-JSON: each byte codepoint-mapped (utf-8 e2 9c 93).
 			wJSON: `"ok\u00e2\u009c\u0093"`,
 			want:  "ok✓", fastWant: "ok✓"},
 		{name: "bytes-to-string-invalid-utf8", writer: `"bytes"`, reader: `"string"`,
@@ -11336,8 +11368,8 @@ func TestDifferentialFastavroPromotion(t *testing.T) {
 
 			// Writer-wire byte parity: both impls must produce the same
 			// bytes for the writer value, so the resolved reads below
-			// consume ONE agreed wire (none of these schemas contain maps,
-			// whose entry order would legitimately differ).
+			// consume one agreed wire. None of these schemas contain maps,
+			// whose entry order would legitimately differ.
 			enc := o.call(oracleJob{Op: "encode", Schema: json.RawMessage(c.writer),
 				Value: json.RawMessage(c.valJSON), Kind: c.kind})
 			if !enc.OK {
@@ -11421,21 +11453,21 @@ func TestDifferentialFastavroPromotion(t *testing.T) {
 
 // ---------- encode_error_identity_census_test.go ----------
 
-// Error-identity contract (doc.go "# Errors"): encode-side USER-VALUE failures
-// are errors.As-able to *SemanticError on BOTH wires; decode-side WIRE-CONTENT
+// Error-identity contract (doc.go "# Errors"): encode-side user-value failures
+// are errors.As-able to *SemanticError on both wires. Decode-side wire-content
 // failures are plain errors on both. Three encode-side families deliberately
-// agree as PLAIN on both wires instead: a TYPED nil pointer, where both surface
-// the shared indirection sentinel; a CustomType.Encode callback error, where the
-// user's own error value is returned verbatim; and an invalid UUID string
-// against fixed(16)+uuid, where parseUUID's error is bare.
+// agree as plain on both wires instead. On a typed nil pointer both surface the
+// shared indirection sentinel. On a CustomType.Encode callback error the user's
+// own error value is returned verbatim, and on an invalid UUID string against
+// fixed(16)+uuid parseUUID's error is bare.
 //
-// Identity must be asserted at TOP LEVEL: at record positions recordFieldError
-// wraps EVERY field error in a *SemanticError, so a record-position probe cannot
-// distinguish a wrapped arm from an unwrapped one — which the record-position
-// subtest documents.
+// We assert identity at top level: at record positions recordFieldError wraps
+// every field error in a *SemanticError. A record-position probe therefore
+// cannot distinguish a wrapped arm from an unwrapped one, which the
+// record-position subtest documents.
 
-// encodeIdentityBothWires runs v through Encode and EncodeJSON and
-// asserts both reject it with the same *SemanticError verdict.
+// encodeIdentityBothWires runs v through Encode and EncodeJSON, and we assert
+// both reject it with the same *SemanticError verdict.
 func encodeIdentityBothWires(t *testing.T, schema string, v any, wantSemantic bool) {
 	t.Helper()
 	s := mustParse(t, schema)
@@ -11459,14 +11491,14 @@ func encodeIdentityBothWires(t *testing.T, schema string, v any, wantSemantic bo
 	}
 }
 
-// TestMatrix_UntypedNilEncodeSemanticErrorBothWires pins that an
-// UNTYPED nil at top level against a non-nullable schema is an
-// encode-side user-value failure carrying *SemanticError identity on
-// both wire formats — Encode wraps it at the entry guard (and via the
-// union serializer), and EncodeJSON must match. A TYPED nil pointer is
+// TestMatrix_UntypedNilEncodeSemanticErrorBothWires pins one family: an
+// untyped nil at top level against a non-nullable schema is an
+// encode-side user-value failure. It carries *SemanticError identity on
+// both wire formats, so Encode wraps it at the entry guard (and via the
+// union serializer), and EncodeJSON must match. A typed nil pointer is
 // a different family: both wires surface the plain indirection
-// sentinel, and nil against a null schema or a union with a null
-// branch succeeds on both wires.
+// sentinel. Nil against a null schema or a union with a null branch
+// succeeds on both wires.
 func TestMatrix_UntypedNilEncodeSemanticErrorBothWires(t *testing.T) {
 	t.Run("non-nullable primitive", func(t *testing.T) {
 		encodeIdentityBothWires(t, `"string"`, nil, true)
@@ -11500,11 +11532,11 @@ func TestMatrix_UntypedNilEncodeSemanticErrorBothWires(t *testing.T) {
 }
 
 // TestMatrix_EncodeErrorIdentityCensus drives one triggering input per
-// error-return family at TOP LEVEL through both encoders and asserts
-// the family's identity contract. The census exists so a new or edited
-// error return in either encoder that drops (or spuriously adds)
-// *SemanticError identity for a whole family fails here rather than
-// surfacing as a per-wire errors.As difference in user code.
+// error-return family at top level through both encoders, and we assert
+// the family's identity contract. The census exists to catch a new or
+// edited error return in either encoder. One that drops (or spuriously
+// adds) *SemanticError identity for a whole family fails here, rather
+// than surfacing as a per-wire errors.As difference in user code.
 func TestMatrix_EncodeErrorIdentityCensus(t *testing.T) {
 	semantic := []struct {
 		name   string
@@ -11523,10 +11555,10 @@ func TestMatrix_EncodeErrorIdentityCensus(t *testing.T) {
 		{"fixed size mismatch", `{"type":"fixed","name":"F","size":4}`, []byte{1, 2, 3}},
 		{"missing defaultless field", `{"type":"record","name":"R","fields":[{"name":"f","type":"int"}]}`, map[string]any{}},
 		{"union no branch matched", `["int","string"]`, struct{ X int }{1}},
-		// The no-match wrap must be UNCONDITIONAL (as serUnion's is), not
-		// inherited from the last branch error's chain: a typed nil's
-		// per-branch failure is the PLAIN indirection sentinel, so this
-		// row fails if the union dispatcher forwards it bare.
+		// The no-match wrap must be unconditional, as serUnion's is,
+		// not inherited from the last branch error's chain. A typed
+		// nil's per-branch failure is the plain indirection sentinel,
+		// so this row fails if the union dispatcher forwards it bare.
 		{"union no branch matched, typed nil", `["int","string"]`, (*string)(nil)},
 		{"decimal precision exceeded", `{"type":"bytes","logicalType":"decimal","precision":2,"scale":0}`, big.NewRat(12345, 1)},
 		{"decimal non-numeric string", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":0}`, "12x"},
@@ -11576,7 +11608,7 @@ func TestMatrix_EncodeErrorIdentityCensus(t *testing.T) {
 		}
 	})
 
-	// Decode-side WIRE-CONTENT failures stay plain on both wire formats:
+	// Decode-side wire-content failures stay plain on both wire formats:
 	// the wire named a symbol/index that the schema does not have.
 	t.Run("decode/binary enum ordinal out of range is plain", func(t *testing.T) {
 		s := mustParse(t, `{"type":"enum","name":"E","symbols":["A","B"]}`)
@@ -11607,9 +11639,9 @@ func TestMatrix_EncodeErrorIdentityCensus(t *testing.T) {
 	})
 
 	// Record positions mask family identity: recordFieldError wraps every
-	// field error into a *SemanticError with the field path, so even the
+	// field error into a *SemanticError with the field path. Even the
 	// families that are plain at top level carry SemanticError identity
-	// here. This is why every row above asserts at top level.
+	// here. That is why every row above asserts at top level.
 	t.Run("record position wraps every family", func(t *testing.T) {
 		s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"f","type":"string"}]}`)
 		in := map[string]any{"f": nil} // untyped nil field value
@@ -11628,28 +11660,28 @@ func TestMatrix_EncodeErrorIdentityCensus(t *testing.T) {
 // ---------- cap_compliance_table_test.go ----------
 
 // ---------------------------------------------------------------------------
-// The DoS-cap PRODUCER-COMPLIANCE table.
+// The DoS-cap producer-compliance table.
 //
 // The rule: every reader-side cap needs a producer-side compliance check, with
-// one documented exception. What the table adds is that the rule is asked of
-// every cap and of every CARRIER, because a cap is not one question — the same
-// bound is reachable through a wire VALUE and through a schema DEFAULT, and
-// defaults are pre-encoded by a separate walk sharing no code with the
-// serializers. Four rounds in a row found the value-carrier face of a cap, fixed
-// it, and left the default-carrier face for the next round.
+// one documented exception. What the table adds is that we ask the rule of
+// every cap and of every carrier, because a cap is not one question. The same
+// bound is reachable through a wire value and through a schema default.
+// Defaults are also pre-encoded by a separate walk sharing no code with the
+// serializers. Four rounds in a row found the value-carrier face of a cap,
+// fixed it, and left the default-carrier face for the next round.
 //
 // Three things make this a table rather than a pile of pins:
 //
-//   - Every cap carries an APPLICABILITY verdict with its reason. Not every cap
+//   - Every cap carries an applicability verdict with its reason. Not every cap
 //     bounds a wire value: one bounds a Go target type, another a pre-allocation
 //     hint that refuses nothing. "Not applicable, because X" is a real cell.
-//   - Expectations come from the RULE, not from what the code does today. The
-//     invariant is PER-WIRE self-consistency — if Encode on a wire succeeds,
-//     Decode on that same wire must — and no more. It is deliberately NOT "the
-//     cap rejects on every wire": maxZeroByteItems is binary-only, because JSON
-//     text cannot amplify, and demanding uniform rejection would encode a false
-//     invariant and fail a correct implementation.
-//   - A cap added later lands with no row and FAILS until someone classifies it
+//   - Expectations come from the rule, not from what the code does today. The
+//     invariant is per-wire self-consistency: if Encode on a wire succeeds
+//     then Decode on that same wire must, and no more. It is deliberately NOT
+//     "the cap rejects on every wire": maxZeroByteItems is binary-only,
+//     because JSON text cannot amplify. Demanding uniform rejection would
+//     encode a false invariant and fail a correct implementation.
+//   - A cap added later lands with no row and fails until someone classifies it
 //     (TestInvariant_EveryCapIsClassified). Without that the table is a snapshot
 //     of today's caps and the next one repeats the last four rounds.
 // ---------------------------------------------------------------------------
@@ -11659,7 +11691,7 @@ type capApplicability string
 const (
 	// capWireValue: the cap refuses wire content, so both carriers must comply.
 	capWireValue capApplicability = "wire-value"
-	// capReaderOnly: reader-only BY DESIGN — the documented exception. The
+	// capReaderOnly: reader-only by design, the documented exception. The
 	// table asserts the exception rather than closing it.
 	capReaderOnly capApplicability = "reader-only-by-design"
 	// capNotApplicable: the cap has no wire-value face at all.
@@ -11828,7 +11860,7 @@ func capRows() []capRow {
 		},
 
 		// Below: bounds the #11 entry does not enumerate. The completeness
-		// guard surfaced them, which is the guard doing its job — the written
+		// guard surfaced them, which is the guard doing its job; the written
 		// list was never the set of caps.
 		{
 			konst:         "maxSchemaJSONBytes",
@@ -11882,12 +11914,12 @@ func capRows() []capRow {
 }
 
 // nestings are the shapes the leaf can sit at. This is the axis the
-// default-carrier bug turned on: the charge was asked of the FIELD's kind, so
+// default-carrier bug turned on. The charge was asked of the field's kind, so
 // every nested leaf went unasked, and no existing generator varied it.
 var capNestings = []struct {
 	name string
 	// arm is the encodeDefaultDepth case this nesting drives, or "" for the
-	// flat shape which drives no composite arm. The completeness guard matches
+	// flat shape, which drives no composite arm. The completeness guard matches
 	// on it, so a composite arm with no nesting here fails loudly.
 	arm string
 	// field renders the record field holding the leaf, given the leaf schema
@@ -11899,7 +11931,7 @@ var capNestings = []struct {
 	{"flat", "", func(inner, d string) string { return fieldOf("d", inner, d) },
 		func(leaf any) any { return leaf }},
 	{"in-record", "record", func(inner, d string) string {
-		// The default has to sit on the OUTER field: a record-typed field
+		// The default has to sit on the outer field: a record-typed field
 		// defaults as a whole object. Hanging it on the inner field instead
 		// leaves the outer one defaultless, and the cell then measures
 		// "missing key" rather than the cap.
@@ -11911,9 +11943,9 @@ var capNestings = []struct {
 	{"in-map", "map", func(inner, d string) string {
 		return fieldOf("d", `{"type":"map","values":`+inner+`}`, objOf(d))
 	}, func(leaf any) any { return map[string]any{"k": leaf} }},
-	// A union default corresponds to the FIRST branch, so the leaf's own
+	// A union default corresponds to the first branch, so the leaf's own
 	// literal is the union's literal. This arm hid every cap until it was
-	// driven: it selects a branch by trying each and keeping the first that
+	// driven. It selects a branch by trying each and keeping the first that
 	// encodes, and it charged nothing at all.
 	{"in-union", "union", func(inner, d string) string {
 		return fieldOf("d", `[`+inner+`,"null"]`, d)
@@ -11984,7 +12016,7 @@ func TestMatrix_CapProducerCompliance(t *testing.T) {
 						}
 						s, err := avro.Parse(schema)
 						if err != nil {
-							// The rule forbids a PARSE reject for an
+							// The rule forbids a parse reject for an
 							// unwritable default: a reader that drops the
 							// field must still be able to read its data.
 							t.Fatalf("schema must parse; the bound belongs on encode: %v", err)
@@ -12002,9 +12034,9 @@ func recordOf(field string) string {
 	return `{"type":"record","name":"R","fields":[` + field + `,{"name":"keep","type":"int"}]}`
 }
 
-// capCheckWires asserts PER-WIRE self-consistency: on each wire independently,
-// if Encode succeeded then Decode of that same output must succeed. It does NOT
-// require the cap to reject on every wire — some caps are binary-only because
+// capCheckWires asserts per-wire self-consistency: on each wire independently,
+// if Encode succeeded then Decode of that same output must succeed. We do NOT
+// require the cap to reject on every wire. Some caps are binary-only because
 // the JSON representation cannot amplify, and demanding uniform rejection would
 // encode an invariant the rule does not state.
 func capCheckWires(t *testing.T, s *avro.Schema, val any, over bool) {
@@ -12042,8 +12074,9 @@ func capCheckWires(t *testing.T, s *avro.Schema, val any, over bool) {
 			}
 		}
 	}
-	// At or under the bound the value must actually make it onto the wire, or
-	// the check moved the boundary inward and the cells above pass vacuously.
+	// At or under the bound the value must actually make it onto the wire.
+	// Otherwise the check moved the boundary inward and the cells above pass
+	// vacuously.
 	if !over {
 		if _, err := s.Encode(val); err != nil {
 			t.Fatalf("at-cap must still encode: %v", err)
@@ -12051,19 +12084,20 @@ func capCheckWires(t *testing.T, s *avro.Schema, val any, over bool) {
 	}
 }
 
-// TestInvariant_OCFBlockCapsStayReaderOnly asserts the EXCEPTION as a cell. The
-// block-size pair is reader-only BY DESIGN, and the type system already says so:
-// WithMaxBlockBytes is a ReaderOpt, so it cannot even be handed to NewWriter —
-// a stronger statement of the exception than any behavioral probe, since producer
-// enforcement is not merely absent but unexpressible. It was implemented once and
-// reverted (it traps data at flush and leaves an unclosable compressed-size
-// residual), so this cell exists to fail if a later round re-adds it.
+// TestInvariant_OCFBlockCapsStayReaderOnly asserts the exception as a cell. The
+// block-size pair is reader-only by design, and the type system says so
+// already. WithMaxBlockBytes is a ReaderOpt, so it cannot even be handed to
+// NewWriter. That is a stronger statement of the exception than any behavioral
+// probe: producer enforcement is not merely absent but unexpressible. It was
+// implemented once and reverted, since it traps data at flush and leaves an
+// unclosable compressed-size residual. We keep this cell to fail if a later
+// round re-adds it.
 func TestInvariant_OCFBlockCapsStayReaderOnly(t *testing.T) {
 	var _ ocf.ReaderOpt = ocf.WithMaxBlockBytes(1 << 10)
 	var _ ocf.ReaderOpt = ocf.WithMaxDecompressedBlockBytes(1 << 10)
 
 	// And behaviorally: a writer given a datum far larger than any reader
-	// bound still WRITES it, because the bound governs reading.
+	// bound still writes it, because the bound governs reading.
 	s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"b","type":"bytes"}]}`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
@@ -12071,7 +12105,7 @@ func TestInvariant_OCFBlockCapsStayReaderOnly(t *testing.T) {
 		t.Fatalf("the block-size cap is reader-only by design; the writer must not enforce it: %v", err)
 	}
 	mustClose(t, w)
-	// The matching reader bound then refuses that file — the exception is a
+	// The matching reader bound then refuses that file: the exception is a
 	// working reader-side bound, not an absent one.
 	if _, err := ocf.NewReader(bytes.NewReader(buf.Bytes()), ocf.WithMaxBlockBytes(1<<10)); err == nil {
 		var sink any
@@ -12083,15 +12117,15 @@ func TestInvariant_OCFBlockCapsStayReaderOnly(t *testing.T) {
 }
 
 // capNamePattern matches the identifiers this family names its bounds with.
-// It is applied only to CONST declarations — an assignment like
-// `maxBlockBytes = o.n` inside a constructor is a local binding of a bound
-// declared elsewhere, not a new bound, and matching it would make the guard
-// demand rows for things that are not caps.
+// We apply it only to const declarations: an assignment like
+// `maxBlockBytes = o.n` inside a constructor binds a bound declared elsewhere.
+// It is not a new bound, and matching it would make the guard demand rows for
+// things that are not caps.
 var capNamePattern = regexp.MustCompile(`^(max[A-Z]\w*|default[A-Z]\w*Bytes|\w*SafetyLimit|\w*ScaleLimit)$`)
 
 var capConstDecl = regexp.MustCompile(`^\s*(?:const\s+)?([A-Za-z_]\w*)\s+=`)
 
-// scanCapConsts returns every cap-shaped CONSTANT declared in path.
+// scanCapConsts returns every cap-shaped constant declared in path.
 func scanCapConsts(src string) []string {
 	var out []string
 	inBlock := false
@@ -12124,23 +12158,29 @@ func scanCapConsts(src string) []string {
 var capNotABound = map[string]string{
 	"maxVarintLen":  "an encoding width, not a bound on accepted input",
 	"maxVarlongLen": "an encoding width, not a bound on accepted input",
-	// Saturating a magnitude REFUSES nothing: a schema declaring a fixed
+	// Saturating a magnitude refuses nothing: a schema declaring a fixed
 	// larger than this still parses, encodes and decodes exactly as before.
 	// The ceiling only keeps arithmetic on that magnitude inside the integer
-	// range, so there is no over-cap input to build and no producer-side
+	// range. There is then no over-cap input to build and no producer-side
 	// compliance to check. Its own guards are the ones that watch the
 	// arithmetic (magnitude_arithmetic_test.go).
 	"maxSchemaMagnitude": "an arithmetic ceiling, not a bound on accepted input — nothing is refused for exceeding it",
-	// Exhausting the walk allowance REFUSES nothing either: the walk stops
-	// deriving a tighter per-element minimum and falls back to the same
-	// conservative stand-in it uses for a cycle, making the block bound LOOSER. A
-	// schema past the allowance parses, encodes and decodes exactly as before, so
-	// there is no over-allowance input to build and no producer-side compliance to
-	// check. Two guards watch it instead: agreement with an un-memoized walk,
-	// where an allowance low enough to change an answer would surface, and the
-	// width cells, where an allowance counting the wrong UNIT would — this one is
-	// charged per child examined, since entering a node costs its child count.
+	// Exhausting the walk allowance refuses nothing either: the walk stops
+	// deriving a tighter per-element minimum. It falls back to the same
+	// conservative stand-in it uses for a cycle, making the block bound
+	// looser. A schema past the allowance parses, encodes and decodes exactly
+	// as before, so there is no over-allowance input to build and no
+	// producer-side compliance to check. Two guards watch it instead: one is
+	// agreement with an un-memoized walk, where an allowance low enough to
+	// change an answer would surface. The other is the width cells, where an
+	// allowance counting the wrong unit would. This one is charged per child
+	// examined, since entering a node costs its child count.
 	"maxMinBytesWork": "a walk allowance that loosens a derived bound, not a bound on accepted input — nothing is refused for exceeding it",
+	// ExpandReferences is a metadata-API transform, not a reader: it takes a
+	// tree the parser already accepted and decides how much of it to copy. Over
+	// the ceiling it returns the same tree unexpanded, so no input is refused
+	// and no producer has anything to comply with.
+	"maxExpandedNodes": "a ceiling on how large a copy ExpandReferences will build, not a bound on accepted input — over it the tree comes back unexpanded rather than rejected",
 }
 
 // TestInvariant_EveryCapIsClassified is the completeness half: a cap added
@@ -12196,11 +12236,12 @@ func TestInvariant_EveryCapIsClassified(t *testing.T) {
 	}
 }
 
-// scanDefaultWalkCompositeArms returns the kinds encodeDefaultDepth RECURSES
-// through — the arms that can nest a cap's carrier below the field's own node.
-// It is derived from the source rather than listed, because a hand-listed axis
-// is what let the union arm hide: it was a composite the table never drove, and
-// a longer hand list would only move the blind spot to the next arm.
+// scanDefaultWalkCompositeArms returns the kinds encodeDefaultDepth recurses
+// through, the arms that can nest a cap's carrier below the field's own
+// node. We derive it from the source rather than listing it, because a
+// hand-listed axis is what let the union arm hide. That arm was a composite the
+// table never drove, and a longer hand list would only move the blind spot to
+// the next arm.
 func scanDefaultWalkCompositeArms(src string) []string {
 	start := strings.Index(src, "func encodeDefaultDepth(")
 	if start < 0 {
@@ -12238,10 +12279,10 @@ func scanDefaultWalkCompositeArms(src string) []string {
 }
 
 // TestInvariant_EveryDefaultWalkArmHasANestingCell is the completeness half of
-// the NESTING axis, mirroring the cap classifier: every composite arm of the
-// default walk must be driven by a nesting, or land with no cell and FAIL. The
-// union arm is why this exists — it recursed like the other three, behaved
-// differently from all of them (it selects a branch by trying each), and was
+// the nesting axis, mirroring the cap classifier. Every composite arm of the
+// default walk must be driven by a nesting, or land with no cell and fail. The
+// union arm is why this exists. It recursed like the other three, but behaved
+// differently from all of them: it selects a branch by trying each. It was
 // simply absent from a hand-written axis, so the table stayed green over an open
 // hole. An axis that omits the shape a bug lives in is worse than no axis,
 // because it reads as coverage.
@@ -12279,11 +12320,11 @@ func TestInvariant_EveryDefaultWalkArmHasANestingCell(t *testing.T) {
 
 // Tier-2 error-message DoS bound (CORRECTNESS_PLAN.md DoS gap). Every
 // fmt.Errorf("...%q...", x) interpolating wire- or schema-controlled content is a
-// 1:1 amplification vector: a hostile N-byte input rejected into an N-byte error
+// 1:1 amplification vector. A hostile N-byte input rejected into an N-byte error
 // message floods logging pipelines, RPC error channels, metric labels and traces.
 // The trunc*ForError helpers exist to cap that echo, but the recurring regression
-// is a call site that forgets to use them. The invariant pinned here: the error
-// from a rejected hostile input is bounded by a small constant, INDEPENDENT of
+// is a call site that forgets to use them. Here we pin the invariant. The error
+// from a rejected hostile input is bounded by a small constant, independent of
 // input size, so a call site that drops its trunc wrapper trips the cap.
 func TestErrorMessageBounded(t *testing.T) {
 	const hostileLen = 1 << 20 // 1 MiB
@@ -12342,9 +12383,9 @@ func TestErrorMessageBounded(t *testing.T) {
 }
 
 // A deeply nested schema that the builder rejects (past the recursion
-// limit) must not produce an unbounded error message: each nesting level
-// wraps the inner error, so without a cap a 1500-deep array yields a
-// ~15 KB message from a ~37 KB input — the same amplification the
+// limit) must not produce an unbounded error message. Each nesting level
+// wraps the inner error, so without a cap a 1500-deep array yields a ~15 KB
+// message from a ~37 KB input. That is the same amplification the
 // per-value trunc helpers prevent, accumulated over the wrap chain.
 func TestRegression_DeepSchemaErrorBounded(t *testing.T) {
 	for _, depth := range []int{1100, 1500, 3000} {
@@ -12359,20 +12400,20 @@ func TestRegression_DeepSchemaErrorBounded(t *testing.T) {
 	}
 }
 
-// A valid deeply-nested schema — 900 array levels, under the build's maxDepth —
-// must PARSE, and its canonical form must come out non-empty. The former
-// json.Unmarshaler front-end re-scanned each node's full subtree, and Parse also
-// fed Canonical() whose nested MarshalJSON re-copied each subtree; both are now
-// single-pass. What this cell holds is the depth itself: 900 levels is a legal
-// schema and neither surface may refuse it.
+// A valid deeply-nested schema, 900 array levels and under the build's
+// maxDepth, must parse, and its canonical form must come out non-empty. The
+// former json.Unmarshaler front-end re-scanned each node's full subtree, and
+// Parse also fed Canonical(), whose nested MarshalJSON re-copied each
+// subtree. Both are now single-pass. What this cell holds is the depth
+// itself: 900 levels is a legal schema, and neither surface may refuse it.
 func TestRegression_DeepValidSchemaParsesLinear(t *testing.T) {
 	deep := strings.Repeat(`{"type":"array","items":`, 900) + `"int"` + strings.Repeat(`}`, 900)
 	s, err := avro.Parse(deep)
 	if err != nil {
 		t.Fatalf("parse valid deep schema: %v", err)
 	}
-	// Canonical() is on the hot Parse path for the SOE fingerprint, so it has
-	// to survive the same depth.
+	// Canonical() is on the hot Parse path for the single-object-encoding
+	// fingerprint, so it has to survive the same depth.
 	if len(s.Canonical()) == 0 {
 		t.Error("Canonical() of a 900-deep schema is empty")
 	}
@@ -12407,11 +12448,12 @@ func jsonEscapeForTest(s string) string {
 
 // SchemaNode.Schema() (the Root().Schema() metadata round-trip) must be O(n) in
 // schema size, not O(depth*subtree). toJSONWalk snapshotted every named type's
-// full marshaled body for conflict detection, so on a nested record chain each
-// enclosing record re-marshaled everything below it (O(n^2)) even though the
-// snapshot map is only ever read on a duplicate fullname. Parse() and Canonical()
-// of the same schema already handle this shape, and this drives the metadata
-// emitter over the same 900-deep, ~318KB record chain: it must rebuild it.
+// full marshaled body for conflict detection. On a nested record chain each
+// enclosing record therefore re-marshaled everything below it (O(n^2)). That
+// work was wasted: the snapshot map is only ever read on a duplicate fullname.
+// Parse() and Canonical() of the same schema already handle this shape, and
+// this drives the metadata emitter over the same 900-deep, ~318KB record chain:
+// it must rebuild it.
 func TestRegression_RootSchemaEmitterLinearOnDeepNesting(t *testing.T) {
 	const depth = 900
 	var sb strings.Builder
@@ -12430,16 +12472,17 @@ func TestRegression_RootSchemaEmitterLinearOnDeepNesting(t *testing.T) {
 	mustNodeSchema(t, root)
 }
 
-// A schema field name has no length cap at parse — validName is pure grammar and
-// WithLaxNames permits any non-empty string — so a registry schema can carry a
-// multi-megabyte name, and runtime per-datum errors that echo it amplify 1:N:
-// one oversized error string on every Encode/Decode call. The binary
-// type-mismatch path routes the name through SemanticError.Field, which Error()
-// render-truncates; these four paths — JSON missing-field on encode and decode,
-// JSON alias collision, and the binary struct-mapping missing-field whose name
-// rides in .Err rather than the truncated .Field — must apply the same bound at
-// construction. The control proves the asymmetry: the .Field path is already
-// bounded, so a failure here is a missed sibling of that bound.
+// A schema field name has no length cap at parse: validName is pure grammar,
+// and WithLaxNames permits any non-empty string. A registry schema can
+// therefore carry a multi-megabyte name. Runtime per-datum errors that echo it
+// amplify 1:N, one oversized error string on every Encode/Decode call. The
+// binary type-mismatch path routes the name through SemanticError.Field, which
+// Error() render-truncates. These four paths must apply the same bound at
+// construction: JSON missing-field on encode and decode, JSON alias collision,
+// and the binary struct-mapping missing-field. That last one's name rides in
+// .Err rather than the truncated .Field. The control proves the asymmetry: the
+// .Field path is already bounded, so a failure here is a missed sibling of that
+// bound.
 func TestMatrix_FieldNameErrorEchoBounded(t *testing.T) {
 	const hostileLen = 1 << 20 // 1 MiB
 	const cap = 4096
@@ -12486,9 +12529,9 @@ func TestMatrix_FieldNameErrorEchoBounded(t *testing.T) {
 
 	// Control: the binary type-mismatch path routes the field name through
 	// SemanticError.Field (render-truncated in errors.go). It is already
-	// bounded — present so a future change that breaks the render truncation
-	// is caught here, and to document that the four cases above are an
-	// asymmetry with this path, not field names being inherently echo-safe.
+	// bounded, and is here so a future change that breaks the render truncation
+	// is caught. It also documents that the four cases above are an asymmetry
+	// with this path, not field names being inherently echo-safe.
 	t.Run("control: binary type mismatch already bounded", func(t *testing.T) {
 		huge := strings.Repeat("A", hostileLen)
 		s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"`+huge+`","type":"int"}]}`)
@@ -12500,8 +12543,8 @@ func TestMatrix_FieldNameErrorEchoBounded(t *testing.T) {
 // nestStrayContainer builds a stray-container-key chain d levels deep on a
 // non-binding kind ("int"). key is one of the recursive stray-routed keys:
 // "items"/"values" wrap a schema, "fields" wraps a one-field record shape.
-// Every level's key is a stray (int binds none of them), so the whole input
-// is accepted as inert metadata — and each level's body is a valid schema
+// Every level's key is a stray, since int binds none of them, so the whole
+// input is accepted as inert metadata. Each level's body is a valid schema
 // shape, so the parser and the Root() metadata walker both descend it.
 func nestStrayContainer(key string, d int) string {
 	open, closeStr := `{"type":"int","`+key+`":`, `}`
@@ -12519,12 +12562,12 @@ func nestStrayContainer(key string, d int) string {
 	return sb.String()
 }
 
-// wantAccept asserts fn ACCEPTS (nil error). It is the avro_test twin of the
-// helper in package avro — same rule, restated rather than reached, because
-// this package cannot see the internal one. Its existence is what lets an
-// external cost cell be rowed with the magnitudes it drives instead of being
-// waved through as an exemption: the registry's cross-check requires a cell
-// rowed with values to take a harness, and this is the harness.
+// wantAccept asserts fn accepts (nil error). It is the avro_test twin of the
+// helper in package avro. We restate the rule rather than reach it, since this
+// package cannot see the internal one. Having it here lets us row an external
+// cost cell with the magnitudes it drives. Without it the cell gets waved
+// through as an exemption. The registry's cross-check requires a cell rowed
+// with values to take a harness, and this is the harness.
 func wantAccept(t *testing.T, name string, fn func() error) {
 	t.Helper()
 	if err := fn(); err != nil {
@@ -12533,22 +12576,22 @@ func wantAccept(t *testing.T, name string, fn func() error) {
 }
 
 // A reserved structural/naming key on a kind that does not bind it is decoded
-// once by the parser's arm to decide whether it surfaces as-written or rides in
-// Props. That decode must not be repeated: the props-routing loop and the Root()
-// metadata walk each ROUTE the same bodies, and a second decode re-enters the
-// recursive schema decode, so two decodes per level compound to O(2^depth) — a
-// sub-KB input a doubled decode cannot finish at all.
+// once by the parser's arm, to decide whether it surfaces as-written or rides
+// in Props. That decode must not be repeated. The props-routing loop and the
+// Root() metadata walk each route the same bodies, and a second decode
+// re-enters the recursive schema decode. Two decodes per level compound to
+// O(2^depth), and on a sub-KB input a doubled decode cannot finish at all.
 //
-// Every entry point must ACCEPT the chain, at a depth where a doubled decode is
-// still conceivably survivable (20, on a sub-KB input) and again at depths where
-// it is not (400 and 800). The deeper pair is what the exponential cannot reach:
-// 2^400 subtree decodes do not complete, so a regression surfaces as this cell
-// failing to finish rather than as a number.
+// Every entry point must accept the chain. We drive it at a depth where a
+// doubled decode is still conceivably survivable (20, on a sub-KB input), and
+// again at depths where it is not (400 and 800). The deeper pair is what the
+// exponential cannot reach: 2^400 subtree decodes do not complete, so a
+// regression surfaces as this cell failing to finish rather than as a number.
 func TestMatrix_NestedStrayContainerKeyLinearCost(t *testing.T) {
 	t.Parallel()
 
-	// Every parse entry point + the metadata rebuild, for each recursive
-	// stray-routed key, on a sub-KB input.
+	// Here we drive every parse entry point plus the metadata rebuild, for
+	// each recursive stray-routed key, on a sub-KB input.
 	const shallowDepth = 20
 	for _, key := range []string{"items", "values", "fields"} {
 		schema := nestStrayContainer(key, shallowDepth)
@@ -12579,10 +12622,11 @@ func TestMatrix_NestedStrayContainerKeyLinearCost(t *testing.T) {
 		}
 	}
 
-	// The depths a doubled decode cannot reach. Parse and the metadata rebuild
-	// must both come back with an answer on a 400- and an 800-level chain; at
-	// 2^400 subtree decodes the regression does not return, so there is nothing
-	// to time and nothing to compare — the cell simply does not finish.
+	// The depths a doubled decode cannot reach. Parse and the metadata
+	// rebuild must both come back with an answer on a 400- and an 800-level
+	// chain. At 2^400 subtree decodes the regression does not return, so
+	// there is nothing to time and nothing to compare: the cell simply does
+	// not finish.
 	for _, depth := range []int{400, 800} {
 		deep := nestStrayContainer("items", depth)
 		wantAccept(t, fmt.Sprintf("Parse/items/depth=%d", depth), func() error {

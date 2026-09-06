@@ -6,18 +6,16 @@ import (
 	"fmt"
 )
 
-// soeHeader returns the schema's Single Object Encoding header, hashing the
-// canonical form on the first call and reusing the result forever after.
-// Every read of s.soe goes through here: the SOE entry points are the only
-// consumers, so a schema that never writes or reads single-object bytes never
-// pays for the hash, and a bare field read would race the first caller that
-// does.
+// soeHeader hashes the canonical form on the first call and reuses it after.
+// Every read of s.soe goes through here: a schema that never touches
+// single-object bytes never pays for the hash, and a bare field read would
+// race the first caller that does.
 //
-// The soeHashed guard rather than a bare soeOnce.Do: every single-object
-// message pays this check, and inlining sync.Once.Do puts the function 1 unit
-// over the inline budget, which cost a measurable 4ns per AppendSingleObject
-// on a small payload. The flag is written INSIDE the Once, after the header
-// bytes, so a reader that observes it true is ordered after those writes.
+// We guard with soeHashed rather than calling soeOnce.Do directly because
+// inlining sync.Once.Do puts this function 1 unit over the inline budget,
+// costing a measurable 4ns per AppendSingleObject on a small payload. The
+// flag is written *inside* the Once, after the header bytes, so a reader that
+// observes it true is ordered after those writes.
 func (s *Schema) soeHeader() *[10]byte {
 	if !s.soeHashed.Load() {
 		s.hashSOEHeader()
@@ -43,9 +41,8 @@ func (s *Schema) AppendSingleObject(dst []byte, v any, opts ...Opt) ([]byte, err
 	return s.AppendEncode(dst, v, opts...)
 }
 
-// validateSOEHeader checks that data has the 10-byte Single Object Encoding
-// header (length + magic bytes). Shared by DecodeSingleObject and
-// SingleObjectFingerprint so the two paths agree on the error shapes.
+// validateSOEHeader is shared by DecodeSingleObject and
+// SingleObjectFingerprint so the two paths agree on their error shapes.
 func validateSOEHeader(data []byte) error {
 	if len(data) < 10 {
 		return fmt.Errorf("avro: single-object encoding too short: need at least 10 bytes, have %d", len(data))
@@ -59,8 +56,8 @@ func validateSOEHeader(data []byte) error {
 // DecodeSingleObject decodes a Single Object Encoding message into v after
 // verifying the magic and fingerprint match this schema.
 //
-// For a schema returned by [Resolve], the writer's fingerprint is also
-// accepted — wire bytes carry the writer's fingerprint per the SOE spec,
+// For a schema returned by [Resolve], we also accept the writer's
+// fingerprint: wire bytes carry the writer's fingerprint per the SOE spec,
 // and a resolved schema is the right place to decode them.
 func (s *Schema) DecodeSingleObject(data []byte, v any, opts ...Opt) ([]byte, error) {
 	if err := validateSOEHeader(data); err != nil {
@@ -76,19 +73,19 @@ func (s *Schema) DecodeSingleObject(data []byte, v any, opts ...Opt) ([]byte, er
 // acceptsWriterSOE reports whether header is the fingerprint of the writer
 // this schema resolves from.
 //
-// A single-object message carries the fingerprint of the schema that PRODUCED
-// the bytes, which is the writer whenever a resolution is involved, so a
-// resolved schema is the one place those bytes can be decoded. Java reaches the
-// same outcome through a fingerprint registry (BinaryMessageDecoder); the
-// single-schema model bakes it into the resolved schema's own check.
+// A single-object message carries the fingerprint of the schema that
+// *produced* the bytes. With a resolution involved that is the writer, so a
+// resolved schema is the one place those bytes can be decoded. Java reaches
+// the same outcome through a fingerprint registry (BinaryMessageDecoder); we
+// bake it into the resolved schema's own check.
 //
-// The writer is reached through the writer SCHEMA rather than a copied header,
-// which keeps its fingerprint lazy: a resolved schema that never decodes
-// single-object bytes hashes neither canonical form. It asks resolveWriter —
-// the one field holding that schema — so writer acceptance cannot drift from
-// the resolution it belongs to. Always false for a schema that is not a
-// resolution, which has no writer to accept; resolveWriter is nil for exactly
-// that set, since an identity resolution returns the reader itself.
+// We reach the writer through its schema rather than a copied header, which
+// keeps its fingerprint lazy: a resolved schema that never decodes
+// single-object bytes hashes neither canonical form. We ask resolveWriter,
+// the one field holding that schema, so writer acceptance cannot drift from
+// the resolution it belongs to. This is always false for a schema that is not
+// a resolution, which has no writer to accept; resolveWriter is nil for
+// exactly that set, since an identity resolution returns the reader itself.
 func (s *Schema) acceptsWriterSOE(header [10]byte) bool {
 	return s.resolveWriter != nil && header == *s.resolveWriter.soeHeader()
 }

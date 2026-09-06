@@ -2,17 +2,18 @@ package avro
 
 // Shared child enumeration for the raw-JSON schema walkers: the SchemaCache
 // self-containment pair (collectTreeDefs, inlineTreeDefs) and the Root()
-// metadata walker. All three need one rule — which keys hold child schemas,
-// what a flat-form ("linkedin/goavro") field lifts to, which namespace scope
-// each child resolves in — and differ only in what they do at each position.
-// walkNodeChildren is that rule, built on the parser's own predicates.
+// metadata walker. All three need one rule for which keys hold child schemas,
+// what a flat-form ("linkedin/goavro") field lifts to, and which namespace
+// scope each child resolves in. They differ only in what they do at each
+// position, so walkNodeChildren is that one rule, built on the parser's own
+// predicates.
 
 // nodeChildScope returns the namespace scope a node's container children
-// resolve in: a named kind opens its own (dotted-name prefix, else the
-// "namespace" attribute including the explicit-empty form, else the enclosing
-// scope); every other node passes the enclosing scope through.
+// resolve in. A named kind opens its own: the dotted-name prefix, else the
+// "namespace" attribute (the explicit-empty form included), else the enclosing
+// scope. Every other node passes the enclosing scope through.
 //
-// Keyed on KIND alone. Gating on name presence would be wrong — the build
+// We key on kind alone. Gating on name presence would be wrong: the build
 // registers a fullname even with no "name" key at all (a lax-accepted empty
 // short name, fullname "ns."), and the children build under it.
 func nodeChildScope(v map[string]any, ns string) string {
@@ -23,11 +24,11 @@ func nodeChildScope(v map[string]any, ns string) string {
 }
 
 // nodeChildVisitor receives one node's child-schema positions from
-// walkNodeChildren. A nil callback skips its position. Every key handed to a
-// callback is the exact lowercase spelling, the only one that binds, so
-// mutating walkers write back to the key actually in the map.
+// walkNodeChildren. A nil callback skips its position. Every key we hand a
+// callback is the exact lowercase spelling, the only one that binds, so a
+// mutating walker writes back to the key actually in the map.
 type nodeChildVisitor struct {
-	// typeValue is the node's own "type" value, resolving in the ENCLOSING
+	// typeValue is the node's own "type" value, resolving in the *enclosing*
 	// scope rather than the child scope: a wrapped reference {"type":"X"}
 	// binds X where the node sits. It is a child position because that
 	// reference can name a cache-inherited type.
@@ -49,19 +50,16 @@ type nodeChildVisitor struct {
 	values func(key, scope string)
 
 	// fieldNoType fires for a field element with no "type" key, reachable only
-	// inside a STRAY "fields" — a bound record build rejects a nil field type.
+	// inside a stray "fields": a bound record build rejects a nil field type.
 	fieldNoType func(i int, fo map[string]any)
 
-	// strayKeys also fires the container callbacks on kinds that do not BIND
-	// the key, for bodies parsing as the key's schema shape. Default is
-	// bound-only, and must stay so for any walker that REGISTERS names: a
+	// strayKeys also fires the container callbacks on kinds that do not *bind*
+	// the key, for bodies parsing as the key's schema shape. The default is
+	// bound-only, and must stay so for any walker that registers names. A
 	// definition-shaped value inside a stray key would take its fullname in a
 	// first-wins store and shadow the real definition everywhere that store
-	// feeds.
-	//
-	// The metadata walker alone sets it, because surfacing stray keys
-	// as-written is read-only. Pinned by
-	// TestMatrix_MetadataStrayKeySurfacedAsWritten.
+	// feeds. The metadata walker alone sets it, since surfacing stray keys
+	// as-written is read-only.
 	strayKeys bool
 
 	// strayShapeMemo memoizes the stray-body shape checks by subtree pointer,
@@ -73,12 +71,12 @@ type nodeChildVisitor struct {
 
 // walkNodeChildren enumerates node v's child-schema positions: its own "type"
 // value, each record field's type (flat-form fields lifted), array items, map
-// values. Keys are read by exact name. ns is the scope v sits in, handed to
+// values. We read keys by exact name. ns is the scope v sits in, handed to
 // typeValue; childNS is the scope v's containers resolve in.
 //
 // Order is fixed: type, fields in declaration order, items, values. Each
-// container key fires only on the kind that binds it — fields on record/error,
-// items on array, values on map — unless vis.strayKeys opts in. Under the
+// container key fires only on the kind that binds it (fields on record/error,
+// items on array, values on map) unless vis.strayKeys opts in. Under the
 // default a node fires at most one of the three; a strayKeys walk of a
 // primitive can fire several.
 func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor) {

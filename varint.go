@@ -14,16 +14,16 @@ func appendUint64(dst []byte, u uint64) []byte {
 		byte(u>>32), byte(u>>40), byte(u>>48), byte(u>>56))
 }
 
-// uvarintLens maps bits.Len32's result to the uvarint byte length. Only
-// indices 0..32 are ever read — that is bits.Len32's whole range — but the
-// table is 256 long so the compiler can prove byte(bits.Len32(u)) is in
-// bounds and drop the check.
+// uvarintLens maps bits.Len32's result to the uvarint byte length. We only
+// read indices 0..32, bits.Len32's whole range, but we keep the table 256
+// long so the compiler can prove byte(bits.Len32(u)) is in bounds and drop
+// the check.
 //
-// The entries past index 32 are unreachable padding and are NOT a valid
-// 64-bit extension: they were written in decimal notation, so index 64
-// holds \x10 (16), not the 10 a uvarlong would need. uvarintLen is the
-// 32-bit lookup and nothing else; appendVarlong does its own magnitude
-// switch and never reads this.
+// Everything past index 32 is unreachable padding, and it is *not* a valid
+// 64-bit extension: we wrote the entries in decimal notation, so index 64
+// holds \x10 (16), not the 10 a uvarlong needs. This is the 32-bit lookup
+// and nothing else. appendVarlong does its own magnitude switch and never
+// reads it.
 const uvarintLens = "\x01\x01\x01\x01\x01\x01\x01\x01\x02\x02\x02\x02\x02\x02\x02\x03\x03\x03\x03\x03\x03\x03\x04\x04\x04\x04\x04\x04\x04\x05\x05\x05\x05\x05\x05\x05\x06\x06\x06\x06\x06\x06\x06\x07\x07\x07\x07\x07\x07\x07\x08\x08\x08\x08\x08\x08\x08\x09\x09\x09\x09\x09\x09\x09\x10\x10\x10\x10\x10\x10\x10\x11\x11\x11\x11\x11\x11\x11\x12\x12\x12\x12\x12\x12\x12\x13\x13\x13\x13\x13\x13\x13\x14\x14\x14\x14\x14\x14\x14\x15\x15\x15\x15\x15\x15\x15\x16\x16\x16\x16\x16\x16\x16\x17\x17\x17\x17\x17\x17\x17\x18\x18\x18\x18\x18\x18\x18\x19\x19\x19\x19\x19\x19\x19\x20\x20\x20\x20\x20\x20\x20\x21\x21\x21\x21\x21\x21\x21\x22\x22\x22\x22\x22\x22\x22\x23\x23\x23\x23\x23\x23\x23\x24\x24\x24\x24\x24\x24\x24\x25\x25\x25\x25\x25\x25\x25\x26\x26\x26\x26\x26\x26\x26\x27\x27\x27\x27\x27\x27\x27\x28\x28\x28\x28\x28\x28\x28\x29\x29\x29\x29\x29\x29\x29\x30\x30\x30\x30\x30\x30\x30\x31\x31\x31\x31\x31\x31\x31\x32\x32\x32\x32\x32\x32\x32\x33\x33\x33\x33\x33\x33\x33\x34\x34\x34\x34\x34\x34\x34\x35\x35\x35\x35\x35\x35\x35\x36\x36\x36\x36\x36\x36\x36\x37\x37\x37"
 
 func uvarintLen(u uint32) int {
@@ -63,10 +63,9 @@ func appendUvarint(dst []byte, u uint32) []byte {
 	}
 }
 
-// appendVarlong writes i as a zigzag-encoded varlong (1-10 bytes).
-// Mirrors appendUvarint's length-keyed switch shape: bench shows a
-// 30-50% improvement over the generic loop across all lengths
-// (BenchmarkVarlongPerLen_*; switch wins at every byte length).
+// appendVarlong writes i as a zigzag-encoded varlong (1-10 bytes). We
+// mirror appendUvarint's length-keyed switch: benchmarks put the switch
+// 30-50% ahead of the generic loop at every byte length.
 func appendVarlong(dst []byte, i int64) []byte {
 	u := uint64(i)<<1 ^ uint64(i>>63)
 	switch {

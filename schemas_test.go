@@ -30,7 +30,7 @@ const arrayOfPtrInnerSchema = `{
 			}}}]
 		}`
 
-// Wrapper{items: array of Rec{v:int}} — the ptr-record array path.
+// Wrapper{items: array of Rec{v:int}}, the ptr-record array path.
 const arrayOfPtrRecSchema = `{
 			"type": "record",
 			"name": "Wrapper",
@@ -53,7 +53,7 @@ const enumColorSchema = `{
 		]
 	}`
 
-// iface{s: Foobar{f:int}} — a record field holding a record.
+// iface{s: Foobar{f:int}}, a record field holding a record.
 const ifaceFoobarSchema = `{
 		"type": "record",
 		"name": "iface",
@@ -70,7 +70,7 @@ const ifaceFoobarSchema = `{
 		]
 	}`
 
-// Item{name:string, color: Color} — Color by reference, defined elsewhere.
+// Item{name:string, color: Color}. Color by reference, defined elsewhere.
 const itemColorRefSchema = `{
 		"type": "record",
 		"name": "Item",
@@ -111,7 +111,7 @@ const nestedInnerSchema = `{
 		}}]
 	}`
 
-// Node{value:int, next:[null,Node]} — a self-referential record.
+// Node{value:int, next:[null,Node]}. A self-referential record.
 const nodeRecursiveSchema = `{"type":"record","name":"Node","fields":[
 		{"name":"value","type":"int"},
 		{"name":"next","type":["null","Node"]}
@@ -150,7 +150,7 @@ const orderPriceSchema = `{"type":"record","name":"Order","fields":[
 			{"name":"price","type":{"type":"long","logicalType":"money"}}
 		]}`
 
-// prims — one field per primitive type.
+// prims: one field per primitive type.
 const primsSchema = `{
 		"type":"record","name":"prims","fields":[
 			{"name":"b","type":"boolean"},
@@ -174,19 +174,19 @@ const recASchema = `{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"}
 	]}`
 
-// R{b:string, a:int} — reader-side field order flipped from recABSchema.
+// R{b:string, a:int}. Reader-side field order flipped from recABSchema.
 const recBASchema = `{"type":"record","name":"R","fields":[
 		{"name":"b","type":"string"},
 		{"name":"a","type":"int"}
 	]}`
 
-// r{a:int, b:string} — lowercase record name.
+// r{a:int, b:string}. Lowercase record name.
 const recIntBSchema = `{"type":"record","name":"r","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"string"}
 	]}`
 
-// r{a:long, b:string} — lowercase record name.
+// r{a:long, b:string}. Lowercase record name.
 const recLongBSchema = `{"type":"record","name":"r","fields":[
 		{"name":"a","type":"long"},
 		{"name":"b","type":"string"}
@@ -219,7 +219,7 @@ const recordNameEmailSchema = `{"type":"record","name":"Record","fields":[
 		{"name":"email","type":["null","string"]}
 	]}`
 
-// strings — ten string fields, for wide-record work.
+// strings: ten string fields, for wide-record work.
 const stringsSchema = `{"type":"record","name":"strings","fields":[
 		{"name":"s1","type":"string"},
 		{"name":"s2","type":"string"},
@@ -233,7 +233,7 @@ const stringsSchema = `{"type":"record","name":"strings","fields":[
 		{"name":"s10","type":"string"}
 	]}`
 
-// the Superhero record wrapped in ["null", ...].
+// The Superhero record wrapped in ["null", ...].
 const superheroUnionSchema = `
 ["null",
 {

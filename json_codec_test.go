@@ -20,20 +20,20 @@ import (
 // every field, however that field got its value.
 //
 // A field present in the JSON is decoded by the JSON decoder. A field absent
-// from it is filled from its schema default, which routes through the BINARY
-// deser fn and reads the options off the per-call slab. Two readers of one
-// option, and a caller sees both in a single returned map — so the axes are
-// the option combination crossed with the field's provenance, and crossed
-// again with whether the union branch carries a logical type, since that is
-// what the second option renames.
+// from it is filled from its schema default. That routes through the binary
+// deser fn, which reads the options off the per-call slab. So we have two
+// readers of one option, and a caller sees both in a single returned map. We
+// cross the option combination with the field's provenance, then again with
+// whether the union branch carries a logical type, since that is what the
+// second option renames.
 //
-// Each cell asserts twice. The two provenances must AGREE, which is the
-// cross-path question and the one a second copy of an option can get wrong.
-// Each must also match what the option itself says: wrapped in a {branch:
-// value} envelope exactly when TaggedUnions is on, and the branch named with
-// its logical type exactly when TagLogicalTypes is on. Agreement alone would
-// stay green if both readers were wrong together, which is precisely the case
-// a parity oracle cannot see.
+// We assert twice per cell. The two provenances must agree; that is the
+// cross-path question, and the one a second copy of an option can get wrong.
+// Each must also match what the option itself says. We want a {branch: value}
+// envelope exactly when TaggedUnions is on, and the branch named with its
+// logical type exactly when TagLogicalTypes is on. Agreement alone would stay
+// green if both readers were wrong together, and that is what a parity oracle
+// cannot see.
 func TestMatrix_JSONDecodeOptionsAgreeAcrossFieldProvenance(t *testing.T) {
 	const schema = `{"type":"record","name":"R","fields":[
 		{"name":"p","type":["int","string"]},
@@ -60,7 +60,7 @@ func TestMatrix_JSONDecodeOptionsAgreeAcrossFieldProvenance(t *testing.T) {
 
 	// tagOf reports the envelope key a value is wrapped in, or "" when it is
 	// not wrapped at all. A union value is never legitimately a one-key map
-	// in this schema, so the two are distinguishable.
+	// in this schema, so we can tell the two apart.
 	tagOf := func(v any) string {
 		m, ok := v.(map[string]any)
 		if !ok || len(m) != 1 {
@@ -94,8 +94,8 @@ func TestMatrix_JSONDecodeOptionsAgreeAcrossFieldProvenance(t *testing.T) {
 						pair.present, presentTag, pair.filled, filledTag)
 				}
 
-				// Answerable from the options alone, so both readers being
-				// wrong together cannot pass.
+				// We answer from the options alone, so both readers
+				// being wrong together cannot pass.
 				want := ""
 				if c.tagged {
 					want = pair.wantTag
@@ -289,16 +289,14 @@ func TestAvroJSONRoundTrip(t *testing.T) {
 		"extra":  "hello",
 	}
 
-	// Encode to Avro JSON.
 	encoded := mustEncodeJSON(t, s, original)
 
-	// Verify it's valid JSON.
+	// The output must be valid JSON.
 	var parsed any
 	if err := json.Unmarshal(encoded, &parsed); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, encoded)
 	}
 
-	// Decode back.
 	var decoded any
 	mustDecodeJSON(t, s, encoded, &decoded)
 
@@ -329,12 +327,12 @@ func TestAvroJSONNamedUnionBranch(t *testing.T) {
 	}`
 	s := mustParse(t, schema)
 
-	// Encode: with TaggedUnions, non-null branch should use the record name.
+	// With TaggedUnions we expect the non-null branch to key off the record
+	// name, so "Inner" is the union type name.
 	data := map[string]any{
 		"value": map[string]any{"x": int32(42)},
 	}
 	encoded := mustEncodeJSON(t, s, data, TaggedUnions())
-	// Should contain "Inner" as the union type name.
 	var parsed map[string]any
 	json.Unmarshal(encoded, &parsed)
 	valueObj, ok := parsed["value"].(map[string]any)
@@ -345,7 +343,6 @@ func TestAvroJSONNamedUnionBranch(t *testing.T) {
 		t.Errorf("expected Inner key in union, got: %s", encoded)
 	}
 
-	// Decode back.
 	var decoded any
 	mustDecodeJSON(t, s, encoded, &decoded)
 	m := decoded.(map[string]any)
@@ -372,10 +369,10 @@ func TestDecodeJSONIntoStruct(t *testing.T) {
 
 // TestDecodeJSONUnionTaggedNullIntoAny exercises the union object decode
 // path at json_decode.go:809 / 844. When the JSON is a tagged union object
-// whose branch is "null" (e.g. {"null":null}), the inner decode produces
-// nil, wrapUnion returns nil, and the previous code did
-// v.Set(reflect.ValueOf(nil)) — which panics with "reflect.Value.Set on
-// zero Value". The decode should produce a nil any, not panic.
+// whose branch is "null" (e.g. {"null":null}), the inner decode produces nil
+// and wrapUnion returns nil. The previous code then did
+// v.Set(reflect.ValueOf(nil)), which panics with "reflect.Value.Set on zero
+// Value". We must decode to a nil any, not panic.
 func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -406,37 +403,38 @@ func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
 	}
 }
 
-// TestMatrix_TaggedUnionsBareNullForNullBranch locks that EncodeJSON emits bare
-// `null` for the null branch under TaggedUnions, matching the doc commitment,
-// Java's JsonEncoder.writeIndex, and the Avro JSON spec's bare-null union form.
-// Without it, appendAvroJSONUnion's four cfg.tagged sites would wrap any branch
-// including null, producing {"null":null}, while the entry early-null — reached
-// when the entry peel converts a nil Pointer/Interface to invalid — emits bare
-// "null" regardless: two paths, same conceptual input, different output. The
-// structural fix is appendUnionBranch, which centralizes `wrap iff cfg.tagged &&
-// branch.kind != "null"` so a future dispatcher inherits the special case.
+// TestMatrix_TaggedUnionsBareNullForNullBranch locks that EncodeJSON emits
+// bare `null` for the null branch under TaggedUnions. That matches the doc
+// commitment, Java's JsonEncoder.writeIndex, and the Avro JSON spec's
+// bare-null union form. Without it, appendAvroJSONUnion's four cfg.tagged
+// sites wrap any branch including null, producing {"null":null}. Meanwhile
+// the entry early-null, reached when the entry peel converts a nil
+// Pointer/Interface to invalid, emits bare "null" regardless. Two paths, same
+// conceptual input, different output. The structural fix is
+// appendUnionBranch, which centralizes `wrap iff cfg.tagged && branch.kind !=
+// "null"` so a future dispatcher inherits the special case.
 func TestMatrix_TaggedUnionsBareNullForNullBranch(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
 		value  any
 	}{
-		// Nil Pointer / Interface — reach the entry early-null path via
-		// the peel loop at appendAvroJSON:189-197; this leg pins the
-		// early-null path's bare-null emission.
+		// Nil Pointer / Interface: we reach the entry early-null path
+		// via the peel loop at appendAvroJSON:189-197. This leg pins
+		// that path's bare-null emission.
 		{"nil ptr against [null,bytes]", `["null","bytes"]`, (*[]byte)(nil)},
 		{"nil ptr against [null,int]", `["null","int"]`, (*int)(nil)},
 		{"any holding nil ptr against [null,int]", `["null","int"]`, any((*int)(nil))},
 
-		// Nil Slice / Map / Chan / Func — reach appendAvroJSONUnion's
+		// Nil Slice / Map / Chan / Func: we reach appendAvroJSONUnion's
 		// nil-first dispatch. Without bare-null emission this site
 		// wraps null in {"null":null} under TaggedUnions.
 		{"nil slice against [null,bytes]", `["null","bytes"]`, []byte(nil)},
 		{"nil slice against [null,int,bytes]", `["null","int","bytes"]`, []byte(nil)},
 		{"nil map against [null,{type:map,values:int}]", `["null",{"type":"map","values":"int"}]`, map[string]int(nil)},
 
-		// Try-each null branch reached from a non-nil shape that fails
-		// every other branch — must emit bare null even though the
+		// Try-each null branch, reached from a non-nil shape that fails
+		// every other branch: we must emit bare null even though the
 		// non-null branches would have been wrapped.
 	}
 	for _, tc := range cases {
@@ -446,8 +444,8 @@ func TestMatrix_TaggedUnionsBareNullForNullBranch(t *testing.T) {
 			if string(got) != "null" {
 				t.Errorf("got %s, want null (TaggedUnions doc: \"wraps non-null union values\")", got)
 			}
-			// Round-trip: decoder must accept bare null regardless of
-			// TaggedUnions setting so the encoded output stays valid.
+			// Round-trip: the decoder must accept bare null whatever
+			// the TaggedUnions setting, so what we emit stays valid.
 			var back any
 			if err := s.DecodeJSON(got, &back, TaggedUnions()); err != nil {
 				t.Fatalf("DecodeJSON round-trip: %v", err)
@@ -472,14 +470,13 @@ func TestAvroJSONNamespacedUnionBranch(t *testing.T) {
 	schema := `["null",{"type":"enum","name":"Status","namespace":"com.example","symbols":["ACTIVE","DELETED"]}]`
 	s := mustParse(t, schema)
 
-	// Encode with TaggedUnions: should use fully qualified name.
+	// With TaggedUnions, the fully qualified name.
 	encoded := mustEncodeJSON(t, s, "ACTIVE", TaggedUnions())
 	want := `{"com.example.Status":"ACTIVE"}`
 	if string(encoded) != want {
 		t.Errorf("got %s, want %s", encoded, want)
 	}
 
-	// Decode back.
 	var got any
 	mustDecodeJSON(t, s, encoded, &got)
 	if got != "ACTIVE" {
@@ -505,7 +502,7 @@ func TestAvroJSONNestedUnionRecord(t *testing.T) {
 			},
 		},
 	}
-	// Tagged: should have Node wrapping at each level.
+	// Tagged: Node wrapping at each level.
 	encoded, err := s.EncodeJSON(data, TaggedUnions())
 	if err != nil {
 		t.Fatalf("EncodeJSON(TaggedUnions()): %v", err)
@@ -526,7 +523,7 @@ func TestAvroJSONNestedUnionRecord(t *testing.T) {
 		t.Errorf("value: got %v", gm["value"])
 	}
 
-	// Bare: should produce nested records without wrapping.
+	// Bare: nested records, no wrapping.
 	bare, err := s.EncodeJSON(data)
 	if err != nil {
 		t.Fatalf("EncodeJSON(bare): %v", err)
@@ -574,7 +571,7 @@ func TestAvroJSONArrayOfUnions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// First verify binary encoding works.
+	// We first check that binary encoding works.
 	data := []any{"hello", int32(42)}
 	binary, err := s.Encode(data)
 	if err != nil {
@@ -616,7 +613,6 @@ func TestAvroJSONArrayOfUnions(t *testing.T) {
 func TestAvroJSONArrayOfUnionsWithNull(t *testing.T) {
 	schema := `{"type":"array","items":["null","string"]}`
 	s := mustParse(t, schema)
-	// Encode with nil in the array.
 	data := []any{nil, "hello", nil}
 	encoded := mustEncodeJSON(t, s, data)
 	want := `[null,"hello",null]`
@@ -628,7 +624,6 @@ func TestAvroJSONArrayOfUnionsWithNull(t *testing.T) {
 func TestDecodeJSONArrayOfUnionsWithNull(t *testing.T) {
 	schema := `{"type":"array","items":["null","string"]}`
 	s := mustParse(t, schema)
-	// Decode Avro JSON with null in union array.
 	input := `[null,{"string":"hello"},null]`
 	var got any
 	mustDecodeJSON(t, s, []byte(input), &got)
@@ -752,7 +747,7 @@ func TestDecodeJSONTypeErrors(t *testing.T) {
 }
 
 func TestAppendAvroJSONTypeErrors(t *testing.T) {
-	// Test error paths in appendAvroJSON directly.
+	// We drive appendAvroJSON's error paths directly.
 	tests := []struct {
 		name string
 		kind string
@@ -894,17 +889,18 @@ func TestEncodeJSONTaggedUnionMaps(t *testing.T) {
 		t.Fatal("expected error for wrong branch name")
 	}
 
-	// Tagged map where the key matches a branch name but the value doesn't
-	// match that branch's type. Should fall through to try the whole map
-	// against other branches (e.g. a map branch), matching Encode behavior.
+	// Tagged map where the key matches a branch name but the value does
+	// not match that branch's type. We fall through and try the whole map
+	// against other branches (e.g. a map branch), matching Encode.
 	s3, err := Parse(`{"type":"record","name":"T","fields":[
 		{"name":"u","type":["null","int",{"type":"map","values":"string"}]}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// {"int": "not_a_number"} — key "int" matches the int branch, but "not_a_number"
-	// fails for int. The whole map should then match the map<string> branch.
+	// {"int": "not_a_number"}: key "int" matches the int branch, but
+	// "not_a_number" fails for int, so the whole map then matches the
+	// map<string> branch.
 	out, err = s3.EncodeJSON(map[string]any{"u": map[string]any{"int": "not_a_number"}}, TaggedUnions())
 	if err != nil {
 		t.Fatalf("fallthrough to map branch: %v", err)
@@ -937,9 +933,9 @@ func TestSchemaNodeErrors(t *testing.T) {
 		t.Fatal("expected error for record without name")
 	}
 
-	// Root() on a schema — the JSON re-parse can't actually fail since
-	// Schema.full is always valid JSON set by Parse. But let's verify
-	// Root works on all schema types.
+	// Root() on a schema: the JSON re-parse cannot actually fail, since
+	// Parse always sets Schema.full to valid JSON. We check Root on every
+	// schema type.
 	for _, schema := range []string{
 		`"null"`,
 		`"int"`,
@@ -1098,7 +1094,7 @@ func TestEncodeJSONMissingMapKey(t *testing.T) {
 		{"name":"a","type":"int","default":0},
 		{"name":"b","type":"string"}
 	]}`)
-	// "a" is missing from the map — should encode as null/default.
+	// "a" is missing from the map, so it encodes as its default.
 	encoded := mustEncodeJSON(t, s, map[string]any{"b": "hello"})
 	var parsed map[string]any
 	json.Unmarshal(encoded, &parsed)
@@ -1121,8 +1117,8 @@ func TestEncodeJSONNilInUnion(t *testing.T) {
 }
 
 func TestAvroJSONBinaryRoundTrip(t *testing.T) {
-	// Encode to Avro JSON, decode to any, encode to binary, decode to any.
-	// Verify the values match.
+	// We encode to Avro JSON, decode to any, encode to binary, decode to
+	// any, then check the values match.
 	schema := `{
 		"type":"record","name":"Event",
 		"fields":[
@@ -1143,17 +1139,17 @@ func TestAvroJSONBinaryRoundTrip(t *testing.T) {
 		"extra":  "hello",
 	}
 
-	// Path 1: binary encode → binary decode
+	// Path 1: binary encode, then binary decode.
 	binary := mustEncode(t, s, original)
 	var fromBinary any
 	mustDecode(t, s, binary, &fromBinary)
 
-	// Path 2: avro JSON encode → avro JSON decode
+	// Path 2: Avro JSON encode, then Avro JSON decode.
 	jsonBytes := mustEncodeJSON(t, s, original)
 	var fromJSON any
 	mustDecodeJSON(t, s, jsonBytes, &fromJSON)
 
-	// Both paths should produce the same result.
+	// Both paths must agree.
 	mb := fromBinary.(map[string]any)
 	mj := fromJSON.(map[string]any)
 	if mb["id"] != mj["id"] {
@@ -1184,7 +1180,7 @@ func TestAvroJSONStructRoundTrip(t *testing.T) {
 	email := "a@b.com"
 	original := Record{Name: "Alice", Age: 30, Email: &email}
 
-	// Struct → Avro JSON → struct
+	// Struct to Avro JSON and back to struct.
 	jsonBytes := mustEncodeJSON(t, s, &original)
 	var got Record
 	mustDecodeJSON(t, s, jsonBytes, &got)
@@ -1283,17 +1279,18 @@ func TestEncodeJSONLinkedinFloats(t *testing.T) {
 	}
 }
 
-// LinkedinFloats encodes NaN as a bare JSON null. Inside a bare (untagged) union
-// a bare null is claimed by the union's null branch — or rejected when the union
-// has none — before the float branch's null→NaN rule runs, so a union-member NaN
-// does not round-trip. That is the inherent ambiguity of the null-for-NaN
-// convention when null is also a structural union value, which TaggedUnions
-// disambiguates; ±Inf encodes as the number token ±1e999 and round-trips in a
-// bare union regardless. This pins the contract documented on LinkedinFloats.
+// LinkedinFloats encodes NaN as a bare JSON null. Inside a bare (untagged)
+// union, the union's null branch claims that bare null, or the union rejects
+// it when there is no null branch. Either way that happens before the float
+// branch's null-means-NaN rule runs, so a union NaN does not round-trip. That
+// is the inherent ambiguity of the null-for-NaN convention when null is also
+// a structural union value, and TaggedUnions disambiguates it. ±Inf encodes
+// as the number token ±1e999 and round-trips in a bare union regardless.
+// This pins the contract documented on LinkedinFloats.
 func TestMatrix_LinkedinFloatsNaNUnionAmbiguity(t *testing.T) {
 	nan := float32(math.Float32frombits(0x7fc00000))
 
-	// Bare union WITH a null branch: NaN encodes as null and decodes to the
+	// Bare union *with* a null branch: NaN encodes as null and decodes to the
 	// null branch (nil), not back to NaN.
 	t.Run("bare union with null branch loses NaN to null branch", func(t *testing.T) {
 		s := MustParse(`["null","float"]`)
@@ -1308,8 +1305,8 @@ func TestMatrix_LinkedinFloatsNaNUnionAmbiguity(t *testing.T) {
 		}
 	})
 
-	// Bare union WITHOUT a null branch: NaN still encodes as null, which
-	// the decoder rejects — there is no null branch to receive it.
+	// Bare union *without* a null branch: NaN still encodes as null, which
+	// the decoder rejects: there is no null branch to receive it.
 	t.Run("bare union without null branch rejects null on decode", func(t *testing.T) {
 		s := MustParse(`["float","string"]`)
 		js := mustAppendEncodeJSON(t, s, nil, nan, LinkedinFloats())
@@ -1323,7 +1320,7 @@ func TestMatrix_LinkedinFloatsNaNUnionAmbiguity(t *testing.T) {
 	})
 
 	// TaggedUnions disambiguates: {"float":null} routes the null to the
-	// float branch, which reapplies the null→NaN rule, so NaN round-trips.
+	// float branch, which reapplies the null-means-NaN rule, so NaN survives.
 	t.Run("tagged union round-trips NaN", func(t *testing.T) {
 		s := MustParse(`["null","float"]`)
 		js := mustAppendEncodeJSON(t, s, nil, nan, LinkedinFloats(), TaggedUnions())
@@ -1359,12 +1356,12 @@ func TestMatrix_LinkedinFloatsNaNUnionAmbiguity(t *testing.T) {
 
 func TestEncodeJSONTaggedUnions(t *testing.T) {
 	s := mustParse(t, `["null","string","int"]`)
-	// Tagged: should wrap.
+	// Tagged: wrapped.
 	got := mustEncodeJSON(t, s, "hello", TaggedUnions())
 	if string(got) != `{"string":"hello"}` {
 		t.Errorf("tagged: got %s", got)
 	}
-	// Bare (default): should not wrap.
+	// Bare (default): unwrapped.
 	got = mustEncodeJSON(t, s, "hello")
 	if string(got) != `"hello"` {
 		t.Errorf("bare: got %s", got)
@@ -1569,8 +1566,8 @@ func TestDecodeJSONNaNInfRoundTrip(t *testing.T) {
 		{"double -Inf string", `"double"`, `"-Infinity"`},
 		{"float null → NaN", `"float"`, `null`},
 		{"double null → NaN", `"double"`, `null`},
-		// Lowercase quoted "nan" is rejected to match Java/fastavro/
-		// goavro (all of which exact-match "NaN"); see
+		// We reject lowercase quoted "nan" to match Java/fastavro/
+		// goavro, which all exact-match "NaN"; see
 		// TestMatrix_JSONDecodeBareNaNInfinityCasingParity.
 	}
 	for _, tt := range tests {
@@ -1657,7 +1654,7 @@ func TestEncodeJSONRecordOptionalField(t *testing.T) {
 		{"name":"b","type":"string","default":"hi"}
 	]}`
 	s := mustParse(t, schema)
-	// Missing field "b" with default — should succeed with the default value.
+	// Missing field "b" has a default, so encode succeeds with it.
 	got := mustEncodeJSON(t, s, map[string]any{"a": int32(1)})
 	if string(got) != `{"a":1,"b":"hi"}` {
 		t.Errorf("got %s", got)
@@ -1682,9 +1679,9 @@ func TestBareUnionMultiRecordRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The tagged form recovers any branch deterministically — the Avro JSON spec
-	// form for a non-null union, and the only JSON form that round-trips a
-	// multi-record union (Java/fastavro/goavro require it).
+	// The tagged form recovers any branch deterministically. It is the Avro
+	// JSON spec form for a non-null union. It is also the only JSON form that
+	// round-trips a multi-record union; Java/fastavro/goavro require it.
 	var v1 any
 	if err := s.DecodeJSON([]byte(`{"Bar":{"y":"hello"}}`), &v1); err != nil {
 		t.Fatalf("tagged DecodeJSON: %v", err)
@@ -1709,34 +1706,34 @@ func TestBareUnionMultiRecordRoundTrip(t *testing.T) {
 		t.Fatalf("DecodeJSON tagged: %v", err)
 	}
 
-	// BARE JSON of a multi-record union commits to the FIRST declaration-order
-	// branch whose structure the object matches; it does NOT backtrack to a later
-	// record branch. That backtracking is the branch-guessing the Avro JSON spec
-	// + Java/fastavro/goavro avoid (they require the tagged form), and it is
-	// 2^depth for recursive unions (see
-	// TestRegression_BareUnionJSONNoExponentialBacktrack). So a bare object
-	// matching only the SECOND branch (Bar's {"y":...}) fails against the first
-	// branch (Foo needs "x"); the tagged form recovers Bar.
+	// Bare JSON of a multi-record union commits to the first
+	// declaration-order branch whose structure the object matches. It does
+	// NOT backtrack to a later record branch. That backtracking is the
+	// branch-guessing the Avro JSON spec and Java/fastavro/goavro avoid;
+	// they require the tagged form. It is also 2^depth for recursive unions,
+	// see TestRegression_BareUnionJSONNoExponentialBacktrack. So a bare
+	// object matching only the second branch (Bar's {"y":...}) fails against
+	// the first branch, since Foo needs "x". The tagged form recovers Bar.
 	var barBare any
 	if err := s.DecodeJSON([]byte(`{"y":"hello"}`), &barBare); err == nil {
 		t.Fatal(`bare {"y":"hello"} must commit to the first record branch Foo and fail (missing "x"); tagged form required for Bar`)
 	}
-	// A bare object matching the FIRST branch (Foo) decodes fine.
+	// A bare object matching the first branch (Foo) decodes fine.
 	var foo any
 	if err := s.DecodeJSON([]byte(`{"x":5}`), &foo); err != nil {
 		t.Fatalf("bare first-branch decode: %v", err)
 	}
 
-	// Direct Encode of a bare map still matches branches by STRUCTURE on the
-	// binary encode side (unaffected by the JSON-decode commit-to-first).
+	// Direct Encode of a bare map still matches branches by structure on the
+	// binary encode side, unaffected by the JSON-decode commit-to-first.
 	if _, err := s.Encode(map[string]any{"y": "hello"}); err != nil {
 		t.Fatalf("direct Encode of Bar map: %v", err)
 	}
 }
 
 func TestDecodeJSONBareUnionFallthrough(t *testing.T) {
-	// Union ["null","string"] with input {"int":42} — not a valid branch.
-	// Should still error even with bare matching.
+	// Union ["null","string"] with input {"int":42}, not a valid branch. This
+	// must still error even with bare matching.
 	s := mustParse(t, `["null","string"]`)
 	var v any
 	if err := s.DecodeJSON([]byte(`{"int":42}`), &v); err == nil {
@@ -1745,8 +1742,8 @@ func TestDecodeJSONBareUnionFallthrough(t *testing.T) {
 }
 
 func TestDecodeJSONTaggedFloatNull(t *testing.T) {
-	// {"float": null} in a ["null","float"] union — the null is inside
-	// the float branch, which decodes as NaN (goavro convention).
+	// {"float": null} in a ["null","float"] union: the null is inside the
+	// float branch, which decodes as NaN (goavro convention).
 	s := mustParse(t, `["null","float"]`)
 	var v any
 	mustDecodeJSON(t, s, []byte(`{"float":null}`), &v)
@@ -1760,8 +1757,8 @@ func TestDecodeJSONTaggedFloatNull(t *testing.T) {
 }
 
 func TestSerStringJsonNumberInUnion(t *testing.T) {
-	// json.Number in a ["null","string"] union — no numeric branch,
-	// should error since string rejects json.Number.
+	// json.Number in a ["null","string"] union has no numeric branch, so it
+	// errors: string rejects json.Number.
 	s, err := Parse(`["null","string"]`)
 	if err != nil {
 		t.Fatal(err)
@@ -1771,7 +1768,7 @@ func TestSerStringJsonNumberInUnion(t *testing.T) {
 		t.Fatal("expected error: json.Number should not match string branch")
 	}
 
-	// json.Number in a ["null","int","string"] union — should match int.
+	// json.Number in a ["null","int","string"] union matches int.
 	s2, err := Parse(`["null","int","string"]`)
 	if err != nil {
 		t.Fatal(err)
@@ -1786,7 +1783,7 @@ func TestSerStringJsonNumberInUnion(t *testing.T) {
 }
 
 func TestDecodeJSONBareUnionStringVsRecord(t *testing.T) {
-	// Union ["null","string",record] — a map should match the record, not string.
+	// Union ["null","string",record]: a map matches the record, not string.
 	schema := `["null","string",{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}]`
 	s := mustParse(t, schema)
 	var v any
@@ -1854,8 +1851,8 @@ func TestEncodeJSONDurationRoundTrip(t *testing.T) {
 }
 
 func TestEncodeJSONStructCacheSharing(t *testing.T) {
-	// Verify that binary Encode and EncodeJSON share the typeFieldMapping
-	// cache on serRecord: calling one warms the cache for the other.
+	// Binary Encode and EncodeJSON share the typeFieldMapping cache on
+	// serRecord: calling one warms the cache for the other.
 	type R struct {
 		Name string `avro:"name"`
 		Age  int32  `avro:"age"`
@@ -1870,7 +1867,7 @@ func TestEncodeJSONStructCacheSharing(t *testing.T) {
 	}
 	v := R{Name: "Alice", Age: 30}
 
-	// Binary encode first — warms the cache.
+	// Binary encode first, which warms the cache.
 	bin, err := s.Encode(&v)
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
@@ -1879,7 +1876,7 @@ func TestEncodeJSONStructCacheSharing(t *testing.T) {
 		t.Fatal("empty binary output")
 	}
 
-	// JSON encode second — should reuse the cached mapping.
+	// JSON encode second, which must reuse the cached mapping.
 	j, err := s.EncodeJSON(&v)
 	if err != nil {
 		t.Fatalf("EncodeJSON: %v", err)
@@ -2008,7 +2005,7 @@ func TestFromAvroJSONDoubleTypeCheck(t *testing.T) {
 
 func TestAppendJSONStringEscaping(t *testing.T) {
 	s, _ := Parse(`"string"`)
-	// Test control characters and special escapes.
+	// Control characters and special escapes.
 	tests := []struct {
 		in   string
 		want string
@@ -2035,10 +2032,10 @@ func TestAppendJSONStringEscaping(t *testing.T) {
 	}
 }
 
-// TestEncodeJSONUFFFDIdempotence pins the canonical-idempotence guarantee
-// of the JSON encoder for U+FFFD: an invalid UTF-8 byte and a valid
-// U+FFFD codepoint must encode to the same bytes, so decode-encode-
-// decode-encode of any input is a no-op after the first pass.
+// TestEncodeJSONUFFFDIdempotence pins the canonical-idempotence guarantee of
+// the JSON encoder for U+FFFD. An invalid UTF-8 byte and a valid U+FFFD
+// codepoint must encode to the same bytes. Repeated decode and encode of any
+// input is then a no-op after the first pass.
 func TestEncodeJSONUFFFDIdempotence(t *testing.T) {
 	s, _ := Parse(`"string"`)
 	// String containing one invalid UTF-8 byte.
@@ -2071,8 +2068,8 @@ func TestEncodeJSONUFFFDIdempotence(t *testing.T) {
 }
 
 func TestDecodeJSONGoavroLogicalBranchName(t *testing.T) {
-	// goavro uses "long.timestamp-millis" as union branch names.
-	// DecodeJSON should accept these via findUnionBranch fallback.
+	// goavro uses "long.timestamp-millis" as union branch names. We accept
+	// those through the findUnionBranch fallback.
 	schema := `["null",{"type":"long","logicalType":"timestamp-millis"}]`
 	s := mustParse(t, schema)
 	var v any
@@ -2121,9 +2118,9 @@ func TestSerStringTextAppenderLong(t *testing.T) {
 // TestLogicalTypeRoundTrips verifies that every logical type round-trips
 // through all four encode/decode functions:
 //
-//	value → Encode → Decode → same value
-//	value → EncodeJSON → DecodeJSON → same value
-//	value → Encode → Decode → EncodeJSON → DecodeJSON → same value
+//	value -> Encode -> Decode -> same value
+//	value -> EncodeJSON -> DecodeJSON -> same value
+//	value -> Encode -> Decode -> EncodeJSON -> DecodeJSON -> same value
 func TestLogicalTypeRoundTrips(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -2175,7 +2172,7 @@ func TestLogicalTypeRoundTrips(t *testing.T) {
 			json:   "1742378400000000000",
 		},
 		{
-			// Spec / Java / fastavro form: unscaled-int (33 → 0x21)
+			// Spec / Java / fastavro form: unscaled-int (33 as 0x21)
 			// emitted as a codepoint-mapped Avro JSON byte string.
 			name:   "decimal-bytes",
 			schema: `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
@@ -2208,7 +2205,7 @@ func TestLogicalTypeRoundTrips(t *testing.T) {
 				t.Fatalf("Parse: %v", err)
 			}
 
-			// Encode → Decode
+			// Encode, then Decode.
 			binary, err := s.Encode(tt.value)
 			if err != nil {
 				t.Fatalf("Encode: %v", err)
@@ -2219,7 +2216,7 @@ func TestLogicalTypeRoundTrips(t *testing.T) {
 				t.Errorf("Encode→Decode: got %T(%v), want %T(%v)", decoded, decoded, tt.want, tt.want)
 			}
 
-			// EncodeJSON → DecodeJSON
+			// EncodeJSON, then DecodeJSON.
 			jb, err := s.EncodeJSON(tt.value)
 			if err != nil {
 				t.Fatalf("EncodeJSON: %v", err)
@@ -2235,7 +2232,7 @@ func TestLogicalTypeRoundTrips(t *testing.T) {
 				t.Errorf("EncodeJSON→DecodeJSON: got %T(%v), want %T(%v)", djDecoded, djDecoded, tt.want, tt.want)
 			}
 
-			// Full round-trip: Encode → Decode → EncodeJSON → DecodeJSON
+			// Full round-trip: Encode, Decode, EncodeJSON, DecodeJSON.
 			jb2, err := s.EncodeJSON(decoded)
 			if err != nil {
 				t.Fatalf("EncodeJSON(decoded): %v", err)
@@ -2281,7 +2278,7 @@ func TestPrimitiveRoundTrips(t *testing.T) {
 				t.Fatalf("Parse: %v", err)
 			}
 
-			// Encode → Decode
+			// Encode, then Decode.
 			binary, err := s.Encode(tt.value)
 			if err != nil {
 				t.Fatalf("Encode: %v", err)
@@ -2292,7 +2289,7 @@ func TestPrimitiveRoundTrips(t *testing.T) {
 				t.Errorf("Encode→Decode: got %T(%v), want %T(%v)", decoded, decoded, tt.want, tt.want)
 			}
 
-			// EncodeJSON → DecodeJSON
+			// EncodeJSON, then DecodeJSON.
 			jb, err := s.EncodeJSON(tt.value)
 			if err != nil {
 				t.Fatalf("EncodeJSON: %v", err)
@@ -2308,7 +2305,7 @@ func TestPrimitiveRoundTrips(t *testing.T) {
 				t.Errorf("EncodeJSON→DecodeJSON: got %T(%v), want %T(%v)", djDecoded, djDecoded, tt.want, tt.want)
 			}
 
-			// Cross: Encode → Decode → EncodeJSON → DecodeJSON
+			// Cross: Encode, Decode, EncodeJSON, DecodeJSON.
 			jb2, err := s.EncodeJSON(decoded)
 			if err != nil {
 				t.Fatalf("EncodeJSON(decoded): %v", err)
@@ -2401,7 +2398,7 @@ func TestEncodeJSONLogical(t *testing.T) {
 		schema string
 		v      any
 	}{
-		// date: time.Time → int
+		// date: time.Time to int
 		{"date from time.Time", `{"type":"int","logicalType":"date"}`, tm},
 		{"date from string", `{"type":"int","logicalType":"date"}`, "2020-01-01"},
 		// time-millis: int path from time.Time (hour/min/sec derived)
@@ -2589,16 +2586,17 @@ func TestEncodeJSONStringBytesEnumCoverage(t *testing.T) {
 
 // TestMatrix_BytesToAvroJSONStringCodepointPerByte pins that
 // [bytesToAvroJSONString] emits each byte 0x00-0xFF as a separate Unicode
-// codepoint. `string(b)` is NOT equivalent: it reinterprets the slice as UTF-8,
-// collapsing adjacent bytes that form a valid sequence (c3 a9 → one codepoint
-// instead of two) and mapping invalid bytes to U+FFFD, which
-// avroJSONBytesToBytes then rejects as out of range. The spec mandates one byte
-// per codepoint.
+// codepoint. `string(b)` is NOT equivalent. It reinterprets the slice as
+// UTF-8, collapsing adjacent bytes that form a valid sequence (c3 a9 becomes
+// one codepoint instead of two). It also maps invalid bytes to U+FFFD, which
+// avroJSONBytesToBytes then rejects as out of range. The spec mandates one
+// byte per codepoint.
 //
-// Round-trip invariant: avroJSONBytesToBytes(bytesToAvroJSONString(b)) == b for
-// every []byte. That inverse pair is what makes SchemaField.Default round-trip
-// through SchemaNode.Schema; the naive string(b) path — or json.Marshal's
-// base64 — breaks it for any default containing a byte >= 0x80.
+// Round-trip invariant: avroJSONBytesToBytes(bytesToAvroJSONString(b)) == b
+// for every []byte. That
+// inverse pair is what makes SchemaField.Default round-trip through
+// SchemaNode.Schema. The naive string(b) path, or json.Marshal's base64,
+// breaks it for any default containing a byte >= 0x80.
 func TestMatrix_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -2628,7 +2626,7 @@ func TestMatrix_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
 				t.Errorf("round-trip mismatch: bytesToAvroJSONString(%x) → %q → avroJSONBytesToBytes → %x",
 					tc.in, encoded, decoded)
 			}
-			// One codepoint per input byte — the property string([]byte)
+			// One codepoint per input byte, the property string([]byte)
 			// violates whenever the slice contains bytes ≥ 0x80.
 			runeCount := 0
 			for range encoded {
@@ -2641,12 +2639,12 @@ func TestMatrix_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
 		})
 	}
 
-	// Direct demonstration that string(b) does NOT satisfy the contract:
-	// bytes c3 a9 (which happen to spell U+00E9 in UTF-8) collapse to
-	// the single rune 'é' under string([]byte), then avroJSONBytesToBytes
-	// maps that one rune back to a single byte 0xE9 — losing the original
-	// 2-byte input. This locks "don't use string(b) as a shortcut" in
-	// case a future refactor is tempted to simplify the helper.
+	// Here we show directly that string(b) does NOT satisfy the contract.
+	// Bytes c3 a9 (which happen to spell U+00E9 in UTF-8) collapse to the
+	// single rune 'é' under string([]byte). avroJSONBytesToBytes then maps
+	// that one rune back to a single byte 0xE9, losing the original 2-byte
+	// input. This locks in "do not use string(b) as a shortcut" against a
+	// future simplification of the helper.
 	t.Run("string([]byte) breaks the round-trip on high-bit bytes", func(t *testing.T) {
 		in := []byte{0xC3, 0xA9}
 		naive := string(in)
@@ -2660,12 +2658,12 @@ func TestMatrix_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
 	})
 }
 
-// The errTooDeep recursion bound must be UNIFORM across binary encode,
-// JSON encode, binary decode, and JSON decode — one increment per schema
-// nesting level. Record/union JSON encode formerly incremented twice per
-// level (a same-level dispatch hop also bumped depth), halving the budget
-// so a value DecodeJSON accepted (and binary Encode accepted) failed
-// EncodeJSON with errTooDeep at half the depth — a round-trip break.
+// The errTooDeep recursion bound must be uniform across binary encode, JSON
+// encode, binary decode, and JSON decode: one increment per schema nesting
+// level. Record/union JSON encode formerly incremented twice per level, since
+// a same-level dispatch hop also bumped depth. That halved the budget, so a
+// value DecodeJSON and binary Encode both accepted failed EncodeJSON with
+// errTooDeep at half the depth. That is a round-trip break.
 func TestRegression_JSONEncodeDepthMatchesDecode(t *testing.T) {
 	var b strings.Builder
 	const n = 900 // well under maxDepth (1000), well over the former /2 break
@@ -2959,8 +2957,8 @@ func TestDecodeJSONEscapedStrings(t *testing.T) {
 }
 
 // TestDecodeJSONInvalidEscapeRejected pins that an unrecognized escape
-// sequence (\x, \z, \q — none of the eight escapes JSON defines) is
-// REJECTED rather than silently decoded with the backslash dropped.
+// sequence (\x, \z, \q, none of the eight escapes JSON defines) is
+// rejected rather than silently decoded with the backslash dropped.
 // Dropping the backslash corrupts string content (e.g. "C:\dir" would
 // decode to "C:dir"), and the authoritative implementations reject:
 // Java's JsonDecoder uses Jackson with no backslash-escaping feature
@@ -3013,10 +3011,10 @@ func TestDecodeJSONInvalidEscapeRejected(t *testing.T) {
 }
 
 // TestDecodeJSONRawControlCharRejected pins that an unescaped control
-// character (U+0000–U+001F) inside a JSON string is rejected, matching
+// character (U+0000-U+001F) inside a JSON string is rejected, matching
 // encoding/json, Java (Jackson), fastavro, and RFC 8259 §7 (which
 // requires control chars to be escaped). The escaped forms, plus
-// 0x7F (DEL — not a JSON control char) stay accepted. The rejection is
+// 0x7F (DEL, not a JSON control char) stay accepted. The rejection is
 // uniform across string/enum/map-key/bytes (all route through
 // consumeStringRaw).
 func TestDecodeJSONRawControlCharRejected(t *testing.T) {
@@ -3056,8 +3054,8 @@ func TestDecodeJSONRawControlCharRejected(t *testing.T) {
 // TestDecodeJSONInvalidUTF8Rejected pins that invalid UTF-8 byte
 // sequences inside a JSON string are rejected. Valid multi-byte UTF-8
 // stays accepted, as do the \u00XX escapes the encoder produces for
-// non-ASCII bytes — so the encode→decode round-trip the bytes display
-// path relies on is preserved.
+// non-ASCII bytes, so the encode and decode round trip that the bytes
+// display path relies on is preserved.
 func TestDecodeJSONInvalidUTF8Rejected(t *testing.T) {
 	s := MustParse(`"string"`)
 	for _, in := range []string{
@@ -3130,16 +3128,15 @@ func TestDecodeJSONTrailingContentRejected(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONFloatGrammarRejected pins that a JSON number whose
-// grammar is invalid per RFC 8259 — a trailing dot with no fractional
-// digit ("5.", "5.e3", "1.e5") — is REJECTED when decoding into a
-// float/double target, the same as the int/long arms already reject it
-// and the same as Java (Jackson), fastavro (Python json), and goavro
-// (whose numberLength state machine requires a digit after the dot)
-// reject. Without the shared isJSONNumber gate, strconv.ParseFloat would
-// silently accept these. The IEEE special forms (±Inf from overflow,
-// NaN/Infinity tokens) remain accepted — those are semantic leniencies,
-// not grammar violations.
+// TestDecodeJSONFloatGrammarRejected pins that a JSON number whose grammar
+// is invalid per RFC 8259, a trailing dot with no fractional digit ("5.",
+// "5.e3", "1.e5"), is rejected when decoding into a float/double target,
+// the same as the int/long arms already reject it and the same as Java
+// (Jackson), fastavro (Python json), and goavro (whose numberLength state
+// machine requires a digit after the dot) reject. Without the shared
+// isJSONNumber gate, strconv.ParseFloat would silently accept these. The
+// IEEE special forms (±Inf from overflow, NaN/Infinity tokens) remain
+// accepted: those are semantic leniencies, not grammar violations.
 func TestDecodeJSONFloatGrammarRejected(t *testing.T) {
 	bad := []string{"5.", "5.e3", "1.e5", "-5.", "0.", "5.E3"}
 	for _, schema := range []string{`"float"`, `"double"`, `"long"`, `"int"`} {
@@ -3153,7 +3150,7 @@ func TestDecodeJSONFloatGrammarRejected(t *testing.T) {
 	}
 
 	// Valid grammar must still decode on float/double, including the
-	// overflow→±Inf and special-float forms that are deliberately lenient.
+	// overflow-to-±Inf and special-float forms that are deliberately lenient.
 	type fc struct {
 		in   string
 		want float64
@@ -3182,7 +3179,7 @@ func TestDecodeJSONFloatGrammarRejected(t *testing.T) {
 	}
 
 	// Encode/decode symmetry: EncodeJSON rejects json.Number("5.") and so
-	// must DecodeJSON — both now run the same isJSONNumber gate.
+	// must DecodeJSON; both run the same isJSONNumber gate.
 	d := MustParse(`"double"`)
 	for _, in := range []string{"5.", "5.e3"} {
 		_, encErr := d.EncodeJSON(json.Number(in))
@@ -3518,7 +3515,8 @@ func TestDecodeJSONLogicalTypesAny(t *testing.T) {
 		{`{"type":"long","logicalType":"time-micros"}`, `1500000`, func(v any) bool { _, ok := v.(time.Duration); return ok }},
 		// decodeLogicalLong: plain (no logical)
 		{`"long"`, `99`, func(v any) bool { return v == int64(99) }},
-		// decodeLogicalFixed: decimal (4 bytes: value 33, scale 2 → 0.33; precision must fit in 4 bytes: max 9)
+		// decodeLogicalFixed: decimal (4 bytes: value 33, scale 2, so 0.33;
+		// precision must fit in 4 bytes: max 9)
 		{`{"type":"fixed","name":"d","size":4,"logicalType":"decimal","precision":9,"scale":2}`, `"\u0000\u0000\u0000!"`, func(v any) bool { _, ok := v.(*big.Rat); return ok }},
 		// decodeLogicalFixed: duration (12 bytes, all printable ASCII for simplicity)
 		{`{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`, "\"abcdefghijkl\"", func(v any) bool { _, ok := v.(Duration); return ok }},
@@ -3585,7 +3583,7 @@ func TestDecodeJSONCustomDecoderSkipAll(t *testing.T) {
 	})
 	var out any
 	mustDecodeJSON(t, s, []byte(`42`), &out)
-	// All decoders skipped → raw int64 value.
+	// All decoders skipped, so we get the raw int64 value.
 	if out != int64(42) {
 		t.Fatalf("got %v (%T)", out, out)
 	}
@@ -3653,7 +3651,7 @@ func TestDecodeJSONNullTypedTargets(t *testing.T) {
 // decodes to the target's Go zero value, always replacing any prior value: the
 // binary path honors this unconditionally, while the JSON path historically
 // zeroed only nilable kinds, leaving non-nilable concrete targets at whatever
-// they held — a silent value-bleed footgun across reused decode targets. Covers
+// they held, a silent value-bleed footgun across reused decode targets. Covers
 // decodeNull, the decodeUnion null branch, and assignAny's nil value.
 func TestDecodeJSONNullIntoNonPointerZeroes(t *testing.T) {
 	t.Run("top-level null", func(t *testing.T) {
@@ -3733,7 +3731,7 @@ func TestDecodeJSONTaggedUnionTypedTarget(t *testing.T) {
 // TestDecodeJSONUnionBareTypedTarget exercises bare union into non-pointer typed target.
 func TestDecodeJSONUnionBareTypedTarget(t *testing.T) {
 	s, _ := Parse(`["null","string","int"]`)
-	// Decode bare string into *any — already covered.
+	// Decode bare string into *any, already covered.
 	// Decode bare int into a typed int32 target (non-pointer, multi-branch).
 	var out int32
 	mustDecodeJSON(t, s, []byte(`42`), &out)
@@ -4018,7 +4016,7 @@ func TestDecodeJSONCustomDecoderInnerError(t *testing.T) {
 func TestDecodeJSONFixedScanError(t *testing.T) {
 	s, _ := Parse(`{"type":"fixed","name":"f","size":3}`)
 	var out any
-	// Not a string → error.
+	// Not a string, so this errors.
 	if err := s.DecodeJSON([]byte(`42`), &out); err == nil {
 		t.Fatal("expected error")
 	}
@@ -4418,7 +4416,7 @@ func TestDecodeJSONLogicalTypesNonAddressable(t *testing.T) {
 // TestDecodeJSONStringWithEscapes exercises the resolveJSONEscapes path
 // in consumeString and consumeStringZeroCopy.
 func TestDecodeJSONStringWithEscapes(t *testing.T) {
-	// String value with escapes (goes through consumeSlabString → resolveJSONEscapes).
+	// String value with escapes (consumeSlabString into resolveJSONEscapes).
 	s, _ := Parse(`"string"`)
 	var out any
 	mustDecodeJSON(t, s, []byte(`"hello\tworld"`), &out)
@@ -4426,7 +4424,7 @@ func TestDecodeJSONStringWithEscapes(t *testing.T) {
 		t.Fatalf("got %q", out)
 	}
 
-	// Map key with escapes (goes through consumeSlabString → resolveJSONEscapes).
+	// Map key with escapes (consumeSlabString into resolveJSONEscapes).
 	sm, _ := Parse(`{"type":"map","values":"int"}`)
 	var mout any
 	mustDecodeJSON(t, sm, []byte(`{"key\twith\ttabs":42}`), &mout)
@@ -4570,7 +4568,7 @@ func TestParseJSONInt64NegOverflowExact(t *testing.T) {
 func TestDecodeJSONWalkEscapesBadHex(t *testing.T) {
 	s, _ := Parse(`"string"`)
 	var out any
-	// \uXXGG — invalid hex digits.
+	// \uXXGG, invalid hex digits.
 	if err := s.DecodeJSON([]byte(`"\u00GG"`), &out); err == nil {
 		t.Fatal("expected error for bad hex in \\u")
 	}
@@ -4579,19 +4577,19 @@ func TestDecodeJSONWalkEscapesBadHex(t *testing.T) {
 // TestDecodeJSONLogicalTyped exercises typed target paths for logical
 // types in decodeInt, decodeLong, decodeFixed, and decodeBytes.
 func TestDecodeJSONLogicalTyped(t *testing.T) {
-	// date → time.Time
+	// date decodes to time.Time
 	t.Run("date to time.Time", func(t *testing.T) {
 		s := MustParse(`{"type":"int","logicalType":"date"}`)
 		var tm time.Time
 		mustDecodeJSON(t, s, []byte("18262"), &tm)
 	})
-	// time-millis → time.Duration
+	// time-millis decodes to time.Duration
 	t.Run("time-millis to time.Duration", func(t *testing.T) {
 		s := MustParse(`{"type":"int","logicalType":"time-millis"}`)
 		var d time.Duration
 		mustDecodeJSON(t, s, []byte("12345"), &d)
 	})
-	// timestamp-millis → time.Time (each variant)
+	// timestamp-millis decodes to time.Time (each variant)
 	for _, lt := range []string{"timestamp-millis", "local-timestamp-millis"} {
 		t.Run(lt+" to time.Time", func(t *testing.T) {
 			s := MustParse(`{"type":"long","logicalType":"` + lt + `"}`)
@@ -4658,9 +4656,9 @@ func TestDecodeJSONErrorPaths(t *testing.T) {
 	if err := enumS.DecodeJSON([]byte(`"C"`), new(string)); err == nil {
 		t.Error("expected unknown symbol error")
 	}
-	// int / uint targets are accepted (ordinal) per binary parity —
-	// see TestMatrix_JSONEnumDecodeIntoIntTargetParity. Only
-	// genuinely unsupported targets (channel, slice, etc.) error.
+	// int / uint targets are accepted as the ordinal, in binary parity; see
+	// TestMatrix_JSONEnumDecodeIntoIntTargetParity. Only genuinely
+	// unsupported targets (channel, slice, etc.) error.
 	if err := enumS.DecodeJSON([]byte(`"A"`), new([]int)); err == nil {
 		t.Error("expected unsupported target error for slice")
 	}
@@ -4684,11 +4682,10 @@ func TestDecodeJSONErrorPaths(t *testing.T) {
 	if err := doubleS.DecodeJSON([]byte(`"not a double"`), new(float64)); err == nil {
 		t.Error("expected invalid double error")
 	}
-	// int → float target is now supported (round-trip parity with
-	// documented encode-side whole-number divergence). See
-	// TestMatrix_IntLongDecodeIntoFloatJSONNumber. Genuinely
-	// unsupported targets (slice, struct without method, etc.) still
-	// error.
+	// An int into a float target is supported, in round-trip parity with the
+	// documented encode-side whole-number divergence; see
+	// TestMatrix_IntLongDecodeIntoFloatJSONNumber. Genuinely unsupported
+	// targets (slice, struct without method, etc.) still error.
 	intS := MustParse(`"int"`)
 	if err := intS.DecodeJSON([]byte(`42`), new([]int)); err == nil {
 		t.Error("expected unsupported target for int (slice)")
@@ -4737,13 +4734,12 @@ func TestDecodeJSONMapTimeValues(t *testing.T) {
 }
 
 // DecodeJSON must honor TaggedUnions / TagLogicalTypes for a union field
-// that is FILLED FROM ITS DEFAULT (absent in the input) exactly as it does
-// for a present union field — and exactly as Schema.Decode (binary),
-// resolved DecodeJSON, and EncodeJSON already do. The default-fill path
-// routes through the binary deser fn, which reads the slab's taggedUnions
-// flag; DecodeJSON populated only the jsonDecoder's wrapUnions field and
-// left the slab flag at the pool default, so the envelope was dropped on
-// default-filled fields only.
+// filled from its default (absent in the input) exactly as it does for a
+// present union field, and exactly as Schema.Decode (binary), resolved
+// DecodeJSON, and EncodeJSON already do. The default-fill path routes through
+// the binary deser fn, which reads the slab's taggedUnions flag; DecodeJSON
+// populated only the jsonDecoder's wrapUnions field and left the slab flag at
+// the pool default, so the envelope was dropped on default-filled fields only.
 func TestRegression_DecodeJSONTaggedUnionDefaultFill(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"f","type":["null","string"],"default":"hello"},
@@ -4789,7 +4785,7 @@ func TestRegression_DecodeJSONTaggedUnionDefaultFill(t *testing.T) {
 // under TaggedUnions handles a non-empty interface target exactly like
 // binary Decode: the {branch: value} envelope applies only to targets
 // that map[string]any is assignable to, and is skipped silently for
-// every other interface target (deserUnion.maybeWrap's contract) — the
+// every other interface target (deserUnion.maybeWrap's rule), so the
 // decoded branch value lands bare. Without the skip, a union value that
 // satisfies the caller's interface decodes through binary but errors
 // through JSON on the same option.

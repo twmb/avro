@@ -17,28 +17,28 @@ import (
 
 // ---------- dark_sweep_test.go ----------
 //
-// Cells for code paths the rest of the suite executes with NOTHING — derived
-// from a coverage census that unions every Test, net and fuzz seed and then
-// subtracts. A block reached by nothing is the only place a behavioral defect
-// can hide, so each cell drives an input that lands on one and checks the result
-// against an oracle OUTSIDE this package: encoding/json, big.Int arithmetic for
-// the timestamp bounds, the binary auto-fill for the metadata default surface,
-// and json.Valid for the strict skipper.
+// Cells for code paths the rest of the suite executes with *nothing*. We
+// derive them from a coverage census that unions every Test, net and fuzz
+// seed and then subtracts. A block reached by nothing is the only place a
+// behavioral defect can hide. So each cell drives an input that lands on one
+// and checks the result against an oracle *outside* this package:
+// encoding/json, big.Int arithmetic for the timestamp bounds, the binary
+// auto-fill for the metadata default surface, and json.Valid for the strict
+// skipper.
 //
 // The axes decide which arm runs, not which value: carrier shape, container
 // shape, nesting parity, and wire path. Parity is what makes the recursion
-// guards reachable at all — each schema level costs one depth unit, so which
-// node sits on the limit depth is decided by its distance from the root.
+// guards reachable at all. Each schema level costs one depth unit, so a
+// node's distance from the root decides which node lands on the limit depth.
 
 // ---------------------------------------------------------------------------
 // Timestamp scaling: the int64 overflow boundary on both sides.
 //
-// timeToTimestampScaled has three guards — the negative-second adjustment
+// timeToTimestampScaled has three guards: the negative-second adjustment
 // branch's floor, that branch's residual-underflow check, and the positive
-// side's sub-second-carry check. Which one fires is decided by the sign of
-// the second and by how much room the scale leaves at the extreme, so the
-// cell crosses (unit) x (side) and computes the answer independently with
-// math/big.
+// side's sub-second-carry check. Which one fires depends on the sign of the
+// second and on how much room the scale leaves at the extreme. So we cross
+// (unit) x (side) and compute the answer independently with math/big.
 // ---------------------------------------------------------------------------
 
 func TestMatrix_TimestampScaledOverflowBoundaries(t *testing.T) {
@@ -58,8 +58,8 @@ func TestMatrix_TimestampScaledOverflowBoundaries(t *testing.T) {
 		{"local-timestamp-nanos", 1e9, 1, true},
 	}
 
-	// The local-* logicals encode WALL CLOCK, not an instant: the Go time's
-	// calendar fields are re-read as if they were UTC before scaling, so the
+	// The local-* logicals encode *wall clock*, not an instant. The Go time's
+	// calendar fields are re-read as if they were UTC before scaling. The
 	// oracle has to make the same move or it compares two different instants.
 	asEncoded := func(local bool, t time.Time) time.Time {
 		if !local {
@@ -69,9 +69,9 @@ func TestMatrix_TimestampScaledOverflowBoundaries(t *testing.T) {
 			t.Second(), t.Nanosecond(), time.UTC)
 	}
 
-	// Oracle: exact arithmetic, no int64 anywhere. The wire value for a
-	// time is sec*scale + nsec/subScale (integer division), and the encode
-	// must succeed exactly when that lands in [MinInt64, MaxInt64].
+	// Oracle: exact arithmetic, no int64 anywhere. The wire value for a time
+	// is sec*scale + nsec/subScale (integer division). The encode must
+	// succeed exactly when that lands in [MinInt64, MaxInt64].
 	oracle := func(sec, nsec, scale, subScale int64) (*big.Int, bool) {
 		want := new(big.Int).Mul(big.NewInt(sec), big.NewInt(scale))
 		want.Add(want, big.NewInt(nsec/subScale))
@@ -86,10 +86,10 @@ func TestMatrix_TimestampScaledOverflowBoundaries(t *testing.T) {
 			s := mustParse(t, fmt.Sprintf(`{"type":"long","logicalType":%q}`, u.logical))
 			maxSec := int64(math.MaxInt64) / u.scale
 
-			// Every side of both guards. The nanosecond is chosen so the
-			// sub-second term is non-zero (that is what routes the negative
-			// case into the adjustment branch at all) and so the positive
-			// case straddles the MaxInt64 remainder.
+			// Every side of both guards. We choose the nanosecond so the
+			// sub-second term is non-zero, which is what routes the negative
+			// case into the adjustment branch at all. The positive case then
+			// straddles the MaxInt64 remainder.
 			cells := []struct {
 				name string
 				sec  int64
@@ -110,7 +110,7 @@ func TestMatrix_TimestampScaledOverflowBoundaries(t *testing.T) {
 					continue // not expressible as a time.Time nanosecond
 				}
 				tv := time.Unix(c.sec, c.nsec)
-				// time.Unix normalizes; re-read what it actually holds so the
+				// time.Unix normalizes. Re-read what it actually holds so the
 				// oracle sees the same input the encoder does.
 				enc := asEncoded(u.local, tv)
 				gotSec, gotNsec := enc.Unix(), int64(enc.Nanosecond())
@@ -132,9 +132,9 @@ func TestMatrix_TimestampScaledOverflowBoundaries(t *testing.T) {
 					t.Fatalf("%s: decode: %v", c.name, err)
 				}
 				// The decoded time must carry the same tick count the oracle
-				// computed; compare in the wire domain, not the Go domain,
-				// because a Time far outside the monotonic range still
-				// round-trips its tick value.
+				// computed. We compare in the wire domain, not the Go domain.
+				// A Time far outside the monotonic range still round-trips
+				// its tick value.
 				var raw int64
 				rawSchema, err := avro.Parse(`"long"`)
 				if err != nil {
@@ -157,10 +157,10 @@ func TestMatrix_TimestampScaledOverflowBoundaries(t *testing.T) {
 //
 // SchemaNode.Props holds any Go value, and SchemaNode.Schema() re-emits it.
 // The render canonicalizes the shapes that have a marshal-identical canonical
-// twin and leaves the rest opaque, and separately charges each value against
-// a byte budget. Both walks branch on carrier shape, so the axes are
-// (carrier) x (position: top-level, or nested under a value that forces the
-// fixup walk to recurse). The oracle is encoding/json itself.
+// twin and leaves the rest opaque. It separately charges each value against a
+// byte budget. Both walks branch on carrier shape, so the axes are (carrier)
+// x (position: top-level, or nested under a value that forces the fixup walk
+// to recurse). The oracle is encoding/json itself.
 // ---------------------------------------------------------------------------
 
 type darkPtrMarshaler struct{ V int }
@@ -185,9 +185,9 @@ type darkOKKey int
 
 func (k darkOKKey) MarshalText() ([]byte, error) { return []byte(fmt.Sprint(int(k))), nil }
 
-// A string-KIND key with a MarshalText that would fail: encoding/json resolves
-// string-kind keys by their raw string and never consults MarshalText, so this
-// must marshal fine on both sides.
+// A string-*kind* key with a MarshalText that would fail. encoding/json
+// resolves string-kind keys by their raw string and never consults
+// MarshalText, so this must marshal fine on both sides.
 type darkFailStringKey string
 
 func (darkFailStringKey) MarshalText() ([]byte, error) {
@@ -213,7 +213,7 @@ func TestMatrix_SchemaTreeValueRenderMatchesEncodingJSON(t *testing.T) {
 		v    any
 	}{
 		// Elements whose marshal is reachable only through the addressable
-		// slot: boxing them into []any would change the output, so the
+		// slot. Boxing them into []any would change the output, so the
 		// container has to stay opaque.
 		{"ptr-receiver-marshaler-slice", []darkPtrMarshaler{{1}, {2}}},
 		{"ptr-receiver-marshaler-array", [2]darkPtrMarshaler{{1}, {2}}},
@@ -232,11 +232,11 @@ func TestMatrix_SchemaTreeValueRenderMatchesEncodingJSON(t *testing.T) {
 	}
 
 	// Position axis: alone, or as a sibling of a value that forces the walk
-	// to rebuild the whole container (a +Inf needs the numeric fixup, so
+	// to rebuild the whole container. A +Inf needs the numeric fixup, so
 	// every sibling is revisited through the by-kind conversion arms rather
-	// than passed through). path says where to find the carrier again in the
-	// re-emitted tree, so the comparison stays about the carrier alone —
-	// the trigger itself has no encoding/json image to compare against.
+	// than passed through. path says where to find the carrier again in the
+	// re-emitted tree. That keeps the comparison about the carrier alone: the
+	// trigger itself has no encoding/json image to compare against.
 	positions := []struct {
 		name string
 		wrap func(v any) any
@@ -266,7 +266,7 @@ func TestMatrix_SchemaTreeValueRenderMatchesEncodingJSON(t *testing.T) {
 				val := pos.wrap(c.v)
 				n.Props["p"] = val
 
-				// Oracle: what encoding/json makes of the CARRIER — not of
+				// Oracle: what encoding/json makes of the carrier, *not* of
 				// the wrapper, whose +Inf trigger encoding/json refuses by
 				// design. The one documented substitution is the byte slice,
 				// which Avro renders as its codepoint string rather than
@@ -327,10 +327,10 @@ func TestMatrix_SchemaTreeValueRenderMatchesEncodingJSON(t *testing.T) {
 }
 
 // darkSubstituteAvroImages applies the two documented differences between the
-// re-emitted schema and a plain json.Marshal: +Inf/-Inf render as the
-// 1e1000 number forms (json.Marshal refuses them outright, so they only reach
-// here from a sibling position where the outer container marshaled), and a
-// byte slice renders as Avro's codepoint-per-byte string rather than base64.
+// re-emitted schema and a plain json.Marshal. +Inf/-Inf render as the 1e1000
+// number forms. json.Marshal refuses them outright, so they only reach here
+// from a sibling position where the outer container marshaled. A byte slice
+// renders as Avro's codepoint-per-byte string rather than base64.
 func darkSubstituteAvroImages(want any, orig any) any {
 	switch w := want.(type) {
 	case map[string]any:
@@ -382,12 +382,12 @@ func darkAsByteSlice(v any) ([]byte, bool) {
 	return b, true
 }
 
-// Non-finite and signed-zero floats have no encoding/json image at all —
+// Non-finite and signed-zero floats have no encoding/json image at all.
 // Marshal refuses +Inf/-Inf outright and renders -0.0 with integer syntax
 // that re-parses sign-less. The render substitutes the JSON number forms Avro
-// uses instead, so the oracle here is the ROUND TRIP: re-parsing the emitted
-// schema has to give back a schema whose canonical bytes and prop image are
-// stable, and the emitted literal has to be the documented one.
+// uses instead, so the oracle here is the *round trip*. Re-parsing the
+// emitted schema has to give back a schema whose canonical bytes and prop
+// image are stable. The emitted literal has to be the documented one.
 func TestMatrix_SchemaTreeNonFiniteFloatImages(t *testing.T) {
 	t.Parallel()
 
@@ -417,8 +417,8 @@ func TestMatrix_SchemaTreeNonFiniteFloatImages(t *testing.T) {
 		for _, pos := range positions {
 			t.Run(c.name+"/"+pos.name, func(t *testing.T) {
 				t.Parallel()
-				// json.Marshal has no image for these; that is the reason the
-				// render substitutes one.
+				// json.Marshal has no image for these. That is why the render
+				// substitutes one.
 				if _, err := json.Marshal(c.v); err == nil && strings.Contains(c.want, "e1000") {
 					t.Fatalf("oracle precondition broken: json.Marshal accepted %v", c.v)
 				}
@@ -457,7 +457,7 @@ func TestMatrix_SchemaTreeNonFiniteFloatImages(t *testing.T) {
 }
 
 // A key type that json.Marshal itself rejects must be reported with
-// json.Marshal's own cause rather than silently charged or dropped.
+// json.Marshal's own cause. Nothing is silently charged or dropped.
 func TestMatrix_SchemaTreeMapKeyMarshalFailureSurfacesJSONCause(t *testing.T) {
 	t.Parallel()
 	s := mustParse(t, `{"type":"record","name":"R","fields":[]}`)
@@ -482,11 +482,11 @@ func TestMatrix_SchemaTreeMapKeyMarshalFailureSurfacesJSONCause(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Union defaults: the metadata branch selector against the wire auto-fill.
 //
-// Root().Fields[i].Default reports the default after choosing a union branch;
-// the binary decoder fills the same field from the same default when the
-// writer omits it. The two selectors are separate implementations, so the
-// cell crosses (branch kind) x (default shape) and drives BOTH, requiring
-// that they name the same branch.
+// Root().Fields[i].Default reports the default after choosing a union branch.
+// The binary decoder fills the same field from the same default when the
+// writer omits it. These are two separate implementations. So we drive *both*
+// across (branch kind) x (default shape) and require that they name the same
+// branch.
 // ---------------------------------------------------------------------------
 
 func TestMatrix_UnionDefaultMetadataSelectionMatchesWireFill(t *testing.T) {
@@ -545,8 +545,8 @@ func TestMatrix_UnionDefaultMetadataSelectionMatchesWireFill(t *testing.T) {
 			}
 
 			// Oracle: the wire auto-fill. A writer without "f" makes the
-			// reader materialize the default; the branch the WIRE picked must
-			// produce a value of the same Go type the metadata reported.
+			// reader materialize the default. The branch the *wire* picked
+			// must produce a value of the same Go type the metadata reported.
 			writer := `{"type":"record","name":"R","fields":[
 				{"name":"e0","type":{"type":"enum","name":"E","symbols":["A","B"]}}]}`
 			ws, err := avro.Parse(writer)
@@ -574,10 +574,11 @@ func TestMatrix_UnionDefaultMetadataSelectionMatchesWireFill(t *testing.T) {
 }
 
 // darkSameBranchShape reports whether the wire auto-fill and the metadata
-// Default named the same union branch. It compares the branch CLASS, not the
-// exact Go type: the wire materializes a decoded value (a record fills every
-// field, an enum arrives as a string) while the metadata surfaces the default
-// as written, so the record/array/map/scalar class is the shared question.
+// Default named the same union branch. It compares the branch *class*, not
+// the exact Go type. The wire materializes a decoded value: a record fills
+// every field, an enum arrives as a string. The metadata surfaces the default
+// as written. That leaves the record/array/map/scalar class as the shared
+// question.
 func darkSameBranchShape(wire, meta any) bool {
 	class := func(v any) string {
 		switch v.(type) {
@@ -604,15 +605,15 @@ func darkSameBranchShape(wire, meta any) bool {
 }
 
 // ---------------------------------------------------------------------------
-// The recursion limit, across container shapes AND nesting parity.
+// The recursion limit, across container shapes and nesting parity.
 //
-// Every schema level costs one depth unit, so a recursive schema puts its
-// record nodes on one parity and its union / array / map nodes on the other.
-// Only whichever lands ON the limit trips, which is why a single recursive
-// shape exercises exactly one of the guards: the cell shifts the whole tree
-// by one level to reach the other. The assertion is the same on both sides —
-// deep input is refused with the recursion-limit error and nothing panics,
-// shallow input of the same shape round-trips.
+// Every schema level costs one depth unit. A recursive schema therefore puts
+// its record nodes on one parity and its union / array / map nodes on the
+// other. Only whichever lands *on* the limit trips, so a single recursive
+// shape exercises exactly one guard. We shift the whole tree by one level to
+// reach the other. The assertion is the same on both sides. Deep input is
+// refused with the recursion-limit error and nothing panics. Shallow input of
+// the same shape round-trips.
 // ---------------------------------------------------------------------------
 
 type darkNullNext struct {
@@ -654,19 +655,19 @@ func TestMatrix_RecursionLimitAcrossShapesAndParity(t *testing.T) {
 
 	shapes := []struct {
 		name string
-		// body is the recursive record's field list, named "T"; the writer
-		// form appends one extra trailing field so the reader must skip
+		// body is the recursive record's field list, named "T". The writer
+		// form appends one extra trailing field, so the reader must skip
 		// through the same depth.
 		body string
 		// mk builds a Go value nested d levels.
 		mk func(d int) any
 		// wire builds a binary encoding nested d levels, or nil.
 		wire func(d int) []byte
-		// wwire is the same nesting in the WRITER's shape (one extra
+		// wwire is the same nesting in the *writer's* shape (one extra
 		// trailing int field per level), or nil to skip the resolve case.
 		wwire func(d int) []byte
-		// mkTarget allocates a CONCRETE decode target for the given shift,
-		// which compiles a different (unsafe, field-offset) decoder than the
+		// mkTarget allocates a *concrete* decode target for the given shift.
+		// That compiles a different (unsafe, field-offset) decoder than the
 		// any/map targets.
 		mkTarget func(shift int) any
 	}{
@@ -890,9 +891,9 @@ func TestMatrix_RecursionLimitAcrossShapesAndParity(t *testing.T) {
 // ---------------------------------------------------------------------------
 // The strict JSON skipper on malformed tails.
 //
-// Unknown fields in Avro JSON are skipped by a strict scanner rather than a
+// We skip unknown fields in Avro JSON with a strict scanner rather than a
 // permissive one, so every malformed continuation has to be an error. Oracle:
-// encoding/json's own json.Valid — an input the stdlib calls invalid must not
+// encoding/json's own json.Valid. An input the stdlib calls invalid must not
 // decode here either.
 // ---------------------------------------------------------------------------
 
@@ -918,8 +919,8 @@ func TestMatrix_StrictJSONSkipperRejectsMalformedSkippedValues(t *testing.T) {
 
 	s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
 	// Closing axis: a malformed value followed by the record's own '}' is a
-	// different scanner state than the same value truncated at EOF — the
-	// first has a byte to reject, the second has none.
+	// different scanner state than the same value truncated at EOF. The first
+	// has a byte to reject, the second has none.
 	for _, closing := range []struct {
 		name string
 		tail string
@@ -945,11 +946,12 @@ func TestMatrix_StrictJSONSkipperRejectsMalformedSkippedValues(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Enum carriers, both wires.
 //
-// The enum encoders dispatch on the Go carrier: the builtin string takes a
-// fast path, a text-marshaling type takes the name path, a NAMED string type
-// with no text method takes the generic string path, and an integer takes the
-// ordinal path. The two wires implement this separately, so the cell crosses
-// (carrier) x (wire) and requires the same accept/reject verdict from both.
+// The enum encoders dispatch on the Go carrier. The builtin string takes a
+// fast path, a text-marshaling type takes the name path, a *named* string
+// type with no text method takes the generic string path, and an integer
+// takes the ordinal path. The two wires implement this separately, so the
+// cell crosses (carrier) x (wire) and requires the same accept/reject verdict
+// from both.
 // ---------------------------------------------------------------------------
 
 type darkNamedEnum string
@@ -1007,10 +1009,10 @@ func TestMatrix_EnumCarrierAcceptanceAgreesAcrossWires(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Records carried by a map whose key type is not plain string.
 //
-// map[string]any has a fast path; every other string-KIND key type takes the
-// generic map arm, on both wires. json.Number is a string-kind type whose
-// values must remain valid number literals, so a record field name that is
-// not one has to be refused rather than silently written.
+// map[string]any has a fast path. Every other string-*kind* key type takes
+// the generic map arm, on both wires. json.Number is a string-kind type whose
+// values must remain valid number literals. A record field name that is not
+// one has to be refused rather than silently written.
 // ---------------------------------------------------------------------------
 
 type darkMapKey string
@@ -1022,9 +1024,9 @@ func TestMatrix_RecordFromNonCanonicalMapCarrier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	// A field name that IS a valid JSON number literal needs a relaxed name
-	// validator (the Avro grammar forbids a leading digit), which is exactly
-	// the shape a json.Number-keyed carrier can actually round-trip.
+	// A field name that *is* a valid JSON number literal needs a relaxed name
+	// validator, because the Avro grammar forbids a leading digit. That is
+	// exactly the shape a json.Number-keyed carrier can actually round-trip.
 	numeric, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"12","type":"string"}]}`,
 		avro.WithLaxNames(nil))
 	if err != nil {
@@ -1060,9 +1062,10 @@ func TestMatrix_RecordFromNonCanonicalMapCarrier(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Resolved JSON decode: the writer-shaped JSON is transformed through the
-// writer's own binary form before the resolving decode, so a writer JSON the
-// writer schema rejects has to fail there rather than half-transform.
+// Resolved JSON decode: we transform the writer-shaped JSON through the
+// writer's own binary form before the resolving decode. A writer JSON the
+// writer schema rejects therefore has to fail there rather than
+// half-transform.
 // ---------------------------------------------------------------------------
 
 func TestMatrix_ResolvedJSONDecodeRejectsBadWriterJSON(t *testing.T) {
@@ -1109,13 +1112,14 @@ func TestMatrix_ResolvedJSONDecodeRejectsBadWriterJSON(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Field-level logicalType: where the lift points.
 //
-// A logicalType written as a SIBLING of "type" on a field object is lifted into
-// the type definition for the WIRE path only — the metadata API keeps reporting
-// the schema as written, the documented scope of the concession. Which node the
-// lift lands on depends on the field's type shape: a bare primitive takes it, a
-// union hands it to the first non-null branch, an object takes it unless it
-// already carries one, and a union with NO non-null branch has nowhere to put
-// it. The oracle is the equivalent NESTED-form schema.
+// A logicalType written as a *sibling* of "type" on a field object is lifted
+// into the type definition for the wire path only. The metadata API keeps
+// reporting the schema as written, the documented scope of the concession.
+// Which node the lift lands on depends on the field's type shape. A bare
+// primitive takes it. A union hands it to the first non-null branch. An
+// object takes it unless it already carries one. A union with no non-null
+// branch has nowhere to put it. The oracle is the equivalent nested-form
+// schema.
 // ---------------------------------------------------------------------------
 
 func TestMatrix_FieldLevelLogicalLiftTargetShapes(t *testing.T) {
@@ -1125,13 +1129,13 @@ func TestMatrix_FieldLevelLogicalLiftTargetShapes(t *testing.T) {
 
 	cells := []struct {
 		name string
-		// flat carries the annotation on the FIELD; nested is the same
+		// flat carries the annotation on the *field*; nested is the same
 		// schema written the spec-blessed way, and is the oracle.
 		flatType, flatExtra string
 		nestedType          string
 		// metaLogical is what the metadata surface reports for the field's
-		// type node: the lift never writes there, so this is "" unless the
-		// TYPE itself carried an annotation.
+		// type node. The lift never writes there, so this is "" unless the
+		// *type* itself carried an annotation.
 		metaLogical string
 	}{
 		{"primitive-target", `"bytes"`, dec,
@@ -1163,9 +1167,9 @@ func TestMatrix_FieldLevelLogicalLiftTargetShapes(t *testing.T) {
 				t.Fatalf("parse nested oracle: %v", err)
 			}
 
-			// The lift is a wire-path rewrite, so the flat form has to
-			// behave EXACTLY like the nested form it stands in for —
-			// including when it rejects.
+			// The lift is a wire-path rewrite. The flat form has to behave
+			// *exactly* like the nested form it stands in for, including when
+			// it rejects.
 			gotBin, gotErr := flat.Encode(map[string]any{"f": rat})
 			wantBin, wantErr := nested.Encode(map[string]any{"f": rat})
 			if (gotErr == nil) != (wantErr == nil) {
@@ -1186,7 +1190,7 @@ func TestMatrix_FieldLevelLogicalLiftTargetShapes(t *testing.T) {
 				t.Fatalf("canonical differs:\n flat %s\nnested %s", flat.Canonical(), nested.Canonical())
 			}
 
-			// The metadata API reports the schema AS WRITTEN: the lift does
+			// The metadata API reports the schema *as written*. The lift does
 			// not reach it, so a field-level annotation stays in the field's
 			// Props and the type node keeps only its own logicalType.
 			f := flat.Root().Fields[0]
@@ -1198,8 +1202,8 @@ func TestMatrix_FieldLevelLogicalLiftTargetShapes(t *testing.T) {
 					t.Fatalf("field-level logicalType left no Props trace: %#v", f.Props)
 				}
 			}
-			// And the re-emitted schema still round-trips to the same
-			// canonical bytes, so nothing the lift did is lost or doubled.
+			// The re-emitted schema still round-trips to the same canonical
+			// bytes, so nothing the lift did is lost or doubled.
 			out, err := flat.Root().Schema()
 			if err != nil {
 				t.Fatalf("re-emit: %v", err)

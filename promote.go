@@ -6,8 +6,6 @@ import (
 	"time"
 )
 
-// promotionDeser returns a deserfn that reads the writer's wire type and
-// sets the reader's Go type, or nil if the promotion is not supported.
 func promotionDeser(writerKind, readerKind string) deserfn {
 	key := writerKind + ">" + readerKind
 	return promotions[key]
@@ -27,7 +25,6 @@ var promotions = map[string]deserfn{
 	"bytes>string": promoteBytesToString,
 }
 
-// promoteRead wraps a wire read + per-target setter into a deserfn.
 func promoteRead[Wire any](
 	read func([]byte) (Wire, []byte, error),
 	apply func(reflect.Value, Wire) error,
@@ -41,15 +38,15 @@ func promoteRead[Wire any](
 	}
 }
 
-// promoteIntFloatMantissa is the int→float conversion shared by the four
-// int/long→float/double promotion arms. A float/double READER schema opts into
-// IEEE precision, so wire magnitudes it cannot hold exactly IEEE-round
-// silently. Matches Java's ResolvingDecoder.readDouble, fastavro's
-// maybe_promote, and hamba's createDoubleConverter.
+// promoteIntFloatMantissa is the int->float conversion shared by the four
+// int/long->float/double promotion arms. A float/double reader schema opts
+// into IEEE precision, so we silently IEEE-round any wire magnitude it cannot
+// hold exactly. Java's ResolvingDecoder.readDouble, fastavro's maybe_promote
+// and hamba's createDoubleConverter all do the same.
 //
-// Asymmetric with the same-schema decode: s.Decode(wire, &f float64) against
-// MustParse("long") still rejects. Lossiness is acceptable when the READER
-// SCHEMA is lossy; when only the Go type is, the wire held a value the user
+// This is asymmetric with the same-schema decode: s.Decode(wire, &f float64)
+// against MustParse("long") still rejects. Lossiness is fine when the *reader
+// schema* is lossy. When only your Go type is, the wire held a value you
 // should not silently lose.
 //
 // The float64 cast keeps the long's full value; setFloatValue's SetFloat
@@ -84,11 +81,11 @@ var (
 )
 
 // readBytesPrefix reads a varlong length prefix and validates it against the
-// remaining buffer, keeping the three error shapes (varlong, negative, overrun)
-// in one place for every length-prefixed promotion.
+// remaining buffer. Every length-prefixed promotion comes through here, so the
+// three error shapes (varlong, negative, overrun) stay in one place.
 //
-// destAvroType labels the negative-length SemanticError; wireTypeName labels
-// the overrun ShortBufferError. The two swap by direction: string→bytes tags
+// destAvroType labels the negative-length SemanticError, wireTypeName the
+// overrun ShortBufferError. The two swap by direction: string->bytes tags
 // negative as "bytes" (destination) and short-buffer as "string" (the writer's
 // wire type).
 func readBytesPrefix(src []byte, destAvroType, wireTypeName string) (n int, rest []byte, err error) {
@@ -105,37 +102,37 @@ func readBytesPrefix(src []byte, destAvroType, wireTypeName string) (n int, rest
 	return int(length), rest, nil
 }
 
-func promoteStringToBytes(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+func promoteStringToBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	n, src, err := readBytesPrefix(src, "bytes", "string")
 	if err != nil {
 		return nil, err
 	}
-	if err := setBytesValue(indirectAlloc(v), src[:n], "bytes"); err != nil {
+	if err := setBytesValue(indirectAlloc(v), src[:n], "bytes", sl); err != nil {
 		return nil, err
 	}
 	return src[n:], nil
 }
 
 // promotionDeserForLogical returns a deserfn that reads the writer's wire type
-// AND applies the reader's logical conversion, or nil when the reader has no
+// *and* applies the reader's logical conversion, or nil when the reader has no
 // logical reachable through a promotion. The bare promotion desers know nothing
-// about logicals, so without this a writer int → reader {"long",
+// about logicals, so without this a writer int -> reader {"long",
 // "logicalType":"timestamp-millis"} yields raw int64 instead of time.Time.
 func promotionDeserForLogical(writerKind string, r *schemaNode) deserfn {
 	if r.logical == "" {
 		return nil
 	}
-	// Keyed on the PROMOTION, using the same "writer>reader" key the
-	// promotions table itself is keyed by — not on the reader kind alone.
-	// Each wrapper below reads the WRITER's wire form (a varint for
-	// int→long, a varlong length prefix for string↔bytes) before applying
-	// the reader's conversion, so it is correct only for the exact pair it
-	// is written for. Keying on the pair is what makes that structural: a
-	// promotion added to the table with no arm here falls through to the
-	// bare widening deser instead of reaching a wrapper that would misread
-	// the wire. The pairs absent here have no reachable logical reader —
-	// long→float, long→double and float→double all land on float/double,
-	// which carry no logical types.
+	// We key on the promotion, using the same "writer>reader" key the
+	// promotions table uses, *not* on the reader kind alone. Each wrapper
+	// below reads the writer's wire form (a varint for int->long, a varlong
+	// length prefix for string<->bytes) before applying the reader's
+	// conversion. So it is correct only for the exact pair we wrote it for.
+	// Keying on the pair makes that structural. Add a promotion to the table
+	// with no arm here and it falls through to the bare widening deser,
+	// rather than reaching a wrapper that would misread the wire. The pairs
+	// absent here have no reachable logical reader: long->float, long->double
+	// and float->double all land on float/double, which carry no logical
+	// types.
 	switch writerKind + ">" + r.kind {
 	case "int>long":
 		switch r.logical {
@@ -174,10 +171,9 @@ func promoteIntToLongTime(conv func(int64) time.Time) deserfn {
 	}
 }
 
-// promoteIntToLongTimeMicros mirrors deserTimeMicros but reads the
-// writer's varint (int) and widens to int64 before applying the
-// duration conversion. time-micros has its own overflow check inside
-// timeMicrosToDuration; we preserve it here.
+// promoteIntToLongTimeMicros mirrors deserTimeMicros, but we read the writer's
+// varint (int) and widen to int64 before converting. time-micros has its own
+// overflow check inside timeMicrosToDuration; we keep it.
 func promoteIntToLongTimeMicros(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {
@@ -186,12 +182,11 @@ func promoteIntToLongTimeMicros(src []byte, v reflect.Value, _ *slab) ([]byte, e
 	return src, setTimeMicrosTarget(indirectAlloc(v), int64(val))
 }
 
-// promoteStringToBytesDecimal reads the writer's varlong-length-
-// prefixed string bytes and applies the reader's decimal conversion
-// at the given schema scale. Mirrors deserBytesDecimal but with the
-// length-read shape of promoteStringToBytes.
+// promoteStringToBytesDecimal is deserBytesDecimal with the length-read shape
+// of promoteStringToBytes: we read the writer's string bytes, then convert at
+// the reader's schema scale.
 func promoteStringToBytesDecimal(scale int) deserfn {
-	return func(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		n, src, err := readBytesPrefix(src, "bytes", "string")
 		if err != nil {
 			return nil, err
@@ -206,18 +201,17 @@ func promoteStringToBytesDecimal(scale int) deserfn {
 			return src[n:], nil
 		}
 		// Fall through to plain bytes target.
-		if err := setBytesValue(v, b, "bytes"); err != nil {
+		if err := setBytesValue(v, b, "bytes", sl); err != nil {
 			return nil, err
 		}
 		return src[n:], nil
 	}
 }
 
-// promoteStringToBytesBigDecimal reads the writer's varlong-length-
-// prefixed bytes and dispatches to the same arms as deserBigDecimal
-// (parse as structured big-decimal payload, fall back to raw bytes
-// for opaque-pass-through targets).
-func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+// promoteStringToBytesBigDecimal reads the writer's length-prefixed bytes and
+// dispatches to deserBigDecimal's arms: parse as a structured big-decimal
+// payload, fall back to raw bytes for opaque-pass-through targets.
+func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	n, src, err := readBytesPrefix(src, "bytes", "string")
 	if err != nil {
 		return nil, err
@@ -226,7 +220,7 @@ func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byt
 	v = indirectAlloc(v)
 	done, err := applyBigDecimalPayload(v, payload)
 	if !done {
-		err = setBytesValue(v, payload, "big-decimal")
+		err = setBytesValue(v, payload, "big-decimal", sl)
 	}
 	if err != nil {
 		return nil, err

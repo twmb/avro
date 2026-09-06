@@ -8,8 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/importer"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"math"
 	"math/big"
+	"os"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -18,11 +24,13 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/twmb/avro/internal/optmark"
 )
 
 // ---------- deser_test.go ----------
 
-// ptr returns a pointer to v. Used in tests instead of Go 1.26's new(v).
+// ptr returns a pointer to v. We use it instead of Go 1.26's new(v).
 func ptr[T any](v T) *T { return &v }
 
 func roundTrip[T any](t *testing.T, schema string, input T) T {
@@ -37,7 +45,7 @@ func roundTrip[T any](t *testing.T, schema string, input T) T {
 	return output
 }
 
-// encode is a test helper that encodes v with schema and returns the raw bytes.
+// encode encodes v with schema and returns the raw bytes.
 func encode(t *testing.T, schema string, v any) []byte {
 	t.Helper()
 	s := mustParse(t, schema)
@@ -45,7 +53,7 @@ func encode(t *testing.T, schema string, v any) []byte {
 	return dst
 }
 
-// decode is a test helper that decodes src into v with schema.
+// decode decodes src into v with schema.
 func decode(t *testing.T, schema string, src []byte, v any) {
 	t.Helper()
 	s := mustParse(t, schema)
@@ -55,7 +63,7 @@ func decode(t *testing.T, schema string, src []byte, v any) {
 	}
 }
 
-// decodeErr is a test helper that expects Decode to return an error.
+// decodeErr expects Decode to return an error.
 func decodeErr(t *testing.T, schema string, src []byte, v any) {
 	t.Helper()
 	s := mustParse(t, schema)
@@ -66,9 +74,9 @@ func decodeErr(t *testing.T, schema string, src []byte, v any) {
 }
 
 // -----------------------------------------------------------------------
-// Wire-format tests: verify encoded bytes match Avro spec, and that
-// decoding those bytes produces the correct value. These ensure
-// interoperability with other Avro implementations.
+// Wire-format tests. We assert the encoded bytes match the Avro spec, and
+// that decoding those bytes gives the value back. This is what keeps us
+// interoperable with other Avro implementations.
 // -----------------------------------------------------------------------
 
 func TestWireFormatBoolean(t *testing.T) {
@@ -89,7 +97,7 @@ func TestWireFormatBoolean(t *testing.T) {
 }
 
 func TestWireFormatInt(t *testing.T) {
-	// int 27 → zigzag 54 → 0x36
+	// int 27 -> zigzag 54 -> 0x36
 	dst := encode(t, `"int"`, ptr(int32(27)))
 	if !bytes.Equal(dst, []byte{0x36}) {
 		t.Fatalf("encode 27: got %x, want 36", dst)
@@ -103,7 +111,7 @@ func TestWireFormatInt(t *testing.T) {
 }
 
 func TestWireFormatLong(t *testing.T) {
-	// long 2147483648 → zigzag 4294967296 → multi-byte varint
+	// long 2147483648 -> zigzag 4294967296 -> multi-byte varint
 	dst := encode(t, `"long"`, ptr(int64(2147483648)))
 	if !bytes.Equal(dst, []byte{0x80, 0x80, 0x80, 0x80, 0x10}) {
 		t.Fatalf("encode 2147483648: got %x, want 8080808010", dst)
@@ -117,7 +125,7 @@ func TestWireFormatLong(t *testing.T) {
 }
 
 func TestWireFormatFloat(t *testing.T) {
-	// float32(1.15) → bits 0x3F933333 → LE bytes 33 33 93 3F
+	// float32(1.15) -> bits 0x3F933333 -> LE bytes 33 33 93 3F
 	dst := encode(t, `"float"`, ptr(float32(1.15)))
 	if !bytes.Equal(dst, []byte{0x33, 0x33, 0x93, 0x3F}) {
 		t.Fatalf("encode 1.15f: got %x, want 3333933f", dst)
@@ -131,7 +139,7 @@ func TestWireFormatFloat(t *testing.T) {
 }
 
 func TestWireFormatDouble(t *testing.T) {
-	// float64(1.15) → bits 0x3FF2666666666666 → LE bytes
+	// float64(1.15) -> bits 0x3FF2666666666666 -> LE bytes
 	dst := encode(t, `"double"`, ptr(float64(1.15)))
 	if !bytes.Equal(dst, []byte{0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0xF2, 0x3F}) {
 		t.Fatalf("encode 1.15: got %x, want 66666666666666f23f", dst)
@@ -145,7 +153,7 @@ func TestWireFormatDouble(t *testing.T) {
 }
 
 func TestWireFormatString(t *testing.T) {
-	// "foo" → length 3, zigzag 6, then 0x66 0x6F 0x6F
+	// "foo" -> length 3, zigzag 6, then 0x66 0x6F 0x6F
 	dst := encode(t, `"string"`, ptr("foo"))
 	if !bytes.Equal(dst, []byte{0x06, 0x66, 0x6F, 0x6F}) {
 		t.Fatalf("encode foo: got %x, want 06666f6f", dst)
@@ -159,7 +167,7 @@ func TestWireFormatString(t *testing.T) {
 }
 
 func TestWireFormatBytes(t *testing.T) {
-	// 4 bytes → length 4, zigzag 8 → 0x08 then raw
+	// 4 bytes -> length 4, zigzag 8 -> 0x08 then raw
 	b := []byte{0xEC, 0xAB, 0x44, 0x00}
 	dst := encode(t, `"bytes"`, &b)
 	if !bytes.Equal(dst, []byte{0x08, 0xEC, 0xAB, 0x44, 0x00}) {
@@ -228,7 +236,7 @@ func TestWireFormatMap(t *testing.T) {
 }
 
 func TestWireFormatEnum(t *testing.T) {
-	// Enum index 1 → zigzag 2 → 0x02
+	// Enum index 1 -> zigzag 2 -> 0x02
 	schema := `{"type":"enum","name":"test","symbols":["foo","bar"]}`
 	data := []byte{0x02}
 
@@ -253,14 +261,14 @@ func TestWireFormatFixed(t *testing.T) {
 func TestWireFormatUnionNull(t *testing.T) {
 	schema := `["null","string"]`
 
-	// Null branch: index 0 → 0x00
+	// Null branch: index 0 -> 0x00
 	var v *string
 	decode(t, schema, []byte{0x00}, &v)
 	if v != nil {
 		t.Fatalf("decode union null: got %v, want nil", v)
 	}
 
-	// String branch: index 1 → 0x02, then "foo"
+	// String branch: index 1 -> 0x02, then "foo"
 	decode(t, schema, []byte{0x02, 0x06, 0x66, 0x6F, 0x6F}, &v)
 	if v == nil || *v != "foo" {
 		t.Fatalf("decode union string: got %v, want foo", v)
@@ -268,7 +276,7 @@ func TestWireFormatUnionNull(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// Round-trip tests: encode then decode, verify equality.
+// Round-trip tests: we encode, then decode, then check equality.
 // -----------------------------------------------------------------------
 
 func TestRoundTripPrimitives(t *testing.T) {
@@ -303,7 +311,7 @@ func TestRoundTripPrimitives(t *testing.T) {
 				t.Errorf("got %v, want %v", got, v)
 			}
 		}
-		// NaN != NaN, so test separately.
+		// NaN != NaN, so we check it separately.
 		got := roundTrip(t, `"float"`, float32(math.NaN()))
 		if !math.IsNaN(float64(got)) {
 			t.Errorf("NaN round-trip: got %v", got)
@@ -602,7 +610,7 @@ func TestRoundTripInterface(t *testing.T) {
 	input := Iface{S: &IfaceF{F: 3}}
 	encoded := mustAppendEncode(t, s, nil, &input)
 
-	// Deserialize into a struct where the interface field is pre-set
+	// Here we deserialize into a struct whose interface field is pre-set
 	// with the concrete pointer type.
 	output := Iface{S: &IfaceF{}}
 	rem := mustDecode(t, s, encoded, &output)
@@ -687,7 +695,7 @@ func TestDecodeShortBuffer(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
-			// Use a generic target; the error should come from reading, not type mismatch.
+			// A generic target keeps the error coming from reading, not a type mismatch.
 			var v any
 			switch tt.schema {
 			case `"boolean"`:
@@ -712,7 +720,7 @@ func TestDecodeShortBuffer(t *testing.T) {
 				var b []byte
 				_, err = s.Decode(tt.data, &b)
 			default:
-				// Decode into any — hits reflect path.
+				// Decode into any: hits the reflect path.
 				_, err = s.Decode(tt.data, &v)
 			}
 			_ = v
@@ -722,7 +730,7 @@ func TestDecodeShortBuffer(t *testing.T) {
 		})
 	}
 
-	// Also test fixed UUID short buffer with typed targets.
+	// Also the fixed UUID short buffer, through typed targets.
 	t.Run("fixed uuid [16]byte", func(t *testing.T) {
 		s := MustParse(`{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`)
 		var u [16]byte
@@ -739,7 +747,7 @@ func TestDecodeShortBuffer(t *testing.T) {
 			t.Fatal("expected error for short buffer")
 		}
 	})
-	// Test short buffer through struct decode (hits unsafe fast path).
+	// Short buffer through struct decode, which hits the unsafe fast path.
 	t.Run("fixed uuid in struct short", func(t *testing.T) {
 		type R struct {
 			ID [16]byte `avro:"id"`
@@ -784,9 +792,9 @@ func TestDecodeTypeMismatch(t *testing.T) {
 		{"bool into string", `"boolean"`, []byte{0x01}, ptr("")},
 		{"int into bool", `"int"`, []byte{0x36}, ptr(false)},
 		{"string into int", `"string"`, []byte{0x06, 0x66, 0x6f, 0x6f}, ptr(int32(0))},
-		// "int into float" used to be pinned as rejection; now
-		// supported (round-trip parity with the documented encode-side
-		// whole-number-float-as-int divergence). See
+		// "int into float" used to be pinned as a rejection. We now
+		// support it, for round-trip parity with the documented
+		// encode-side whole-number-float-as-int divergence. See
 		// TestMatrix_IntLongDecodeIntoFloatJSONNumber.
 		{"fixed into int array", `{"type":"fixed","name":"f","size":6}`, []byte{1, 2, 3, 4, 5, 6}, ptr([6]int{})},
 		{"array into string", `{"type":"array","items":"int"}`, []byte{0x00}, ptr("")},
@@ -811,13 +819,13 @@ func TestDecodeTypeMismatch(t *testing.T) {
 
 func TestDecodeInvalidUnionIndex(t *testing.T) {
 	// Union ["null", "string"] only has indices 0 and 1; index 2 is out of range.
-	decodeErr(t, `["null","string"]`, []byte{0x04}, ptr((*string)(nil))) // zigzag 4 → 2
+	decodeErr(t, `["null","string"]`, []byte{0x04}, ptr((*string)(nil))) // zigzag 4 -> 2
 }
 
 func TestDecodeInvalidEnumIndex(t *testing.T) {
 	// Enum with 2 symbols; index 2 is out of range.
 	schema := `{"type":"enum","name":"e","symbols":["a","b"]}`
-	decodeErr(t, schema, []byte{0x04}, ptr("")) // zigzag 4 → 2
+	decodeErr(t, schema, []byte{0x04}, ptr("")) // zigzag 4 -> 2
 }
 
 func TestDecodeNonPointer(t *testing.T) {
@@ -833,7 +841,7 @@ func TestDecodeNonPointer(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestDecodeRecordNilPointer(t *testing.T) {
-	// Decode into **Record where the inner pointer is nil → allocate through it.
+	// Decode into **Record where the inner pointer is nil: we allocate through it.
 	schema := `{"type":"record","name":"r","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"}]}`
 	data := []byte{0x36, 0x06, 0x66, 0x6f, 0x6f} // {a:27, b:"foo"}
 
@@ -863,7 +871,7 @@ func TestDecodeEmbeddedPointerStruct(t *testing.T) {
 	]}`
 	data := []byte{0x36, 0x06, 0x66, 0x6f, 0x6f, 0x06, 0x62, 0x61, 0x72} // a=27, b="foo", c="bar"
 
-	// Embed pointer is nil — decoder should allocate it.
+	// Embed pointer is nil: we allocate it.
 	var got Outer
 	decode(t, schema, data, &got)
 	if got.Embed == nil {
@@ -875,8 +883,8 @@ func TestDecodeEmbeddedPointerStruct(t *testing.T) {
 }
 
 func TestDecodeEmbeddedPointerStructPreset(t *testing.T) {
-	// Same as above but C is pre-set to a non-zero value.
-	// Ensures the embedded pointer allocation doesn't interfere.
+	// Same as above, but C is pre-set to a non-zero value. We check that
+	// the embedded pointer allocation does not disturb it.
 	type Embed struct {
 		A int64  `avro:"a"`
 		B string `avro:"b"`
@@ -1051,7 +1059,7 @@ func TestDecodeUnionNullableBytes(t *testing.T) {
 }
 
 func TestDecodeUnionPtrReuse(t *testing.T) {
-	// When decoding a union into a pre-existing pointer, reuse the allocation.
+	// Decoding a union into a pre-existing pointer must reuse the allocation.
 	schema := `["null",{"type":"record","name":"r","fields":[
 		{"name":"a","type":"long"},{"name":"b","type":"string"}
 	]}]`
@@ -1144,9 +1152,9 @@ func TestDecodeArrayBlockError(t *testing.T) {
 }
 
 func TestDecodeArrayOversizedCountUnsafe(t *testing.T) {
-	// A crafted array block count that exceeds the buffer length.
-	// This tests the unsafe fast path (udArrayDirect and udArrayPtrRecord)
-	// to ensure they don't allocate based on untrusted counts.
+	// A crafted array block count that exceeds the buffer length. We drive
+	// the unsafe fast path (udArrayDirect and udArrayPtrRecord) to prove
+	// neither allocates on an untrusted count.
 	schema := `{"type":"array","items":"int"}`
 	s := mustParse(t, schema)
 	// count=999999 (zigzag-encoded), but only a few bytes of data.
@@ -1154,14 +1162,14 @@ func TestDecodeArrayOversizedCountUnsafe(t *testing.T) {
 	data = appendVarlong(data, 999999)
 	data = append(data, 0x00, 0x00)
 
-	// Decode into []int32 — triggers the unsafe primitive array path.
+	// Decode into []int32: triggers the unsafe primitive array path.
 	var sl []int32
 	_, err := s.Decode(data, &sl)
 	if err == nil {
 		t.Fatal("expected error for oversized array count")
 	}
 
-	// Also test with struct containing a slice (triggers unsafe struct fast path).
+	// Also a struct holding a slice, which triggers the unsafe struct fast path.
 	type R struct {
 		A []int32 `avro:"a"`
 	}
@@ -1224,13 +1232,11 @@ func TestDecodeUnionIntoInterface(t *testing.T) {
 }
 
 func TestDecodeNegativeStringLength(t *testing.T) {
-	// Negative length for string should error.
-	decodeErr(t, `"string"`, []byte{0x01}, ptr("")) // zigzag 1 → -1
+	decodeErr(t, `"string"`, []byte{0x01}, ptr("")) // zigzag 1 -> -1
 }
 
 func TestDecodeNegativeBytesLength(t *testing.T) {
-	// Negative length for bytes should error.
-	decodeErr(t, `"bytes"`, []byte{0x01}, ptr([]byte{})) // zigzag 1 → -1
+	decodeErr(t, `"bytes"`, []byte{0x01}, ptr([]byte{})) // zigzag 1 -> -1
 }
 
 func TestDecodeFloatIntoInterface(t *testing.T) {
@@ -1335,12 +1341,10 @@ func TestDecodeFixedIntoInterface(t *testing.T) {
 }
 
 func TestDecodeFixedTypeMismatch(t *testing.T) {
-	// Fixed into a non-array.
 	decodeErr(t, `{"type":"fixed","name":"f","size":4}`, []byte{1, 2, 3, 4}, ptr(int32(0)))
 }
 
 func TestDecodeFixedWrongSize(t *testing.T) {
-	// Fixed of size 4 into a [3]byte array.
 	decodeErr(t, `{"type":"fixed","name":"f","size":4}`, []byte{1, 2, 3, 4}, ptr([3]byte{}))
 }
 
@@ -1529,10 +1533,10 @@ func TestTypeFieldMappingTaggedBeatsUntagged(t *testing.T) {
 }
 
 func TestTypeFieldMappingSameDepthTaggedBeatsUntagged(t *testing.T) {
-	// Two same-depth fields resolving to one name with DIFFERENT tagged
+	// Two same-depth fields resolving to one name with *different* tagged
 	// status are a tag tiebreak, not an ambiguous collision: the tagged
-	// field wins. Ambiguity is reserved for same-depth fields with the
-	// SAME tagged status (the lazy-error pins in embed_selection_test.go).
+	// field wins. We reserve ambiguity for same-depth fields with the same
+	// tagged status (the lazy-error pins in embed_selection_test.go).
 	type EmbA struct {
 		Val string `avro:"Name"` // tagged, depth 2
 	}
@@ -1670,7 +1674,7 @@ func TestDecodeArrayNegativeBlockShortRead(t *testing.T) {
 }
 
 func TestDecodeArrayCapGrowth(t *testing.T) {
-	// Test that the array can grow from pre-allocated to larger.
+	// The array must grow from pre-allocated to larger.
 	schema := `{"type":"array","items":"int"}`
 	s := mustParse(t, schema)
 	input := []int32{1, 2, 3, 4, 5}
@@ -1764,7 +1768,7 @@ func TestVarint4Byte(t *testing.T) {
 }
 
 func TestRoundTripIntWidths(t *testing.T) {
-	// Verify all signed/unsigned integer widths that fit in avro int.
+	// Every signed and unsigned integer width that fits in avro int.
 	schema := `"int"`
 
 	for _, tc := range []struct {
@@ -1957,10 +1961,10 @@ func BenchmarkDeserializeGeneric(b *testing.B) {
 // Unsafe fast-path coverage: all Go type widths through struct fields
 // -----------------------------------------------------------------------
 
-// These tests exercise every branch in usInt/udInt, usLong/udLong,
-// usFloat/udFloat, usDouble/udDouble by creating record schemas where
-// the Go struct field types vary. The unsafe fast path compiles per-Kind
-// closures, so we need struct fields of each Kind.
+// Here we drive every branch in usInt/udInt, usLong/udLong, usFloat/udFloat,
+// and usDouble/udDouble. The Go struct field types vary across record schemas.
+// The unsafe fast path compiles per-Kind closures, so we need a struct field
+// of each Kind.
 
 func testUnsafeIntLongAllKinds(t *testing.T, avroType string) {
 	t.Helper()
@@ -2040,7 +2044,7 @@ func TestUnsafeIntAllKinds(t *testing.T)  { testUnsafeIntLongAllKinds(t, "int") 
 func TestUnsafeLongAllKinds(t *testing.T) { testUnsafeIntLongAllKinds(t, "long") }
 
 func TestUnsafeFloatDoubleKinds(t *testing.T) {
-	// Test avro "float" mapped to Go float64, and avro "double" mapped to Go float32.
+	// Avro "float" mapped to Go float64, and avro "double" mapped to Go float32.
 	type FF32 struct {
 		V float32 `avro:"v"`
 	}
@@ -2087,7 +2091,7 @@ func TestUnsafeFloatDoubleKinds(t *testing.T) {
 }
 
 func TestUnsafePointerToPrimitive(t *testing.T) {
-	// Test the tryCompileFieldSer recursive pointer-through-primitive path.
+	// Here we drive tryCompileFieldSer's recursive pointer-through-primitive path.
 	type R struct {
 		V *int32 `avro:"v"`
 	}
@@ -2096,7 +2100,7 @@ func TestUnsafePointerToPrimitive(t *testing.T) {
 	v := int32(42)
 	in := R{V: &v}
 	dst := mustAppendEncode(t, s, nil, &in)
-	// Decode back — pointer fields go through slow path for deser.
+	// Decode back: pointer fields go through the slow path.
 	var out R
 	mustDecode(t, s, dst, &out)
 	if out.V == nil || *out.V != 42 {
@@ -2105,8 +2109,8 @@ func TestUnsafePointerToPrimitive(t *testing.T) {
 }
 
 func TestUnsafePointerToComplexFallback(t *testing.T) {
-	// A field with a pointer to a complex type (e.g., *[]int32) should
-	// use the slow path, not crash tryCompileFieldSer.
+	// A field pointing at a complex type (e.g. *[]int32) must take the
+	// slow path, not crash tryCompileFieldSer.
 	type R struct {
 		V *[]int32 `avro:"v"`
 	}
@@ -2123,8 +2127,8 @@ func TestUnsafePointerToComplexFallback(t *testing.T) {
 }
 
 func TestUnsafeDecodeTruncatedBuffer(t *testing.T) {
-	// Exercise error branches in unsafe deserializers (udBool, udString,
-	// udBytesSlice) by feeding truncated data into struct-field decode.
+	// Here we drive the error branches in the unsafe deserializers (udBool,
+	// udString, udBytesSlice) by feeding truncated data to a struct decode.
 	type BoolRec struct {
 		V bool `avro:"v"`
 	}
@@ -2170,7 +2174,7 @@ func TestUnsafeDecodeTruncatedBuffer(t *testing.T) {
 }
 
 func TestDecodeIntUint(t *testing.T) {
-	// Exercise the CanUint branch in the slow-path deserInt.
+	// The CanUint branch in the slow-path deserInt.
 	schema := `"int"`
 	s := mustParse(t, schema)
 	dst := mustAppendEncode(t, s, nil, ptr(int32(42)))
@@ -2196,10 +2200,10 @@ func TestDecodeLongUint(t *testing.T) {
 	}
 }
 
-// numericKindTestType returns a reflect.Type whose Kind is k, for the unsafe
-// per-kind ser/deser constructors (usInt/usLong/udInt/udLong/udDouble) which
-// take the field's reflect.Type so SemanticError.GoType matches the reflect
-// path. Test-only helper.
+// numericKindTestType returns a reflect.Type whose Kind is k. We feed it to
+// the unsafe per-kind ser/deser constructors (usInt/usLong/udInt/udLong/
+// udDouble), which take the field's reflect.Type so SemanticError.GoType
+// matches the reflect path. Test-only helper.
 func numericKindTestType(k reflect.Kind) reflect.Type {
 	switch k {
 	case reflect.Bool:
@@ -2333,8 +2337,8 @@ func TestUnsafeDeserializeFloatErrors(t *testing.T) {
 	}
 }
 
-// TestUnsafeBytesDeserErrors covers error paths in udBytesDeser:
-// truncated input (readVarlong error) and negative length.
+// TestUnsafeBytesDeserErrors covers the error paths in udBytesDeser: truncated
+// input (a readVarlong error) and a negative length.
 func TestUnsafeBytesDeserErrors(t *testing.T) {
 	fn := udBytesDeser
 	var buf [24]byte
@@ -2345,7 +2349,7 @@ func TestUnsafeBytesDeserErrors(t *testing.T) {
 		t.Fatal("expected error for truncated input")
 	}
 
-	// Negative length: unsigned varint 1 → zigzag-decoded = -1.
+	// Negative length: unsigned varint 1 zigzag-decodes to -1.
 	_, err = fn([]byte{0x01}, unsafe.Pointer(&buf[0]), &slab{})
 	if err == nil {
 		t.Fatal("expected error for negative bytes length")
@@ -2353,18 +2357,18 @@ func TestUnsafeBytesDeserErrors(t *testing.T) {
 }
 
 // TestMatrix_UnionEmitTagsAreFullLengthAtEveryBranch pins that a union's two
-// emit-tag tables carry an entry for every branch, by decoding through every
+// emit-tag tables carry an entry for every branch. We decode through every
 // branch index of every union shape with the tagging options on.
 //
-// maybeWrap picks branchNames or logicalNames by the wire's branch index and
-// indexes it without a length check, so a table that skipped entries — for
-// branches with no logical type, or whose qualified spelling another branch
-// already owns — would panic on exactly the branches it skipped. The axes are
-// the union's shape, the branch actually on the wire, and how the union was
-// compiled: directly by a parse, or by a resolution, which builds these tables
-// at three separate sites of its own.
+// maybeWrap picks branchNames or logicalNames by the wire's branch index. It
+// indexes without a length check, so a table that skipped entries would panic
+// on exactly the branches it skipped. Entries get skipped for branches with no
+// logical type, or whose qualified spelling another branch already owns. The
+// axes are the union's shape, the branch actually on the wire, and how we
+// compiled the union: directly by a parse, or by a resolution, which builds
+// these tables at three separate sites of its own.
 //
-// The assertion is answerable from the input: the options say a decoded union
+// The assertion is answerable from the input. The options say a decoded union
 // value is a one-key envelope, so any branch that comes back bare or panics is
 // wrong whatever the other branches did.
 func TestMatrix_UnionEmitTagsAreFullLengthAtEveryBranch(t *testing.T) {
@@ -2384,7 +2388,7 @@ func TestMatrix_UnionEmitTagsAreFullLengthAtEveryBranch(t *testing.T) {
 		{"logical-first", `[{"type":"long","logicalType":"timestamp-millis"},"null","int"]`,
 			[]any{int64(1000), nil, int32(1)},
 			[]string{"long.timestamp-millis", "", "int"}},
-		// Two qualified branches: each must keep its OWN qualification, so a
+		// Two qualified branches. Each must keep its own qualification, so a
 		// table that shifted by one would swap them rather than go short.
 		{"two-logicals", `["null",{"type":"long","logicalType":"timestamp-millis"},{"type":"int","logicalType":"date"},"string"]`,
 			[]any{nil, int64(1000), int32(5), "s"},
@@ -2417,9 +2421,9 @@ func TestMatrix_UnionEmitTagsAreFullLengthAtEveryBranch(t *testing.T) {
 					}
 					if v == nil {
 						// A null decodes to a nil interface, and maybeWrap
-						// returns before the tables on an invalid element —
-						// so the null branch is the one index that does NOT
-						// exercise them, and it must stay bare.
+						// returns before the tables on an invalid element.
+						// So the null branch is the one index that does
+						// *not* reach them, and it must stay bare.
 						if got["u"] != nil {
 							t.Fatalf("null branch decoded %#v, want a bare nil", got["u"])
 						}
@@ -2429,10 +2433,10 @@ func TestMatrix_UnionEmitTagsAreFullLengthAtEveryBranch(t *testing.T) {
 					if !ok || len(m) != 1 {
 						t.Fatalf("branch %d decoded %#v, want a one-key envelope", branch, got["u"])
 					}
-					// The exact tag, not merely some tag: a table that
-					// shifted or dropped a qualification still produces an
-					// envelope, and the wrong one routes a re-encode to a
-					// different branch.
+					// We want the exact tag, not merely some tag. A
+					// table that shifted or dropped a qualification
+					// still produces an envelope, and the wrong one
+					// routes a re-encode to a different branch.
 					for k := range m {
 						if k != sh.tags[branch] {
 							t.Fatalf("branch %d emitted tag %q, want %q", branch, k, sh.tags[branch])
@@ -2453,22 +2457,23 @@ func TestMatrix_UnionEmitTagsAreFullLengthAtEveryBranch(t *testing.T) {
 }
 
 // TestMatrix_FastPathDeclinesOnIncompleteFieldMeta pins that the unsafe field
-// compilers decline — rather than fault — whenever the metadata a shape needs
+// compilers decline, rather than fault, whenever the metadata a shape needs
 // is missing, on both wires.
 //
-// A record field names its Avro type by asking its fieldMeta, so a field
-// carrying NO meta names no type and reaches no shape arm at all; the other
-// cells name a shape but withhold the inner metadata that shape needs. The
-// axes are the wire (encode and decode compile through separate switches over
-// one vocabulary) and the shape whose metadata is withheld.
+// A record field names its Avro type by asking its fieldMeta. A field carrying
+// no meta names no type and reaches no shape arm at all. The other cells name
+// a shape but withhold the inner metadata that shape needs. The axes are the
+// wire (encode and decode compile through separate switches over one
+// vocabulary) and the shape whose metadata we withhold.
 //
-// Every cell carries a COMPLETE twin: the same shape and the same Go type with
-// the metadata supplied, which must compile to a non-nil fast path. Without
-// it a cell proves only that something declined, which the kind checks would
-// also do — the twin is what attributes the refusal to the missing metadata.
+// Every cell carries a *complete* twin: the same shape and the same Go type
+// with the metadata supplied, which must compile to a non-nil fast path.
+// Without it a cell proves only that something declined, which the kind checks
+// would also do. The twin is what attributes the refusal to the missing
+// metadata.
 func TestMatrix_FastPathDeclinesOnIncompleteFieldMeta(t *testing.T) {
 	// A real record's compiled tables, so the record cells' complete twins
-	// carry something the compiler will actually accept.
+	// carry something the compiler actually accepts.
 	rec := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"v","type":"int"}]}`)
 	type R struct {
 		V int32 `avro:"v"`
@@ -2522,8 +2527,8 @@ func TestMatrix_FastPathDeclinesOnIncompleteFieldMeta(t *testing.T) {
 		}
 	}
 
-	// The record arm needs a real compiled table on both wires, so it is
-	// crossed separately rather than being forced into the table above.
+	// The record arm needs a real compiled table on both wires, so we cross
+	// it separately rather than force it into the table above.
 	t.Run("encode/record/no-table", func(t *testing.T) {
 		if got := tryCompileFieldSer(&serRecordField{meta: &fieldMeta{avroType: "record"}}, recGo); got != nil {
 			t.Fatalf("compiled a record fast path with no serRecord")
@@ -2543,8 +2548,8 @@ func TestMatrix_FastPathDeclinesOnIncompleteFieldMeta(t *testing.T) {
 	})
 	realized++
 
-	// Element shapes an array declines for reasons of its own, kept because
-	// they are the arms that walk the inner metadata one level deeper.
+	// Element shapes an array declines for reasons of its own. We keep them
+	// because they are the arms that walk the inner metadata one level deeper.
 	if fn := tryCompileFieldSer(&serRecordField{
 		meta: &fieldMeta{avroType: "array", inner: &fieldMeta{avroType: "nullunion", inner: intMeta()}},
 	}, reflect.SliceOf(reflect.TypeFor[int32]())); fn != nil {
@@ -2562,7 +2567,7 @@ func TestMatrix_FastPathDeclinesOnIncompleteFieldMeta(t *testing.T) {
 }
 
 // TestUsArraySerErrorPaths covers the error handling in usArrayNullUnionPtr
-// and usArrayDirect by passing a synthetic error-returning userfn.
+// and usArrayDirect, via a synthetic error-returning userfn.
 func TestUsArraySerErrorPaths(t *testing.T) {
 	errFake := fmt.Errorf("fake")
 	failFn := func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
@@ -2595,15 +2600,15 @@ func TestUnsafePtrNilSerialize(t *testing.T) {
 		X *int32 `avro:"x"`
 	}
 	s := mustParse(t, `{"type":"record","name":"S","fields":[{"name":"x","type":"int"}]}`)
-	// Encode with nil pointer — should trigger errUnsafeNilPtr via the fast path.
+	// A nil pointer must trigger errUnsafeNilPtr via the fast path.
 	_, err := s.AppendEncode(nil, &S{X: nil})
 	if err == nil {
 		t.Fatal("expected error for nil pointer field")
 	}
 }
 
-// TestSerRecordSlowPath covers the reflect-based slow path in serRecord.ser
-// by encoding a non-addressable struct value (not a pointer).
+// TestSerRecordSlowPath covers the reflect-based slow path in serRecord.ser,
+// through a non-addressable struct value rather than a pointer.
 func TestSerRecordSlowPath(t *testing.T) {
 	type S struct {
 		X int32 `avro:"x"`
@@ -2612,12 +2617,11 @@ func TestSerRecordSlowPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Encode struct value (not pointer) → v.CanAddr() is false → slow path.
+	// Encode struct value (not pointer): v.CanAddr() is false, so slow path.
 	got, err := s.AppendEncode(nil, S{X: 42})
 	if err != nil {
 		t.Fatalf("slow path encode: %v", err)
 	}
-	// Verify by decoding.
 	var out S
 	mustDecode(t, s, got, &out)
 	if out.X != 42 {
@@ -2633,7 +2637,7 @@ func TestSerRecordSlowPathError(t *testing.T) {
 		Y *int32 `avro:"y"`
 	}
 	s := mustParse(t, `{"type":"record","name":"S","fields":[{"name":"x","type":"int"},{"name":"y","type":"int"}]}`)
-	// Non-addressable struct value with nil pointer field → slow path + error.
+	// Non-addressable struct value with nil pointer field: slow path + error.
 	_, err := s.AppendEncode(nil, S{X: 42, Y: nil})
 	if err == nil {
 		t.Fatal("expected error for nil pointer in slow path")
@@ -2645,8 +2649,8 @@ func TestSerRecordSlowPathError(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestGenericUnionRoundTrip(t *testing.T) {
-	// Multi-branch union ["int","string"] exercises the generic serUnion.ser
-	// and deserUnion.deser paths (not the null-union fast path).
+	// A multi-branch union ["int","string"] takes us through the generic
+	// serUnion.ser and deserUnion.deser paths, not the null-union fast path.
 	schema := `["int","string"]`
 	s := mustParse(t, schema)
 
@@ -2690,10 +2694,10 @@ func TestSerNullNonNil(t *testing.T) {
 	encodeErr(t, `"null"`, ptr(int32(42)))
 }
 
-// TestDeserIntegerOverflow verifies that decoding an Avro int or long into a
-// too-narrow Go integer target returns an error rather than silently
-// truncating or wrapping. This mirrors the range checks already performed on
-// the encode side in [Schema.Encode].
+// TestDeserIntegerOverflow pins that we error, rather than silently truncate
+// or wrap, when an Avro int or long decodes into a too-narrow Go integer
+// target. This mirrors the range checks we already run on the encode side in
+// [Schema.Encode].
 func TestDeserIntegerOverflow(t *testing.T) {
 	t.Run("long into int32 positive overflow", func(t *testing.T) {
 		s := MustParse(`"long"`)
@@ -2755,12 +2759,12 @@ func TestDeserIntegerOverflow(t *testing.T) {
 }
 
 // TestDeserNullIntoNonPointerZeroes verifies that decoding a null-branch union
-// into a non-pointer Go field always replaces the prior value with the Go zero,
-// matching encoding/json/v2: "A JSON null may be decoded into every supported Go
-// value where it is equivalent to storing the zero value", and "the decoded
-// value replaces any pre-existing value". Prior to v1.x.0 twmb/avro matched
-// encoding/json v1 and left non-pointer targets untouched on null, which
-// preserved prior values across reused struct decodes — a silent
+// into a non-pointer Go field always replaces the prior value with the Go zero.
+// That matches encoding/json/v2: "A JSON null may be decoded into every
+// supported Go value where it is equivalent to storing the zero value", and
+// "the decoded value replaces any pre-existing value". Before v1.x.0 we matched
+// encoding/json v1 and left non-pointer targets untouched on null. That
+// preserved prior values across reused struct decodes, a silent
 // data-corruption footgun.
 func TestDeserNullIntoNonPointerZeroes(t *testing.T) {
 	// Covers: deserNullUnion (["null", T]), deserNullSecondUnion (["T", "null"]),
@@ -2783,8 +2787,8 @@ func TestDeserNullIntoNonPointerZeroes(t *testing.T) {
 		D string `avro:"d"`
 	}
 
-	// Pre-populate the struct to verify null always zeroes, regardless of
-	// prior state.
+	// We pre-populate the struct, so null must zero it regardless of prior
+	// state.
 	got := Row{A: 99, B: 88, C: 77, D: "prior"}
 	mustDecode(t, s, encoded, &got)
 	want := Row{}
@@ -2815,7 +2819,7 @@ func TestDeserNullUnionErrors(t *testing.T) {
 }
 
 func TestReadUvarintOverflow(t *testing.T) {
-	// 5 bytes all with continuation bit set → overflow error.
+	// 5 bytes all with continuation bit set: overflow error.
 	_, _, err := readUvarint([]byte{0x80, 0x80, 0x80, 0x80, 0x80})
 	if err == nil {
 		t.Fatal("expected overflow error")
@@ -2823,7 +2827,7 @@ func TestReadUvarintOverflow(t *testing.T) {
 }
 
 func TestReadUvarlongOverflow(t *testing.T) {
-	// 10 bytes all with continuation bit set → overflow error.
+	// 10 bytes all with continuation bit set: overflow error.
 	_, _, err := readUvarlong([]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80})
 	if err == nil {
 		t.Fatal("expected overflow error")
@@ -2831,7 +2835,7 @@ func TestReadUvarlongOverflow(t *testing.T) {
 }
 
 func TestReadUvarlongShort10(t *testing.T) {
-	// 9 continuation bytes with no 10th byte → short buffer.
+	// 9 continuation bytes with no 10th byte: short buffer.
 	_, _, err := readUvarlong([]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80})
 	if err == nil {
 		t.Fatal("expected short buffer error")
@@ -3155,8 +3159,8 @@ func TestMapPrimitiveRoundTrips(t *testing.T) {
 	})
 }
 
-// TestArrayInterfaceRoundTrips covers the reflect.Interface unwrap branches
-// in serArray specialized methods by encoding []any slices through typed schemas.
+// TestArrayInterfaceRoundTrips covers the reflect.Interface unwrap branches in
+// the serArray specialized methods. We encode []any slices through typed schemas.
 func TestArrayInterfaceRoundTrips(t *testing.T) {
 	t.Run("boolean", func(t *testing.T) {
 		s := mustParse(t, `{"type":"array","items":"boolean"}`)
@@ -3226,8 +3230,8 @@ func TestArrayInterfaceRoundTrips(t *testing.T) {
 	})
 }
 
-// TestMapInterfaceRoundTrips covers the reflect.Interface unwrap branches
-// in serMap specialized methods by encoding map[string]any through typed schemas.
+// TestMapInterfaceRoundTrips covers the reflect.Interface unwrap branches in
+// the serMap specialized methods. We encode map[string]any through typed schemas.
 func TestMapInterfaceRoundTrips(t *testing.T) {
 	t.Run("boolean", func(t *testing.T) {
 		s := mustParse(t, `{"type":"map","values":"boolean"}`)
@@ -3521,9 +3525,9 @@ func TestMapDeserTruncatedPrimitives(t *testing.T) {
 	}
 }
 
-// TestArrayFastLoopErrors covers error paths inside the specialized fast
-// loop functions (deserArrayStringLoop, etc.) by crafting payloads where
-// the block count passes the outer sanity check but element data is malformed.
+// TestArrayFastLoopErrors covers the error paths inside the specialized fast
+// loop functions (deserArrayStringLoop, etc.). We craft payloads whose block
+// count passes the outer sanity check but whose element data is malformed.
 func TestArrayFastLoopErrors(t *testing.T) {
 	t.Run("string_negative_length", func(t *testing.T) {
 		s := mustParse(t, `{"type":"array","items":"string"}`)
@@ -3594,9 +3598,9 @@ func TestArrayFastLoopErrors(t *testing.T) {
 	})
 }
 
-// TestMapFastBlockErrors covers error paths inside the specialized fast
-// block functions by crafting payloads where block count passes the outer
-// sanity check but key or value data is malformed.
+// TestMapFastBlockErrors covers the error paths inside the specialized fast
+// block functions. We craft payloads whose block count passes the outer sanity
+// check but whose key or value data is malformed.
 func TestMapFastBlockErrors(t *testing.T) {
 	t.Run("string_key_readvarlong_error", func(t *testing.T) {
 		s := mustParse(t, `{"type":"map","values":"string"}`)
@@ -3730,8 +3734,8 @@ func TestMapSlowPathErrors(t *testing.T) {
 		}
 	})
 	t.Run("value_deser_error", func(t *testing.T) {
-		// Use a map with record values to exercise the slow path (non-fast-block).
-		// Encode valid first entry, but truncate second entry's value data.
+		// We use a map with record values to reach the slow path (non-fast-block).
+		// The first entry is valid; we truncate the second entry's value data.
 		schema := `{"type":"map","values":{"type":"record","name":"R","fields":[{"name":"n","type":"int"}]}}`
 		s := mustParse(t, schema)
 		type R struct {
@@ -3751,14 +3755,14 @@ func TestMapSlowPathErrors(t *testing.T) {
 // TestGenericArrayDeserError covers the error path in the generic
 // (non-fast-loop) array deser when deserItem fails.
 func TestGenericArrayDeserError(t *testing.T) {
-	// Use array of records (non-primitive) to exercise generic deser path.
-	// Decode into any (interface) to ensure we go through the reflect path,
-	// not the unsafe struct path.
+	// We use an array of records (non-primitive) to reach the generic deser
+	// path. We decode into any so we go through the reflect path, not the
+	// unsafe struct path.
 	schema := `{"type":"array","items":{"type":"record","name":"R","fields":[{"name":"n","type":"int"}]}}`
 	s := mustParse(t, schema)
-	// Craft binary: count=2 passes sanity check, record1 decodes OK,
-	// record2 has malformed varint causing deserItem error at L508.
-	// count=2 (varlong 0x04), record1 n=1 (varint 0x02),
+	// We craft the binary so count=2 passes the sanity check and record1
+	// decodes OK. record2 has a malformed varint, hitting the deserItem
+	// error at L508. count=2 (varlong 0x04), record1 n=1 (varint 0x02),
 	// record2 n=malformed (0x80 continuation bit, no following byte).
 	data := []byte{0x04, 0x02, 0x80}
 	var got any
@@ -3836,7 +3840,7 @@ func TestSerGenericArrayMapErrors(t *testing.T) {
 		}
 	})
 	t.Run("array_generic_item_error", func(t *testing.T) {
-		// Pass wrong struct type to trigger serItem error.
+		// A wrong struct type triggers the serItem error.
 		type Wrong struct {
 			X string `avro:"x"` // field name mismatch
 		}
@@ -4038,8 +4042,8 @@ func TestSerFixedDefault(t *testing.T) {
 // ["type","null"] unions where the type is a forward reference to a
 // record defined later in the same parent record's fields.
 func TestNullSecondUnionForwardRef(t *testing.T) {
-	// Field "b" references "B" which is defined later in field "c".
-	// This exercises the isMissing check at schema.go L461.
+	// Field "b" references "B", which is defined later in field "c". That
+	// is how we reach the isMissing check at schema.go L461.
 	schema := `{
 		"type": "record",
 		"name": "A",
@@ -4060,7 +4064,7 @@ func TestNullSecondUnionForwardRef(t *testing.T) {
 	if got.B == nil || got.B.X != 42 || got.C.X != 7 {
 		t.Errorf("got %+v", got)
 	}
-	// Also test nil (null second).
+	// Also nil (null second).
 	input2 := A{B: nil, C: B{X: 7}}
 	got2 := roundTrip(t, schema, input2)
 	if got2.B != nil {
@@ -4121,9 +4125,9 @@ func TestArrayRecordValueDeser(t *testing.T) {
 	}
 }
 
-// TestWarmFastPathArrayPtrRecord does two round-trips so the second pass
-// goes through the serRecordFastPtr / deserRecordFastPtr branches inside
-// array and null-union callers after the inner record's fast path is compiled.
+// TestWarmFastPathArrayPtrRecord does two round-trips. The first compiles the
+// inner record's fast path. The second then goes through the serRecordFastPtr
+// and deserRecordFastPtr branches inside the array and null-union callers.
 func TestWarmFastPathArrayPtrRecord(t *testing.T) {
 	schema := superheroUnionSchema
 	s := mustParse(t, schema)
@@ -4145,8 +4149,8 @@ func TestWarmFastPathArrayPtrRecord(t *testing.T) {
 	}
 }
 
-// TestWarmFastPathNullUnionRecord does two round-trips for a null-union
-// record field to exercise the allFast serRecordFastPtr / deserRecordFastPtr
+// TestWarmFastPathNullUnionRecord does two round-trips for a null-union record
+// field. The second reaches the allFast serRecordFastPtr / deserRecordFastPtr
 // branches inside usNullUnionRecord / udNullUnionRecord.
 func TestWarmFastPathNullUnionRecord(t *testing.T) {
 	schema := longListSchema
@@ -4165,8 +4169,8 @@ func TestWarmFastPathNullUnionRecord(t *testing.T) {
 	}
 }
 
-// TestWarmFastPathArrayNullUnionRecord does two round-trips for an array
-// of null-union records to exercise the allFast branch inside
+// TestWarmFastPathArrayNullUnionRecord does two round-trips for an array of
+// null-union records. The second reaches the allFast branch inside
 // usArrayNullUnionRecord.
 func TestWarmFastPathArrayNullUnionRecord(t *testing.T) {
 	type Outer struct {
@@ -4210,7 +4214,6 @@ func TestRegularUnionField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Encode int value.
 	input := Wrapper{Val: int32(42)}
 	encoded, err := s.AppendEncode(nil, &input)
 	if err != nil {
@@ -4223,7 +4226,6 @@ func TestRegularUnionField(t *testing.T) {
 	if out.Val != int32(42) {
 		t.Errorf("got %v, want 42", out.Val)
 	}
-	// Encode string value.
 	input2 := Wrapper{Val: "hello"}
 	encoded2, err := s.AppendEncode(nil, &input2)
 	if err != nil {
@@ -4238,9 +4240,9 @@ func TestRegularUnionField(t *testing.T) {
 	}
 }
 
-// TestSerRecordFastPtrError triggers the error path in serRecordFastPtr
-// by encoding a nil *int32 field mapped to non-null "int" inside a
-// null-union record whose fast path is pre-warmed.
+// TestSerRecordFastPtrError triggers the error path in serRecordFastPtr. We
+// encode a nil *int32 field mapped to non-null "int" inside a null-union
+// record whose fast path is pre-warmed.
 func TestSerRecordFastPtrError(t *testing.T) {
 	type Inner struct {
 		P *int32 `avro:"p"`
@@ -4263,7 +4265,7 @@ func TestSerRecordFastPtrError(t *testing.T) {
 	var dummy Outer
 	enc, _ := s.AppendEncode(nil, &valid)
 	s.Decode(enc, &dummy)
-	// Now encode with nil P → error in serRecordFastPtr.
+	// Now encode with nil P: error in serRecordFastPtr.
 	bad := Outer{Item: &Inner{P: nil}}
 	_, err := s.AppendEncode(nil, &bad)
 	if err == nil {
@@ -4271,8 +4273,8 @@ func TestSerRecordFastPtrError(t *testing.T) {
 	}
 }
 
-// TestDeserRecordFastPtrError triggers the error path in deserRecordFastPtr
-// by feeding truncated data after warming up the fast path.
+// TestDeserRecordFastPtrError triggers the error path in deserRecordFastPtr.
+// We feed truncated data after warming up the fast path.
 func TestDeserRecordFastPtrError(t *testing.T) {
 	type Inner struct {
 		X int32  `avro:"x"`
@@ -4325,7 +4327,7 @@ func TestArrayPtrRecordNilError(t *testing.T) {
 // deser (both udArrayPtrRecord and udArrayDirect). A negative count
 // indicates the block's byte size follows.
 func TestArrayNegativeCountBlock(t *testing.T) {
-	// Test with a value array ([]int32) to exercise udArrayDirect.
+	// A value array ([]int32) reaches udArrayDirect.
 	t.Run("direct", func(t *testing.T) {
 		schema := arrayOfIntSchema
 		s := mustParse(t, schema)
@@ -4335,9 +4337,9 @@ func TestArrayNegativeCountBlock(t *testing.T) {
 		var out Wrapper
 		s.Decode(enc, &out)
 
-		// Manually craft data with negative count block:
-		// negative count, then byte_size as varlong,
-		// then 3 varint-encoded elements, then terminating 0.
+		// We craft data with a negative count block: negative count,
+		// then byte_size as varlong, then 3 varint-encoded elements,
+		// then terminating 0.
 		var elems []byte
 		elems = appendVarint(elems, 1)
 		elems = appendVarint(elems, 2)
@@ -4358,7 +4360,7 @@ func TestArrayNegativeCountBlock(t *testing.T) {
 		}
 	})
 
-	// Test with ptr record array to exercise udArrayPtrRecord.
+	// A ptr record array reaches udArrayPtrRecord.
 	t.Run("ptr_record", func(t *testing.T) {
 		type Wrapper struct {
 			Items []*Rec `avro:"items"`
@@ -4392,8 +4394,8 @@ func TestArrayNegativeCountBlock(t *testing.T) {
 	})
 }
 
-// TestArrayMultiBlockDeser covers the else branch in array deser (cap >= newLen)
-// by feeding a two-block array through the fast deser path.
+// TestArrayMultiBlockDeser covers the else branch in array deser (cap >= newLen).
+// We feed a two-block array through the fast deser path.
 func TestArrayMultiBlockDeser(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
 		schema := arrayOfIntSchema
@@ -4528,7 +4530,7 @@ func TestArrayDeserTruncatedData(t *testing.T) {
 // TestArraySerError covers error paths in usArrayDirect and usArrayRecord.
 func TestArraySerError(t *testing.T) {
 	type Inner struct {
-		P *int32 `avro:"p"` // non-null-union pointer; nil → error
+		P *int32 `avro:"p"` // non-null-union pointer; nil errors
 	}
 	type Outer struct {
 		Items []Inner `avro:"items"` // value slice, not ptr slice
@@ -4585,7 +4587,7 @@ func TestNullUnionMapField(t *testing.T) {
 	if out.M == nil || (*out.M)["a"] != 1 {
 		t.Errorf("got %v, want map with a=1", out.M)
 	}
-	// Also test nil case.
+	// Also the nil case.
 	input2 := Wrapper{M: nil}
 	encoded2, err := s.AppendEncode(nil, &input2)
 	if err != nil {
@@ -4669,7 +4671,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		s.Decode(enc, &dummy)
 		s.AppendEncode(nil, &valid) // second call warms inner fast path
 
-		// Now encode with nil P inside a record → error.
+		// Now encode with nil P inside a record: error.
 		bad := Outer{Items: []*Inner{{P: nil}}}
 		_, err := s.AppendEncode(nil, &bad)
 		if err == nil {
@@ -4693,7 +4695,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		s.Decode(enc, &dummy)
 		s.AppendEncode(nil, &valid) // warm inner fast path
 
-		// Encode with nil P → error in inner record ser.
+		// Encode with nil P: error in inner record ser.
 		bad := Outer{Items: []*Inner{{P: nil}}}
 		_, err := s.AppendEncode(nil, &bad)
 		if err == nil {
@@ -4763,8 +4765,8 @@ func TestArraySerErrorWarm(t *testing.T) {
 }
 
 // TestArrayReusedSliceCap covers the else branch (cap >= newLen) in
-// udArrayPtrRecord and udArrayDirect by decoding twice into the same
-// variable, so the second decode reuses the existing slice capacity.
+// udArrayPtrRecord and udArrayDirect. We decode twice into the same variable,
+// so the second decode reuses the existing slice capacity.
 func TestArrayReusedSliceCap(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
 		schema := arrayOfIntSchema
@@ -4776,7 +4778,7 @@ func TestArrayReusedSliceCap(t *testing.T) {
 		// First decode: allocates slice cap=5.
 		var out Wrapper
 		s.Decode(encBig, &out)
-		// Second decode: reuses cap=5 for 2 elements → else branch.
+		// Second decode: reuses cap=5 for 2 elements, hits the else branch.
 		mustDecode(t, s, encSmall, &out)
 		if !reflect.DeepEqual(out.Vals, []int32{1, 2}) {
 			t.Errorf("got %v, want [1 2]", out.Vals)
@@ -4796,7 +4798,7 @@ func TestArrayReusedSliceCap(t *testing.T) {
 		// First decode: allocates.
 		var out Wrapper
 		s.Decode(encBig, &out)
-		// Second decode: reuses capacity → else branch.
+		// Second decode: reuses capacity, hits the else branch.
 		mustDecode(t, s, encSmall, &out)
 		if len(out.Items) != 1 || out.Items[0].V != 10 {
 			t.Errorf("got %+v, want [{10}]", out.Items)
@@ -4815,7 +4817,7 @@ func TestArrayNegativeCountReadVarlongError(t *testing.T) {
 		// Negative count with truncated byte-size.
 		var data []byte
 		data = appendVarlong(data, -3) // negative count
-		// No byte-size follows → readVarlong error.
+		// No byte-size follows: readVarlong error.
 		var out Wrapper
 		_, err := s.Decode(data, &out)
 		if err == nil {
@@ -4888,13 +4890,13 @@ func TestRecordMappedToMap(t *testing.T) {
 // Adversarial / Pathological Edge Cases
 // -----------------------------------------------------------------------
 //
-// These tests feed crafted malicious inputs to the unsafe fast paths to
-// verify that length lies, count overflows, truncated data, and other
-// adversarial patterns are caught cleanly without memory corruption.
+// Here we feed crafted malicious inputs to the unsafe fast paths. Length lies,
+// count overflows, truncated data, and other adversarial patterns must all be
+// caught cleanly, without memory corruption.
 
-// TestAdversarialStringLengthLie exercises the unsafe string deserializer
-// (udStringDeser) with wire data where the encoded length exceeds the
-// available bytes in src.
+// TestAdversarialStringLengthLie drives the unsafe string deserializer
+// (udStringDeser) with wire data whose encoded length exceeds the bytes
+// available in src.
 func TestAdversarialStringLengthLie(t *testing.T) {
 	type R struct {
 		A string `avro:"a"`
@@ -4925,7 +4927,7 @@ func TestAdversarialStringLengthLie(t *testing.T) {
 			return d
 		}()},
 		// Negative length.
-		{"negative", []byte{0x01}}, // zigzag 1 → -1
+		{"negative", []byte{0x01}}, // zigzag 1 -> -1
 		// Truncated varint (continuation bit set, no terminator).
 		{"truncated_varint", []byte{0x80}},
 		// Empty src.
@@ -4949,7 +4951,7 @@ func TestAdversarialStringLengthLie(t *testing.T) {
 	}
 }
 
-// TestAdversarialBytesLengthLie exercises the unsafe bytes deserializer
+// TestAdversarialBytesLengthLie drives the unsafe bytes deserializer
 // (udBytesDeser) with lying lengths.
 func TestAdversarialBytesLengthLie(t *testing.T) {
 	type R struct {
@@ -4971,7 +4973,7 @@ func TestAdversarialBytesLengthLie(t *testing.T) {
 			d = append(d, 0x01, 0x02)
 			return d
 		}()},
-		{"negative", []byte{0x01}}, // zigzag → -1
+		{"negative", []byte{0x01}}, // zigzag -> -1
 		{"off_by_one", func() []byte {
 			var d []byte
 			d = appendVarlong(d, 3)
@@ -4996,9 +4998,9 @@ func TestAdversarialBytesLengthLie(t *testing.T) {
 	}
 }
 
-// TestAdversarialArrayCountLie exercises the unsafe array deserializers
-// (udArrayDirect and udArrayPtrRecord) with block counts that lie about
-// the number of items available in the data.
+// TestAdversarialArrayCountLie drives the unsafe array deserializers
+// (udArrayDirect and udArrayPtrRecord) with block counts that lie about the
+// number of items available in the data.
 func TestAdversarialArrayCountLie(t *testing.T) {
 	t.Run("direct_int", func(t *testing.T) {
 		type R struct {
@@ -5102,10 +5104,9 @@ func TestAdversarialArrayCountLie(t *testing.T) {
 	})
 }
 
-// TestAdversarialMinInt64BlockCount tests that a crafted block count of
-// math.MinInt64 is rejected. -MinInt64 overflows to MinInt64 in two's
-// complement, so without explicit checking the count stays negative and
-// causes a panic in SetLen.
+// TestAdversarialMinInt64BlockCount pins that we reject a crafted block count
+// of math.MinInt64. -MinInt64 overflows to MinInt64 in two's complement.
+// Without an explicit check the count stays negative and panics in SetLen.
 func TestAdversarialMinInt64BlockCount(t *testing.T) {
 	t.Run("array_reflect", func(t *testing.T) {
 		schema := `{"type":"array","items":"int"}`
@@ -5165,8 +5166,8 @@ func TestAdversarialMinInt64BlockCount(t *testing.T) {
 	})
 }
 
-// TestAdversarialNullUnionBadIndex tests null-union deserialization
-// through the unsafe path with invalid index bytes.
+// TestAdversarialNullUnionBadIndex drives null-union deserialization through
+// the unsafe path with invalid index bytes.
 func TestAdversarialNullUnionBadIndex(t *testing.T) {
 	t.Run("primitive", func(t *testing.T) {
 		type R struct {
@@ -5214,7 +5215,7 @@ func TestAdversarialNullUnionBadIndex(t *testing.T) {
 		s := mustParse(t, schema)
 		t.Run("bad_index", func(t *testing.T) {
 			var out R
-			_, err := s.Decode([]byte{0x04}, &out) // zigzag 4→2, invalid
+			_, err := s.Decode([]byte{0x04}, &out) // zigzag 4 -> 2, invalid
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -5229,9 +5230,9 @@ func TestAdversarialNullUnionBadIndex(t *testing.T) {
 	})
 }
 
-// TestAdversarialTruncationSweep encodes a valid multi-field record and then
-// decodes every possible truncation of the encoded bytes. Every prefix
-// shorter than the full encoding must produce an error, not a panic.
+// TestAdversarialTruncationSweep encodes a valid multi-field record, then we
+// decode every possible truncation of the encoded bytes. Every prefix shorter
+// than the full encoding must error, not panic.
 func TestAdversarialTruncationSweep(t *testing.T) {
 	type R struct {
 		A int32   `avro:"a"`
@@ -5262,7 +5263,7 @@ func TestAdversarialTruncationSweep(t *testing.T) {
 	}
 }
 
-// TestAdversarialNestedRecordTruncation tests truncation within nested
+// TestAdversarialNestedRecordTruncation drives truncation within nested
 // records through the unsafe fast path.
 func TestAdversarialNestedRecordTruncation(t *testing.T) {
 	type Inner struct {
@@ -5327,9 +5328,8 @@ func TestAdversarialNoAliasing(t *testing.T) {
 	}
 }
 
-// TestAdversarialRedecodeOverwrite verifies that decoding into a struct
-// that already contains values correctly overwrites all fields through
-// the unsafe fast path.
+// TestAdversarialRedecodeOverwrite pins that decoding into a struct that
+// already holds values overwrites every field through the unsafe fast path.
 func TestAdversarialRedecodeOverwrite(t *testing.T) {
 	type R struct {
 		A int32  `avro:"a"`
@@ -5386,7 +5386,7 @@ func TestAdversarialNullUnionRedecode(t *testing.T) {
 	}
 }
 
-// TestAdversarialVarintBoundary tests varint/varlong extreme values and
+// TestAdversarialVarintBoundary drives varint/varlong extreme values and
 // overflow through the unsafe fast path.
 func TestAdversarialVarintBoundary(t *testing.T) {
 	t.Run("int32_extremes", func(t *testing.T) {
@@ -5422,8 +5422,8 @@ func TestAdversarialVarintBoundary(t *testing.T) {
 	})
 }
 
-// TestAdversarialMapKeyLengthLie exercises map deserialization with
-// adversarial key lengths.
+// TestAdversarialMapKeyLengthLie drives map deserialization with adversarial
+// key lengths.
 func TestAdversarialMapKeyLengthLie(t *testing.T) {
 	schema := `{"type":"map","values":"int"}`
 	s := mustParse(t, schema)
@@ -5466,9 +5466,9 @@ func TestAdversarialMapKeyLengthLie(t *testing.T) {
 	}
 }
 
-// TestAdversarialAlignmentStress verifies the unsafe fast path handles
-// struct fields at various alignment boundaries correctly by round-tripping
-// a struct with fields of every primitive type at different offsets.
+// TestAdversarialAlignmentStress pins that the unsafe fast path handles struct
+// fields at every alignment boundary. We round-trip a struct carrying a field
+// of every primitive type, each at a different offset.
 func TestAdversarialAlignmentStress(t *testing.T) {
 	type Packed struct {
 		A bool    `avro:"a"` // offset 0, align 1
@@ -5533,8 +5533,8 @@ func TestAdversarialAlignmentStress(t *testing.T) {
 	}
 }
 
-// TestAdversarialFieldOrderMismatch tests that the unsafe fast path handles
-// structs where Go field order differs from schema field order.
+// TestAdversarialFieldOrderMismatch pins that the unsafe fast path handles a
+// struct whose Go field order differs from the schema field order.
 func TestAdversarialFieldOrderMismatch(t *testing.T) {
 	type R struct {
 		Z int64   `avro:"z"`
@@ -5556,9 +5556,8 @@ func TestAdversarialFieldOrderMismatch(t *testing.T) {
 	}
 }
 
-// TestAdversarialEmbeddedStructOffset tests that computeFieldOffset
-// correctly handles embedded (anonymous) struct fields by summing offsets
-// along the index path.
+// TestAdversarialEmbeddedStructOffset pins that computeFieldOffset handles
+// embedded (anonymous) struct fields by summing offsets along the index path.
 func TestAdversarialEmbeddedStructOffset(t *testing.T) {
 	type Base struct {
 		A int32  `avro:"a"`
@@ -5580,7 +5579,7 @@ func TestAdversarialEmbeddedStructOffset(t *testing.T) {
 	}
 }
 
-// TestAdversarialZeroLengthValues tests zero-length strings, bytes, and
+// TestAdversarialZeroLengthValues drives zero-length strings, bytes, and
 // empty arrays/maps through the unsafe fast path.
 func TestAdversarialZeroLengthValues(t *testing.T) {
 	type R struct {
@@ -5601,7 +5600,7 @@ func TestAdversarialZeroLengthValues(t *testing.T) {
 	}
 }
 
-// TestAdversarialArrayNullUnionLie tests arrays of nullable records with
+// TestAdversarialArrayNullUnionLie drives arrays of nullable records with
 // adversarial inputs through the unsafe fast path.
 func TestAdversarialArrayNullUnionLie(t *testing.T) {
 	type Inner struct {
@@ -5710,7 +5709,7 @@ func TestTimestampMicrosRoundTrip(t *testing.T) {
 
 func TestDateRoundTrip(t *testing.T) {
 	schema := `{"type":"int","logicalType":"date"}`
-	// Use a date at midnight UTC.
+	// A date at midnight UTC.
 	input := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC)
 	got := roundTrip(t, schema, input)
 	if !got.Equal(input) {
@@ -5738,10 +5737,10 @@ func TestTimeMicrosRoundTrip(t *testing.T) {
 
 func TestLocalTimestampMillisRoundTrip(t *testing.T) {
 	schema := `{"type":"long","logicalType":"local-timestamp-millis"}`
-	// Per Avro 1.12 spec / Java reference, local-timestamp encodes the
-	// wall-clock fields as-if-UTC; decode returns a UTC time.Time with
-	// matching wall-clock components. Use a UTC input so the host
-	// timezone doesn't affect the round-trip.
+	// Per the Avro 1.12 spec and the Java reference, local-timestamp
+	// encodes the wall-clock fields as-if-UTC. Decode returns a UTC
+	// time.Time with matching wall-clock components. We use a UTC input so
+	// the host timezone cannot affect the round-trip.
 	now := time.UnixMilli(time.Now().UnixMilli()).UTC()
 	got := roundTrip(t, schema, now)
 	if !got.Equal(now) {
@@ -5967,7 +5966,7 @@ func TestOmitzero(t *testing.T) {
 }
 
 func TestOmitzeroStringValue(t *testing.T) {
-	// Test omitzero with a non-pointer string field in a null union.
+	// omitzero with a non-pointer string field in a null union.
 	type R struct {
 		Name string `avro:"name,omitzero"`
 	}
@@ -5999,13 +5998,14 @@ func TestOmitzeroStringValue(t *testing.T) {
 	}
 }
 
-// TestRegression_OmitzeroNullSecondUnion locks in that omitzero on a null-SECOND
-// union (["T","null"]) emits the correct null-branch index (0x02 = zigzag 1), not
-// 0x00. Both the slow path (serRecord.ser at ser.go:704) and the fast-path
+// TestRegression_OmitzeroNullSecondUnion locks that omitzero on a null-second
+// union (["T","null"]) emits the correct null-branch index (0x02 = zigzag 1),
+// not 0x00. Both the slow path (serRecord.ser at ser.go:704) and the fast-path
 // slow-fn fallback (serRecordFast at unsafe.go:152) must look up the null
-// branch's actual index; unconditionally emitting 0x00 would corrupt the wire for
-// null-second unions — twmb couldn't decode its own output. The slow-path case is
-// a bare struct value, hitting the ser.go shortcut through the reflect fallback.
+// branch's actual index. Unconditionally emitting 0x00 would corrupt the wire
+// for null-second unions: we could not decode our own output. The slow-path
+// case is a bare struct value, hitting the ser.go shortcut through the reflect
+// fallback.
 func TestRegression_OmitzeroNullSecondUnion(t *testing.T) {
 	type R struct {
 		Name string `avro:"name,omitzero"`
@@ -6016,7 +6016,7 @@ func TestRegression_OmitzeroNullSecondUnion(t *testing.T) {
 		{"name":"tail","type":"int"}
 	]}`)
 	enc := mustAppendEncode(t, s, nil, &R{Name: "", Tail: 42})
-	// name → null branch (index 1, byte 0x02), tail → 42 (zigzag 0x54).
+	// name -> null branch (index 1, byte 0x02), tail -> 42 (zigzag 0x54).
 	want := []byte{0x02, 0x54}
 	if !bytes.Equal(enc, want) {
 		t.Fatalf("wire mismatch: got %x, want %x", enc, want)
@@ -6030,8 +6030,8 @@ func TestRegression_OmitzeroNullSecondUnion(t *testing.T) {
 	}
 }
 
-// TestRegression_OmitzeroNullSecondUnionPtr is the *T variant; this
-// exercises the fast-path's slowFn fallback at unsafe.go:152.
+// TestRegression_OmitzeroNullSecondUnionPtr is the *T variant. It reaches the
+// fast path's slowFn fallback at unsafe.go:152.
 func TestRegression_OmitzeroNullSecondUnionPtr(t *testing.T) {
 	type R struct {
 		Name *string `avro:"name,omitzero"`
@@ -6059,12 +6059,13 @@ func TestRegression_OmitzeroNullSecondUnionPtr(t *testing.T) {
 // between map default-fill and omitzero across the three no-written-default
 // field shapes (the doc.go "Struct tags" contract):
 //
-//   - ["null", T]: an implicit null default is inferred, so BOTH routes encode
+//   - ["null", T]: we infer an implicit null default, so both routes encode
 //     null and map fill does not error.
-//   - [T, "null"]: a union default must match the first branch, so none is
-//     inferred. The one divergence: omitzero encodes the null branch, map fill
+//   - [T, "null"]: a union default must match the first branch, so we infer
+//     none. The one divergence: omitzero encodes the null branch, map fill
 //     errors on the missing key.
-//   - plain T: nothing to fill with — omitzero keeps the zero, map fill errors.
+//   - plain T: nothing to fill with, so omitzero keeps the zero and map
+//     fill errors.
 func TestRegression_OmitzeroMapFillEffectiveDefaultParity(t *testing.T) {
 	type R struct {
 		F int64 `avro:"f,omitzero"`
@@ -6340,7 +6341,6 @@ func TestLogicalTypeDeserTypeMismatch(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := mustParse(t, tt.schema)
-			// Encode a valid value.
 			encoded := mustAppendEncode(t, s, nil, ptr(int64(42)))
 			// Decode into incompatible type.
 			var v bool
@@ -6423,7 +6423,8 @@ func TestTimeMicrosInRecord(t *testing.T) {
 	}
 }
 
-// In-record with int64 fields for logical types (exercises tryCompileLogicalSer/Deser fallback).
+// In-record int64 fields for logical types, which reach the
+// tryCompileLogicalSer/Deser fallback.
 func TestLogicalTypeInRecordWithIntFields(t *testing.T) {
 	type RMillis struct {
 		TS int64 `avro:"ts"`
@@ -6516,7 +6517,8 @@ func TestOmitzeroSlowPath(t *testing.T) {
 		{"name":"name","type":["null","string"]}
 	]}`
 	s := mustParse(t, schema)
-	// Pass struct by value (not pointer) to force non-addressable slow path.
+	// We pass the struct by value, not a pointer, to force the
+	// non-addressable slow path.
 	var v any = R{Name: ""}
 	encoded := mustAppendEncode(t, s, nil, v)
 	if len(encoded) != 1 || encoded[0] != 0 {
@@ -6842,8 +6844,8 @@ func TestSchemaValidateLogicalSoftDrop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected soft-drop accept for date-on-string, got: %v", err)
 	}
-	// Round-trip a plain string through the schema: the logical is
-	// dropped so encode/decode is bare string.
+	// We round-trip a plain string: the logical is dropped, so encode and
+	// decode are bare string.
 	enc, err := s.AppendEncode(nil, "hello")
 	if err != nil {
 		t.Fatalf("encode bare string: %v", err)
@@ -6927,7 +6929,7 @@ func TestDurationPointer(t *testing.T) {
 func TestDurationShortBuffer(t *testing.T) {
 	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
 	s := mustParse(t, schema)
-	// Only 11 bytes — needs 12.
+	// Only 11 bytes, needs 12.
 	short := make([]byte, 11)
 	var out Duration
 	_, err := s.Decode(short, &out)
@@ -6949,7 +6951,7 @@ func TestTimestampNanosRoundTrip(t *testing.T) {
 
 func TestLocalTimestampNanosRoundTrip(t *testing.T) {
 	schema := `{"type":"long","logicalType":"local-timestamp-nanos"}`
-	// Use UTC input — see TestLocalTimestampMillisRoundTrip rationale.
+	// UTC input; see TestLocalTimestampMillisRoundTrip for why.
 	now := time.Now().UTC()
 	got := roundTrip(t, schema, now)
 	if !got.Equal(now) {
@@ -7006,12 +7008,12 @@ func TestTimestampNanosDecodeUint(t *testing.T) {
 	}
 }
 
-// TestTimestampNanosDecodeIntoString pins decoder symmetry with the
-// encoder for timestamp-nanos into a *string. deserTimeAsLong has a
-// String arm that emits the RFC 3339 Nano form so the round-trip
-// succeeds. See TestMatrix_TimeLogicalStringRoundTrip for the
-// full matrix across all seven string-accepting time logicals; this
-// test keeps a single-cell schema/input shape as a sanity check.
+// TestTimestampNanosDecodeIntoString pins decoder symmetry with the encoder
+// for timestamp-nanos into a *string. deserTimeAsLong has a String arm that
+// emits the RFC 3339 Nano form, so the round-trip succeeds. See
+// TestMatrix_TimeLogicalStringRoundTrip for the full matrix across all seven
+// string-accepting time logicals. Here we keep a single-cell schema and input
+// shape as a sanity check.
 func TestTimestampNanosDecodeIntoString(t *testing.T) {
 	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
 	now := time.Now()
@@ -7342,17 +7344,17 @@ func TestBytesDecimalDecodeFloat64Overflow(t *testing.T) {
 }
 
 func TestDecimalSchemaValidation(t *testing.T) {
-	// decimal without precision is invalid per spec; twmb rejects at parse.
+	// decimal without precision is invalid per spec, so we reject at parse.
 	// The references are laxer here: fastavro 1.12.2's parse validation
 	// skips a missing precision entirely (parses; its writer then KeyErrors
-	// at use — observed), and Java's Decimal.validate throw is caught by
+	// at use, observed), and Java's Decimal.validate throw is caught by
 	// fromSchemaIgnoreInvalid, soft-dropping the logical to bare bytes.
 	// Rejecting beats both: a spec-required attribute is missing, and
 	// silently dropping the decimal is a silent interop divergence.
 	if _, err := Parse(`{"type":"bytes","logicalType":"decimal"}`); err == nil {
 		t.Fatal("expected error for decimal missing precision")
 	}
-	// decimal on int is wrong-underlying-type → falls back to int (forward
+	// decimal on int is wrong-underlying-type, so it falls back to int (forward
 	// compat for unknown logical-on-primitive combinations).
 	if _, err := Parse(`{"type":"int","logicalType":"decimal","precision":10}`); err != nil {
 		t.Fatalf("expected fallback to int, got error: %v", err)
@@ -7385,7 +7387,7 @@ func TestFixedDecimalShortBuffer(t *testing.T) {
 func TestBytesDecimalNegativeLength(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
 	s := mustParse(t, schema)
-	// Zigzag encode -1 as length → 0x01.
+	// Zigzag encode -1 as length: 0x01.
 	data := []byte{0x01}
 	var out *big.Rat
 	_, err := s.Decode(data, &out)
@@ -7446,7 +7448,7 @@ func TestDurationInRecordAsFixedArray(t *testing.T) {
 // ---- Decimal: bigIntToBytes edge cases ----
 
 func TestBytesDecimalHighBitPositive(t *testing.T) {
-	// Value 1.28 (unscaled 128) — 128=0x80, needs 0x00 prefix.
+	// Value 1.28 (unscaled 128): 128=0x80, needs 0x00 prefix.
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
 	r := new(big.Rat).SetFrac64(128, 100) // 1.28, unscaled = 128
 	got := roundTrip(t, schema, r)
@@ -7456,7 +7458,7 @@ func TestBytesDecimalHighBitPositive(t *testing.T) {
 }
 
 func TestBytesDecimalMinusOne(t *testing.T) {
-	// Value -0.01 (unscaled -1) — special case in bigIntToBytes.
+	// Value -0.01 (unscaled -1): special case in bigIntToBytes.
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
 	r := new(big.Rat).SetFrac64(-1, 100)
 	got := roundTrip(t, schema, r)
@@ -7466,7 +7468,8 @@ func TestBytesDecimalMinusOne(t *testing.T) {
 }
 
 func TestBytesDecimalNegativeNeedsPadding(t *testing.T) {
-	// Value -1.29 (unscaled -129) — abs=128, bytes=[0x80], flip=[0x7f], needs 0xff prefix.
+	// Value -1.29 (unscaled -129): abs=128, bytes=[0x80], flip=[0x7f],
+	// needs 0xff prefix.
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
 	r := new(big.Rat).SetFrac64(-129, 100)
 	got := roundTrip(t, schema, r)
@@ -7546,12 +7549,12 @@ func TestBytesDecimalTruncatedVarint(t *testing.T) {
 	}
 }
 
-// ---- Decimal: empty bytes (zero length) → bytesToBigInt empty ----
+// ---- Decimal: empty bytes (zero length), bytesToBigInt empty ----
 
 func TestBytesDecimalEmptyBytes(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
 	s := mustParse(t, schema)
-	// Length 0 → empty bytes → bytesToBigInt([]) → 0.
+	// Length 0 -> empty bytes -> bytesToBigInt([]) -> 0.
 	data := []byte{0x00} // varint 0
 	var out *big.Rat
 	rem := mustDecode(t, s, data, &out)
@@ -7608,7 +7611,7 @@ func TestFixedDecimalSerNilPointer(t *testing.T) {
 }
 
 func TestParseUUIDInvalidHex(t *testing.T) {
-	// Test each hex segment separately to hit all parseUUID error branches.
+	// One corrupt hex segment per case, to hit every parseUUID error branch.
 	uuidSchema := `{"type":"string","logicalType":"uuid"}`
 	s, _ := Parse(uuidSchema)
 	invalids := []string{
@@ -7720,8 +7723,8 @@ func TestBigDecimalOnFixedSoftDrop(t *testing.T) {
 	// big-decimal requires bytes; on fixed (any size), the logical
 	// soft-drops. Matches Java's BigDecimal.validate at
 	// LogicalTypes.java:466-470 (throws for non-bytes; caught by
-	// fromSchemaIgnoreInvalid → silent drop). Schema parses as bare
-	// fixed(16); the user's wire bytes are treated opaquely.
+	// fromSchemaIgnoreInvalid, a silent drop). The schema parses as bare
+	// fixed(16), and we treat the wire bytes opaquely.
 	if _, err := Parse(`{"type":"fixed","name":"F","size":16,"logicalType":"big-decimal"}`); err != nil {
 		t.Fatalf("expected soft-drop accept for big-decimal on fixed, got: %v", err)
 	}
@@ -7768,8 +7771,8 @@ func TestMaxDecimalDigitsZeroSize(t *testing.T) {
 // ---- Coverage: timestamp-nanos logicalSer/logicalDeser paths ----
 
 func TestTimestampNanosLogicalTypeInComplexSchema(t *testing.T) {
-	// This exercises the logicalSer/logicalDeser paths for nanos when
-	// the schema is given as a complex object (not already a primitive).
+	// Here we reach the logicalSer/logicalDeser paths for nanos, with the
+	// schema given as a complex object rather than a primitive.
 	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
 	s := mustParse(t, schema)
 	now := time.Now()
@@ -7990,7 +7993,6 @@ func TestImplicitNullDefaultMap(t *testing.T) {
 
 func TestArrayBlockCountExceedsBuffer(t *testing.T) {
 	s, _ := Parse(`{"type":"array","items":"int"}`)
-	// Manually craft: block count = 1000 (varint), no items.
 	buf := appendVarlong(nil, 1000) // count=1000 but no data
 	var v []int32
 	_, err := s.Decode(buf, &v)
@@ -8048,12 +8050,12 @@ func TestDeserUUIDTextUnmarshalerError(t *testing.T) {
 
 func TestDecimalPrecisionZero(t *testing.T) {
 	// Java's LogicalTypes.Decimal.validate throws for precision <= 0
-	// (LogicalTypes.java:383-385) — though its schema parse catches the
+	// (LogicalTypes.java:383-385), though its schema parse catches the
 	// throw and soft-drops the logical rather than failing. fastavro's
-	// parse_schema hard-rejects NEGATIVE precision but its `if precision:`
+	// parse_schema hard-rejects *negative* precision but its `if precision:`
 	// truthiness guard skips the check for 0 (parses, observed 1.12.2).
-	// twmb hard-rejects the whole <= 0 range: a decimal that can hold
-	// zero digits is malformed per the spec's positive-precision rule.
+	// We hard-reject the whole <= 0 range: a decimal that can hold zero
+	// digits is malformed per the spec's positive-precision rule.
 	if _, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":0}`); err == nil {
 		t.Fatal("expected error for decimal precision=0")
 	}
@@ -8188,7 +8190,7 @@ func TestUnsafeUdUUIDInvalidHex(t *testing.T) {
 }
 
 func TestNullSecondUnion(t *testing.T) {
-	// Test ["string", "null"] union (null-second).
+	// A ["string", "null"] union (null-second).
 	schema := `{"type":"record","name":"r","fields":[
 		{"name":"val","type":["string","null"]}
 	]}`
@@ -8248,7 +8250,7 @@ func TestNullSecondUnion(t *testing.T) {
 }
 
 func TestNullSecondUnionRoundTrip(t *testing.T) {
-	// Test round-trip with various types in ["T", "null"] unions.
+	// Various types in ["T", "null"] unions.
 	schema := `{"type":"record","name":"r","fields":[
 		{"name":"num","type":["int","null"]},
 		{"name":"text","type":["string","null"]}
@@ -8279,8 +8281,8 @@ func TestNullSecondUnionRoundTrip(t *testing.T) {
 }
 
 func TestNullSecondUnionReflectPath(t *testing.T) {
-	// Test ["int", "null"] union through the reflect slow path by passing
-	// values directly (not through an addressable struct field).
+	// Here we drive an ["int", "null"] union through the reflect slow path.
+	// We pass values directly, not through an addressable struct field.
 	schema := `["int","null"]`
 	s, err := Parse(schema)
 	if err != nil {
@@ -8305,7 +8307,7 @@ func TestNullSecondUnionReflectPath(t *testing.T) {
 		t.Fatalf("leftover bytes: %d", len(rem))
 	}
 
-	// Nil value: pass nil directly → reflect.ValueOf(nil) is invalid.
+	// Nil value: pass nil directly, so reflect.ValueOf(nil) is invalid.
 	dst, err = s.AppendEncode(nil, nil)
 	if err != nil {
 		t.Fatalf("encode nil: %v", err)
@@ -8349,7 +8351,7 @@ func TestNullSecondUnionReflectPath(t *testing.T) {
 }
 
 func TestNullSecondUnionPtrReflect(t *testing.T) {
-	// Test the reflect Ptr path of deserNullSecondUnion by decoding
+	// We reach the reflect Ptr path of deserNullSecondUnion by decoding
 	// a ["int", "null"] union into a top-level *int32.
 	schema := `["int","null"]`
 	s, err := Parse(schema)
@@ -8393,7 +8395,7 @@ func TestNullSecondUnionPtrReflect(t *testing.T) {
 }
 
 func TestFixedSliceRoundTrip(t *testing.T) {
-	// Verify that fixed-type values survive encode as []byte → decode as []byte.
+	// Fixed-type values must survive encode and decode as []byte.
 	schema := `{"type":"record","name":"r","fields":[
 		{"name":"data","type":{"type":"fixed","name":"f","size":4}}
 	]}`
@@ -8406,14 +8408,13 @@ func TestFixedSliceRoundTrip(t *testing.T) {
 	}
 }
 
-// TestDecodeReuseAnyTarget covers indirectAlloc's interface-target
-// handling. indirectAlloc keeps the interface as the destination
-// unless its inner is a non-nil pointer (where the pointee IS
-// addressable). Without that guard, decoding twice into the same
-// *any panics with "SetInt using unaddressable value": the first
-// decode populates *any with a concrete (e.g. int32) value, and the
-// second decode unwraps the non-nil interface to that unaddressable
-// inner value, so SetInt panics.
+// TestDecodeReuseAnyTarget covers indirectAlloc's interface-target handling.
+// indirectAlloc keeps the interface as the destination unless its inner is a
+// non-nil pointer (where the pointee *is* addressable). Without that guard,
+// decoding twice into the same *any panics with "SetInt using unaddressable
+// value". The first decode populates *any with a concrete (e.g. int32) value.
+// The second unwraps the non-nil interface to that unaddressable inner value,
+// so SetInt panics.
 func TestDecodeReuseAnyTarget(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -8496,12 +8497,11 @@ func TestDecodeReuseAnyTarget(t *testing.T) {
 	}
 }
 
-// TestDecodeNonEmptyInterfaceTarget covers the setIface fix. Before the
-// fix, decoding any schema into *interface{Foo()} panicked with
-// "reflect.Set: value of type X is not assignable to type
-// interface{Foo()}" — reflect.Value.Set has no built-in assignability
-// guard for interface targets. The decoder now returns a SemanticError
-// from setIface instead.
+// TestDecodeNonEmptyInterfaceTarget covers the setIface fix. Before the fix,
+// decoding any schema into *interface{Foo()} panicked with "reflect.Set: value
+// of type X is not assignable to type interface{Foo()}". reflect.Value.Set has
+// no built-in assignability guard for interface targets. We now return a
+// SemanticError from setIface instead.
 func TestDecodeNonEmptyInterfaceTarget(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -8523,8 +8523,8 @@ func TestDecodeNonEmptyInterfaceTarget(t *testing.T) {
 		{"record", `{"type":"record","name":"r","fields":[{"name":"x","type":"int"}]}`, []byte{84}, `{"x":1}`},
 		{"date", `{"type":"int","logicalType":"date"}`, []byte{84}, `42`},
 		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, []byte{84}, `42`},
-		// null branches produce nil, which IS assignable to any
-		// interface — those legitimately decode without error.
+		// null branches produce nil, which *is* assignable to any
+		// interface, so those legitimately decode without error.
 		// Only non-null produced values need the assignability error.
 		{"nullable union value", `["null","int"]`, []byte{2, 84}, `{"int":42}`},
 		{"3-branch bare", `["null","int","string"]`, nil, `"hello"`},
@@ -8562,13 +8562,12 @@ func TestDecodeNonEmptyInterfaceTarget(t *testing.T) {
 	}
 }
 
-// TestDecodeReuseAnyTargetStaleKeys pins the documented stale-key
-// behavior of map reuse in deserRecord.deser and decodeRecordAny:
-// when *any already wraps a map[string]any, the decoder overwrites
-// keys present in the schema and leaves any other keys untouched.
-// This matches encoding/json's behavior when unmarshaling into a
-// non-empty map. Callers that want a fresh decode should clear or
-// replace the map.
+// TestDecodeReuseAnyTargetStaleKeys pins the documented stale-key behavior of
+// map reuse in deserRecord.deser and decodeRecordAny: when *any already wraps
+// a map[string]any, we overwrite keys present in the schema and leave any
+// other keys untouched. This matches encoding/json's behavior when
+// unmarshaling into a non-empty map. Callers that want a fresh decode should
+// clear or replace the map.
 func TestDecodeReuseAnyTargetStaleKeys(t *testing.T) {
 	schemaA := `{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`
 	schemaB := `{"type":"record","name":"S","fields":[{"name":"y","type":"int"}]}`
@@ -8663,7 +8662,7 @@ func TestRegression_DeserFixedUUIDBytesAliasesInput(t *testing.T) {
 	}
 }
 
-// Finding 7: union default may match any branch — Avro 1.12+. POSITIVE
+// Finding 7: union default may match any branch, per Avro 1.12+. A positive
 // regression test: locks in the deliberate spec-1.12 behavior. Earlier
 // 1.11 strict-first-branch readers (and goavro) reject this; Java 1.12.0+
 // and fastavro v1.7+ accept. Reference: Apache Avro AVRO-3649 / PR #2503.
@@ -8674,11 +8673,11 @@ func TestRegression_UnionDefaultAcceptsAnyBranch_Avro112(t *testing.T) {
 }
 
 // TestRegression_EncodeJSONBareUnionsByDefault locks in the deliberate design
-// choice that EncodeJSON emits bare (non-tagged) unions by default, diverging
-// from the Avro 1.12 JSON-encoding spec's {"type_name": value}; spec-compliant
-// tagged output is opt-in via TaggedUnions(), whose doc carries the rationale.
-// This exists so the choice can't drift silently — flipping it would be a
-// behavior change for existing users.
+// choice that EncodeJSON emits bare (non-tagged) unions by default. That
+// diverges from the Avro 1.12 JSON-encoding spec's {"type_name": value}.
+// Spec-compliant tagged output is opt-in via TaggedUnions(), whose doc carries
+// the rationale. This exists so the choice cannot drift silently: flipping it
+// would be a behavior change for existing users.
 func TestRegression_EncodeJSONBareUnionsByDefault(t *testing.T) {
 	schema := MustParse(`{
 		"type":"record","name":"R",
@@ -8705,7 +8704,7 @@ func TestRegression_EncodeJSONBareUnionsByDefault(t *testing.T) {
 // for hand-written JSON. No reference implementation emits or reads
 // this form: Java emits and requires the fullname envelope, and
 // fastavro 1.12.2 does too (its json_writer keys by fullname and its
-// AvroJSONDecoder.read_index exact-matches branch labels — a
+// AvroJSONDecoder.read_index exact-matches branch labels, so a
 // short-name tag raises, observed). The uniqueness guard in
 // findUnionBranch keeps the leniency unambiguous.
 func TestRegression_DecodeJSONUnionTagShortName(t *testing.T) {
@@ -8747,7 +8746,7 @@ func TestRegression_DecodeJSONUnionTagAmbiguousShortName(t *testing.T) {
 			{"type":"record","name":"User","namespace":"b","fields":[{"name":"y","type":"int"}]}
 		]}
 	]}`)
-	// Ambiguous short name → must error rather than silently pick.
+	// Ambiguous short name: must error rather than silently pick.
 	in := []byte(`{"u":{"User":{"x":1}}}`)
 	var out map[string]any
 	if err := sch.DecodeJSON(in, &out); err == nil {
@@ -8764,13 +8763,14 @@ func TestRegression_DecodeJSONUnionTagAmbiguousShortName(t *testing.T) {
 	}
 }
 
-// TestRegression_WriterUnionBranchMismatchFailsFast locks in this library's
-// fail-fast posture for writer-union resolution: every writer branch must be
-// compatible with the reader at Resolve time, and the first incompatibility is
-// returned eagerly. This deliberately diverges from Java's Resolver.WriterUnion
-// (per-branch ErrorAction deferred to decode time) and fastavro's read_union —
-// see checkWriterUnion's doc for the rationale. A producer that narrowed during
-// evolution but never emits the dropped branch must update its schema first.
+// TestRegression_WriterUnionBranchMismatchFailsFast locks in the fail-fast
+// posture we take on writer-union resolution: every writer branch must be
+// compatible with the reader at Resolve time, and we return the first
+// incompatibility eagerly. This deliberately diverges from Java's
+// Resolver.WriterUnion (per-branch ErrorAction deferred to decode time) and
+// fastavro's read_union; see checkWriterUnion's doc for the rationale. A
+// producer that narrowed during evolution but never emits the dropped branch
+// must update its schema first.
 func TestRegression_WriterUnionBranchMismatchFailsFast(t *testing.T) {
 	writer := MustParse(`["null","string"]`)
 	reader := MustParse(`"string"`)
@@ -8805,13 +8805,13 @@ func TestRegression_NullUnionNonCanonicalVarint(t *testing.T) {
 // TestRegression_LongDefaultPrecisionLoss verifies that long-typed
 // schema defaults > 2^53 round-trip exact (no float64 truncation).
 // json.Unmarshal-into-any would decode numeric defaults as float64,
-// silently rounding 9007199254740993 → 9007199254740992;
+// silently rounding 9007199254740993 to 9007199254740992;
 // unmarshalDefault uses UseNumber to preserve the integer.
 func TestRegression_LongDefaultPrecisionLoss(t *testing.T) {
 	const want = int64(9007199254740993)
 	src := `{"type":"record","name":"R","fields":[{"name":"x","type":"long","default":9007199254740993}]}`
 	s := MustParse(src)
-	enc := mustAppendEncode(t, s, nil, map[string]any{}) // missing field → use default
+	enc := mustAppendEncode(t, s, nil, map[string]any{}) // missing field, use default
 	type recOut struct {
 		X int64 `avro:"x"`
 	}
@@ -8829,8 +8829,8 @@ func TestRegression_LongDefaultPrecisionLoss(t *testing.T) {
 // and scale > precision; its truthiness guards skip 0/missing, observed
 // 1.12.2). Java's Decimal.validate throws for each, but schema parse
 // catches the throw (fromSchemaIgnoreInvalid) and soft-drops the
-// logical — silently stripping the logical type and treating the schema
-// as plain bytes/fixed is exactly the interop hazard rejecting avoids.
+// logical. Silently stripping the logical type and treating the schema as
+// plain bytes/fixed is exactly the interop hazard rejecting avoids.
 func TestMatrix_InvalidDecimalRejected(t *testing.T) {
 	cases := []struct {
 		name, schema string
@@ -9025,7 +9025,7 @@ func TestRegression_DecodeArrayOfNullCappedAtLimit(t *testing.T) {
 }
 
 // TestRegression_DecodeArrayOfNullCumulativeAcrossBlocks verifies the
-// cap is cumulative — chunking the count across multiple sub-cap blocks
+// cap is cumulative: chunking the count across multiple sub-cap blocks
 // must still fail.
 func TestRegression_DecodeArrayOfNullCumulativeAcrossBlocks(t *testing.T) {
 	sch := MustParse(`{"type":"array","items":"null"}`)
@@ -9092,7 +9092,7 @@ func TestRegression_TimeMicrosAnyVsDurationParity(t *testing.T) {
 	if _, err := sch.Decode(encoded, &d); err == nil {
 		t.Fatalf("*time.Duration: expected overflow error, got d=%v", d)
 	}
-	// *any target: same schema, same wire bytes — should also error.
+	// *any target: same schema, same wire bytes, should also error.
 	var a any
 	if _, err := sch.Decode(encoded, &a); err == nil {
 		t.Fatalf("*any: expected same overflow error as *time.Duration, got a=%v (paths diverged)", a)
@@ -9103,10 +9103,10 @@ func TestRegression_TimeMicrosAnyVsDurationParity(t *testing.T) {
 // Java parity: per the Avro 1.12 JSON-encoding section, "each character
 // represents one byte" and "Unicode code points 0-255 are mapped to
 // unsigned 8-bit byte values 0-255". Java decodes JSON strings into
-// Java Strings (UTF-8 → UTF-16) then maps each char to a byte via
+// Java Strings (UTF-8 to UTF-16) then maps each char to a byte via
 // ISO-8859-1; fastavro does the same via str.encode("iso-8859-1").
-// twmb must apply codepoint mapping; walking raw input bytes one-by-
-// one would decode JSON literal "é" (UTF-8 c3 a9) to [0xC3, 0xA9]
+// We must apply codepoint mapping. Walking raw input bytes one by one
+// would decode the JSON literal "é" (UTF-8 c3 a9) to [0xC3, 0xA9]
 // instead of the spec-correct [0xE9].
 func TestRegression_JSONBytesUnicodeCharCodepointSemantics(t *testing.T) {
 	sch := MustParse(`"bytes"`)
@@ -9179,7 +9179,7 @@ func TestMatrix_TimestampDeserParity(t *testing.T) {
 			s := MustParse(tc.schema)
 			enc := mustAppendEncode(t, s, nil, tc.in)
 
-			// 1. any-target → empty-interface arm of setIface.
+			// 1. any-target: empty-interface arm of setIface.
 			var anyT any
 			if _, err := s.Decode(enc, &anyT); err != nil {
 				t.Fatalf("any: %v", err)
@@ -9188,7 +9188,7 @@ func TestMatrix_TimestampDeserParity(t *testing.T) {
 				t.Errorf("expected time.Time, got %T", anyT)
 			}
 
-			// 2. time.Time target → timeType arm.
+			// 2. time.Time target: timeType arm.
 			var typed time.Time
 			if _, err := s.Decode(enc, &typed); err != nil {
 				t.Fatalf("time.Time: %v", err)
@@ -9197,14 +9197,14 @@ func TestMatrix_TimestampDeserParity(t *testing.T) {
 				t.Errorf("got %v want %v", typed, tc.in)
 			}
 
-			// 3. typed-interface implemented by time.Time → setIface
+			// 3. typed-interface implemented by time.Time: setIface
 			//    AssignableTo(true) accepts.
 			var st stringerIface
 			if _, err := s.Decode(enc, &st); err != nil {
 				t.Errorf("Stringer: time.Time should be assignable: %v", err)
 			}
 
-			// 4. typed-interface NOT implemented → setIface rejects.
+			// 4. typed-interface NOT implemented: setIface rejects.
 			var bad unsupported
 			if _, err := s.Decode(enc, &bad); err == nil {
 				t.Errorf("unsupported iface: expected error")
@@ -9229,9 +9229,9 @@ func TestMatrix_TimestampDeserParity(t *testing.T) {
 // TestRegression_DecimalBytesUnionJSONRoundTrip locks in that
 // EncodeJSON / DecodeJSON round-trip a decimal-bytes value when it is
 // a non-null branch of a union. Two failure modes: EncodeJSON
-// emitting 0.33 (non-spec) and the union dispatch table refusing to
-// route digit tokens to bytes/fixed branches; either alone breaks
-// EncodeJSON ↔ DecodeJSON round-trip.
+// emitting 0.33 (non-spec), and the union dispatch table refusing to
+// route digit tokens to bytes/fixed branches. Either alone breaks the
+// EncodeJSON and DecodeJSON round-trip.
 func TestRegression_DecimalBytesUnionJSONRoundTrip(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"v","type":["null",{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}]}
@@ -9294,21 +9294,21 @@ type tmIntField struct {
 	F int64 `avro:"f"`
 }
 
-// TestMatrix_TimeMicrosOverflowGuardIsUniform crosses the overflow guard's three
-// axes at once. The guard lives in one conversion helper so every caller rejects
-// the same values, and "every caller" is the claim — but the suite reached it
-// one caller and one target at a time, so no cell asked whether the four callers
-// AGREE, and the time.Time target's overflow arm was reached by nothing.
+// TestMatrix_TimeMicrosOverflowGuardIsUniform crosses the overflow guard's
+// three axes at once. The guard lives in one conversion helper so every caller
+// rejects the same values. "Every caller" is the claim, but we reached it one
+// caller and one target at a time. No cell asked whether the four callers
+// agree, and nothing reached the time.Time target's overflow arm.
 //
 //	caller  binary safe, binary unsafe (a struct field), JSON typed, JSON any
 //	target  time.Duration, time.Time, any, and int64 as the control
 //	value   in range, both boundaries, and one past each boundary
 //
-// The rule is stated independently of the code: a value overflows exactly when
-// it cannot be scaled to nanoseconds inside an int64, and the guard must fire
-// for every target that MATERIALIZES a duration and none that does not. int64 is
-// in the matrix precisely because it must keep accepting the overflowing values,
-// and the boundary cells are the two immediately inside the limit, so an
+// The rule is stated independently of the code. A value overflows exactly when
+// it cannot be scaled to nanoseconds inside an int64. The guard must fire for
+// every target that materializes a duration and none that does not. int64 is
+// in the matrix precisely because it must keep accepting the overflowing
+// values. The boundary cells are the two immediately inside the limit, so an
 // off-by-one shows up as a rejected legal value.
 func TestMatrix_TimeMicrosOverflowGuardIsUniform(t *testing.T) {
 	const microsPerNano = int64(time.Microsecond) // 1000
@@ -9342,8 +9342,8 @@ func TestMatrix_TimeMicrosOverflowGuardIsUniform(t *testing.T) {
 
 	scalarS := MustParse(`{"type":"long","logicalType":"time-micros"}`)
 	recS := MustParse(`{"type":"record","name":"TMR","fields":[{"name":"f","type":{"type":"long","logicalType":"time-micros"}}]}`)
-	// The wire is written through the PLAIN long schema, so the payload is
-	// whatever int64 the cell names — the encoder's own range checks cannot
+	// The wire is written through the plain long schema, so the payload is
+	// whatever int64 the cell names: the encoder's own range checks cannot
 	// pre-filter the values this test is about.
 	plainScalarS := MustParse(`"long"`)
 	plainRecS := MustParse(`{"type":"record","name":"TMR","fields":[{"name":"f","type":"long"}]}`)
@@ -9424,11 +9424,11 @@ func TestMatrix_TimeMicrosOverflowGuardIsUniform(t *testing.T) {
 
 // TestDurationSubResolutionTruncatesTowardZero locks that time.Duration values
 // whose nanosecond component is not a whole multiple of the schema's resolution
-// unit are silently truncated toward zero at encode, matching
+// unit are silently truncated toward zero at encode. That matches
 // time.Duration.Milliseconds() and .Microseconds(). The wire cannot represent
-// sub-resolution precision, so encode must truncate, round, or reject; this
-// implementation truncates, as README §Logical Types and the serTimeMillis
-// doc-string record. A whole-millisecond Duration round-trips exactly.
+// sub-resolution precision, so encode must truncate, round, or reject. We
+// truncate, as README §Logical Types and the serTimeMillis doc-string record.
+// A whole-millisecond Duration round-trips exactly.
 func TestDurationSubResolutionTruncatesTowardZero(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -9457,7 +9457,7 @@ func TestDurationSubResolutionTruncatesTowardZero(t *testing.T) {
 		{
 			name:   "time-micros sub-us truncates",
 			schema: `{"type":"long","logicalType":"time-micros"}`,
-			in:     time.Duration(1_500_999), // 1.500999ms → 1500us
+			in:     time.Duration(1_500_999), // 1.500999ms -> 1500us
 			want:   1500 * time.Microsecond,
 		},
 	}
@@ -9638,7 +9638,7 @@ func TestRegression_UUIDFixedJSONDecodeIntoAny(t *testing.T) {
 // the specialized array<long> ser path does NOT silently skip the
 // time-micros logical conversion when the user provides
 // []time.Duration. The specialization selector must inspect the
-// inner's logical type, not just af.canon.primitive — otherwise the
+// inner's logical type, not just af.canon.primitive. Otherwise the
 // encoder appendVarlong's raw nanoseconds (1500*time.Microsecond =
 // 1500000 ns) instead of the spec-required microseconds (1500).
 func TestRegression_ArrayLongTimeMicrosBypassesLogicalSer(t *testing.T) {
@@ -9716,7 +9716,7 @@ func TestRegression_ArrayStringUUIDAccepts16Byte(t *testing.T) {
 
 // TestRegression_RecordArrayTimeMillisAddrVsByValParity locks in that
 // the same record + same data produces the same wire bytes regardless
-// of input addressability — the unsafe fast path (addressable) and
+// of input addressability: the unsafe fast path (addressable) and
 // the safe specialized serArray.serInt (by-value) must agree on the
 // time-millis conversion, not silently encode raw nanoseconds.
 func TestRegression_RecordArrayTimeMillisAddrVsByValParity(t *testing.T) {
@@ -9738,7 +9738,7 @@ func TestRegression_RecordArrayTimeMillisAddrVsByValParity(t *testing.T) {
 // TestRegression_RecordArrayIntPtrAddrVsByValParity locks in that
 // addressable and by-value record encoding produce the same result for
 // a []*int32 array field. The safe specialized serArray.serInt must
-// unwrap both reflect.Interface AND reflect.Pointer (matching the
+// unwrap both reflect.Interface and reflect.Pointer (matching the
 // unsafe fast path's pp := *(*unsafe.Pointer)(p) indirection).
 func TestRegression_RecordArrayIntPtrAddrVsByValParity(t *testing.T) {
 	type R struct {
@@ -9818,7 +9818,7 @@ func TestRegression_LocalTimestampMillisJSONEncodeFromString(t *testing.T) {
 
 // TestRegression_DefaultJSONIgnoresTaggedUnions locks in that
 // missing-field record defaults respect encoder options. Missing-field
-// defaults route through the full appendAvroJSON dispatch — so under
+// defaults route through the full appendAvroJSON dispatch, so under
 // TaggedUnions a "hello" union default emits {"string":"hello"} (the
 // form Java/fastavro JsonDecoder require) rather than the bare
 // pre-marshalled value.
@@ -9952,7 +9952,7 @@ func TestRegression_TimestampMillisMicrosUnsafeOverflow(t *testing.T) {
 
 // TestMatrix_DecodeJSONLongOverflowGap locks in that JSON-encoded long values
 // exceeding int64 are rejected, not silently wrapped. parseJSONInt64 uses a
-// per-digit pre-multiply bound that is safe near 2^64/9 — the boundary where the
+// per-digit pre-multiply bound that is safe near 2^64/9, the boundary where the
 // naive "n*10+d wrapped if it went down" post-multiply check has a gap, since
 // n*10+d can wrap mod 2^64 to a value still ≥ prev. The 20-digit family
 // 2049638230412172402d (d ∈ 0..9) probes that boundary. Java's
@@ -10022,8 +10022,8 @@ func TestMatrix_DecodeJSONLongOverflowGap(t *testing.T) {
 // TestRegression_DeserFixedArrayBlockCountOverflow locks in that
 // decoding into a fixed-size Go array [N]T errors instead of panicking
 // when the wire's block count would overflow the int64 idx+count
-// arithmetic. The bound check uses `count > int64(arrLen-idx)` —
-// comparing two non-negative int64 values without wrap risk — rather
+// arithmetic. The bound check uses `count > int64(arrLen-idx)`,
+// comparing two non-negative int64 values without wrap risk, rather
 // than the `idx+int(count) > arrLen` form which wraps for count near
 // MaxInt64 and would otherwise let an attacker-controlled count panic
 // v.Index(idx) when idx exceeds arrLen.
@@ -10137,8 +10137,8 @@ func TestRegression_DeserArraySliceBlockCountOverflow(t *testing.T) {
 // Go's time normalization makes the seconds component of
 // time.UnixMilli(MinInt64) = -maxSec - 1 (the remainder being negative,
 // normalization decrements sec and adds 1e9 to nsec), so we mirror Java's
-// Instant.toEpochMilli adjustment branch for sec < 0 && nsec > 0 —
-// `(sec+1)*1000 + (nsec/1e6 - 1000)` — which accepts the full int64 range. A
+// Instant.toEpochMilli adjustment branch for sec < 0 && nsec > 0,
+// `(sec+1)*1000 + (nsec/1e6 - 1000)`, which accepts the full int64 range. A
 // naive symmetric guard `sec > maxSec || sec < -maxSec` would reject
 // sec = -maxSec - 1.
 func TestRegression_TimestampMillisMinInt64(t *testing.T) {
@@ -10152,7 +10152,7 @@ func TestRegression_TimestampMillisMinInt64(t *testing.T) {
 	}
 }
 
-// TestRegression_TimestampMicrosMinInt64 — same parity rule for
+// TestRegression_TimestampMicrosMinInt64 pins the same parity rule for
 // microseconds. Java's TimestampMicrosConversion.toLong (line 185-198)
 // has the explicit adjustment branch.
 func TestRegression_TimestampMicrosMinInt64(t *testing.T) {
@@ -10166,9 +10166,9 @@ func TestRegression_TimestampMicrosMinInt64(t *testing.T) {
 	}
 }
 
-// TestRegression_TimestampMillisMinInt64UnsafePath — the unsafe
-// struct-fast-path (usTimestampMillis) calls the same helper so the
-// MinInt64 acceptance propagates automatically. This test pins that.
+// TestRegression_TimestampMillisMinInt64UnsafePath pins that the unsafe
+// struct-fast-path (usTimestampMillis) calls the same helper, so the
+// MinInt64 acceptance propagates automatically.
 func TestRegression_TimestampMillisMinInt64UnsafePath(t *testing.T) {
 	type R struct {
 		T time.Time `avro:"t"`
@@ -10183,7 +10183,7 @@ func TestRegression_TimestampMillisMinInt64UnsafePath(t *testing.T) {
 	}
 }
 
-// TestRegression_LocalTimestampMillisMinInt64 — local-timestamp
+// TestRegression_LocalTimestampMillisMinInt64 pins that local-timestamp
 // variants delegate to the timestamp-* helpers, inheriting the same
 // MinInt64 acceptance. Java's LocalTimestampMillisConversion.toLong
 // (line 274-277) similarly delegates to TimestampMillisConversion.toLong.
@@ -10242,12 +10242,12 @@ func TestRegression_DecodeJSONCustomDecoderConcurrentRace(t *testing.T) {
 // TestRegression_EncodeJSONNilPtrIntoNonNullableUnion locks in that
 // EncodeJSON of a nil *T into a union that doesn't contain "null"
 // errors instead of silently emitting "null". The binary path
-// (serUnion.ser → branch tryAll) errors with "no matching branch",
+// (serUnion.ser -> branch tryAll) errors with "no matching branch",
 // Java/fastavro reject the same input (UnresolvedUnionException /
-// "do not match"), and the library's own DecodeJSON rejects null
-// against a no-null union (see
+// "do not match"), and our own DecodeJSON rejects null against a
+// no-null union (see
 // TestRegression_UnionWithoutNullBranchAcceptsJsonNull). Encoding
-// "null" here would produce output the library can't read back.
+// "null" here would produce output we cannot read back.
 func TestRegression_EncodeJSONNilPtrIntoNonNullableUnion(t *testing.T) {
 	s := MustParse(`["int","string"]`)
 	var p *int
@@ -10285,15 +10285,15 @@ func TestRegression_EncodeJSONNilPtrIntoNullableUnion(t *testing.T) {
 
 // TestMatrix_EncodeJSONNullParity locks binary/JSON encode parity for the plain
 // "null" type across every site reaching serNull or appendAvroJSON's case
-// "null". Both must (1) reject non-nil non-nilable values with errNonNil — the
-// JSON arm cannot just emit literal `null` regardless of v — and (2) accept
+// "null". Both must (1) reject non-nil non-nilable values with errNonNil (the
+// JSON arm cannot just emit literal `null` regardless of v) and (2) accept
 // typed-nil values arriving via an Interface wrapper, since generic serUnion /
 // serArray / serMap dispatch calls serNull with Kind=Interface and both sides
 // must peel before the kind switch.
 //
-// The 2-branch [null,T] optimization is unaffected (serNullUnionAt → isNilValue
-// peels interfaces); the concern is 3+ branch dispatch and the
-// array<null>/map<null>/null-typed-field cases.
+// The 2-branch [null,T] optimization is unaffected (serNullUnionAt calls
+// isNilValue, which peels interfaces); the concern is 3+ branch dispatch and
+// the array<null>/map<null>/null-typed-field cases.
 //
 // The matrix covers both directions at the four sites routing through serNull's
 // kind-switch: a top-level "null" schema, a null-typed record field, a
@@ -10302,8 +10302,8 @@ func TestRegression_EncodeJSONNilPtrIntoNullableUnion(t *testing.T) {
 //
 // Cross-impl: Java and fastavro are silently lenient on both wires
 // (GenericDatumWriter.NULL writes the marker without checking datum; same in
-// write_null). twmb's binary path is deliberately strict per
-// TestSerNullNonNilableType, so this brings JSON to the strict choice rather
+// write_null). Our binary path is deliberately strict per
+// TestSerNullNonNilableType, so we bring JSON to the strict choice rather
 // than weakening binary.
 func TestMatrix_EncodeJSONNullParity(t *testing.T) {
 	// ---- Reject arm: non-nil non-nilable values must error on both paths ----
@@ -10338,7 +10338,7 @@ func TestMatrix_EncodeJSONNullParity(t *testing.T) {
 		}
 	})
 	t.Run("typed-nil map into null schema accepted", func(t *testing.T) {
-		// Symmetric positive case: a typed-nil map IS a valid no-value
+		// Symmetric positive case: a typed-nil map *is* a valid no-value
 		// representation (matches serNull's IsNil arm for Map kind).
 		s := MustParse(`"null"`)
 		var m map[string]any
@@ -10354,7 +10354,7 @@ func TestMatrix_EncodeJSONNullParity(t *testing.T) {
 	// ---- Accept arm: typed-nil wrapped in any() must be recognized as
 	// null at every dispatch site that calls serNull on iter.Value()
 	// (the wrapped-Interface form). The 2-branch [null,T] case at the
-	// top-level uses serNullUnionAt → isNilValue and is indirect-aware
+	// top-level uses serNullUnionAt -> isNilValue and is indirect-aware
 	// by construction; the cases below all route through the generic
 	// serNull which must peel the Interface wrapper before its kind
 	// switch (a bare Kind=Interface IsNil=false check would miss
@@ -10418,7 +10418,7 @@ func TestMatrix_EncodeJSONNullParity(t *testing.T) {
 		// unwraps via Go's interface unboxing (m["x"] returns the
 		// underlying nil pointer), so the value reaches serNull as
 		// Kind=Pointer not Kind=Interface and was always accepted.
-		// Pin it so a future change to that path can't regress.
+		// We pin it so a future change to that path cannot regress.
 		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"null"}]}`)
 		parity(t, s, map[string]any{"x": (*int)(nil)})
 	})
@@ -10429,7 +10429,7 @@ func TestMatrix_EncodeJSONNullParity(t *testing.T) {
 // pointer, with or without an enclosing any{} wrapper. The 2-branch [null,T]
 // optimization works via isNilValue, which peels both Pointer and Interface, but
 // serNull peeled only Interface, so the outer Pointer's IsNil()==false reached
-// the kind switch and errNonNil came back — while JSON's appendAvroJSON indirect
+// the kind switch and errNonNil came back, while JSON's appendAvroJSON indirect
 // loop already peeled both and succeeded, a binary/JSON asymmetry.
 func TestMatrix_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 	nilIntPtrPtr := func() any { var p *int; return &p }
@@ -10484,15 +10484,16 @@ func TestMatrix_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 // binary and JSON union encoders for a bare nil Map / Slice / []byte against a
 // multi-branch union containing "null". appendAvroJSONUnion's try-each loop
 // unconditionally skipped the null branch, and the upstream peel only handles
-// Pointer/Interface, so a bare nil Map never landed on case "null": binary
-// picked null while JSON returned "no union branch matched", or silently emitted
-// "" for nil []byte. The fix drops the null-skip; case "null" rejects non-nil
-// with errNonNil so non-nil inputs fall cleanly through.
+// Pointer/Interface, so a bare nil Map never landed on case "null". Binary
+// picked null while JSON returned "no union branch matched", or silently
+// emitted "" for nil []byte. The fix drops the null-skip; case "null" rejects
+// non-nil with errNonNil so non-nil inputs fall cleanly through.
 //
-// Distinct from TestMatrix_EncodeJSONNullParity, which covers TAGGED dispatch.
-// The bare form goes through unionTypeNameForValue into try-each, exactly where
-// the null-skip blocked it — every existing parity test passes the typed-nil
-// through the tagged form, so widening serNull's peel alone hides the bug.
+// Distinct from TestMatrix_EncodeJSONNullParity, which covers *tagged*
+// dispatch. The bare form goes through unionTypeNameForValue into try-each,
+// exactly where the null-skip blocked it. Every existing parity test passes
+// the typed-nil through the tagged form, so widening serNull's peel alone
+// hides the bug.
 func TestMatrix_EncodeJSONNullParityBareNilContainer(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -10594,14 +10595,14 @@ func TestMatrix_EncodeJSONNullParityBareNilContainer(t *testing.T) {
 	}
 }
 
-// TestMatrix_EncodeJSONNullBytesUnionParity locks the "Go nil = absent → null
+// TestMatrix_EncodeJSONNullBytesUnionParity locks the "Go nil = absent -> null
 // branch" semantic uniformly across union arities and encoders: all four
-// dispatch sites must agree — binary 2-branch (serNullUnionAt → isNilValue),
+// dispatch sites must agree: binary 2-branch (serNullUnionAt -> isNilValue),
 // binary N-branch, JSON N-branch, and JSON tagged. A nil-first short-circuit at
 // the entry of serUnion.ser and appendAvroJSONUnion applies the general rule;
 // without it, three near-identical schemas give three results for []byte(nil),
 // N-branch type-name dispatch naming Slice<uint8> "bytes" regardless of IsNil.
-// Dropping the null-skip from try-each alone does not suffice — type-name
+// Dropping the null-skip from try-each alone does not suffice: type-name
 // dispatch fires first.
 func TestMatrix_EncodeJSONNullBytesUnionParity(t *testing.T) {
 	tests := []struct {
@@ -10664,10 +10665,10 @@ func TestMatrix_EncodeJSONNullBytesUnionParity(t *testing.T) {
 			wantBin:  []byte{2, 0},
 			wantJSON: `""`,
 		},
-		// 3-branch: nil-first dispatch wins on both sides — picks
+		// 3-branch: nil-first dispatch wins on both sides, picking
 		// null uniformly with the 2-branch case. Without the nil-first
-		// short-circuit, binary would pick bytes (idx 2 → wire [4, 0])
-		// and JSON would pick bytes (`""`), a binary 2-branch ↔
+		// short-circuit, binary would pick bytes (idx 2 -> wire [4, 0])
+		// and JSON would pick bytes (`""`), a binary 2-branch versus
 		// 3-branch inconsistency.
 		{
 			name:     "3-branch [null,int,bytes] + []byte(nil)",
@@ -10683,7 +10684,7 @@ func TestMatrix_EncodeJSONNullBytesUnionParity(t *testing.T) {
 			name:     "3-branch [bytes,int,null] + []byte(nil)",
 			schema:   `["bytes","int","null"]`,
 			value:    []byte(nil),
-			wantBin:  []byte{4}, // null branch (idx 2 → zigzag 4)
+			wantBin:  []byte{4}, // null branch (idx 2 -> zigzag 4)
 			wantJSON: "null",
 		},
 		// 3-branch without a null branch: type-name dispatch picks
@@ -10714,8 +10715,8 @@ func TestMatrix_EncodeJSONNullBytesUnionParity(t *testing.T) {
 // TestMatrix_EncodeNullParity2BranchNilChanFunc locks parity between the binary
 // 2-branch [null,T] optimization and the binary 3-branch / JSON paths for nil
 // Chan and nil Func. serNull and appendAvroJSON's case "null" both accept
-// v.IsNil() for {Pointer, Interface, Map, Slice, Chan, Func}, but isNilValue —
-// used only by the 2-branch optimization — peeled Pointer/Interface while its
+// v.IsNil() for {Pointer, Interface, Map, Slice, Chan, Func}, but isNilValue,
+// used only by the 2-branch optimization, peeled Pointer/Interface while its
 // terminal kind switch covered only {Map, Slice}, so a nil Chan/Func fell to
 // fns[valIdx] and errored where both try-each paths accepted. isNilValue's
 // terminal switch must match serNull's accept set exactly.
@@ -10812,7 +10813,7 @@ func TestRegression_TimestampNanosMinInt64(t *testing.T) {
 	}
 }
 
-// TestRegression_LocalTimestampNanosMinInt64 — local-timestamp-nanos
+// TestRegression_LocalTimestampNanosMinInt64 pins that local-timestamp-nanos
 // delegates to timeToTimestampNanos, inheriting the same fix.
 func TestRegression_LocalTimestampNanosMinInt64(t *testing.T) {
 	in := time.Unix(0, math.MinInt64).UTC()
@@ -10865,7 +10866,7 @@ func TestRegression_DecodeJSONBytesOverflowTypedTarget(t *testing.T) {
 // TestRegression_SerRecordMapNamedStringKey locks in that binary
 // encoding a record from map[NamedKey]any (where NamedKey has
 // underlying type string) doesn't panic. v.MapIndex must use a key
-// value of the map's exact key type — a bare string panics when the
+// value of the map's exact key type: a bare string panics when the
 // map's key type is a named subtype, even though Go's type system
 // allows the conversion at the source level.
 func TestRegression_SerRecordMapNamedStringKey(t *testing.T) {
@@ -10973,10 +10974,10 @@ func TestRegression_ResolveDeserRecordMapNamedKey(t *testing.T) {
 	}
 }
 
-// TestRegression_DecodeJSONDecimalRecordFloatField — the typical user
-// shape: a record with a float-typed field backed by a decimal
+// TestRegression_DecodeJSONDecimalRecordFloatField covers the typical
+// user shape: a record with a float-typed field backed by a decimal
 // logical type. The struct-decode path delegates to the same decimal
-// arm, so binary↔JSON parity for the leaf flows up to records.
+// arm, so binary and JSON parity for the leaf flows up to records.
 func TestRegression_DecodeJSONDecimalRecordFloatField(t *testing.T) {
 	type R struct {
 		V float64 `avro:"v"`
@@ -11070,13 +11071,14 @@ func TestRegression_MapDecodeBucketAmplificationDoS(t *testing.T) {
 }
 
 // TestRegression_ResolveArrayPromotion_MinItemBytesBoundTooStrict locks that
-// resolveArray bounds the writer's wire block-count against the WRITER's
-// per-item minimum, not the reader's resolved item size — the wire was produced
+// resolveArray bounds the writer's wire block-count against the *writer's*
+// per-item minimum, not the reader's resolved item size: the wire was produced
 // by the writer, so its minimum is what the bound must use. Using the reader's
-// resolved node would reject array<int> writer → array<double> reader on a valid
-// 18-byte stream of 16 small ints, because the reader's min is 8 bytes;
-// resolveMap uses the same writer-min rule. Java, fastavro and avro-rs all
-// decode promoted arrays with no per-block count-times-item-size check at all.
+// resolved node would reject an array<int> writer against an array<double>
+// reader on a valid 18-byte stream of 16 small ints, because the reader's min
+// is 8 bytes; resolveMap uses the same writer-min rule. Java, fastavro and
+// avro-rs all decode promoted arrays with no per-block count-times-item-size
+// check at all.
 func TestRegression_ResolveArrayPromotion_MinItemBytesBoundTooStrict(t *testing.T) {
 	w := MustParse(`{"type":"array","items":"int"}`)
 	r := MustParse(`{"type":"array","items":"double"}`)
@@ -11138,8 +11140,8 @@ func TestRegression_ResolveArrayRecordEvolution_DefaultedField_TooStrict(t *test
 // encoder's case "fixed" arm invokes the avro.Duration 12-byte path only when
 // node.logical == "duration". Without the gate the Duration branch fires for any
 // fixed node regardless of logical or size, producing a 12-byte duration
-// encoding in a fixed schema declaring a different size — invalid Avro JSON that
-// this library's own decoder rejects and Java/fastavro consumers reject. The
+// encoding in a fixed schema declaring a different size: invalid Avro JSON that
+// our own decoder rejects and Java/fastavro consumers reject. The
 // binary path assigns serDuration only when node.logical == "duration"
 // (schema.go:1665), so the gate must mirror that.
 func TestRegression_JSONDurationIgnoresNonDurationFixedSize(t *testing.T) {
@@ -11156,7 +11158,7 @@ func TestRegression_JSONDurationIgnoresNonDurationFixedSize(t *testing.T) {
 // case "bytes" String branch uses codepoint mapping (1 byte per
 // codepoint up to U+00FF), matching the binary path's
 // defaultStringToBytes. A naive []byte(v.String()) UTF-8 conversion
-// would produce 2 bytes for U+00FF — wrong per spec.
+// would produce 2 bytes for U+00FF, wrong per spec.
 func TestRegression_EncodeJSONBytesDefaultCodepointMapping(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"r","fields":[{"name":"a","type":"bytes","default":"ÿ"}]}`)
 	out := mustEncodeJSON(t, s, map[string]any{})
@@ -11167,7 +11169,7 @@ func TestRegression_EncodeJSONBytesDefaultCodepointMapping(t *testing.T) {
 }
 
 // TestRegression_EncodeJSONFixedDefaultCodepointMapping is the fixed
-// counterpart. Same codepoint-mapping rule applies — for a fixed(size=1)
+// counterpart. Same codepoint-mapping rule applies: for a fixed(size=1)
 // field with a U+00FF default, the encoded byte is 0xff (1 byte). A
 // UTF-8 conversion would produce 2 bytes and fail the fixed size check.
 func TestRegression_EncodeJSONFixedDefaultCodepointMapping(t *testing.T) {
@@ -11181,8 +11183,8 @@ func TestRegression_EncodeJSONFixedDefaultCodepointMapping(t *testing.T) {
 
 // TestRegression_ResolveReaderUnionAmbiguousUnqualifiedNames locks that Resolve
 // picks the correct full-name match when a reader union contains two named types
-// with the same unqualified name in different namespaces — a configuration the
-// spec explicitly permits. findMatchingBranch / namesMatch must match by FULL
+// with the same unqualified name in different namespaces, a configuration the
+// spec explicitly permits. findMatchingBranch / namesMatch must match by *full*
 // name when namespaces differ; unqualified-name match alone would let writer
 // b.Foo pick reader a.Foo, typically erroring with "field has no default and is
 // missing from writer" or silently yielding wrong output. Java and fastavro both
@@ -11210,7 +11212,7 @@ func TestRegression_ResolveReaderUnionAmbiguousUnqualifiedNames(t *testing.T) {
 // encoder rejects a map whose Go key kind isn't reflect.String,
 // matching the binary path's serMapPreamble (ser.go) which errors
 // with SemanticError{AvroType: "map"}. The JSON path checks both
-// v.Kind() == reflect.Map AND the key kind — without the key check,
+// v.Kind() == reflect.Map *and* the key kind: without the key check,
 // a map[int]V would silently emit JSON object keys like
 // "<int Value>" (invalid Avro JSON that round-trips to a wrong
 // map). Avro spec: "Map keys are assumed to be strings."
@@ -11232,8 +11234,8 @@ func TestRegression_JSONEncodeNonStringKeyMap(t *testing.T) {
 // pointer element types (**T, ***T), matching the unsafe fast path
 // which chases arbitrarily-deep pointers via
 // `pp := *(*unsafe.Pointer)(p)`. The safe specializations must
-// recurse through Elem() until reaching the concrete primitive type
-// — a single-level unwrap would reject **T as "cannot use *int32
+// recurse through Elem() until reaching the concrete primitive type;
+// a single-level unwrap would reject **T as "cannot use *int32
 // with Avro type int".
 func TestMatrix_ArrayMapMultiLevelPointerElements(t *testing.T) {
 	intArr := MustParse(`{"type":"array","items":"int"}`)
@@ -11348,7 +11350,7 @@ func TestRegression_ArrayLongTimeMicrosAcceptsTime(t *testing.T) {
 // equivalent time.Duration. Binary and JSON paths both checked.
 func TestRegression_SerTimeMicrosAcceptsTime(t *testing.T) {
 	s := MustParse(`{"type":"long","logicalType":"time-micros"}`)
-	// 14:30:45.123456 — non-zero in every field.
+	// 14:30:45.123456, non-zero in every field.
 	tm := time.Date(2020, 6, 15, 14, 30, 45, 123_456_000, time.UTC)
 	d := time.Duration(tm.Hour())*time.Hour + time.Duration(tm.Minute())*time.Minute + time.Duration(tm.Second())*time.Second + time.Duration(tm.Nanosecond())
 	// Binary parity with time.Duration input.
@@ -11554,10 +11556,8 @@ func TestResolveFieldAddedWithDefault(t *testing.T) {
 	reader := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string","default":"hello"}]}`)
 	resolved := mustResolve(t, writer, reader)
 
-	// Encode with writer schema.
 	encoded := mustEncode(t, writer, map[string]any{"a": 42})
 
-	// Decode with resolved schema into interface.
 	var result any
 	mustDecode(t, resolved, encoded, &result)
 	m, ok := result.(map[string]any)
@@ -11646,7 +11646,6 @@ func TestResolveEnumEvolution(t *testing.T) {
 	reader := mustParse(t, `{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`)
 	resolved := mustResolve(t, writer, reader)
 
-	// Encode "C" with writer.
 	encoded := mustEncode(t, writer, "C")
 
 	var result string
@@ -11708,7 +11707,6 @@ func TestResolveUnionEvolution(t *testing.T) {
 		t.Fatalf("expected *int64(42), got %v", result)
 	}
 
-	// Encode null.
 	encoded = mustEncode(t, writer, (*int32)(nil))
 	mustDecode(t, resolved, encoded, &result)
 	if result != nil {
@@ -12056,7 +12054,7 @@ func TestSkipUnion(t *testing.T) {
 }
 
 func TestSkipFunctions(t *testing.T) {
-	// Encode various types and verify skip advances past them correctly.
+	// Various encoded types, checking that skip advances past each.
 	tests := []struct {
 		name   string
 		schema string
@@ -12103,7 +12101,7 @@ func TestSkipFunctions(t *testing.T) {
 		})
 	}
 
-	// Null is zero bytes, test directly.
+	// Null is zero bytes, so it goes directly.
 	t.Run("null", func(t *testing.T) {
 		sentinel := byte(0xFE)
 		data := []byte{sentinel}
@@ -12194,7 +12192,7 @@ func TestResolvePromotionInRecord(t *testing.T) {
 }
 
 func TestResolveRecordDefault(t *testing.T) {
-	// Test default for a record field whose type is also a record.
+	// A default for a record field whose type is also a record.
 	writer := mustParse(t, `{"type":"record","name":"Outer","fields":[
 		{"name":"x","type":"int"}
 	]}`)
@@ -12272,7 +12270,7 @@ func TestResolveReaderUnionWriterNonUnion(t *testing.T) {
 
 func TestResolveReaderUnionTaggedUnions(t *testing.T) {
 	// Writer is "string", reader is ["null","string"].
-	// Schema evolution: writer non-union → reader union.
+	// Schema evolution: writer non-union -> reader union.
 	// TaggedUnions should wrap the result.
 	writer := mustParse(t, `"string"`)
 	reader := mustParse(t, `["null","string"]`)
@@ -12299,16 +12297,15 @@ func TestResolveReaderUnionTaggedUnions(t *testing.T) {
 	}
 }
 
-// TestResolveReaderUnionTaggedWrapTargetParity verifies that decoding
-// through a resolved reader-union (writer non-union, reader union) treats
-// every decode-target shape exactly like the natural union path. The
-// TaggedUnions {branch: value} envelope applies only to targets that
-// map[string]any is assignable to; for every other target (concrete
-// types, non-empty interfaces) the wrap is skipped silently — the
-// contract documented on deserUnion.maybeWrap — never turned into an
-// error. The natural decode of the reader-shaped wire is the oracle for
-// each cell; resolved binary and resolved JSON (which funnels through the
-// same resolving deser) must agree with it.
+// TestResolveReaderUnionTaggedWrapTargetParity verifies that decoding through a
+// resolved reader-union (writer non-union, reader union) treats every
+// decode-target shape exactly like the natural union path. The TaggedUnions
+// {branch: value} envelope applies only to targets that map[string]any is
+// assignable to. For every other target (concrete types, non-empty interfaces)
+// we skip the wrap silently, never turning it into an error; that is the
+// contract documented on deserUnion.maybeWrap. The natural decode of the
+// reader-shaped wire is the oracle for each cell. Resolved binary and resolved
+// JSON (which funnels through the same resolving deser) must agree with it.
 func TestResolveReaderUnionTaggedWrapTargetParity(t *testing.T) {
 	writer := mustParse(t, `{"type":"long","logicalType":"timestamp-millis"}`)
 	reader := mustParse(t, `["null",{"type":"long","logicalType":"timestamp-millis"}]`)
@@ -12395,13 +12392,13 @@ func TestResolveReaderUnionTaggedWrapTargetParity(t *testing.T) {
 	})
 }
 
-// TestResolvedRecordIntoAnyMapReuseParity verifies the resolved record
-// decoder honors the documented map-reuse contract for *any targets: when
-// the target interface already wraps a map[string]any, schema fields are
-// written into the existing map and unrelated keys are retained (see
-// reuseOrMakeStringAnyMap and TestDecodeReuseAnyTargetStaleKeys, which pin
-// the natural decoder's behavior). The natural decode is the oracle;
-// resolved binary and resolved JSON decodes must match it.
+// TestResolvedRecordIntoAnyMapReuseParity verifies the resolved record decoder
+// honors the documented map-reuse contract for *any targets: when the target
+// interface already wraps a map[string]any, we write schema fields into the
+// existing map and retain unrelated keys. See reuseOrMakeStringAnyMap and
+// TestDecodeReuseAnyTargetStaleKeys, which pin the natural decoder's behavior.
+// The natural decode is the oracle. Resolved binary and resolved JSON decodes
+// must match it.
 func TestResolvedRecordIntoAnyMapReuseParity(t *testing.T) {
 	writer := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
 	reader := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"long","default":7}]}`)
@@ -12668,7 +12665,7 @@ func TestSkipToDeser(t *testing.T) {
 }
 
 func TestSkipRecordFieldError(t *testing.T) {
-	// Record with an int field, but pass truncated data.
+	// A record with an int field, but truncated data.
 	node := &schemaNode{
 		kind: "record",
 		fields: []fieldNode{
@@ -12959,9 +12956,8 @@ func TestResolveEnumIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Make canonical forms different so Resolve doesn't short-circuit.
-	// Actually they'll be the same... so we need to use the resolveEnum directly.
-	// Let's test via resolveEnum.
+	// The canonical forms come out the same here, so Resolve would
+	// short-circuit. We call resolveEnum directly instead.
 	resolved, err := resolveEnum(reader.node, writer.node, &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err != nil {
 		t.Fatal(err)
@@ -13103,7 +13099,8 @@ func TestResolveSelfReferencingRecordDivergent(t *testing.T) {
 }
 
 func TestResolveWriterUnionNullUnionOptimization(t *testing.T) {
-	// Writer ["null","int"], reader "long" — exercises null-union optimization path in resolveWriterUnion.
+	// Writer ["null","int"], reader "long": exercises the null-union
+	// optimization path in resolveWriterUnion.
 	writer := mustParse(t, `["null","int"]`)
 	reader := mustParse(t, `["null","long"]`)
 	resolved := mustResolve(t, writer, reader)
@@ -13302,7 +13299,7 @@ func TestResolveDeserTruncatedData(t *testing.T) {
 }
 
 func TestResolveDeserReadError(t *testing.T) {
-	// Writer and reader both have field A but promoted (int→long).
+	// Writer and reader both have field A but promoted (int to long).
 	// Test with truncated data to trigger read error.
 	writer := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
 	reader := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
@@ -13475,7 +13472,7 @@ func TestEncodeDefaultRecordFieldDefault(t *testing.T) {
 			{name: "b", node: &schemaNode{kind: "string"}},
 		},
 	}
-	// Provide "b" but not "a" — "a" has a default.
+	// Provide "b" but not "a"; "a" has a default.
 	encoded, err := encodeDefault(nil, map[string]any{"b": "hello"}, node)
 	if err != nil {
 		t.Fatal(err)
@@ -13751,7 +13748,7 @@ func TestResolveUnionUnionBranchError(t *testing.T) {
 }
 
 func TestResolveDeserStructMissingField(t *testing.T) {
-	// Struct is missing a field the reader schema expects → typeFieldMapping error.
+	// Struct is missing a field the reader schema expects: typeFieldMapping error.
 	// Schemas must differ so Resolve doesn't short-circuit.
 	writer := mustParse(t, recABSchema)
 	reader := mustParse(t, `{"type":"record","name":"R","fields":[
@@ -13812,13 +13809,13 @@ func TestResolveFullyQualifiedAlias(t *testing.T) {
 	}
 }
 
-// A namespace-qualified alias names exactly that fullname — spec "Aliases": if a
+// A namespace-qualified alias names exactly that fullname. Spec "Aliases": if a
 // type named "a.b" has aliases "c" and "x.y", their fully qualified names are
-// "a.c" and "x.y". It must not match a same-short-name type in a DIFFERENT
-// namespace: Java rewrites writer names through a fullname-keyed alias map
-// (Schema.applyAliases) and fastavro matches the writer's fullname or bare short
-// name against the alias strings as written (match_schemas), and both reject this
-// pair. Only an alias declared WITHOUT a dot short-matches across namespaces
+// "a.c" and "x.y". It must not match a same-short-name type in a different
+// namespace. Java rewrites writer names through a fullname-keyed alias map
+// (Schema.applyAliases). fastavro matches the writer's fullname or bare short
+// name against the alias strings as written (match_schemas). Both reject this
+// pair. Only an alias declared *without* a dot short-matches across namespaces
 // (fastavro's raw-string tier, executed; Java is fullname-only).
 func TestResolveQualifiedAliasIsNamespaceScoped(t *testing.T) {
 	writer := MustParse(`{"type":"record","name":"n2.Old","fields":[{"name":"a","type":"int"}]}`)
@@ -13852,14 +13849,14 @@ func TestResolveQualifiedAliasIsNamespaceScoped(t *testing.T) {
 	}
 }
 
-// Aliases follow the names' dot rule (leadingDotName): a single leading dot
-// with a DOTLESS remainder is the null-namespace escape (".x" is the
-// fullname "x"), and any other dotted spelling is a fullname VERBATIM —
+// Aliases follow the names' dot rule (leadingDotName). A single leading dot
+// with a *dotless* remainder is the null-namespace escape (".x" is the
+// fullname "x"), and any other dotted spelling is a fullname verbatim.
 // Java's Name constructor nulls the space only when it is empty (lastDot
 // split, then `if ("".equals(space)) space = null`), so ".a.b" keeps its
-// non-empty space ".a"; fastavro compares alias strings as written, so a
+// non-empty space ".a". fastavro compares alias strings as written, so a
 // raw ".a.b" matches only a writer literally named ".a.b". Stripping the
-// dot from ".a.b" would match writer "a.b" — a match neither reference
+// dot from ".a.b" would match writer "a.b", a match neither reference
 // makes.
 func TestResolveLeadingDotAliasDotRule(t *testing.T) {
 	lax := WithLaxNames(func(string) error { return nil })
@@ -13882,7 +13879,7 @@ func TestResolveLeadingDotAliasDotRule(t *testing.T) {
 		t.Errorf(`Resolve: alias ".a.b" matched writer "a.b"`)
 	}
 
-	// ... and it DOES match a (lax-named) writer literally called ".a.b".
+	// ... and it *does* match a (lax-named) writer literally called ".a.b".
 	writerDot, err := Parse(`{"type":"record","name":".a.b","fields":[{"name":"a","type":"int"}]}`, lax)
 	if err != nil {
 		t.Fatalf("lax writer .a.b: %v", err)
@@ -13922,9 +13919,9 @@ type ptrTextString string
 
 func (p *ptrTextString) MarshalText() ([]byte, error) { return []byte("MT:" + string(*p)), nil }
 
-// long→int JSON native decode must never silently truncate: a wire value
+// long-to-int JSON native decode must never silently truncate: a wire value
 // outside int32 range into []int / map[string]int is preserved on 64-bit
-// (native) and rejected on 32-bit (reflect fallback) — but never garbage. The
+// (native) and rejected on 32-bit (reflect fallback), but never garbage. The
 // int32 value type always rejects (parseJSONInt32 range-checks). Locks the
 // 32-bit narrowing fix.
 func TestRegression_JSONNativeLongIntNoTruncate(t *testing.T) {
@@ -13960,7 +13957,7 @@ func TestRegression_JSONNativeLongIntNoTruncate(t *testing.T) {
 }
 
 // []fpString (named string, no text method) decodes via the array fast loop
-// (deserArrayStringLoop / JSON reflect) — the native loop's exact-string
+// (deserArrayStringLoop / JSON reflect): the native loop's exact-string
 // assertion misses it. map[string]fpString covers the map fast block; this
 // covers the array path, binary and JSON.
 func TestRegression_ArrayNamedStringFastLoopDecode(t *testing.T) {
@@ -13982,7 +13979,7 @@ func TestRegression_ArrayNamedStringFastLoopDecode(t *testing.T) {
 
 // A pointer-receiver MarshalText does not fire on a non-addressable by-value
 // scalar (the value's method set lacks the pointer method), so it encodes as
-// the raw string — matching encoding/json. By pointer (addressable) it fires.
+// the raw string, matching encoding/json. By pointer (addressable) it fires.
 func TestRegression_PointerMarshalTextNonAddressableScalar(t *testing.T) {
 	s := MustParse(`"string"`)
 	v := ptrTextString("hi")
@@ -14007,12 +14004,12 @@ func TestRegression_PointerMarshalTextNonAddressableScalar(t *testing.T) {
 // appendMapPrimitive, serMap.ser, and the JSON map encoder reuse two addressable
 // Values via SetIterKey/SetIterValue instead of allocating a fresh Value per
 // entry. Because the reused value Value is addressable (iter.Value() is not), a
-// struct-valued map now reaches serRecord's unsafe fast path. These pin that the
-// change is behavior-neutral: every map shape round-trips on both wires to a
-// deep-equal value, and the struct-valued map's record bytes match a standalone
-// encode. Maps iterate in randomized order, so multi-entry wire is not
-// byte-stable — decoded values are compared, except for the deterministic
-// single-entry struct case.
+// struct-valued map now reaches serRecord's unsafe fast path. Here we pin that
+// the change is behavior-neutral: every map shape round-trips on both wires to
+// a deep-equal value, and the struct-valued map's record bytes match a
+// standalone encode. Maps iterate in randomized order, so multi-entry wire is
+// not byte-stable. We compare decoded values instead, except for the
+// deterministic single-entry struct case.
 
 type setIterRec struct {
 	A int32  `avro:"a"`
@@ -14124,7 +14121,7 @@ func TestMatrix_MapValueSwitchMatchesGeneral(t *testing.T) {
 }
 
 // Named slice and element types for the array destination-shape axis. A
-// DEFINED slice type and a builtin slice of a DEFINED element type both
+// defined slice type and a builtin slice of a defined element type both
 // leave the native loop, but by different tests, so they are separate axis
 // values rather than two spellings of one.
 type (
@@ -14136,12 +14133,12 @@ type (
 	nsString  []string
 )
 
-// TestMatrix_ArrayElementSwitchMatchesGeneral is the ARRAY sibling of
+// TestMatrix_ArrayElementSwitchMatchesGeneral is the array sibling of
 // TestMatrix_MapValueSwitchMatchesGeneral. The map net crosses the Go type's
-// DEFINEDNESS — builtin value type against a defined one — over every primitive;
-// the array nets never did, so every array cell handed the decoder a builtin
-// slice of a builtin element and took the native loop, leaving the reflect-typed
-// fallback unrun for every primitive.
+// definedness (builtin value type against a defined one) over every primitive.
+// The array nets never did. Every array cell handed the decoder a builtin slice
+// of a builtin element and took the native loop, so the reflect-typed fallback
+// went unrun for every primitive.
 //
 //	builtin-slice   []int32       native loop
 //	defined-slice   nsInt32       reflect loop (the slice type is not []int32)
@@ -14238,14 +14235,14 @@ func TestMatrix_ArrayElementSwitchMatchesGeneral(t *testing.T) {
 				if !bytes.Equal(jsonGot, jsonWant) {
 					t.Errorf("%s JSON encode diverges from the builtin slice:\n got  %s\n want %s", shape.name, jsonGot, jsonWant)
 				}
-				// The JSON round trip is compared against the BUILTIN
-				// shape's JSON round trip, not against the binary wire:
-				// the JSON representation of any NaN is the bare token
-				// NaN, which carries no payload, so a signaling NaN is
-				// quieted on that wire for every shape alike. That is a
-				// property of the representation, not a divergence
-				// between shapes, and the question here is whether the
-				// shapes agree.
+				// We compare the JSON round trip against the builtin
+				// shape's JSON round trip, not against the binary
+				// wire. The JSON representation of any NaN is the
+				// bare token NaN, which carries no payload, so a
+				// signaling NaN is quieted on that wire for every
+				// shape alike. That is a property of the
+				// representation, not a divergence between shapes,
+				// and the question here is whether the shapes agree.
 				jbuiltin := reflect.New(reflect.TypeOf(c.builtin))
 				if err := s.DecodeJSON(jsonWant, jbuiltin.Interface()); err != nil {
 					t.Fatalf("builtin decodeJSON: %v", err)
@@ -14285,9 +14282,9 @@ type f32Field struct {
 }
 
 // float32 must preserve exact bits (signaling-NaN payload included) on every
-// path — matching Java (floatToRawIntBits/intBitsToFloat), fastavro, and IEEE
+// path, matching Java (floatToRawIntBits/intBitsToFloat), fastavro, and IEEE
 // "float is 4 opaque bytes." reflect.Value.Float()/SetFloat would quiet sNaN
-// via a float64 round-trip; the encode/decode paths avoid that. Pins that the
+// via a float64 round-trip; the encode/decode paths avoid that. We pin that the
 // unsafe (addressable) and reflect (by-value) paths agree, and that maps and
 // arrays agree with both.
 func TestRegression_Float32SignalingNaNPreserved(t *testing.T) {
@@ -14295,7 +14292,7 @@ func TestRegression_Float32SignalingNaNPreserved(t *testing.T) {
 	f := math.Float32frombits(bits)
 	wire := []byte{0x01, 0x00, 0x80, 0x7f} // little-endian 0x7f800001
 
-	// ENCODE: record field, both by-value (reflect) and by-pointer (unsafe).
+	// Encode: record field, both by-value (reflect) and by-pointer (unsafe).
 	rec := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"float"}]}`)
 	for _, enc := range []any{f32Field{f}, &f32Field{f}} {
 		b, err := rec.Encode(enc)
@@ -14317,7 +14314,7 @@ func TestRegression_Float32SignalingNaNPreserved(t *testing.T) {
 		t.Fatalf("array encode quieted sNaN: % x", ab)
 	}
 
-	// DECODE: record field, map value, array element, interface — all preserve.
+	// Decode: record field, map value, array element, interface all preserve.
 	var sf f32Field
 	mustDecode(t, rec, wire, &sf)
 	if got := math.Float32bits(sf.F); got != bits {
@@ -14340,7 +14337,7 @@ func TestRegression_Float32SignalingNaNPreserved(t *testing.T) {
 	}
 
 	// Named float32 (fpFloat32): a non-addressable scalar encode hits
-	// float32WireBits's typedmemmove-into-temp branch — distinct from the
+	// float32WireBits's typedmemmove-into-temp branch, distinct from the
 	// builtin-float32 Interface() branch and the unsafe-addressable branch
 	// exercised above, and the only float32 path the rest of this test (and
 	// TestMatrix_MapValueSwitchMatchesGeneral, which uses an addressable
@@ -14408,8 +14405,8 @@ func TestMatrix_ArrayJSONNativeMatchesGeneral(t *testing.T) {
 }
 
 // JSON map encode native must be byte-identical to the reflect path. Single
-// entry → deterministic order. A builtin value type takes the native path; a
-// same-underlying named type takes the reflect (appendAvroJSON) path.
+// entry, so the order is deterministic. A builtin value type takes the native
+// path; a same-underlying named type takes the reflect (appendAvroJSON) path.
 func TestMatrix_MapJSONNativeMatchesGeneral(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -14461,12 +14458,12 @@ func TestRegression_JSONDecodeNative(t *testing.T) {
 	if !reflect.DeepEqual(aOut, in) {
 		t.Fatalf("json array native: %v != %v", aOut, in)
 	}
-	var nsOut nsInt // named slice → fallback
+	var nsOut nsInt // named slice, fallback
 	mustDecodeJSON(t, arrS, aj, &nsOut)
 	if !reflect.DeepEqual([]int32(nsOut), in) {
 		t.Fatalf("json named-slice fallback: %v", nsOut)
 	}
-	var neOut []nElem // named elem → fallback
+	var neOut []nElem // named elem, fallback
 	mustDecodeJSON(t, arrS, aj, &neOut)
 	if !reflect.DeepEqual(neOut, []nElem{0, 1, -1, math.MaxInt32, math.MinInt32}) {
 		t.Fatalf("json named-elem fallback: %v", neOut)
@@ -14483,7 +14480,7 @@ func TestRegression_JSONDecodeNative(t *testing.T) {
 }
 
 // A named map type (type M map[string]int32) has Key()==string and
-// Elem()==int32, so it enters appendMapPrimitive's native switch — but
+// Elem()==int32, so it enters appendMapPrimitive's native switch, but
 // v.Interface() yields the named type, so the comma-ok assertion to the
 // unnamed map[string]int32 fails and it must fall through to the reflect
 // path (not panic, not mis-encode). Single-entry wire must match the
@@ -14512,7 +14509,7 @@ func TestRegression_MapNamedTypeFallsThroughToReflect(t *testing.T) {
 // The struct-valued-map flip: a single-entry map[string]Struct encodes its
 // value through serRecord's unsafe fast path (now that valV is
 // addressable). Its record bytes must be byte-identical to encoding that
-// struct standalone. Single entry → deterministic wire layout:
+// struct standalone. Single entry, so the wire layout is deterministic:
 // [count=1: 0x02][key "k": 0x02 'k'][record bytes...][terminator 0x00].
 func TestRegression_MapStructValueMatchesStandaloneRecord(t *testing.T) {
 	mapS := MustParse(`{"type":"map","values":` + setIterRecSchema + `}`)
@@ -14537,25 +14534,25 @@ func TestRegression_MapStructValueMatchesStandaloneRecord(t *testing.T) {
 
 // ---------- union_branch_match_test.go ----------
 
-// Union-branch selection: the index must give the SCAN's verdict.
+// Union-branch selection: the index must give the scan's verdict.
 //
-// Which reader branch a writer node selects is a rule with four ranks — full
-// name, alias, unqualified short name, bare-alias short name — plus numeric and
-// string/bytes promotion, and a fixed's SIZE folded into the match rather than
+// Which reader branch a writer node selects is a rule with four ranks (full
+// name, alias, unqualified short name, bare-alias short name) plus numeric and
+// string/bytes promotion, and a fixed's size folded into the match rather than
 // checked after it. Answering it by ranking every reader branch is a scan inside
 // the loop both Resolve and CheckCompatibility run, so the answer is now indexed
 // ahead of the questions.
 //
 // Indexing a rule is where a rule quietly changes. Java's
 // Resolver.firstMatchingBranch scans per writer branch too, so there is no
-// reference to re-derive the verdict from — the only thing that can catch a
+// reference to re-derive the verdict from: the only thing that can catch a
 // drift is the scan itself, stated independently and asked the same questions.
 
 // matchTierOracle ranks how strongly a reader branch matches a writer node.
 // This is the rule written out longhand, from the spec clauses and NOT_BUGS
-// #44's ruling, rather than read off branchMatchTiers — so it is an
-// independent statement of what the index is supposed to encode, and a
-// disagreement means the index changed a verdict rather than only its cost.
+// #44's ruling, rather than read off branchMatchTiers. It is an independent
+// statement of what the index is supposed to encode. A disagreement means the
+// index changed a verdict rather than only its cost.
 type matchTierOracle int
 
 const (
@@ -14581,7 +14578,7 @@ func oracleTier(r, w *schemaNode) matchTierOracle {
 	if r.kind == w.kind {
 		switch r.kind {
 		case "record", "enum", "fixed":
-			// Size is part of the MATCH predicate for fixed, not a
+			// Size is part of the *match* predicate for fixed, not a
 			// post-selection check: a wrong-size same-name fixed must not
 			// match, so selection keeps looking and a later size-matching
 			// branch wins.
@@ -14641,7 +14638,7 @@ func branchMatchCorpus() []string {
 		`["string","bytes"]`,
 		`["float","double","long"]`,
 		// Same short name in two namespaces: exact must beat unqualified, and
-		// the reversed pair proves the winner is the NAME and not the order.
+		// the reversed pair proves the winner is the name and not the order.
 		`[{"type":"record","name":"a.R","fields":[]},{"type":"record","name":"b.R","fields":[]}]`,
 		`[{"type":"record","name":"b.R","fields":[]},{"type":"record","name":"a.R","fields":[]}]`,
 		// A qualified alias matches a writer fullname exactly; a bare alias
@@ -14650,7 +14647,7 @@ func branchMatchCorpus() []string {
 		`[{"type":"record","name":"a.Q","aliases":["a.R"],"fields":[]}]`,
 		`[{"type":"record","name":"a.Q","aliases":["R"],"fields":[]}]`,
 		`[{"type":"record","name":"z.Z","fields":[]},{"type":"record","name":"a.Q","aliases":["a.R"],"fields":[]}]`,
-		// Same short name, different sizes: the 4-size writer must skip PAST
+		// Same short name, different sizes: the 4-size writer must skip past
 		// the 8-size branch rather than match and fail later.
 		`[{"type":"fixed","name":"b.F","size":8},{"type":"fixed","name":"a.F","size":4}]`,
 		`[{"type":"fixed","name":"a.F","size":4},{"type":"fixed","name":"b.F","size":8}]`,
@@ -14729,7 +14726,7 @@ func nodeDesc(n *schemaNode) string {
 // TestInvariant_EveryBranchMatchTierIsDriven derives the rank set from
 // branchMatchTiers rather than listing it, so a rank added there without a
 // corpus shape fails here instead of shipping unexercised. It also asserts each
-// rank actually ANSWERS for some cell: a rank whose writerName never returns a
+// rank actually answers for some cell: a rank whose writerName never returns a
 // registered key is present in source and absent from behavior.
 func TestInvariant_EveryBranchMatchTierIsDriven(t *testing.T) {
 	answered := make([]int, len(branchMatchTiers))
@@ -14996,7 +14993,7 @@ func TestFloatOverflowAllPaths(t *testing.T) {
 	t.Run("serFloat: float64 overflow silently narrows to ±Inf", func(t *testing.T) {
 		// Lossy-destination policy: matches Java's
 		// GenericDatumWriter.writeFloat(Number.floatValue()) and fastavro's
-		// struct.pack("<f", v) — finite float64 → float32 silently narrows
+		// struct.pack("<f", v): finite float64 to float32 silently narrows
 		// to ±Inf when out of range.
 		s := MustParse(`"float"`)
 		data, err := s.Encode(overflow)
@@ -15029,7 +15026,7 @@ func TestFloatOverflowAllPaths(t *testing.T) {
 	})
 
 	t.Run("EncodeJSON float: float64 overflow silently narrows", func(t *testing.T) {
-		// Lossy-destination policy: float64 → float32 narrowing produces
+		// Lossy-destination policy: float64 to float32 narrowing produces
 		// ±Inf, emitted via the dedicated "Infinity" JSON literal.
 		s := MustParse(`"float"`)
 		out, err := s.EncodeJSON(overflow)
@@ -15082,9 +15079,9 @@ func itoa(n int) string {
 // in the carrier's own width BEFORE narrowing to int. Narrowing first
 // (int(v.Uint())) truncates a value ≥ 2^32 to its low bits on a 32-bit build,
 // so an out-of-range ordinal like uint64(1<<32+5) would wrap to 5 and encode
-// the wrong symbol there while erroring on 64-bit — a platform-dependent
+// the wrong symbol there while erroring on 64-bit, a platform-dependent
 // silent-wrong-output divergence. The wide comparison rejects it on every
-// platform; this also pins that the error reports the TRUE value, not a
+// platform; this also pins that the error reports the true value, not a
 // truncated/sign-wrapped one (the observable proxy on a 64-bit host).
 func TestMatrix_EnumOrdinalOverflowRejected(t *testing.T) {
 	const schema = `{"type":"enum","name":"e","symbols":["a","b","c"]}` // len 3
@@ -15117,7 +15114,7 @@ func TestMatrix_EnumOrdinalOverflowRejected(t *testing.T) {
 		reject(t, func(s *Schema) ([]byte, error) { return s.AppendEncode(nil, &v) }, "4294967298")
 	})
 
-	// Boundaries that MUST still encode: valid ordinals across int/uint carriers.
+	// Boundaries that must still encode: valid ordinals across int/uint carriers.
 	for _, tc := range []struct {
 		name string
 		v    any
@@ -15153,15 +15150,15 @@ func ptrAny[T any](v T) *T { return &v }
 // ---------- unsafe_depth_test.go ----------
 
 // TestRegression_UnsafeDecodeDepthBounded gives end-to-end coverage of the
-// recursion-depth bound on the UNSAFE decode path: a self-referential record
+// recursion-depth bound on the unsafe decode path: a self-referential record
 // nested past maxDepth, decoded into an addressable struct, must error. Triage
 // note: a scoped mutation run flagged the slab-depth bookkeeping as surviving,
-// and this test does NOT kill those mutants — verified by neutering each, the
-// decode still errors, because the limit is enforced REDUNDANTLY. The wire is
-// hand-built because encode cannot produce an over-deep value, its own depth
-// guard stopping it first.
+// and this test does *not* kill those mutants. Verified by neutering each, the
+// decode still errors, because the limit is enforced redundantly. The wire is
+// hand-built because encode cannot produce an over-deep value; its own depth
+// guard stops it first.
 func TestRegression_UnsafeDecodeDepthBounded(t *testing.T) {
-	// Node = record{ child: ["null", Node], v: int } — a self-referential
+	// Node = record{ child: ["null", Node], v: int }, a self-referential
 	// type whose decode recurses once per nesting level.
 	s := MustParse(`{"type":"record","name":"Node","fields":[` +
 		`{"name":"child","type":["null","Node"]},{"name":"v","type":"int"}]}`)
@@ -15192,7 +15189,7 @@ func TestRegression_UnsafeDecodeDepthBounded(t *testing.T) {
 	}
 
 	// A shallow value must still decode (the guard must not false-trigger on
-	// the unwound path — catches the inverse sl.depth-- on enter / ++ on exit).
+	// the unwound path; catches the inverse sl.depth-- on enter / ++ on exit).
 	shallow := []byte{0x02, 0x00, 0x00, 0x00} // one level: child=Node{child=null,v=0}, v=0
 	var sn Node
 	if _, err := s.Decode(shallow, &sn); err != nil {
@@ -15204,9 +15201,9 @@ func TestRegression_UnsafeDecodeDepthBounded(t *testing.T) {
 
 // jsonDecodeAppliesLogical derives its answer by probing decodeLogical*, so it
 // can't drift from what decode actually does. This test independently pins the
-// probe's output against the HUMAN-KNOWN transform set for every logical — if
-// the probe's type-assertion logic is ever wrong (or a decodeLogical* change
-// flips a logical's transform behavior), one of these explicit expectations
+// probe's output against the human-known transform set for every logical. If
+// the probe's type-assertion logic is ever wrong, or a decodeLogical* change
+// flips a logical's transform behavior, one of these explicit expectations
 // fails, forcing a conscious review. Expected values are spelled out (not
 // re-probed) so this is a genuine check, not a tautology.
 func TestMatrix_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
@@ -15215,27 +15212,27 @@ func TestMatrix_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
 		size          int
 		want          bool
 	}{
-		// Transforming logicals (decode → enriched Go type).
-		{"int", "date", 0, true},                    // → time.Time
-		{"int", "time-millis", 0, true},             // → time.Duration
-		{"long", "time-micros", 0, true},            // → time.Duration
-		{"long", "timestamp-millis", 0, true},       // → time.Time
-		{"long", "timestamp-micros", 0, true},       // → time.Time
-		{"long", "timestamp-nanos", 0, true},        // → time.Time
-		{"long", "local-timestamp-millis", 0, true}, // → time.Time
-		{"long", "local-timestamp-micros", 0, true}, // → time.Time
-		{"long", "local-timestamp-nanos", 0, true},  // → time.Time
-		{"bytes", "decimal", 0, true},               // → *big.Rat
-		{"fixed", "decimal", 8, true},               // → *big.Rat
-		{"bytes", "big-decimal", 0, true},           // → *big.Rat
-		{"fixed", "uuid", 16, true},                 // → [16]byte
-		{"fixed", "duration", 12, true},             // → avro.Duration
+		// Transforming logicals (decode into an enriched Go type).
+		{"int", "date", 0, true},                    // -> time.Time
+		{"int", "time-millis", 0, true},             // -> time.Duration
+		{"long", "time-micros", 0, true},            // -> time.Duration
+		{"long", "timestamp-millis", 0, true},       // -> time.Time
+		{"long", "timestamp-micros", 0, true},       // -> time.Time
+		{"long", "timestamp-nanos", 0, true},        // -> time.Time
+		{"long", "local-timestamp-millis", 0, true}, // -> time.Time
+		{"long", "local-timestamp-micros", 0, true}, // -> time.Time
+		{"long", "local-timestamp-nanos", 0, true},  // -> time.Time
+		{"bytes", "decimal", 0, true},               // -> *big.Rat
+		{"fixed", "decimal", 8, true},               // -> *big.Rat
+		{"bytes", "big-decimal", 0, true},           // -> *big.Rat
+		{"fixed", "uuid", 16, true},                 // -> [16]byte
+		{"fixed", "duration", 12, true},             // -> avro.Duration
 
-		// uuid-on-string transforms for a TYPED target — decodeString parses the
-		// hex-dash string into a [16]byte / UUID-typed target (into *any/string
-		// it is identity, but the gate must report the transform so a no-Decode
+		// uuid-on-string transforms for a *typed* target: decodeString parses the
+		// hex-dash string into a [16]byte / UUID-typed target. Into *any/string
+		// it is identity, but the gate must report the transform, so a no-Decode
 		// CustomType installs the suppression wrapper and the raw decode matches
-		// binary's deserString, which has no [16]byte arm).
+		// binary's deserString, which has no [16]byte arm.
 		{"string", "uuid", 0, true},
 
 		// Non-transforming: no logical; and an unknown future logical
@@ -15248,12 +15245,12 @@ func TestMatrix_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
 		{"long", "some-future-logical", 0, false},
 		{"bytes", "some-future-logical", 0, false},
 
-		// Logical types on a kind they are NOT spec-valid for — reachable only
+		// Logical types on a kind they are NOT spec-valid for, reachable only
 		// when a CustomType resurrects a soft-dropped non-standard placement.
-		// uuid/duration are fixed-only, big-decimal is bytes-only; on the wrong
-		// kind neither the *any decodeLogical{Bytes,Fixed} NOR the typed-target
+		// uuid/duration are fixed-only, big-decimal is bytes-only. On the wrong
+		// kind neither the *any decodeLogical{Bytes,Fixed} nor the typed-target
 		// assignBytes transforms (assignBytes is kind-gated), so the decode is
-		// raw on both wire formats and the probe must report false — otherwise a
+		// raw on both wire formats and the probe must report false. Otherwise a
 		// no-Decode CustomType would over-install the suppression wrapper for a
 		// transform that no longer exists.
 		{"bytes", "uuid", 0, false},
@@ -15261,13 +15258,14 @@ func TestMatrix_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
 		{"fixed", "big-decimal", 8, false},
 
 		// Hostile fixed size: the probe must NOT allocate proportional to size.
-		// jsonDecodeAppliesLogical caps its probe buffer at maxFixedLogicalLen+1,
-		// so a size > maxFixedLogicalLen is neither the uuid(16) nor duration(12)
-		// length and yields the same answer the small non-match case does, while
-		// decimal still transforms at any length. fixed size is schema-controlled
-		// and only validated non-negative, so without the cap make([]byte, size)
-		// here is a parse-time DoS; at 1<<62 a regressed cap panics immediately
-		// with "makeslice: len out of range" (it exceeds the runtime max alloc).
+		// jsonDecodeAppliesLogical caps its probe buffer at maxFixedLogicalLen+1.
+		// A size > maxFixedLogicalLen is neither the uuid(16) nor duration(12)
+		// length, so it yields the same answer the small non-match case does,
+		// while decimal still transforms at any length. fixed size is
+		// schema-controlled and only validated non-negative, so without the cap
+		// make([]byte, size) here is a parse-time DoS. At 1<<62 a regressed cap
+		// panics immediately with "makeslice: len out of range" (it exceeds the
+		// runtime max alloc).
 		{"fixed", "uuid", 1 << 62, false},
 		{"fixed", "duration", 1 << 62, false},
 		{"fixed", "decimal", 1 << 62, true},
@@ -15284,7 +15282,7 @@ func TestMatrix_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
 
 // TestEncodeFromJSONUnmarshal tests that data from json.Unmarshal (which
 // produces float64 for all numbers) can be encoded for every schema type.
-// This catches coercion gaps in the json.Unmarshal → Encode pipeline.
+// This catches coercion gaps in the json.Unmarshal to Encode pipeline.
 func TestEncodeFromJSONUnmarshal(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -15373,15 +15371,14 @@ func TestEncodeFromJSONUnmarshal(t *testing.T) {
 				t.Fatalf("json.Unmarshal: %v", err)
 			}
 			binary := mustEncode(t, s, native)
-			// Verify it decodes back.
 			var decoded any
 			mustDecode(t, s, binary, &decoded)
 		})
 	}
 }
 
-// TestEncodeStringBytesCoercionInCollections tests []byte → string and
-// string → bytes coercion in arrays and maps.
+// TestEncodeStringBytesCoercionInCollections tests []byte to string and
+// string to bytes coercion in arrays and maps.
 func TestEncodeStringBytesCoercionInCollections(t *testing.T) {
 	// []byte in array of strings.
 	t.Run("array of string from bytes", func(t *testing.T) {
@@ -15553,7 +15550,7 @@ func TestEncodeJSONCoercionPaths(t *testing.T) {
 		}
 	})
 
-	// json.Number for bytes-backed decimal (from Decode → EncodeJSON round-trip).
+	// json.Number for bytes-backed decimal, from a Decode then EncodeJSON trip.
 	t.Run("decimal round-trip", func(t *testing.T) {
 		s, _ := Parse(`{"type":"record","name":"R","fields":[
 			{"name":"v","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}}
@@ -15568,7 +15565,7 @@ func TestEncodeJSONCoercionPaths(t *testing.T) {
 		}
 	})
 
-	// []byte for string field — encode and decode round-trips.
+	// []byte for string field: encode and decode round-trips.
 	t.Run("bytes to string to bytes", func(t *testing.T) {
 		s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"s","type":"string"}]}`)
 		type R struct {
@@ -15582,7 +15579,7 @@ func TestEncodeJSONCoercionPaths(t *testing.T) {
 		}
 	})
 
-	// string for bytes field — encode and decode round-trips.
+	// string for bytes field: encode and decode round-trips.
 	t.Run("string to bytes to string", func(t *testing.T) {
 		s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"b","type":"bytes"}]}`)
 		type R struct {
@@ -15597,7 +15594,7 @@ func TestEncodeJSONCoercionPaths(t *testing.T) {
 	})
 }
 
-// TestDecodeStringIntoBytes tests deserString → []byte directly.
+// TestDecodeStringIntoBytes tests deserString into []byte directly.
 func TestDecodeStringIntoBytes(t *testing.T) {
 	s, _ := Parse(`"string"`)
 	binary, _ := s.Encode("hello")
@@ -15608,7 +15605,7 @@ func TestDecodeStringIntoBytes(t *testing.T) {
 	}
 }
 
-// TestDecodeBytesIntoString tests deserBytes → string directly.
+// TestDecodeBytesIntoString tests deserBytes into string directly.
 func TestDecodeBytesIntoString(t *testing.T) {
 	s, _ := Parse(`"bytes"`)
 	binary, _ := s.Encode([]byte("hello"))
@@ -15639,7 +15636,7 @@ func TestEncodeJSONNullSchema(t *testing.T) {
 		}
 	})
 	// Non-nil values must error, matching binary serNull's errNonNil
-	// rejection — see TestMatrix_EncodeJSONNullParity.
+	// rejection; see TestMatrix_EncodeJSONNullParity.
 	t.Run("non-nil value rejected", func(t *testing.T) {
 		if out, err := s.EncodeJSON("ignored"); err == nil {
 			t.Errorf("expected error encoding non-nil value into null schema, got %s", out)
@@ -15655,7 +15652,7 @@ func TestEncodeJSONDecimalFixedRoundTrip(t *testing.T) {
 	binary, _ := s.Encode(map[string]any{"v": r})
 	var decoded any
 	s.Decode(binary, &decoded)
-	// decoded has json.Number for the decimal — EncodeJSON should handle it.
+	// decoded has json.Number for the decimal; EncodeJSON should handle it.
 	jb := mustEncodeJSON(t, s, decoded)
 	if !json.Valid(jb) {
 		t.Fatalf("invalid JSON: %s", jb)
@@ -15675,7 +15672,7 @@ func TestEncodeJSONNilPointerUnion(t *testing.T) {
 
 func TestEncodeJSONStructFieldError(t *testing.T) {
 	type R struct {
-		A bool `avro:"a"` // schema says int — will fail
+		A bool `avro:"a"` // schema says int, will fail
 	}
 	s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
 	_, err := s.EncodeJSON(&R{A: true})
@@ -15685,7 +15682,7 @@ func TestEncodeJSONStructFieldError(t *testing.T) {
 }
 
 func TestEncodeJSONNilPointerTopLevel(t *testing.T) {
-	// Nil *string directly for a union — hits appendAvroJSONUnion with nil pointer.
+	// Nil *string for a union: hits appendAvroJSONUnion with a nil pointer.
 	s, _ := Parse(`["null","string"]`)
 	var p *string
 	b := mustEncodeJSON(t, s, p)
@@ -15695,7 +15692,7 @@ func TestEncodeJSONNilPointerTopLevel(t *testing.T) {
 }
 
 func TestEncodeJSONNilInterfaceInUnion(t *testing.T) {
-	// Map with nil interface value for a union field — hits the IsNil check
+	// Map with nil interface value for a union field: hits the IsNil check
 	// in appendAvroJSONUnion.
 	s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"v","type":["null","string"]}]}`)
 	data := map[string]any{"v": nil}
@@ -15708,7 +15705,8 @@ func TestEncodeJSONNilInterfaceInUnion(t *testing.T) {
 }
 
 func TestEncodeJSONStructMappingError(t *testing.T) {
-	// Struct missing a required field — hits typeFieldMapping error in record encoder.
+	// Struct missing a required field: hits the typeFieldMapping error
+	// in the record encoder.
 	type R struct {
 		A int `avro:"a"`
 	}
@@ -15790,7 +15788,7 @@ func TestDeserFixedArrayNegativeBlock(t *testing.T) {
 
 func TestDeserFixedArrayTruncated(t *testing.T) {
 	s := mustParse(t, `{"type":"array","items":"int"}`)
-	// Truncated data — readVarlong fails.
+	// Truncated data: readVarlong fails.
 	var got [3]int32
 	_, err := s.Decode([]byte{}, &got)
 	if err == nil {
@@ -15801,8 +15799,8 @@ func TestDeserFixedArrayTruncated(t *testing.T) {
 func TestDeserFixedArrayNegBlockOverflow(t *testing.T) {
 	s, _ := Parse(`{"type":"array","items":"int"}`)
 	// MinInt64 zigzag-encoded: negating it still gives negative.
-	data := []byte{0x01} // zigzag for -1... actually need MinInt64.
-	// zigzag(MinInt64) = MaxUint64 which is 0xFF 0xFF ... 0xFF 0x01 (10 bytes)
+	data := []byte{0x01} // placeholder, overwritten with MinInt64 below
+	// zigzag(MinInt64) = MaxUint64, which is 0xFF 0xFF ... 0xFF 0x01 (10 bytes)
 	data = appendVarlong(nil, math.MinInt64)
 	var got [1]int32
 	_, err := s.Decode(data, &got)
@@ -15815,7 +15813,7 @@ func TestDeserFixedArrayNegBlockTruncatedSize(t *testing.T) {
 	s, _ := Parse(`{"type":"array","items":"int"}`)
 	// Negative count but truncated byte-size varlong.
 	data := appendVarlong(nil, -3) // count=-3
-	// No byte-size follows — truncated.
+	// No byte-size follows: truncated.
 	var got [3]int32
 	_, err := s.Decode(data, &got)
 	if err == nil {
@@ -15956,7 +15954,7 @@ func TestEncodeFromJSONUseNumber(t *testing.T) {
 	}
 }
 
-// TestEncodeJSONFromDecoded tests the full pipeline: binary decode → EncodeJSON.
+// TestEncodeJSONFromDecoded tests the full pipeline: binary decode, EncodeJSON.
 // This catches gaps where decoded types (json.Number for decimals, int64 for
 // timestamps) aren't handled by the JSON encoder.
 func TestEncodeJSONFromDecoded(t *testing.T) {
@@ -15985,31 +15983,26 @@ func TestEncodeJSONFromDecoded(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
-			// Encode to binary.
 			binary, err := s.Encode(tt.value)
 			if err != nil {
 				t.Fatalf("Encode: %v", err)
 			}
-			// Decode to any.
 			var decoded any
 			mustDecode(t, s, binary, &decoded)
-			// EncodeJSON from the decoded value.
 			jb, err := s.EncodeJSON(decoded)
 			if err != nil {
 				t.Fatalf("EncodeJSON: %v", err)
 			}
-			// Verify valid JSON.
 			if !json.Valid(jb) {
 				t.Fatalf("invalid JSON: %s", jb)
 			}
-			// DecodeJSON back and re-encode to binary — full round trip.
+			// DecodeJSON back and re-encode to binary: full round trip.
 			var rt any
 			mustDecodeJSON(t, s, jb, &rt)
 			binary2, err := s.Encode(rt)
 			if err != nil {
 				t.Fatalf("re-Encode: %v", err)
 			}
-			// Binary should match.
 			if !bytes.Equal(binary, binary2) {
 				t.Errorf("binary mismatch:\n  original: %v\n  roundtrip: %v", binary, binary2)
 			}
@@ -16336,7 +16329,7 @@ func TestCustomTypeMatching(t *testing.T) {
 
 	t.Run("encode_gotype_skip", func(t *testing.T) {
 		s := parseMoney(t, `{"type":"long","logicalType":"money"}`)
-		// Raw int64 → GoType doesn't match → passes through.
+		// Raw int64: GoType doesn't match, so it passes through.
 		data := mustEncode(t, s, int64(42))
 		if len(data) == 0 {
 			t.Fatal("empty")
@@ -16580,14 +16573,14 @@ func TestCustomTypePointerGoType(t *testing.T) {
 	w := &Wrapper{V: "hello"}
 	data := mustEncode(t, s, w)
 
-	// Decode into *any — exercises the customEncode pointer-level GoType match.
+	// Decode into *any: exercises the customEncode pointer-level GoType match.
 	var out any
 	mustDecode(t, s, data, &out)
 	if got := out.(*Wrapper).V; got != "hello" {
 		t.Errorf("any: got %q", got)
 	}
 
-	// Decode into typed *Wrapper — exercises setCustomResult AssignableTo
+	// Decode into typed *Wrapper: exercises setCustomResult AssignableTo
 	// for pointer-valued results into pointer targets.
 	var typed *Wrapper
 	if _, err := s.Decode(data, &typed); err != nil {
@@ -16627,7 +16620,7 @@ func TestCustomTypePointerGoTypeEncodeSkip(t *testing.T) {
 		},
 	}
 	s, _ := Parse(`{"type":"string","logicalType":"wrapped"}`, ct)
-	// Pointer GoType match, but encoder skips → falls through to raw
+	// Pointer GoType match, but the encoder skips, so it falls through to raw
 	// string ser which fails for *Wrapper.
 	_, err := s.Encode(&Wrapper{V: "x"})
 	if err == nil {
@@ -16693,7 +16686,7 @@ func TestCustomTypeMapFastPathDisabled(t *testing.T) {
 // fast-path gate disables specialization when the element carries a custom
 // type (meta.hasCustomType); the JSON fast-path gate previously checked only
 // logical=="" and emitted/parsed the raw element, silently skipping the
-// custom codec — a binary↔JSON wire divergence. (The existing
+// custom codec, a binary and JSON wire divergence. (The existing
 // TestCustomType{Array,Map}FastPathDisabled use a logicalType-bearing custom
 // type, so logical!="" also tripped the JSON gate and masked this gap.)
 func TestCustomTypeJSONArrayAvroTypeOnly(t *testing.T) {
@@ -16809,9 +16802,9 @@ func TestCustomTypeDecodeIntIntoAny(t *testing.T) {
 
 // TestMatrix_DecodeJSONFillsDefaultThroughCustomDecoder locks that DecodeJSON
 // applies a registered CustomType.Decode to a record field's default when the
-// field is absent — matching binary, where the pre-encoded defaultBytes
+// field is absent, matching binary, where the pre-encoded defaultBytes
 // round-trip through the same wrapped fn as a present field's wire bytes.
-// Without it, applyFieldDefault dispatched through the UNWRAPPED deser, built
+// Without it, applyFieldDefault dispatched through the *unwrapped* deser, built
 // before applyCustomTypes installed the chain, so the raw Avro-native value
 // reached a target expecting the user's domain type. Subtests cover the three
 // iterateRecordFields entry points and each pairs the JSON decode with its
@@ -16871,7 +16864,7 @@ func TestMatrix_DecodeJSONFillsDefaultThroughCustomDecoder(t *testing.T) {
 	})
 
 	t.Run("partial_fill_present_and_default", func(t *testing.T) {
-		// One field present, one filled from default — both must produce
+		// One field present, one filled from default: both must produce
 		// the user's domain type through the custom decoder.
 		s := parseMoney(t, `{"type":"record","name":"R","fields":[
 			{"name":"price","type":{"type":"long","logicalType":"money"},"default":42},
@@ -16892,16 +16885,16 @@ func TestMatrix_DecodeJSONFillsDefaultThroughCustomDecoder(t *testing.T) {
 // TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill locks that
 // AppendEncodeJSON does NOT invoke a registered CustomType.Encode for
 // default-filled record fields, matching binary's encodeDefault. CustomType.Encode
-// converts user-Go-type → Avro-native, and the parsed default is already
+// converts user-Go-type to Avro-native, and the parsed default is already
 // Avro-native, never having had a Go-domain representation, so the directional
 // contract has nothing to apply. Pre-fix, appendJSONFieldDefault routed defaults
 // through appendAvroJSON with a non-nil custom map, firing the user's Encode
-// once per default-filled field where binary fired it zero times — benign for
+// once per default-filled field where binary fired it zero times: benign for
 // GoType-typed encoders that fall through on a type-assertion miss, but a
 // surprise for the GoType=nil encoders used for logging or dispatch.
 func TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill(t *testing.T) {
 	// GoType=nil so the encoder fires on every value reaching the long+
-	// money node — instrumentation pattern that surfaces the asymmetry.
+	// money node, the instrumentation pattern that surfaces the asymmetry.
 	calls := 0
 	ct := CustomType{
 		LogicalType: "money",
@@ -16940,13 +16933,13 @@ func TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill(t *testing.T) 
 }
 
 // The decode-side companion to the encoder default-fill bypass: when a reader
-// field is ABSENT from the writer and filled from its default through
-// resolution, the field's custom Decode must fire EXACTLY ONCE on the SAME raw
+// field is absent from the writer and filled from its default through
+// resolution, the field's custom Decode must fire exactly once on the same raw
 // (logical-suppressed) Avro-native value a natural decode would feed it, on both
 // resolved wires. This pins resolveRecord's default-fill deser construction: the
 // reader field node's deser is the raw, logical-suppressed one, with the custom
 // chain wrapped onto it once. A double-wrap, or feeding the callback the
-// enriched logical value, are the two regressions guarded; the x10 transform
+// enriched logical value, are the two regressions guarded. The x10 transform
 // makes "the callback fired" distinguishable from a coincidental raw coercion.
 func TestRegression_ResolvedDefaultFillFiresCustomDecodeOnceRaw(t *testing.T) {
 	var decodeCalls int
@@ -16969,7 +16962,7 @@ func TestRegression_ResolvedDefaultFillFiresCustomDecodeOnceRaw(t *testing.T) {
 		t.Fatalf("resolve: %v", err)
 	}
 
-	// Reference: a NATURAL decode of an explicit f=42 fires the custom once on
+	// Reference: a natural decode of an explicit f=42 fires the custom once on
 	// the raw int64(42) (the money logical is suppressed because a CustomType
 	// matched) and yields the ×10 transform.
 	wireExplicit, err := reader.AppendEncode(nil, map[string]any{"f": int64(42)})
@@ -17027,10 +17020,10 @@ func TestRegression_ResolvedDefaultFillFiresCustomDecodeOnceRaw(t *testing.T) {
 	}
 }
 
-// A custom-decoded value whose decode TARGET is a recursive pointer type
+// A custom-decoded value whose decode target is a recursive pointer type
 // (cyclic type graph: ctRecursivePtr's element is itself) must terminate with
 // an error, not loop forever allocating a pointer level per iteration.
-// setCustomResult's pointer walk is bounded by maxIndirectDepth — the same
+// setCustomResult's pointer walk is bounded by maxIndirectDepth, the same
 // ceiling the non-custom indirect/indirectAlloc decode path uses, which
 // already errors for this target (so registering a CustomType must not turn a
 // clean error into an unbounded loop). Watchdog so a regression fails by
@@ -17062,13 +17055,13 @@ func TestRegression_CustomDecodeBoundsRecursivePointerTarget(t *testing.T) {
 // ---------- callback_contract_matrix_test.go ----------
 
 // User-supplied callback contract matrix: every point where the codecs do
-// arithmetic, slicing, or a state transition on a value returned by USER code —
+// arithmetic, slicing, or a state transition on a value returned by user code:
 // text-out methods beyond the plain-string positions
 // text_appender_contract_test.go pins, TextUnmarshaler error returns, and
 // CustomType Encode/Decode returns. The invariant per cell: a contract-violating
-// return NEVER panics through a public API and NEVER silently corrupts sibling
+// return never panics through a public API and never silently corrupts sibling
 // data. The lax-name validator, IsZero() bool, and the wire-side use of map keys
-// are structurally immune — the first two return no value the library computes
+// are structurally immune. The first two return no value the library computes
 // with, and map keys are read and written as raw strings on every path.
 
 // symbolTexter's MarshalText names an enum symbol (or violates the
@@ -17091,11 +17084,11 @@ func (e symbolTexter) MarshalText() ([]byte, error) {
 }
 
 // uuidTexter's MarshalText yields UUID text (or violations). On a
-// fixed(16)+uuid schema the 16 wire bytes are DERIVED from the returned
-// text (parseUUID), so wrong content is detectable and must reject; on a
+// fixed(16)+uuid schema the 16 wire bytes are *derived* from the returned
+// text (parseUUID), so wrong content is detectable and must reject. On a
 // string+uuid schema the encoder is string-lenient (serUUID delegates
 // non-[16]byte sources to the string encoder), so arbitrary text encodes
-// verbatim — those cells assert byte-parity with the plain-string twin
+// verbatim. Those cells assert byte-parity with the plain-string twin
 // rather than rejection.
 type uuidTexter struct{ mode string }
 
@@ -17138,7 +17131,7 @@ func TestMatrix_TextOutCallbackReturnShapes(t *testing.T) {
 						return
 					}
 					// unknown and nil-nil (empty text) miss the symbol table;
-					// an error return is surfaced — all as *SemanticError.
+					// an error return is surfaced, all as *SemanticError.
 					if err == nil {
 						t.Fatalf("%s silently encoded: % x", mode, out)
 					}
@@ -17154,11 +17147,11 @@ func TestMatrix_TextOutCallbackReturnShapes(t *testing.T) {
 		}
 	})
 
-	// Every INPUT ARM of the enum encoders — plain string, named string
-	// without text methods, text-out (covered above), int ordinal — must
+	// Every input arm of the enum encoders -- plain string, named string
+	// without text methods, text-out (covered above), int ordinal -- must
 	// produce the same *SemanticError{AvroType: "enum"} identity on both
 	// wires for a value naming no symbol / an out-of-range ordinal. The
-	// cells run at TOP LEVEL deliberately: record positions wrap any
+	// cells run at top level deliberately: record positions wrap any
 	// error in a SemanticError via the field-path wrapper, which would
 	// mask a plain-error arm; top level has no wrapper to hide behind.
 	t.Run("enum-arm-identity", func(t *testing.T) {
@@ -17248,8 +17241,8 @@ func TestMatrix_TextOutCallbackReturnShapes(t *testing.T) {
 		}
 	})
 
-	// The remaining encode user-value failures already AGREE across the
-	// two wires — nil-for-non-nullable is plain on both (its own family),
+	// The remaining encode user-value failures already agree across the
+	// two wires: nil-for-non-nullable is plain on both (its own family),
 	// union no-match and numeric-content rejects are SemanticError on
 	// both. Pin the agreement (identity equality, not any specific shape)
 	// so neither wire drifts alone.
@@ -17289,10 +17282,10 @@ func TestMatrix_TextOutCallbackReturnShapes(t *testing.T) {
 		}
 	})
 
-	// The encode-side unknown-symbol reject is a USER-VALUE failure and
+	// The encode-side unknown-symbol reject is a user-value failure and
 	// carries *SemanticError identity on both wires (asserted above). The
-	// decode-side counterparts — a binary ordinal outside the symbol
-	// table, a JSON string naming no symbol — are WIRE-CONTENT failures,
+	// decode-side counterparts -- a binary ordinal outside the symbol
+	// table, a JSON string naming no symbol -- are wire-content failures,
 	// plain errors on both wires like the union-index and map-key-length
 	// rejects. Pin the two families' boundary so neither side drifts.
 	t.Run("enum-decode-content-errors-stay-plain", func(t *testing.T) {
@@ -17388,7 +17381,7 @@ func TestMatrix_TextOutCallbackReturnShapes(t *testing.T) {
 }
 
 // failingUnmarshaler errors on any text not prefixed "ok". Its error
-// must surface — wrapped so the user's identity is preserved — from
+// must surface, wrapped so the user's identity is preserved, from
 // every text-shaped decode position on both wire formats.
 type failingUnmarshaler struct{ S string }
 
@@ -17646,7 +17639,7 @@ func customDecodeReturning(shape string) CustomType {
 // reflect.Set panic); a non-nil error is fatal with the value discarded
 // and the user's identity preserved; a wrapped ErrSkipCustomType falls
 // through to the value a no-custom decode produces. Whenever Decode
-// returns nil error, sibling fields hold their decoded values — a
+// returns nil error, sibling fields hold their decoded values: a
 // violating callback can never corrupt data beside its own node.
 func TestMatrix_CustomTypeDecodeReturnShapes(t *testing.T) {
 	const recSchema = `{"type":"record","name":"R","fields":[
@@ -17719,7 +17712,7 @@ func TestMatrix_CustomTypeDecodeReturnShapes(t *testing.T) {
 		}
 	}
 
-	// An interface target accepts any result type — the callback's value
+	// An interface target accepts any result type: the callback's value
 	// is the user's own choice there, placed verbatim.
 	t.Run("wrong-type/any-target", func(t *testing.T) {
 		s, _ := Parse(`"long"`, customDecodeReturning("wrong-type"))
@@ -17821,7 +17814,7 @@ func TestInvariant_HiddenStateOnPublicStructs(t *testing.T) {
 		reflect.TypeFor[ShortBufferError](),
 		reflect.TypeFor[Duration](),
 	}
-	// The ONLY types where a caller-set exported field coexists with
+	// The *only* types where a caller-set exported field coexists with
 	// unexported state. Each is justified below and pinned by a behavior
 	// test; adding a name here requires doing the same.
 	composableWithHiddenState := map[string]string{
@@ -17877,10 +17870,10 @@ func TestInvariant_CustomTypeHiddenStateFailsLoud(t *testing.T) {
 
 // TestInvariant_PresenceStateIsValueTransparent executes the claim that the
 // presence flags cannot win over a caller. They differ in kind from refTarget,
-// which selects a DEFINITION and so could substitute one schema for another: a
+// which selects a definition and so could substitute one schema for another: a
 // presence flag decides only whether an attribute whose value is the field's own
 // zero is written at all, never which value. So for every value a caller can set,
-// the value that comes back is the value they set, flag set and flag clear —
+// the value that comes back is the value they set, flag set and flag clear,
 // proved over a node extracted from a parse and the same node hand-composed,
 // including the case a caller cannot otherwise reach, clearing the field to "".
 // Wire, canonical form and fingerprint must be identical across the pair too.
@@ -17980,5 +17973,1336 @@ func wolverine() Superhero {
 			{ID: 2346, Name: "Regeneration", Damage: -2, Energy: 0.55, Passive: true},
 			{ID: 2347, Name: "Adamant skeleton", Damage: -10, Energy: 0, Passive: true},
 		},
+	}
+}
+
+// TestInvariant_SlabNeverRewindsHandedOutMemory pins the property that lets
+// slab.string return an unsafe.String over pooled memory: buf only ever
+// shrinks from the front, or is replaced wholesale by a fresh make. It is
+// never rewound. Every string the slab has handed out aliases a region of some
+// buf, so reclaiming that memory does not free it: it hands the same bytes
+// out twice and silently mutates strings the caller already holds, long after
+// Decode returned. A decoded string used as a map key changes value in place.
+//
+// The slab struct itself *is* pooled and reused (put deliberately retains buf),
+// so "the memory is fresh each call" is not what makes this safe. Only the
+// never-rewound rule does.
+func TestInvariant_SlabNeverRewindsHandedOutMemory(t *testing.T) {
+	sl := &slab{}
+
+	type region struct{ start, end uintptr }
+	var handed []region
+	var held, want []string
+
+	for i := range 300 {
+		// Sizes stride across slabSize so the buffer is exhausted and
+		// replaced several times; a rewind that only shows up at the
+		// replacement boundary is the one worth catching.
+		w := fmt.Sprintf("v%03d-%s", i, strings.Repeat("x", i%53))
+		got := sl.string([]byte(w), len(w))
+		if got != w {
+			t.Fatalf("slab.string returned %q, want %q", got, w)
+		}
+		p := uintptr(unsafe.Pointer(unsafe.StringData(got)))
+		// held keeps every handed-out region reachable for the whole test, so
+		// the allocator cannot recycle one into a later buf and stage an
+		// "overlap" that is not a rewind.
+		held = append(held, got)
+		want = append(want, w)
+		handed = append(handed, region{p, p + uintptr(len(got))})
+
+		if len(sl.buf) == 0 {
+			continue
+		}
+		bs := uintptr(unsafe.Pointer(unsafe.SliceData(sl.buf)))
+		be := bs + uintptr(len(sl.buf))
+		for j, r := range handed {
+			if bs < r.end && r.start < be {
+				t.Fatalf("after %d strings, the slab's remaining buf [%#x,%#x) overlaps the region handed out for string %d [%#x,%#x): buf was rewound",
+					i+1, bs, be, j, r.start, r.end)
+			}
+		}
+	}
+
+	for i, s := range held {
+		if s != want[i] {
+			t.Errorf("string %d mutated by %d later slab allocations: got %q, want %q", i, len(held)-i-1, s, want[i])
+		}
+	}
+}
+
+// TestInvariant_SlabPutDoesNotReclaimBuf guards the same rule at the one place
+// it would plausibly be broken. put hands the slab back for reuse, so
+// reclaiming the tail there (sl.buf = sl.buf[:0], or sl.buf = nil to "free"
+// it) reads like an obvious win and costs nothing visible in any test that
+// does not hold a decoded string across two decodes.
+//
+// Read from source rather than executed: calling put publishes the slab to the
+// pool, and reading its fields afterward races with whoever Gets it next.
+func TestInvariant_SlabPutDoesNotReclaimBuf(t *testing.T) {
+	const decl = "func (sl *slab) put()"
+	src := readFile(t, "deser.go")
+	i := strings.Index(src, decl)
+	if i < 0 {
+		t.Fatalf("%s not found in deser.go — this guard reads it from source, so a rename must update the guard, not silence it", decl)
+	}
+	body := src[i:]
+	if e := strings.Index(body, "\n}\n"); e >= 0 {
+		body = body[:e+2]
+	}
+	if strings.Contains(body, "sl.buf") {
+		t.Errorf("slab.put touches sl.buf:\n\n%s\nbuf must carry over untouched. Every string slab.string returned aliases it; resetting or re-slicing here hands the same bytes out twice.", body)
+	}
+}
+
+//////////////////
+// SKIP UNKNOWN //
+//////////////////
+
+// skipUnknownSchema exercises one field of every kind that skips differently:
+// a varint, a length-prefixed run, both block-framed containers, a union, a
+// fixed run, and a nested record whose own skip is compiled lazily.
+const skipUnknownSchema = `{"type":"record","name":"R","fields":[
+	{"name":"a","type":"int"},
+	{"name":"b","type":"string"},
+	{"name":"c","type":{"type":"array","items":"long"}},
+	{"name":"d","type":["null","string"]},
+	{"name":"e","type":{"type":"map","values":"bytes"}},
+	{"name":"f","type":{"type":"fixed","name":"F","size":3}},
+	{"name":"g","type":{"type":"record","name":"Inner","fields":[
+		{"name":"x","type":"int"},
+		{"name":"y","type":"string"},
+		{"name":"z","type":{"type":"array","items":"string"}}]}},
+	{"name":"h","type":"double"}
+]}`
+
+type skipUnknownInnerFull struct {
+	X int32    `avro:"x"`
+	Y string   `avro:"y"`
+	Z []string `avro:"z"`
+}
+
+type skipUnknownFull struct {
+	A int32                `avro:"a"`
+	B string               `avro:"b"`
+	C []int64              `avro:"c"`
+	D *string              `avro:"d"`
+	E map[string][]byte    `avro:"e"`
+	F [3]byte              `avro:"f"`
+	G skipUnknownInnerFull `avro:"g"`
+	H float64              `avro:"h"`
+}
+
+// skipUnknownPartial maps the first and last fields only, so a skip that
+// over- or under-advances anywhere in between corrupts H rather than
+// silently landing on the right byte.
+type skipUnknownPartial struct {
+	A int32   `avro:"a"`
+	H float64 `avro:"h"`
+}
+
+func skipUnknownFullValue() skipUnknownFull {
+	d := "dee"
+	return skipUnknownFull{
+		A: 7,
+		B: "bee",
+		C: []int64{1, 2, 3},
+		D: &d,
+		E: map[string][]byte{"k": []byte("v"), "": {}},
+		F: [3]byte{9, 8, 7},
+		G: skipUnknownInnerFull{X: 11, Y: "why", Z: []string{"", "zz"}},
+		H: 2.5,
+	}
+}
+
+// skipUnknownWire encodes the full value and appends a sentinel byte, so a
+// decode that stops on the wrong byte is caught by the leftover check rather
+// than only by a wrong field value.
+func skipUnknownWire(t *testing.T, s *Schema) []byte {
+	t.Helper()
+	b, err := s.Encode(skipUnknownFullValue())
+	if err != nil {
+		t.Fatalf("encode full: %v", err)
+	}
+	return append(b, 0xAB)
+}
+
+func TestSkipUnknownPartialStruct(t *testing.T) {
+	s := MustParse(skipUnknownSchema)
+	wire := skipUnknownWire(t, s)
+
+	var got skipUnknownPartial
+	rest, err := s.Decode(wire, &got, SkipUnknown())
+	if err != nil {
+		t.Fatalf("decode with SkipUnknown: %v", err)
+	}
+	if got.A != 7 || got.H != 2.5 {
+		t.Errorf("got %+v, want {A:7 H:2.5}", got)
+	}
+	if len(rest) != 1 || rest[0] != 0xAB {
+		t.Errorf("skips advanced to the wrong byte: leftover %v, want [171]", rest)
+	}
+
+	// Inert by default: the same type and the same schema must still refuse.
+	var got2 skipUnknownPartial
+	if _, err := s.Decode(wire, &got2); err == nil {
+		t.Error("decode without SkipUnknown accepted a partial struct")
+	}
+
+	// Mapping some fields includes mapping none: a struct mapping no field at
+	// all still has to walk the whole record.
+	var none struct{}
+	rest, err = s.Decode(wire, &none, SkipUnknown())
+	if err != nil {
+		t.Fatalf("decode into struct{}: %v", err)
+	}
+	if len(rest) != 1 || rest[0] != 0xAB {
+		t.Errorf("struct{} leftover %v, want [171]", rest)
+	}
+}
+
+// TestSkipUnknownRecursive: a self-recursive record's skipper is compiled
+// lazily inside its own skipRecord, so the wire is what terminates it.
+func TestSkipUnknownRecursive(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"N","fields":[
+		{"name":"v","type":"int"},
+		{"name":"next","type":["null","N"]},
+		{"name":"tail","type":"long"}]}`)
+	type full struct {
+		V    int32 `avro:"v"`
+		Next *full `avro:"next"`
+		Tail int64 `avro:"tail"`
+	}
+	wire, err := s.Encode(full{1, &full{2, &full{3, nil, 30}, 20}, 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire = append(wire, 0xAB)
+	// The struct drops "next", so the whole recursive chain is skipped.
+	var got struct {
+		V    int32 `avro:"v"`
+		Tail int64 `avro:"tail"`
+	}
+	rest, err := s.Decode(wire, &got, SkipUnknown())
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.V != 1 || got.Tail != 10 {
+		t.Errorf("got %+v, want {V:1 Tail:10}", got)
+	}
+	if len(rest) != 1 || rest[0] != 0xAB {
+		t.Errorf("leftover %v, want [171]", rest)
+	}
+}
+
+func TestSkipUnknownNested(t *testing.T) {
+	s := MustParse(skipUnknownSchema)
+	wire := skipUnknownWire(t, s)
+
+	// The outer struct keeps g and h; the inner keeps only y. Both levels are
+	// partial, so the nested record must skip on its own account.
+	type inner struct {
+		Y string `avro:"y"`
+	}
+	var got struct {
+		G inner   `avro:"g"`
+		H float64 `avro:"h"`
+	}
+	rest, err := s.Decode(wire, &got, SkipUnknown())
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.G.Y != "why" || got.H != 2.5 {
+		t.Errorf("got %+v, want inner y=why h=2.5", got)
+	}
+	if len(rest) != 1 || rest[0] != 0xAB {
+		t.Errorf("leftover %v, want [171]", rest)
+	}
+}
+
+// TestSkipUnknownCacheKeyIsolation pins that the compiled mapping is keyed by
+// the *mode* as well as the Go type. One *Schema, one Go type, both modes, in
+// both orders: whichever ran first must not answer for the other.
+func TestSkipUnknownCacheKeyIsolation(t *testing.T) {
+	for _, order := range []struct {
+		name string
+		opt  []Opt
+	}{
+		{"skip-first", []Opt{SkipUnknown()}},
+		{"strict-first", nil},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			s := MustParse(skipUnknownSchema)
+			wire := skipUnknownWire(t, s)
+			run := func(opts ...Opt) error {
+				var got skipUnknownPartial
+				_, err := s.Decode(wire, &got, opts...)
+				if err == nil && (got.A != 7 || got.H != 2.5) {
+					return fmt.Errorf("decoded %+v, want {A:7 H:2.5}", got)
+				}
+				return err
+			}
+			if err := run(order.opt...); (err == nil) != (len(order.opt) == 1) {
+				t.Fatalf("priming decode: err=%v", err)
+			}
+			// Now both modes, twice each, interleaved.
+			for i := range 2 {
+				if err := run(SkipUnknown()); err != nil {
+					t.Errorf("round %d: SkipUnknown decode failed: %v", i, err)
+				}
+				if err := run(); err == nil {
+					t.Errorf("round %d: strict decode accepted a partial struct", i)
+				}
+			}
+		})
+	}
+}
+
+// TestSkipUnknownDoesNotRelaxEncode is the hazard the option is deliberately
+// one-sided about: a struct that does not cover the record would encode zeros
+// for the fields it lacks.
+func TestSkipUnknownDoesNotRelaxEncode(t *testing.T) {
+	s := MustParse(skipUnknownSchema)
+	v := skipUnknownPartial{A: 1, H: 2}
+	for _, tc := range []struct {
+		name string
+		fn   func(opts ...Opt) error
+	}{
+		{"Encode", func(opts ...Opt) error { _, err := s.Encode(v, opts...); return err }},
+		{"AppendEncode", func(opts ...Opt) error { _, err := s.AppendEncode(nil, v, opts...); return err }},
+		{"EncodeJSON", func(opts ...Opt) error { _, err := s.EncodeJSON(v, opts...); return err }},
+		{"AppendSingleObject", func(opts ...Opt) error { _, err := s.AppendSingleObject(nil, v, opts...); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The missing-field error, specifically: an encode that mapped
+			// the record's fields loosely and then failed further along, on a
+			// struct handed to a string encoder, would satisfy a bare "errored"
+			// while having already relaxed the mapping.
+			for _, opts := range [][]Opt{nil, {SkipUnknown()}} {
+				err := tc.fn(opts...)
+				if err == nil {
+					t.Fatalf("opts=%v: encode accepted a partial struct", opts)
+				}
+				if !strings.Contains(err.Error(), "missing field") {
+					t.Errorf("opts=%v: got %v, want the missing-field error", opts, err)
+				}
+			}
+		})
+	}
+}
+
+// TestSkipUnknownThroughContainers reaches the record through every wrapper
+// that has its own decode path: a union branch, an array element, a map value,
+// and a pointer element (the unsafe null-union and array-of-pointer paths).
+func TestSkipUnknownThroughContainers(t *testing.T) {
+	const rec = `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"drop","type":"string"},{"name":"h","type":"double"}]}`
+	type full struct {
+		A    int32   `avro:"a"`
+		Drop string  `avro:"drop"`
+		H    float64 `avro:"h"`
+	}
+	type part struct {
+		A int32   `avro:"a"`
+		H float64 `avro:"h"`
+	}
+	fv := full{A: 7, Drop: "x", H: 2.5}
+	check := func(t *testing.T, gotA int32, gotH float64) {
+		t.Helper()
+		if gotA != 7 || gotH != 2.5 {
+			t.Errorf("got a=%v h=%v, want 7 / 2.5", gotA, gotH)
+		}
+	}
+
+	t.Run("union", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"u","type":["null",` + rec + `]}]}`)
+		wire, err := s.Encode(struct {
+			U *full `avro:"u"`
+		}{&fv})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			U *part `avro:"u"`
+		}
+		if _, err := s.Decode(wire, &got, SkipUnknown()); err != nil {
+			t.Fatal(err)
+		}
+		if got.U == nil {
+			t.Fatal("union branch decoded as null")
+		}
+		check(t, got.U.A, got.U.H)
+	})
+
+	t.Run("array", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"l","type":{"type":"array","items":` + rec + `}}]}`)
+		wire, err := s.Encode(struct {
+			L []full `avro:"l"`
+		}{[]full{fv, fv}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			L []part `avro:"l"`
+		}
+		if _, err := s.Decode(wire, &got, SkipUnknown()); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.L) != 2 {
+			t.Fatalf("got %d elements, want 2", len(got.L))
+		}
+		for _, e := range got.L {
+			check(t, e.A, e.H)
+		}
+	})
+
+	t.Run("array-of-pointer", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"l","type":{"type":"array","items":` + rec + `}}]}`)
+		wire, err := s.Encode(struct {
+			L []*full `avro:"l"`
+		}{[]*full{&fv}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			L []*part `avro:"l"`
+		}
+		if _, err := s.Decode(wire, &got, SkipUnknown()); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.L) != 1 || got.L[0] == nil {
+			t.Fatalf("got %v, want one non-nil element", got.L)
+		}
+		check(t, got.L[0].A, got.L[0].H)
+	})
+
+	t.Run("map", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"m","type":{"type":"map","values":` + rec + `}}]}`)
+		wire, err := s.Encode(struct {
+			M map[string]full `avro:"m"`
+		}{map[string]full{"k": fv}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			M map[string]part `avro:"m"`
+		}
+		if _, err := s.Decode(wire, &got, SkipUnknown()); err != nil {
+			t.Fatal(err)
+		}
+		e, ok := got.M["k"]
+		if !ok {
+			t.Fatalf("got %v, want key k", got.M)
+		}
+		check(t, e.A, e.H)
+	})
+}
+
+// TestSkipUnknownResolved covers the resolution path, whose struct decode has
+// its own field map and its own wire ops: a reader field the Go struct lacks
+// must skip the writer's bytes, and a default-filled one must simply not fill.
+func TestSkipUnknownResolved(t *testing.T) {
+	w := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"gone","type":"string"},
+		{"name":"drop","type":{"type":"array","items":"string"}},
+		{"name":"h","type":"double"}]}`)
+	r := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"long"},
+		{"name":"drop","type":{"type":"array","items":"string"}},
+		{"name":"added","type":"string","default":"dflt"},
+		{"name":"h","type":"double"}]}`)
+	res, err := Resolve(w, r)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	wire, err := w.Encode(struct {
+		A    int32    `avro:"a"`
+		Gone string   `avro:"gone"`
+		Drop []string `avro:"drop"`
+		H    float64  `avro:"h"`
+	}{7, "g", []string{"p", "q"}, 2.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire = append(wire, 0xAB)
+
+	// The struct omits "drop" (present on the wire, must skip) and "added"
+	// (absent from the writer, filled from the default: nothing to fill).
+	var got struct {
+		A int64   `avro:"a"`
+		H float64 `avro:"h"`
+	}
+	rest, err := res.Decode(wire, &got, SkipUnknown())
+	if err != nil {
+		t.Fatalf("resolved decode: %v", err)
+	}
+	if got.A != 7 || got.H != 2.5 {
+		t.Errorf("got %+v, want {A:7 H:2.5}", got)
+	}
+	if len(rest) != 1 || rest[0] != 0xAB {
+		t.Errorf("leftover %v, want [171]", rest)
+	}
+	var strict struct {
+		A int64   `avro:"a"`
+		H float64 `avro:"h"`
+	}
+	if _, err := res.Decode(wire, &strict); err == nil {
+		t.Error("resolved decode without SkipUnknown accepted a partial struct")
+	}
+}
+
+func TestSkipUnknownJSON(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"drop","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"string"}]}},
+		{"name":"dflt","type":"string","default":"d"},
+		{"name":"h","type":"double"}]}`)
+	const src = `{"a":7,"drop":{"x":"gone"},"h":2.5}`
+	var got struct {
+		A int32   `avro:"a"`
+		H float64 `avro:"h"`
+	}
+	if err := s.DecodeJSON([]byte(src), &got, SkipUnknown()); err != nil {
+		t.Fatalf("DecodeJSON: %v", err)
+	}
+	if got.A != 7 || got.H != 2.5 {
+		t.Errorf("got %+v, want {A:7 H:2.5}", got)
+	}
+	var strict struct {
+		A int32   `avro:"a"`
+		H float64 `avro:"h"`
+	}
+	if err := s.DecodeJSON([]byte(src), &strict); err == nil {
+		t.Error("DecodeJSON without SkipUnknown accepted a partial struct")
+	}
+}
+
+func TestSkipUnknownSingleObject(t *testing.T) {
+	s := MustParse(skipUnknownSchema)
+	wire, err := s.AppendSingleObject(nil, skipUnknownFullValue())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got skipUnknownPartial
+	if _, err := s.DecodeSingleObject(wire, &got, SkipUnknown()); err != nil {
+		t.Fatalf("DecodeSingleObject: %v", err)
+	}
+	if got.A != 7 || got.H != 2.5 {
+		t.Errorf("got %+v, want {A:7 H:2.5}", got)
+	}
+	var strict skipUnknownPartial
+	if _, err := s.DecodeSingleObject(wire, &strict); err == nil {
+		t.Error("DecodeSingleObject without SkipUnknown accepted a partial struct")
+	}
+}
+
+// TestSkipUnknownAmbiguousStillErrors: an ambiguous name is not an absent one.
+// The type *has* fields for it, and picking one arbitrarily is not skipping.
+func TestSkipUnknownAmbiguousStillErrors(t *testing.T) {
+	type left struct {
+		V int32 `avro:"v"`
+	}
+	type right struct {
+		V int32 `avro:"v"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"v","type":"int"}]}`)
+	wire := []byte{2}
+	var got struct {
+		left
+		right
+	}
+	_, err := s.Decode(wire, &got, SkipUnknown())
+	if err == nil {
+		t.Fatal("SkipUnknown swallowed an ambiguous field name")
+	}
+	// The ambiguity error specifically, not any error: skipping the field
+	// would also "fail" if the wire then ran short.
+	if !strings.Contains(err.Error(), "duplicate field name") {
+		t.Errorf("got %v, want the duplicate-field-name error", err)
+	}
+}
+
+/////////////////
+// ALIAS INPUT //
+/////////////////
+
+// aliasOffset reports the offset of p within src, or -1 when p points
+// elsewhere. Go's collector does not move heap objects, so comparing the two as
+// addresses holds for the life of the call.
+func aliasOffset(p unsafe.Pointer, src []byte) int {
+	if p == nil || len(src) == 0 {
+		return -1
+	}
+	base := uintptr(unsafe.Pointer(unsafe.SliceData(src)))
+	q := uintptr(p)
+	if q < base || q >= base+uintptr(len(src)) {
+		return -1
+	}
+	return int(q - base)
+}
+
+func strPtr(s string) unsafe.Pointer  { return unsafe.Pointer(unsafe.StringData(s)) }
+func bytePtr(b []byte) unsafe.Pointer { return unsafe.Pointer(unsafe.SliceData(b)) }
+
+const aliasFixed3 = `{"type":"fixed","name":"F3","size":3}`
+const aliasFixedUUID = `{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`
+
+// aliasCases decode one value and hand back the address its payload lives at.
+// The wire is hand-built so the offset the payload must land on is known, which
+// is what makes "it aliased" distinguishable from "it happened to be equal".
+var aliasCases = []struct {
+	name   string
+	schema string
+	wire   []byte
+	want   int // offset of the payload within wire
+	decode func(t *testing.T, s *Schema, wire []byte, opts ...Opt) unsafe.Pointer
+}{
+	{"string/string", `"string"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v string
+			mustAliasDecode(t, s, w, &v, o...)
+			return strPtr(v)
+		}},
+	{"string/bytes", `"string"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v []byte
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v)
+		}},
+	{"string/any", `"string"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v any
+			mustAliasDecode(t, s, w, &v, o...)
+			return strPtr(v.(string))
+		}},
+	{"bytes/bytes", `"bytes"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v []byte
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v)
+		}},
+	{"bytes/string", `"bytes"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v string
+			mustAliasDecode(t, s, w, &v, o...)
+			return strPtr(v)
+		}},
+	{"bytes/any", `"bytes"`, []byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v any
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v.([]byte))
+		}},
+	{"fixed/bytes", aliasFixed3, []byte{'a', 'b', 'c'}, 0,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v []byte
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v)
+		}},
+	{"fixed/string", aliasFixed3, []byte{'a', 'b', 'c'}, 0,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v string
+			mustAliasDecode(t, s, w, &v, o...)
+			return strPtr(v)
+		}},
+	{"fixed/any", aliasFixed3, []byte{'a', 'b', 'c'}, 0,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v any
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v.([]byte))
+		}},
+	{"fixed-uuid/bytes", aliasFixedUUID, make([]byte, 16), 0,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v []byte
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v)
+		}},
+	// A struct field takes the compiled unsafe path, which shadows the reflect
+	// one; the two may not decide aliasing differently.
+	{"record-field/string", `{"type":"record","name":"R","fields":[{"name":"s","type":"string"}]}`,
+		[]byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v struct {
+				S string `avro:"s"`
+			}
+			mustAliasDecode(t, s, w, &v, o...)
+			return strPtr(v.S)
+		}},
+	{"record-field/bytes", `{"type":"record","name":"R","fields":[{"name":"b","type":"bytes"}]}`,
+		[]byte{6, 'a', 'b', 'c'}, 1,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v struct {
+				B []byte `avro:"b"`
+			}
+			mustAliasDecode(t, s, w, &v, o...)
+			return bytePtr(v.B)
+		}},
+	{"array-item/string", `{"type":"array","items":"string"}`,
+		[]byte{2, 6, 'a', 'b', 'c', 0}, 2,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v []string
+			mustAliasDecode(t, s, w, &v, o...)
+			if len(v) != 1 {
+				t.Fatalf("got %d items, want 1", len(v))
+			}
+			return strPtr(v[0])
+		}},
+	{"map-key", `{"type":"map","values":"int"}`,
+		[]byte{2, 6, 'k', 'e', 'y', 2, 0}, 2,
+		func(t *testing.T, s *Schema, w []byte, o ...Opt) unsafe.Pointer {
+			var v map[string]int32
+			mustAliasDecode(t, s, w, &v, o...)
+			if len(v) != 1 {
+				t.Fatalf("got %d entries, want 1", len(v))
+			}
+			for k := range v {
+				return strPtr(k)
+			}
+			return nil
+		}},
+}
+
+func mustAliasDecode(t *testing.T, s *Schema, wire []byte, v any, opts ...Opt) {
+	t.Helper()
+	if _, err := s.Decode(wire, v, opts...); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
+// TestAliasInputSharesBacking pins *both* directions on every target the option
+// covers: with it, the decoded payload lives at its exact wire offset inside
+// src; without it, nowhere inside src at all.
+func TestAliasInputSharesBacking(t *testing.T) {
+	for _, c := range aliasCases {
+		t.Run(c.name, func(t *testing.T) {
+			s := MustParse(c.schema)
+
+			wire := append([]byte(nil), c.wire...)
+			if got := aliasOffset(c.decode(t, s, wire, AliasInput()), wire); got != c.want {
+				t.Errorf("AliasInput: payload at offset %d in src, want %d", got, c.want)
+			}
+			// A separate buffer: a copy that happened to be handed back from a
+			// pool cannot land inside a buffer allocated after it.
+			wire2 := append([]byte(nil), c.wire...)
+			if got := aliasOffset(c.decode(t, s, wire2), wire2); got != -1 {
+				t.Errorf("no option: payload at offset %d in src, want outside", got)
+			}
+		})
+	}
+}
+
+// TestAliasInputMutationIsVisible pins the contract rather than treating it as
+// a bug: the decoded values *are* src, so writing to src rewrites them,
+// including the strings, which Go otherwise guarantees are immutable.
+func TestAliasInputMutationIsVisible(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"s","type":"string"},
+		{"name":"b","type":"bytes"}]}`)
+	var got struct {
+		S string `avro:"s"`
+		B []byte `avro:"b"`
+	}
+	wire := []byte{6, 'a', 'b', 'c', 6, 'x', 'y', 'z'}
+	mustAliasDecode(t, s, wire, &got, AliasInput())
+	if got.S != "abc" || string(got.B) != "xyz" {
+		t.Fatalf("got %q / %q, want abc / xyz", got.S, got.B)
+	}
+	wire[1] = 'Z'
+	wire[5] = 'Q'
+	if got.S != "Zbc" {
+		t.Errorf("string did not follow src: %q, want Zbc", got.S)
+	}
+	if string(got.B) != "Qyz" {
+		t.Errorf("bytes did not follow src: %q, want Qyz", got.B)
+	}
+
+	// And the inverse, which is what every existing caller relies on.
+	var plain struct {
+		S string `avro:"s"`
+		B []byte `avro:"b"`
+	}
+	wire2 := []byte{6, 'a', 'b', 'c', 6, 'x', 'y', 'z'}
+	mustAliasDecode(t, s, wire2, &plain)
+	wire2[1] = 'Z'
+	wire2[5] = 'Q'
+	if plain.S != "abc" || string(plain.B) != "xyz" {
+		t.Errorf("no option: src mutation reached %q / %q", plain.S, plain.B)
+	}
+}
+
+type aliasTextTarget struct{ raw []byte }
+
+// UnmarshalText retains b rather than copying it, so the test measures whether
+// the decoder handed over memory it owns.
+func (a *aliasTextTarget) UnmarshalText(b []byte) error { a.raw = b; return nil }
+
+// TestAliasInputCopiesWhereItMust: a target the decoder builds a new value for
+// keeps copying, option or not.
+func TestAliasInputCopiesWhereItMust(t *testing.T) {
+	t.Run("byte-array", func(t *testing.T) {
+		s := MustParse(aliasFixed3)
+		var v [3]byte
+		wire := []byte{'a', 'b', 'c'}
+		mustAliasDecode(t, s, wire, &v, AliasInput())
+		wire[0] = 'Z'
+		if v != [3]byte{'a', 'b', 'c'} {
+			t.Errorf("array followed src: %q", v)
+		}
+	})
+	t.Run("text-unmarshaler", func(t *testing.T) {
+		s := MustParse(`"string"`)
+		var v aliasTextTarget
+		wire := []byte{6, 'a', 'b', 'c'}
+		mustAliasDecode(t, s, wire, &v, AliasInput())
+		if string(v.raw) != "abc" {
+			t.Fatalf("got %q, want abc", v.raw)
+		}
+		if off := aliasOffset(bytePtr(v.raw), wire); off != -1 {
+			t.Errorf("UnmarshalText got wire memory at offset %d", off)
+		}
+		wire[1] = 'Z'
+		if string(v.raw) != "abc" {
+			t.Errorf("retained text followed src: %q", v.raw)
+		}
+	})
+	t.Run("bytes-decimal", func(t *testing.T) {
+		s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`)
+		var v *big.Rat
+		wire := []byte{4, 0x01, 0x2C} // 300 -> 3.00
+		mustAliasDecode(t, s, wire, &v, AliasInput())
+		before := v.RatString()
+		wire[1] = 0xFF
+		if v.RatString() != before {
+			t.Errorf("decimal followed src: %s, was %s", v.RatString(), before)
+		}
+	})
+	t.Run("long-timestamp", func(t *testing.T) {
+		s := MustParse(`{"type":"long","logicalType":"timestamp-millis"}`)
+		var v time.Time
+		wire := []byte{2}
+		mustAliasDecode(t, s, wire, &v, AliasInput())
+		before := v
+		wire[0] = 4
+		if !v.Equal(before) {
+			t.Errorf("timestamp followed src: %v, was %v", v, before)
+		}
+	})
+	t.Run("fixed-uuid-string", func(t *testing.T) {
+		s := MustParse(aliasFixedUUID)
+		var v string
+		wire := make([]byte, 16)
+		mustAliasDecode(t, s, wire, &v, AliasInput())
+		if off := aliasOffset(strPtr(v), wire); off != -1 {
+			t.Errorf("uuid string aliased src at offset %d — it is a formatted value, not wire bytes", off)
+		}
+	})
+}
+
+// TestAliasInputEmptyStaysNonNil: an aliased empty run must not become a nil
+// slice. A nil is nil-equivalent on re-encode, so a nil-first union would flip
+// a decoded empty bytes onto the null branch.
+func TestAliasInputEmptyStaysNonNil(t *testing.T) {
+	for _, opts := range [][]Opt{nil, {AliasInput()}} {
+		label := fmt.Sprintf("opts=%d", len(opts))
+		for _, c := range []struct {
+			name   string
+			schema string
+			wire   []byte
+		}{
+			{"bytes", `"bytes"`, []byte{0}},
+			{"string", `"string"`, []byte{0}},
+			{"fixed0", `{"type":"fixed","name":"F0","size":0}`, nil},
+		} {
+			s := MustParse(c.schema)
+			var v []byte
+			mustAliasDecode(t, s, c.wire, &v, opts...)
+			if v == nil {
+				t.Errorf("%s/%s: decoded to a nil slice", label, c.name)
+			}
+			if len(v) != 0 {
+				t.Errorf("%s/%s: decoded to %v, want empty", label, c.name, v)
+			}
+			var a any
+			mustAliasDecode(t, s, c.wire, &a, opts...)
+			if b, ok := a.([]byte); c.name != "string" && (!ok || b == nil) {
+				t.Errorf("%s/%s: any decoded to %#v, want a non-nil []byte", label, c.name, a)
+			}
+		}
+		// The consequence the rule exists for: an empty bytes must re-encode
+		// onto the bytes branch, not the null one.
+		u := MustParse(`["null","bytes"]`)
+		var a any
+		mustAliasDecode(t, u, []byte{2, 0}, &a, opts...)
+		out, err := u.Encode(a)
+		if err != nil {
+			t.Fatalf("%s: re-encode: %v", label, err)
+		}
+		if len(out) == 0 || out[0] != 2 {
+			t.Errorf("%s: empty bytes re-encoded as %v, want the bytes branch (2, 0)", label, out)
+		}
+	}
+}
+
+// TestAliasInputDecodeJSONIgnoresIt: a JSON string carrying an escape cannot
+// alias, and aliasing only the ones that happen to have none would make the
+// guarantee vary field by field.
+func TestAliasInputDecodeJSONIgnoresIt(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"s","type":"string"},
+		{"name":"b","type":"bytes"}]}`)
+	// The writer carries a field the reader drops, so this is a real
+	// resolution and not the identity one, which hands back the reader itself
+	// and never reaches decodeJSONResolved.
+	w := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"s","type":"string"},
+		{"name":"b","type":"bytes"},
+		{"name":"gone","type":"int"}]}`)
+	for _, name := range []string{"plain", "resolved"} {
+		t.Run(name, func(t *testing.T) {
+			dec := s
+			src := []byte(`{"s":"abc","b":"xyz"}`)
+			if name == "resolved" {
+				var err error
+				if dec, err = Resolve(w, s); err != nil {
+					t.Fatal(err)
+				}
+				if dec.resolveWriter == nil {
+					t.Fatal("Resolve returned an identity schema; this subtest would not reach decodeJSONResolved")
+				}
+				src = []byte(`{"s":"abc","b":"xyz","gone":1}`)
+			}
+			var got struct {
+				S string `avro:"s"`
+				B []byte `avro:"b"`
+			}
+			if err := dec.DecodeJSON(src, &got, AliasInput()); err != nil {
+				t.Fatalf("DecodeJSON: %v", err)
+			}
+			if got.S != "abc" || string(got.B) != "xyz" {
+				t.Fatalf("got %q / %q", got.S, got.B)
+			}
+			if off := aliasOffset(strPtr(got.S), src); off != -1 {
+				t.Errorf("string aliased the JSON src at offset %d", off)
+			}
+			if off := aliasOffset(bytePtr(got.B), src); off != -1 {
+				t.Errorf("bytes aliased the JSON src at offset %d", off)
+			}
+			for i := range src {
+				src[i] = 'Z'
+			}
+			if got.S != "abc" || string(got.B) != "xyz" {
+				t.Errorf("JSON decode followed src: %q / %q", got.S, got.B)
+			}
+		})
+	}
+}
+
+func TestAliasInputSingleObject(t *testing.T) {
+	s := MustParse(`"string"`)
+	data, err := s.AppendSingleObject(nil, "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v string
+	if _, err := s.DecodeSingleObject(data, &v, AliasInput()); err != nil {
+		t.Fatal(err)
+	}
+	// 10-byte header, then the length varint.
+	if off := aliasOffset(strPtr(v), data); off != 11 {
+		t.Errorf("payload at offset %d, want 11", off)
+	}
+	data[11] = 'Z'
+	if v != "Zbc" {
+		t.Errorf("decoded string did not follow src: %q", v)
+	}
+}
+
+// TestAliasInputIsNotASchemaOpt is the structural half of "OCF never aliases
+// its block buffer": ocf.WithSchemaOpts is the one path that forwards caller
+// options into an OCF reader, and it takes SchemaOpts. AliasInput must stay out
+// of that set: the block buffer is replaced every block.
+func TestAliasInputIsNotASchemaOpt(t *testing.T) {
+	if _, ok := any(AliasInput()).(SchemaOpt); ok {
+		t.Error("AliasInput satisfies SchemaOpt; ocf.WithSchemaOpts would forward it into a reader whose block buffer is overwritten every block")
+	}
+	if _, ok := any(AliasInput()).(optmark.AliasesInput); !ok {
+		t.Error("AliasInput does not implement optmark.AliasesInput; a host that reuses its decode buffer cannot drop it")
+	}
+}
+
+// TestInvariant_ResolvedJSONDropsAliasingOpts reads decodeJSONResolved from
+// source. The composed resolved-JSON path decodes from a re-encoded
+// intermediate it allocates itself, so forwarding an aliasing option there
+// points the caller's values at a buffer they never handed over and pins it for
+// as long as one field is held. Nothing observable distinguishes it (the
+// intermediate is per-call and unreachable), so a source guard is the only
+// thing that can hold the forward honest.
+func TestInvariant_ResolvedJSONDropsAliasingOpts(t *testing.T) {
+	const decl = "func (s *Schema) decodeJSONResolved("
+	src := readFile(t, "json_codec.go")
+	i := strings.Index(src, decl)
+	if i < 0 {
+		t.Fatalf("%s not found in json_codec.go — this guard reads it from source, so a rename must update the guard, not silence it", decl)
+	}
+	body := src[i:]
+	if e := strings.Index(body, "\n}\n"); e >= 0 {
+		body = body[:e+2]
+	}
+	call := strings.Index(body, "s.Decode(")
+	if call < 0 {
+		t.Fatalf("decodeJSONResolved no longer calls s.Decode:\n\n%s", body)
+	}
+	line := body[call:]
+	if e := strings.IndexByte(line, '\n'); e >= 0 {
+		line = line[:e]
+	}
+	if !strings.Contains(line, "dropAliasingOpts(opts)") {
+		t.Errorf("decodeJSONResolved forwards the caller's options raw:\n    %s\nThe buffer it decodes is an intermediate this function allocated, not the caller's src.", strings.TrimSpace(line))
+	}
+}
+
+// foreignBufferDecodeSites rows every call in the package that hands a decode
+// function a src buffer other than the one its caller is decoding. Such a
+// buffer outlives the call or is shared, so under [AliasInput] a decoded value
+// can point into memory the caller never supplied, which is sound only where
+// the contract covers it. Each row states what makes its buffer safe to hand
+// out.
+//
+// Keyed "enclosing func: callee: arg0", the spelling
+// TestInvariant_ForeignBufferDecodeSitesAreRowed derives.
+var foreignBufferDecodeSites = map[string]string{
+	"deser: (&deserFixed{…}).deser: append(b[:0:0], b...)": "a fresh copy of just this value's payload, made so the delegate's remainder is the copy's tail rather than the caller's; nothing else can reach it, so aliasing it is aliasing per-call garbage the value itself keeps alive",
+
+	"applyFieldDefault: node.deserRecord.fields[idx].fn: enc": "the schema's pre-encoded default; DecodeJSON never sets the alias flag, so this path copies out of it regardless",
+
+	"deserInterface: d.deser: d.encodedDefault": "the schema's pre-encoded default, shared by every decode of this resolution; AliasInput's contract forbids writing to anything a decode returns, which is what makes handing it out sound",
+	"deserMap: d.deser: d.encodedDefault":       "same buffer and same rule as deserInterface",
+	"deserStruct: d.deser: d.encodedDefault":    "same buffer and same rule as deserInterface; a struct target is not a different contract",
+}
+
+// fallbackImporter tries compiled export data first and re-asks a source
+// importer for anything it cannot resolve.
+type fallbackImporter struct{ fast, slow types.Importer }
+
+func (i fallbackImporter) Import(path string) (*types.Package, error) {
+	if p, err := i.fast.Import(path); err == nil {
+		return p, nil
+	}
+	return i.slow.Import(path)
+}
+
+// typedPackageFiles type-checks the package's non-test sources so a derivation
+// can ask what a call's callee *is* rather than what it is spelled.
+func typedPackageFiles(t *testing.T) (*token.FileSet, []*ast.File, *types.Package, *types.Info) {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	var files []*ast.File
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", n, err)
+		}
+		files = append(files, f)
+	}
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}}
+	// Compiled export data for everything it covers, source only for what it
+	// does not, which is this module's own internal package. Type-checking the
+	// stdlib from source instead costs seconds, and we run inside the -race
+	// gate, whose headroom is what we are conserving.
+	conf := types.Config{Importer: fallbackImporter{
+		fast: importer.Default(),
+		slow: importer.ForCompiler(fset, "source", nil),
+	}}
+	pkg, err := conf.Check("github.com/twmb/avro", fset, files, info)
+	if err != nil {
+		t.Fatalf("type-checking the package: %v", err)
+	}
+	return fset, files, pkg, info
+}
+
+// TestInvariant_ForeignBufferDecodeSitesAreRowed derives, from the type
+// checker rather than from a spelling, every call whose callee has a deserfn's
+// or skipfn's signature and whose first argument is not the enclosing src, and
+// requires each to be rowed. Signature rather than named type on purpose: a
+// method value like (&deserFixed{n}).deser has the shape without the name, and
+// keying on the name would drop it.
+//
+// It reds in both directions: a new site that feeds a decode some other buffer
+// fails here, and a row whose site has vanished fails too.
+func TestInvariant_ForeignBufferDecodeSitesAreRowed(t *testing.T) {
+	fset, files, pkg, info := typedPackageFiles(t)
+	sigOf := func(name string) *types.Signature {
+		o := pkg.Scope().Lookup(name)
+		if o == nil {
+			t.Fatalf("%s is gone from the package; this derivation names it, so a rename must update the guard rather than silence it", name)
+		}
+		return o.Type().Underlying().(*types.Signature)
+	}
+	deser, skip := sigOf("deserfn"), sigOf("skipfn")
+
+	found := map[string]bool{}
+	for _, f := range files {
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				ce, ok := n.(*ast.CallExpr)
+				if !ok || len(ce.Args) == 0 {
+					return true
+				}
+				if tv, ok := info.Types[ce.Fun]; ok && tv.IsType() {
+					return true // a deserfn(x) conversion, not a call
+				}
+				ft := info.TypeOf(ce.Fun)
+				if ft == nil {
+					return true
+				}
+				sig, ok := ft.Underlying().(*types.Signature)
+				if !ok || (!types.Identical(sig, deser) && !types.Identical(sig, skip)) {
+					return true
+				}
+				if a0 := types.ExprString(ce.Args[0]); a0 != "src" {
+					found[fd.Name.Name+": "+types.ExprString(ce.Fun)+": "+a0] = true
+				}
+				return true
+			})
+		}
+	}
+	if len(found) == 0 {
+		t.Fatalf("the derivation found no decode call at all across %d files; the walk is broken, not the package", len(files))
+	}
+	for site := range found {
+		if _, ok := foreignBufferDecodeSites[site]; !ok {
+			t.Errorf("%s\n  hands a decode a buffer that is not its caller's src. Row it with what makes that buffer safe to hand out, or pass the caller's src.", site)
+		}
+	}
+	for site := range foreignBufferDecodeSites {
+		if !found[site] {
+			t.Errorf("foreignBufferDecodeSites rows %q, which the source no longer contains", site)
+		}
+	}
+	_ = fset
+}
+
+// byteSourceCase drives one byte source, meaning the buffer a decoded value may
+// point into, against a target shape. The axis exists because the alias
+// contract is a rule about the values a decode returns, not about src: the
+// memory behind one is src for a field read off the wire and the parsed Schema
+// for a field filled from its default, and a net that only ever decodes
+// wire-read fields cannot tell those apart.
+type byteSourceCase struct {
+	name string
+	// decoder is called *once* per cell and returns the closure the cell drives.
+	// Once, because the schema has to be built outside the two runs: the memory
+	// a default-filled value points into belongs to one parsed schema, so a
+	// cell that re-parses per run compares two schemas and can never observe
+	// sharing, whatever the code does.
+	decoder func(t *testing.T) func(src []byte) unsafe.Pointer
+	// wire builds a fresh src for each run.
+	wire func(t *testing.T) []byte
+	// inSrc is whether the returned value must point *into* the src it was
+	// handed. shared is whether two independent decodes must hand back the
+	// same address, which is what "points at something the schema owns" looks
+	// like from outside the package.
+	inSrc  bool
+	shared bool
+}
+
+// aliasResolvedDefaultSchemas builds writer and resolved reader for a record
+// whose second field exists only on the reader, filled from a bytes default.
+func aliasResolvedDefaultSchemas(t *testing.T) (writer, resolved *Schema) {
+	t.Helper()
+	w := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	r := MustParse("{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+		"{\"name\":\"a\",\"type\":\"int\"}," +
+		"{\"name\":\"d\",\"type\":\"bytes\",\"default\":\"\\u0001\\u0002\\u0003\"}]}")
+	res, err := Resolve(w, r)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	return w, res
+}
+
+func aliasResolvedWire(t *testing.T) []byte {
+	t.Helper()
+	w, _ := aliasResolvedDefaultSchemas(t)
+	b, err := w.Encode(map[string]any{"a": int32(7)})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return b
+}
+
+// aliasByteSourceCases crosses byte source with the target shapes that reach
+// it. Expectations come from the contract, not from current behavior: a value
+// read off the wire under AliasInput points into src and so cannot be shared
+// between two decodes; a value filled from the schema's default points at
+// memory the schema owns and so *is* shared; a path that does not honor the
+// option points at neither.
+var aliasByteSourceCases = []byteSourceCase{
+	{
+		name: "caller-src/struct",
+		wire: func(t *testing.T) []byte { return []byte{6, 'a', 'b', 'c'} },
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			s := MustParse(`"bytes"`)
+			return func(src []byte) unsafe.Pointer {
+				var got []byte
+				mustAliasDecode(t, s, src, &got, AliasInput())
+				return bytePtr(got)
+			}
+		},
+		inSrc: true, shared: false,
+	},
+	{
+		name: "schema-default/struct",
+		wire: aliasResolvedWire,
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			_, res := aliasResolvedDefaultSchemas(t)
+			return func(src []byte) unsafe.Pointer {
+				var got struct {
+					A int32  `avro:"a"`
+					D []byte `avro:"d"`
+				}
+				mustAliasDecode(t, res, src, &got, AliasInput())
+				return bytePtr(got.D)
+			}
+		},
+		inSrc: false, shared: true,
+	},
+	{
+		name: "schema-default/map",
+		wire: aliasResolvedWire,
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			_, res := aliasResolvedDefaultSchemas(t)
+			return func(src []byte) unsafe.Pointer {
+				got := map[string]any{}
+				mustAliasDecode(t, res, src, &got, AliasInput())
+				return bytePtr(got["d"].([]byte))
+			}
+		},
+		inSrc: false, shared: true,
+	},
+	{
+		name: "schema-default/interface",
+		wire: aliasResolvedWire,
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			_, res := aliasResolvedDefaultSchemas(t)
+			return func(src []byte) unsafe.Pointer {
+				var got any
+				mustAliasDecode(t, res, src, &got, AliasInput())
+				return bytePtr(got.(map[string]any)["d"].([]byte))
+			}
+		},
+		inSrc: false, shared: true,
+	},
+	{
+		name: "schema-default/no-option",
+		wire: aliasResolvedWire,
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			_, res := aliasResolvedDefaultSchemas(t)
+			return func(src []byte) unsafe.Pointer {
+				got := map[string]any{}
+				mustAliasDecode(t, res, src, &got)
+				return bytePtr(got["d"].([]byte))
+			}
+		},
+		inSrc: false, shared: false,
+	},
+	{
+		name: "json-default/ignores-option",
+		wire: func(t *testing.T) []byte { return []byte(`{"a":7}`) },
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			s := MustParse("{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+				"{\"name\":\"a\",\"type\":\"int\"}," +
+				"{\"name\":\"d\",\"type\":\"bytes\",\"default\":\"\\u0001\\u0002\\u0003\"}]}")
+			return func(src []byte) unsafe.Pointer {
+				got := map[string]any{}
+				if err := s.DecodeJSON(src, &got, AliasInput()); err != nil {
+					t.Fatalf("DecodeJSON: %v", err)
+				}
+				return bytePtr(got["d"].([]byte))
+			}
+		},
+		inSrc: false, shared: false,
+	},
+	{
+		name: "synthesized-copy/fixed-decimal-escape",
+		wire: func(t *testing.T) []byte { return []byte{1, 2, 3, 4} },
+		decoder: func(t *testing.T) func([]byte) unsafe.Pointer {
+			s := MustParse(`{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":9,"scale":2}`)
+			return func(src []byte) unsafe.Pointer {
+				var got []byte
+				mustAliasDecode(t, s, src, &got, AliasInput())
+				return bytePtr(got)
+			}
+		},
+		inSrc: false, shared: false,
+	},
+}
+
+// TestMatrix_AliasInputByteSource crosses the buffer a decoded value may point
+// into with the target shape that reaches it.
+//
+// The oracle is memory, not a sibling decode path: where an address lies
+// relative to a buffer the test allocated is answerable from the input alone,
+// so a defect the aliasing and copying paths would share cannot hide behind
+// their agreement.
+func TestMatrix_AliasInputByteSource(t *testing.T) {
+	sources := map[string]int{}
+	for _, c := range aliasByteSourceCases {
+		t.Run(c.name, func(t *testing.T) {
+			sources[strings.SplitN(c.name, "/", 2)[0]]++
+
+			decode := c.decoder(t)
+			src1 := c.wire(t)
+			// The rowed reason every foreign buffer is safe to hand over
+			// starts with "no deserfn writes through its src". That is a claim
+			// about behavior, so every cell checks it rather than trusting the
+			// comment: a decode that scribbled on its input would rewrite the
+			// schema's own default bytes on the cells that pass one.
+			untouched := append([]byte(nil), src1...)
+			p1 := decode(src1)
+			if !bytes.Equal(src1, untouched) {
+				t.Errorf("the decode wrote through its src: %x became %x", untouched, src1)
+			}
+			if p1 == nil {
+				t.Fatal("decode returned no payload address; the cell measured nothing")
+			}
+			if in := aliasOffset(p1, src1) >= 0; in != c.inSrc {
+				t.Errorf("value points into src = %v, want %v", in, c.inSrc)
+			}
+
+			// A second decode over a separate buffer: an address that repeats
+			// cannot be a copy handed back twice, since the two runs allocate
+			// independently.
+			src2 := c.wire(t)
+			p2 := decode(src2)
+			if got := p1 == p2; got != c.shared {
+				t.Errorf("two decodes share a backing address = %v, want %v", got, c.shared)
+			}
+			if c.inSrc && aliasOffset(p2, src2) < 0 {
+				t.Error("second run stopped pointing into its own src")
+			}
+		})
+	}
+	// Liveness floor: every source arm must have actually run, or an axis this
+	// matrix claims to cross is carrying no value.
+	for _, want := range []string{"caller-src", "schema-default", "json-default", "synthesized-copy"} {
+		if sources[want] == 0 {
+			t.Errorf("byte source %q was never realized; the axis is dead", want)
+		}
+	}
+	if sources["schema-default"] < 4 {
+		t.Errorf("schema-default ran %d target shapes, want the struct/map/interface/no-option set", sources["schema-default"])
 	}
 }
