@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // SchemaNode is a read-write representation of an Avro schema. You get one
@@ -1066,29 +1067,9 @@ func jsonEscapedLen(s string, limit int) int {
 
 // jsonEscapedLenBytes is jsonEscapedLen over a byte slice, for text a
 // TextMarshaler returned (the emitter runs it through the same escaper).
+// The count only reads, so a string view of the bytes is safe.
 func jsonEscapedLenBytes(s []byte, limit int) int {
-	n := 0
-	for i := 0; i < len(s); {
-		if b := s[i]; b < utf8.RuneSelf {
-			n += asciiEscapedLen(b)
-			i++
-		} else {
-			c, size := utf8.DecodeRune(s[i:])
-			switch {
-			case c == utf8.RuneError && size == 1:
-				n += jsonInvalidUTF8EmitLen
-			case c == ' ' || c == ' ':
-				n += 6
-			default:
-				n += size
-			}
-			i += size
-		}
-		if n > limit {
-			return n
-		}
-	}
-	return n
+	return jsonEscapedLen(unsafe.String(unsafe.SliceData(s), len(s)), limit)
 }
 
 // avroCodepointEscapedLen is the emitted length of a byte slice that the JSON

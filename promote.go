@@ -206,13 +206,7 @@ func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, sl *slab) ([]by
 	if err != nil {
 		return nil, err
 	}
-	payload := src[:n]
-	v = indirectAlloc(v)
-	done, err := applyBigDecimalPayload(v, payload)
-	if !done {
-		err = setBytesValue(v, payload, "big-decimal", sl)
-	}
-	if err != nil {
+	if err := setBigDecimalTarget(v, src[:n], sl); err != nil {
 		return nil, err
 	}
 	return src[n:], nil
@@ -225,19 +219,7 @@ func promoteBytesToStringUUID(src []byte, v reflect.Value, sl *slab) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
-	v = indirectAlloc(v)
-	// [16]byte target wants the parsed UUID bytes; everything else
-	// gets the canonical-string view (interface, string, []byte).
-	if isUUIDType(v.Type()) {
-		s := string(src[:n])
-		u, err := parseUUID(s)
-		if err != nil {
-			return nil, err
-		}
-		copyBytesToArray(v, u[:])
-		return src[n:], nil
-	}
-	if err := setStringValue(v, src, n, sl); err != nil {
+	if err := setUUIDTarget(v, src[:n], sl); err != nil {
 		return nil, err
 	}
 	return src[n:], nil

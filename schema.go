@@ -3380,22 +3380,39 @@ func unmarshalAnyPreservePrecision(raw string) (any, error) {
 	return normalizeJSONValue(v), nil
 }
 
-func normalizeJSONValue(v any) any {
-	switch tv := v.(type) {
-	case json.Number:
-		return normalizeJSONNumber(tv)
+// mapTree returns a copy of a decoded JSON tree with leaf applied to every
+// non-container value; every map and slice in the result is fresh.
+func mapTree(node any, leaf func(any) any) any {
+	switch v := node.(type) {
 	case map[string]any:
-		for k, val := range tv {
-			tv[k] = normalizeJSONValue(val)
+		m := make(map[string]any, len(v))
+		for k, val := range v {
+			m[k] = mapTree(val, leaf)
 		}
-		return tv
+		return m
 	case []any:
-		for i, val := range tv {
-			tv[i] = normalizeJSONValue(val)
+		s := make([]any, len(v))
+		for i, e := range v {
+			s[i] = mapTree(e, leaf)
 		}
-		return tv
+		return s
 	}
-	return v
+	return leaf(node)
+}
+
+// normalizeJSONValue copies v with every json.Number resolved by
+// normalizeJSONNumber.
+func normalizeJSONValue(v any) any {
+	return mapTree(v, func(leaf any) any {
+		if n, ok := leaf.(json.Number); ok {
+			return normalizeJSONNumber(n)
+		}
+		return leaf
+	})
+}
+
+func deepCopyTree(node any) any {
+	return mapTree(node, func(leaf any) any { return leaf })
 }
 
 // normalizeJSONNumber resolves a json.Number to the idiomatic Go type by

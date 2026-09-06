@@ -2405,17 +2405,23 @@ func (s *deserBigDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	payload := src[:n]
-	src = src[n:]
+	if err := setBigDecimalTarget(v, src[:n], sl); err != nil {
+		return nil, err
+	}
+	return src[n:], nil
+}
+
+// setBigDecimalTarget stores a big-decimal payload into v: the structured
+// decode where a target takes it, else the raw bytes for an opaque
+// pass-through target. The natural decode and the string-to-bytes
+// promotion share it.
+func setBigDecimalTarget(v reflect.Value, payload []byte, sl *slab) error {
 	v = indirectAlloc(v)
 	done, err := applyBigDecimalPayload(v, payload)
 	if !done {
 		err = setBytesValue(v, payload, "big-decimal", sl)
 	}
-	if err != nil {
-		return nil, err
-	}
-	return src, nil
+	return err
 }
 
 // applyBigDecimalPayload tries the structured big-decimal decode first.
@@ -2578,21 +2584,26 @@ func deserUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	v = indirectAlloc(v)
-	if isUUIDType(v.Type()) {
-		u, err := parseUUIDBytes(src[:n])
-		if err != nil {
-			return nil, err
-		}
-		copyBytesToArray(v, u[:])
-		return src[n:], nil
-	}
-	// Non-UUID targets share setStringValue's Interface / String /
-	// TextUnmarshaler / []byte chain. UUID-on-string is wire-equivalent
-	// to plain string; serUUID falls through to serString on the encode
-	// side. Symmetric.
-	if err := setStringValue(v, src, n, sl); err != nil {
+	if err := setUUIDTarget(v, src[:n], sl); err != nil {
 		return nil, err
 	}
 	return src[n:], nil
+}
+
+// setUUIDTarget stores the wire's UUID text s into v: parsed into a
+// [16]byte target, else through setStringValue's Interface / String /
+// TextUnmarshaler / []byte chain, since uuid-on-string is wire-equivalent
+// to plain string (serUUID falls through to serString on encode). The
+// natural decode and the bytes-to-string promotion share it.
+func setUUIDTarget(v reflect.Value, s []byte, sl *slab) error {
+	v = indirectAlloc(v)
+	if isUUIDType(v.Type()) {
+		u, err := parseUUIDBytes(s)
+		if err != nil {
+			return err
+		}
+		copyBytesToArray(v, u[:])
+		return nil
+	}
+	return setStringValue(v, s, len(s), sl)
 }

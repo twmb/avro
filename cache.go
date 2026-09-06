@@ -460,22 +460,3 @@ func defWithExplicitNamespace(def any, fullname string) any {
 	}
 	return cp
 }
-
-func deepCopyTree(node any) any {
-	switch v := node.(type) {
-	case map[string]any:
-		m := make(map[string]any, len(v))
-		for k, val := range v {
-			m[k] = deepCopyTree(val)
-		}
-		return m
-	case []any:
-		s := make([]any, len(v))
-		for i, e := range v {
-			s[i] = deepCopyTree(e)
-		}
-		return s
-	default:
-		return v
-	}
-}
