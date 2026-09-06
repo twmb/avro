@@ -6629,16 +6629,26 @@ func TestMatrix_ForwardRefFixupsLandOnTheirOwnRecord(t *testing.T) {
 // A new post-construction write to a schemaNode's wire fields would break the
 // registration invariant while looking exactly like a builder write.
 var wireFieldAssignments = map[string]string{
-	"buildPrimitive: b.ser":      "builder output",
-	"buildPrimitive: b.deser":    "builder output",
-	"buildUnion: b.ser":          "builder output",
-	"buildUnion: b.deser":        "builder output",
-	"buildComplex: b.ser":        "builder output",
-	"buildComplex: b.deser":      "builder output",
-	"tryAssignNamedRef: b.ser":   "builder output, read back out of the referenced node",
-	"tryAssignNamedRef: b.deser": "builder output, read back out of the referenced node",
-	"applyCustomTypes: b.ser":    "builder output; node.ser is deliberately left bare",
-	"applyCustomTypes: b.deser":  "builder output; node.deser is deliberately left bare",
+	"buildPrimitive: b.ser":         "builder output",
+	"buildPrimitive: b.deser":       "builder output",
+	"buildUnion: b.ser":             "builder output",
+	"buildUnion: b.deser":           "builder output",
+	"buildPrimitiveObject: b.ser":   "builder output",
+	"buildPrimitiveObject: b.deser": "builder output",
+	"buildRecord: b.ser":            "builder output",
+	"buildRecord: b.deser":          "builder output",
+	"buildEnum: b.ser":              "builder output",
+	"buildEnum: b.deser":            "builder output",
+	"buildArray: b.ser":             "builder output",
+	"buildArray: b.deser":           "builder output",
+	"buildMap: b.ser":               "builder output",
+	"buildMap: b.deser":             "builder output",
+	"buildFixed: b.ser":             "builder output",
+	"buildFixed: b.deser":           "builder output",
+	"tryAssignNamedRef: b.ser":      "builder output, read back out of the referenced node",
+	"tryAssignNamedRef: b.deser":    "builder output, read back out of the referenced node",
+	"applyCustomTypes: b.ser":       "builder output; node.ser is deliberately left bare",
+	"applyCustomTypes: b.deser":     "builder output; node.deser is deliberately left bare",
 
 	// fieldMeta, not schemaNode: the unsafe fast path's per-field record
 	// tables, wired when a forward reference resolves. The field entries are
