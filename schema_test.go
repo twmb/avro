@@ -10282,14 +10282,10 @@ var budgetedWalks = []budgetedWalk{
 		reachingPaths: "one: seen created per nodeAwaitsForwardRef call at build"},
 
 	// ---- goTypeDAG: bound is compile-time fixedness + per-type sync.Map ----
-	{fn: "collect", file: "reflect.go", class: goTypeDAG,
+	{fn: "walkPromotedFields", file: "reflect.go", class: goTypeDAG,
 		factors:       "2^(embed depth) on a shared-embed type DAG (visited is defer-delete, so it re-descends)",
-		binds:         "NOT a runtime bound: a Go type is fixed at COMPILE time and the result is amortized by a per-type sync.Map, so the fan-out is not attacker-grown (G3)",
-		reachingPaths: "one: visited created per typeFieldMapping (per Go type; the sync.Map amortizes repeats across calls)"},
-	{fn: "collectFieldsRaw", file: "schema_for.go", class: goTypeDAG,
-		factors:       "2^(embed depth) on a shared-embed type DAG (visited is defer-delete)",
-		binds:         "compile-time fixedness + collectFields' per-call visited; not attacker-grown at runtime (G3)",
-		reachingPaths: "one: visited created per collectFields, per SchemaFor of a Go type"},
+		binds:         "NOT a runtime bound: a Go type is fixed at COMPILE time; typeFieldMapping amortizes its walk by a per-type sync.Map, SchemaFor re-pays it per call, and neither fan-out is attacker-grown (G3)",
+		reachingPaths: "two: visited created per typeFieldMapping (per Go type; the sync.Map amortizes repeats across calls) and per collectFields, per SchemaFor of a Go type"},
 	{fn: "inferType", file: "schema_for.go", class: goTypeDAG,
 		factors:       "type nodes x ptr chains, bounded by depth and maxIndirectDepth",
 		binds:         "seen map[reflect.Type]seenForm memo + depth/ptrChain caps; compile-time type",
@@ -10367,9 +10363,9 @@ var nonWalkMarkerUses = map[string]string{
 	"b.building = make(map[*schemaNode]struct{})":   "re-inits the builder record-in-progress set",
 	"seen := make(map[reflect.Type]seenForm)":       "SchemaFor's inferType memo init; the walk (inferType) is rowed",
 	"seen map[reflect.Type]seenForm":                "inferType/inferRecord/inferField memo parameter; inferType is rowed",
-	"collectFields(t, make(map[reflect.Type]bool))": "inits collectFieldsRaw's visited; the walk is rowed",
-	"visited map[reflect.Type]bool":                 "collect/collectFieldsRaw visited parameter; both rowed",
-	"make(map[reflect.Type]bool)":                   "inits a Go-type walk visited set; the walks (collect/collectFieldsRaw) are rowed",
+	"collectFields(t, make(map[reflect.Type]bool))": "inits walkPromotedFields' visited; the walk is rowed",
+	"visited map[reflect.Type]bool":                 "walkPromotedFields visited parameter; rowed",
+	"make(map[reflect.Type]bool)":                   "inits a Go-type walk visited set; the walk (walkPromotedFields) is rowed",
 	"sync.Map // map[reflect.Type]":                 "a per-Go-type compiled-codec cache, amortized and keyed by fixed types; not a walk",
 }
 

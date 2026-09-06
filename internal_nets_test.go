@@ -467,24 +467,19 @@ var censusRegistry = []censusQuestion{
 			"CONTAINS, the runtime field mapper decides what an encode/decode BINDS, and a field excluded by " +
 			"one must be excluded by the other",
 		answerers: []censusAnswerer{
-			{repr: "SchemaFor, named-field path", site: `tag == "-"`, file: "schema_for.go"},
-			{repr: "SchemaFor, anonymous-embed path", site: `tag == "-"`, file: "schema_for.go"},
-			{repr: "runtime mapper, both paths", site: `tag == "-"`, file: "reflect.go"},
+			{repr: "the one struct walk SchemaFor and the runtime mapper share", site: `tag == "-"`, file: "reflect.go"},
 			{
 				repr: "grammar guard (SchemaFor only)", site: "checkSkipDirectiveExact", file: "schema_for.go",
-				note: "different-by-design and SINGLE-answerer by intent: rejecting a tag that begins with the directive without being it is a typo SchemaFor can name while generating. The runtime mapper has never enforced tag grammar — it takes any tag as a field name, which is what it does with every other malformed tag — so extending the guard there would be a behavior change to a documented boundary, not a consistency fix. Both directions are asserted so neither side can drift into the other.",
+				note: "different-by-design and SINGLE-answerer by intent: rejecting a tag that begins with the directive without being it is a typo SchemaFor can name while generating. The runtime mapper has never enforced tag grammar — it takes any tag as a field name, which is what it does with every other malformed tag — so the shared walk asks the guard on every field and returns its verdict only on the strict (SchemaFor) walk. Both directions are asserted so neither side can drift into the other.",
 			},
 		},
 		tells: []censusTell{
 			{pattern: `tag == "-"`, files: []string{
-				// The two paths, plus one occurrence inside the guard's own
-				// doc comment describing where it is called from.
-				"schema_for.go",
-				"reflect.go", // the runtime mapper's two paths
+				"reflect.go", // the shared walk's exact-match skip
 			}},
 			{pattern: `checkSkipDirectiveExact`, files: []string{
-				// Definition, both call sites, and two doc references.
-				"schema_for.go",
+				"schema_for.go", // the definition
+				"reflect.go",    // the shared walk's one call
 			}},
 			// Rejected tell: `HasPrefix(tag` also matches the "default="
 			// option scan, a different question entirely, and it misses the
@@ -926,17 +921,9 @@ var censusRegistry = []censusQuestion{
 			"the untagged cells are decided by Go and the tagged tier by the documented tiebreaker.",
 		answerers: []censusAnswerer{
 			{
-				repr: "Go struct type, for the inferred schema", site: "resolvePromotedFields", file: "schema_for.go",
-				placement: placementWholeSet, walk: "collectFieldsRaw",
-			},
-			{
-				repr: "Go struct type, for the shared encode/decode field map", site: "typeFieldMapping", file: "reflect.go",
-				placement: placementWholeSet, walk: "collect",
-				note: "different-by-design as a FUNCTION — it produces index paths for a schema's field names, not " +
-					"schemaFields — but it must agree cell for cell, because a schema SchemaFor built has to be one " +
-					"Encode and Decode can use. What the two share is the rule and its placement, and the placement " +
-					"is the half no verdict comparison can see: this site keeps its resolution outside its own " +
-					"recursive closure, and the other keeps it outside collectFieldsRaw.",
+				repr: "Go struct type, for the inferred schema and for the encode/decode field map alike", site: "resolvePromotedFields", file: "reflect.go",
+				placement: placementWholeSet, walk: "walkPromotedFields",
+				note: "one answerer by construction: SchemaFor's collectFields and typeFieldMapping both walk with walkPromotedFields and resolve with resolvePromotedFields, so a schema SchemaFor built is one Encode and Decode can use cell for cell. The placement is the half no verdict comparison can see: the resolution runs once over the root's complete set, outside the recursion.",
 			},
 		},
 		tells: []censusTell{
@@ -944,11 +931,9 @@ var censusRegistry = []censusQuestion{
 			// it only denotes a field when the type it is resolved against is
 			// the root. Every occurrence of that resolution is an answerer.
 			{pattern: `t.FieldByIndex(existing.index).Name`, files: []string{
-				"schema_for.go",
 				"reflect.go",
 			}},
 			{pattern: `duplicate field name`, files: []string{
-				"schema_for.go",
 				"reflect.go",
 			}},
 		},

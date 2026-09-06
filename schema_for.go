@@ -583,249 +583,45 @@ type schemaField struct {
 	decimal   [2]int   // [precision, scale]; zero if not decimal
 }
 
-// collectFields returns root's Avro fields: the full promoted set, then
-// resolved, tagged over untagged, shallower over deeper, and a tie at the
-// winning depth reported as ambiguous. The rule ranges over the whole
-// collected set, since a shallower field declared anywhere above an embedded
-// struct takes the name, so it runs here rather than per recursion level.
-// typeFieldMapping keeps its resolution outside its recursion for the same
-// reason.
+// collectFields returns root's Avro fields: the promoted set from
+// walkPromotedFields, resolved by resolvePromotedFields, with every tag
+// parsed. A name still ambiguous after the full walk rejects here, since
+// SchemaFor must emit every field; the runtime mapper instead defers that
+// error to a lookup of the name.
 func collectFields(root reflect.Type, visited map[reflect.Type]bool) ([]schemaField, error) {
-	raw, err := collectFieldsRaw(root, nil, visited)
+	var raw []promotedField
+	var parsed []schemaField
+	err := walkPromotedFields(root, nil, visited, true, func(f promotedField) error {
+		sf, err := parseSchemaTag(f.sf, f.parts, f.index)
+		if err != nil {
+			return err
+		}
+		raw = append(raw, f)
+		parsed = append(parsed, sf)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return resolvePromotedFields(root, raw)
-}
-
-// collectFieldsRaw walks a struct type depth-first, handling embedded
-// structs and inline tags, and returns every promoted field it finds in
-// encounter order, shallower first, which is what the resolution downstream
-// relies on. It does not resolve name collisions; see
-// collectFields.
-func collectFieldsRaw(t reflect.Type, index []int, visited map[reflect.Type]bool) ([]schemaField, error) {
-	if visited[t] {
-		return nil, nil
-	}
-	// Per-path marking, as in typeFieldMapping: a type reachable through two
-	// sibling embed paths is collected at each occurrence, so a type
-	// inlined twice shows up as the collision it is.
-	visited[t] = true
-	defer delete(visited, t)
-
-	var raw []schemaField
-	for i := 0; i < t.NumField(); i++ {
-		sf := t.Field(i)
-		idx := make([]int, len(index)+1)
-		copy(idx, index)
-		idx[len(index)] = i
-
-		if sf.Anonymous {
-			ft := sf.Type
-			if ft.Kind() == reflect.Pointer {
-				ft = ft.Elem()
-			}
-			if ft.Kind() == reflect.Struct {
-				tag := sf.Tag.Get("avro")
-				if tag == "-" {
-					continue
-				}
-				// Same guard as the named-field path below, in the same
-				// position relative to the exact-match skip: an embedded
-				// struct is where "-,opt" is likeliest to be written, and
-				// deferring to Avro's name grammar is no substitute, since
-				// WithLaxNames can accept "-" and then the embed silently
-				// becomes a field the tag asked to skip.
-				if err := checkSkipDirectiveExact(sf.Name, tag); err != nil {
-					return nil, err
-				}
-				parts, err := splitTag(tag)
-				if err != nil {
-					return nil, err
-				}
-				if parts[0] != "" {
-					// Explicit name on embedded struct: treat as named field.
-					// inline is incompatible with an explicit name; the name
-					// says "make this a field", inline says "flatten, no field."
-					for _, p := range parts[1:] {
-						if p == "inline" {
-							return nil, fmt.Errorf("avro: field %s has tag %q: inline is incompatible with an explicit field name (inline flattens the embed; there is no field at this position to name)",
-								sf.Name, truncForError(tag))
-						}
-					}
-					f, err := parseSchemaTag(sf, parts, idx)
-					if err != nil {
-						return nil, err
-					}
-					raw = append(raw, f)
-					continue
-				}
-				// Anonymous embed with empty name flattens. The embed has
-				// no Avro field of its own at this position, so options
-				// that apply to a field (default=, alias=, type-alias=,
-				// omitzero, logical-type tags) have no target. Reject
-				// rather than drop.
-				for _, p := range parts[1:] {
-					if p != "inline" {
-						return nil, fmt.Errorf("avro: field %s has tag %q: inline is incompatible with option %q (the anonymous embed flattens; there is no field at this position for the option to apply to)",
-							sf.Name, truncForError(tag), truncForError(p))
-					}
-				}
-				nested, err := collectFieldsRaw(ft, idx, visited)
-				if err != nil {
-					return nil, err
-				}
-				raw = append(raw, nested...)
-				continue
-			}
-			if !sf.IsExported() {
-				continue
-			}
-		} else if !sf.IsExported() {
-			continue
-		}
-
-		tag := sf.Tag.Get("avro")
-		if tag == "-" {
-			continue
-		}
-		// Same guard as the anonymous-embed path above; rationale lives on
-		// checkSkipDirectiveExact.
-		if err := checkSkipDirectiveExact(sf.Name, tag); err != nil {
-			return nil, err
-		}
-		parts, err := splitTag(tag)
-		if err != nil {
-			return nil, err
-		}
-
-		// Check for inline.
-		hasInline := false
-		for _, p := range parts[1:] {
-			if p == "inline" {
-				hasInline = true
-				break
-			}
-		}
-		if hasInline {
-			// inline flattens the embedded struct into the parent, so no
-			// other tag option has a target; reject rather than drop so a
-			// typo is caught here.
-			if parts[0] != "" {
-				return nil, fmt.Errorf("avro: field %s has tag %q: inline is incompatible with an explicit field name (inline flattens the embed; there is no field at this position to name)",
-					sf.Name, truncForError(tag))
-			}
-			for _, p := range parts[1:] {
-				if p != "inline" {
-					return nil, fmt.Errorf("avro: field %s has tag %q: inline is incompatible with option %q (inline flattens the embed; there is no field at this position for the option to apply to)",
-						sf.Name, truncForError(tag), truncForError(p))
-				}
-			}
-			ft := sf.Type
-			if ft.Kind() == reflect.Pointer {
-				ft = ft.Elem()
-			}
-			if ft.Kind() != reflect.Struct {
-				return nil, fmt.Errorf("avro: field %s has tag %q: inline requires a struct or pointer-to-struct field type; got %s (inline flattens the embed; there is no struct here to flatten)",
-					sf.Name, truncForError(tag), ft)
-			}
-			nested, err := collectFieldsRaw(ft, idx, visited)
-			if err != nil {
-				return nil, err
-			}
-			raw = append(raw, nested...)
-			goto next
-		}
-
-		{
-			f, err := parseSchemaTag(sf, parts, idx)
-			if err != nil {
-				return nil, err
-			}
-			raw = append(raw, f)
-		}
-	next:
-	}
-	return raw, nil
-}
-
-// resolvePromotedFields decides which promoted field owns each Avro name,
-// over the *complete* set collected from t. See collectFields: the rule
-// ranges over the whole set, and t is the type raw's index paths are rooted
-// at.
-func resolvePromotedFields(t reflect.Type, raw []schemaField) ([]schemaField, error) {
-	// Deduplicate, agreeing with typeFieldMapping so the inferred schema and
-	// the runtime mapping pick the same Go field for each Avro name. Tagged
-	// beats untagged at any depth; among same-tagged-status fields the
-	// shallower wins, and only a same-depth collision at the winning depth
-	// is ambiguous, as Java's setFields and hamba treat it. The decision is
-	// deferred because a shallower field declared later resolves a
-	// same-depth deep collision, as Go's own promotion does.
-	type entry struct {
-		idx int
-		schemaField
-	}
-	m := make(map[string]entry, len(raw))
-	ambiguous := make(map[string][2]string) // name -> the two colliding Go field names
-	for i, f := range raw {
-		if existing, ok := m[f.name]; ok {
-			// Tag tiebreaker first: tagged beats untagged regardless of
-			// depth, so a tagged/untagged pair is resolved, never ambiguous.
-			if f.tagged && !existing.tagged {
-				m[f.name] = entry{i, f}
-				delete(ambiguous, f.name)
-				continue
-			}
-			if !f.tagged && existing.tagged {
-				continue
-			}
-			// Same tagged status: the shallower field wins and clears any
-			// ambiguity a deeper collision recorded; only a collision that
-			// survives at the winning (shallowest) depth is genuinely
-			// ambiguous, and that is decided after the full walk below.
-			if len(f.index) < len(existing.index) {
-				m[f.name] = entry{i, f}
-				delete(ambiguous, f.name)
-				continue
-			}
-			if len(f.index) == len(existing.index) {
-				ambiguous[f.name] = [2]string{t.FieldByIndex(existing.index).Name, t.FieldByIndex(f.index).Name}
-			}
-			continue
-		}
-		m[f.name] = entry{i, f}
-	}
-
-	// A name still marked ambiguous after the full walk has two fields at its
-	// winning depth with the same tagged status and no shallower resolver.
-	// SchemaFor must emit every field, so it rejects here (the schema-driven
-	// runtime mapper instead defers the error to a lookup of the specific
-	// name). Report deterministically by raw encounter order.
-	for _, f := range raw {
-		if names, amb := ambiguous[f.name]; amb {
-			return nil, fmt.Errorf("avro: duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
-				truncForError(f.name), t.String(), truncForError(names[0]), truncForError(names[1]))
+	winners, ambiguous := resolvePromotedFields(root, raw)
+	// Report deterministically, by encounter order.
+	for i := range raw {
+		if names, amb := ambiguous[raw[i].name()]; amb {
+			return nil, fmt.Errorf("avro: %w", ambiguousFieldError(root, raw[i].name(), names))
 		}
 	}
-
-	// Preserve encounter order.
-	result := make([]schemaField, 0, len(m))
-	for _, f := range raw {
-		if e, ok := m[f.name]; ok && e.idx >= 0 {
-			result = append(result, e.schemaField)
-			// Mark as consumed by setting idx to -1.
-			e.idx = -1
-			m[f.name] = e
-		}
+	out := make([]schemaField, 0, len(winners))
+	for _, w := range winners {
+		out = append(out, parsed[w])
 	}
-	return result, nil
+	return out, nil
 }
 
 // checkSkipDirectiveExact rejects an avro tag that begins with "-" without
 // being exactly "-", such as "-,omitzero": you meant to skip but left
 // options attached, or you mean a field literally named "-", which a lax
-// validator would let through. Both tag-reading paths in collectFields call
-// it after their own exact "-" skip.
+// validator would let through. walkPromotedFields asks it after its exact
+// "-" skip.
 func checkSkipDirectiveExact(fieldName, tag string) error {
 	if !strings.HasPrefix(tag, "-") {
 		return nil
