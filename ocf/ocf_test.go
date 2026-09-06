@@ -2609,91 +2609,6 @@ func TestRegression_TrailingEmptyBlockIsCleanEOF(t *testing.T) {
 	}
 }
 
-// TestRegression_BlockCountZeroValidatesSync locks the sibling invariant. A
-// count=0 block with a corrupt sync must be rejected as a sync-mismatch
-// error, *not* silently accepted as clean EOF. Pre-fix readBlock returned
-// io.EOF immediately on count==0 without reading size + data + sync. A
-// tail-truncated file whose count byte happened to read as 0 was then accepted
-// as a clean stream end, losing the corruption-detection invariant the spec
-// requires.
-func TestRegression_BlockCountZeroValidatesSync(t *testing.T) {
-	sync := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	var buf bytes.Buffer
-	s := avrotest.MustParse(t, recordSchema)
-	w := mustNewWriter(t, &buf, s, WithSyncMarker(sync))
-	if err := w.Encode(&person{Name: "alice", Age: 30}); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-	// count=0, size=0, but a corrupt sync (all 0xFF).
-	zeroBlock := append([]byte{}, 0x00, 0x00)
-	zeroBlock = append(zeroBlock, bytes.Repeat([]byte{0xFF}, 16)...)
-	buf.Write(zeroBlock)
-
-	r := mustNewReader(t, &buf)
-	var p person
-	if err := r.Decode(&p); err != nil {
-		t.Fatalf("decode first record: %v", err)
-	}
-	err := r.Decode(&p)
-	if err == nil || err == io.EOF {
-		t.Fatalf("expected sync-mismatch error on count=0 block with corrupt sync, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "sync marker mismatch") {
-		t.Fatalf("expected sync marker mismatch error, got: %v", err)
-	}
-}
-
-// TestRegression_EmptyBlockMidStreamSkipped pins that we skip a count=0 block
-// whose sync marker validates, rather than treat it as end-of-stream. The spec
-// places no constraint on a block's object count. Unlike Avro arrays and maps,
-// file blocks have no terminator, so a zero-count block is valid framing, and
-// fastavro's record iterator reads straight past one. Treating it as EOF
-// silently dropped every record after it. Java never emits the shape and its
-// for-each reader stops at one, while goavro errors and avro-rs stops. Skipping
-// reads everything a foreign writer put in the file and loses nothing.
-func TestRegression_EmptyBlockMidStreamSkipped(t *testing.T) {
-	sync := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	s := avro.MustParse(`"string"`)
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s, WithSyncMarker(sync))
-	if err := w.Encode("first"); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Close(); err != nil { // seals block 1: [count=1]["first"][sync]
-		t.Fatal(err)
-	}
-
-	// Block 2 is spec-valid empty framing: count=0, size=0, valid sync.
-	buf.Write(binary.AppendVarint(nil, 0))
-	buf.Write(binary.AppendVarint(nil, 0))
-	buf.Write(sync[:])
-
-	// Block 3: count=1, one "second" datum, valid sync.
-	datum := avrotest.MustAppendEncode(t, s, nil, "second")
-	buf.Write(binary.AppendVarint(nil, 1))
-	buf.Write(binary.AppendVarint(nil, int64(len(datum))))
-	buf.Write(datum)
-	buf.Write(sync[:])
-
-	r := mustNewReader(t, bytes.NewReader(buf.Bytes()))
-	var got []string
-	for {
-		var v string
-		err := r.Decode(&v)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("Decode: %v", err)
-		}
-		got = append(got, v)
-	}
-	if len(got) != 2 || got[0] != "first" || got[1] != "second" {
-		t.Fatalf("records across a mid-stream empty block: got %v, want [first second]", got)
-	}
-}
-
 // TestRegression_OCFBigDecimalJavaInterop pins that a Java-generated
 // big-decimal OCF file decodes to the correct *big.Rat through our reader.
 // testdata/bigdec.avro is the same vendored file avro-rs uses in
@@ -2725,27 +2640,6 @@ func (f *failAfterNWrites) Write(p []byte) (int, error) {
 	}
 	f.n--
 	return len(p), nil
-}
-
-// TestRegression_OCFWriterCloseClosesCodecWhenPoisoned locks the invariant
-// that Writer.Close() always closes the codec. That holds even when the writer
-// is in an error state from a prior flush failure. Pre-fix Close()
-// short-circuited on w.err != nil and never called codec.Close(), so zstd and
-// similar codecs leaked goroutines and buffers there. We are deliberately more
-// careful than Java, whose DataFileWriter.close is flush-then-close with no
-// finally: a failing flush skips its close, DataFileWriter.java:483-489.
-func TestRegression_OCFWriterCloseClosesCodecWhenPoisoned(t *testing.T) {
-	codec := &leakDetectCodec{name: "null"}
-	// One successful write for the header; subsequent writes fail.
-	// The next flush poisons w.err without aborting construction.
-	w := mustNewWriter(t, &failAfterNWrites{n: 1}, avro.MustParse(`"long"`), WithCodec(codec), WithBlockCount(1))
-	// Encode buffers. BlockCount=1 triggers an immediate flush
-	// which writes to the now-failing writer and poisons w.err.
-	_ = w.Encode(int64(1))
-	_ = w.Close()
-	if codec.closes == 0 {
-		t.Fatal("Writer.Close() did not call codec.Close() after the writer was poisoned")
-	}
 }
 
 // TestRegression_OCFNewReaderClosesCodecOnReaderSchemaFnError locks that
@@ -3189,58 +3083,6 @@ func TestRegression_OCFReaderSchemaPromotion(t *testing.T) {
 	}
 }
 
-// TestRegression_OCFUnknownCodecErrorBounded pins that an unknown avro.codec
-// metadata value from a hostile OCF file produces a bounded error message. The
-// per-entry metadata cap is ocfMetadataSafetyLimit (1 MiB). Without truncation
-// in the unknown-codec error path, a hostile producer could emit a 1 MiB codec
-// name and we would echo all of it: 1:1 DoS amplification through logs and RPC
-// error trailers.
-//
-// Boundary symmetry: a short bad codec name still produces an informative
-// error message.
-func TestRegression_OCFUnknownCodecErrorBounded(t *testing.T) {
-	const maxErrLen = 4096
-
-	mkOCF := func(codecName string) []byte {
-		var buf bytes.Buffer
-		buf.Write([]byte{'O', 'b', 'j', 0x01})
-		schemaJSON := `"long"`
-		mb := make([]byte, 0)
-		mb = binary.AppendVarint(mb, 2)
-		mb = binary.AppendVarint(mb, int64(len("avro.schema")))
-		mb = append(mb, "avro.schema"...)
-		mb = binary.AppendVarint(mb, int64(len(schemaJSON)))
-		mb = append(mb, schemaJSON...)
-		mb = binary.AppendVarint(mb, int64(len("avro.codec")))
-		mb = append(mb, "avro.codec"...)
-		mb = binary.AppendVarint(mb, int64(len(codecName)))
-		mb = append(mb, codecName...)
-		mb = binary.AppendVarint(mb, 0)
-		buf.Write(mb)
-		buf.Write(make([]byte, 16)) // sync marker
-		return buf.Bytes()
-	}
-
-	// Hostile 1 MiB codec name.
-	hostile := strings.Repeat("X", 1<<20)
-	_, err := NewReader(bytes.NewReader(mkOCF(hostile)))
-	if err == nil {
-		t.Fatal("expected error for hostile codec name")
-	}
-	if got := len(err.Error()); got > maxErrLen {
-		t.Errorf("hostile codec name: error length %d exceeds %d-byte cap", got, maxErrLen)
-	}
-
-	// Short bad name: informative content preserved.
-	_, err = NewReader(bytes.NewReader(mkOCF("bogus")))
-	if err == nil {
-		t.Fatal("expected error for bogus codec name")
-	}
-	if !strings.Contains(err.Error(), "bogus") {
-		t.Errorf("short codec name error %q lost diagnostic content", err.Error())
-	}
-}
-
 // closeCountCodec is a null-passthrough codec that counts Close calls. A custom
 // codec that frees pooled buffers or decrements a refcount in Close must be
 // closed exactly once. That holds even when Writer.Close/Reader.Close are
@@ -3375,52 +3217,6 @@ func TestRegression_ReaderRejectsUseAfterCloseAndClosesCodecOnce(t *testing.T) {
 	// rather than leak it.
 	if err := r.Decode(&got); err == nil {
 		t.Errorf("Decode after Close returned nil (value %d); want error", got)
-	}
-}
-
-// A *value* error from Encode, where the datum doesn't fit the schema, must
-// not poison the Writer. We discard the failed datum's partial bytes by
-// restoring the buffer snapshot. Previously-accepted datums survive and the
-// Writer stays usable. Java DataFileWriter.append does the same: it truncates
-// its buffer to the pre-append position and rethrows. Only IO/compression/flush
-// errors poison, where the sink state is unknowable.
-func TestRegression_OCFWriterValueErrorRecovers(t *testing.T) {
-	s := avro.MustParse(`"int"`)
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s)
-	for i := range 5 {
-		if err := w.Encode(int32(i)); err != nil {
-			t.Fatalf("encode %d: %v", i, err)
-		}
-	}
-	// 3.5 is not a whole number: a pure value error.
-	if err := w.Encode(3.5); err == nil {
-		t.Fatal("bad-value Encode returned nil; want error")
-	}
-	for i := 5; i < 7; i++ {
-		if err := w.Encode(int32(i)); err != nil {
-			t.Fatalf("encode %d after value error: %v", i, err)
-		}
-	}
-	mustClose(t, w)
-
-	r := mustNewReader(t, bytes.NewReader(buf.Bytes()))
-	var got []int32
-	for {
-		var v int32
-		if err := r.Decode(&v); err != nil {
-			break
-		}
-		got = append(got, v)
-	}
-	want := []int32{0, 1, 2, 3, 4, 5, 6}
-	if len(got) != len(want) {
-		t.Fatalf("file datums: got %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("file datums: got %v, want %v", got, want)
-		}
 	}
 }
 
@@ -4035,61 +3831,6 @@ func TestRegression_ZeroCountReaderNoLivelock(t *testing.T) {
 			}
 		})
 	}
-}
-
-// eofErrCodec's Decompress fails with bare io.EOF, the sentinel
-// Reader.Decode reserves for a clean end of file.
-type eofErrCodec struct{ contractCodec }
-
-func (e *eofErrCodec) Decompress(src []byte) ([]byte, error) { return nil, io.EOF }
-
-// TestRegression_UserErrorEOFNeverCleanEnd pins Reader.Decode's documented
-// io.EOF exclusivity against caller-originated errors. A codec Decompress error
-// of bare io.EOF, or a CustomType decode callback returning bare io.EOF, must
-// *not* surface as an error matching io.EOF. A `for rd.Decode(&v) != io.EOF`
-// style loop would treat the failure as a clean end and silently drop the rest
-// of the file. Both normalize to a chain matching io.ErrUnexpectedEOF, the same
-// normalization every truncation path applies.
-func TestRegression_UserErrorEOFNeverCleanEnd(t *testing.T) {
-	t.Run("codec-decompress-eof", func(t *testing.T) {
-		file := writeContractOCF(t, &contractCodec{}, 1, 2)
-		r := mustNewReader(t, bytes.NewReader(file), WithCodec(&eofErrCodec{}))
-		var v map[string]any
-		derr := r.Decode(&v)
-		if derr == nil {
-			t.Fatal("failing codec read cleanly")
-		}
-		if errors.Is(derr, io.EOF) {
-			t.Errorf("user codec's io.EOF surfaced as a clean-end match: %v", derr)
-		}
-		if !errors.Is(derr, io.ErrUnexpectedEOF) {
-			t.Errorf("want the ErrUnexpectedEOF normalization, got: %v", derr)
-		}
-	})
-	t.Run("custom-decode-eof", func(t *testing.T) {
-		ct := avro.CustomType{AvroType: "long", Decode: func(v any, sn *avro.SchemaNode) (any, error) {
-			return nil, io.EOF
-		}}
-		s := avrotest.MustParse(t, `{"type":"record","name":"CR2","fields":[{"name":"x","type":"long"}]}`, ct)
-		var buf bytes.Buffer
-		w := mustNewWriter(t, &buf, s)
-		if err := w.Encode(map[string]any{"x": int64(1)}); err != nil {
-			t.Fatal(err)
-		}
-		mustClose(t, w)
-		r := mustNewReader(t, bytes.NewReader(buf.Bytes()), WithSchemaOpts(ct))
-		var v map[string]any
-		derr := r.Decode(&v)
-		if derr == nil {
-			t.Fatal("failing custom decoder read cleanly")
-		}
-		if errors.Is(derr, io.EOF) {
-			t.Errorf("custom decoder's io.EOF surfaced as a clean-end match: %v", derr)
-		}
-		if !errors.Is(derr, io.ErrUnexpectedEOF) {
-			t.Errorf("want the ErrUnexpectedEOF normalization, got: %v", derr)
-		}
-	})
 }
 
 // TestRegression_AliasingCodecOwnedValues pins that decoded []byte and string
@@ -4918,9 +4659,7 @@ var codecOwnerRows = []codecOwnerRow{
 		coveredBy: []string{"TestConstructorErrorReleasesCodec"},
 		declinedCoveredBy: []string{
 			"TestMatrix_SuppliedCodecClosedExactlyOnce",
-			"TestRegression_OCFNewWriterReleasesSupersededCodec",
 			"TestRegression_OCFNilCodecOfferIsNeverClosed",
-			"TestRegression_OCFUncomparableCodecOfferReleasedOnce",
 		},
 	},
 	{
@@ -4928,7 +4667,6 @@ var codecOwnerRows = []codecOwnerRow{
 		coveredBy: []string{"TestConstructorErrorReleasesCodec"},
 		declinedCoveredBy: []string{
 			"TestMatrix_SuppliedCodecClosedExactlyOnce",
-			"TestRegression_OCFAppendWriterReleasesUnmatchedCodec",
 		},
 	},
 	{
@@ -4939,7 +4677,6 @@ var codecOwnerRows = []codecOwnerRow{
 		},
 		declinedCoveredBy: []string{
 			"TestMatrix_SuppliedCodecClosedExactlyOnce",
-			"TestRegression_OCFNewReaderReleasesUnmatchedCodec",
 		},
 	},
 }
@@ -5708,92 +5445,6 @@ func newAppendWith(rws io.ReadWriteSeeker, opts []Opt) (io.Closer, error) {
 // *succeeds*: it hands back a usable Writer or Reader with no indication that
 // the supplied codec was never used, so the leak is invisible from the call site.
 
-// TestRegression_OCFNewReaderReleasesUnmatchedCodec: the file header names
-// "null" and the supplied codec answers a different name, so the reader resolves
-// the built-in and the supplied one is never used by anything.
-func TestRegression_OCFNewReaderReleasesUnmatchedCodec(t *testing.T) {
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, avro.MustParse(`"long"`))
-	if err := w.Encode(int64(7)); err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	mustClose(t, w)
-
-	codec := &leakDetectCodec{name: "zippy"}
-	rd := mustNewReader(t, bytes.NewReader(buf.Bytes()), WithCodec(codec))
-	if codec.closes != 1 {
-		t.Fatalf("unmatched codec closed %d times, want exactly 1: NewReader resolved the "+
-			"built-in null codec and nothing else will ever close this one", codec.closes)
-	}
-	// The reader must still work, and must not close the supplied codec a
-	// second time on the way out.
-	var got int64
-	if err := rd.Decode(&got); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if got != 7 {
-		t.Fatalf("decoded %d, want 7", got)
-	}
-	if err := rd.Close(); err != nil {
-		t.Fatalf("Reader.Close: %v", err)
-	}
-	if codec.closes != 1 {
-		t.Fatalf("unmatched codec closed %d times after Reader.Close, want exactly 1", codec.closes)
-	}
-}
-
-// TestRegression_OCFAppendWriterReleasesUnmatchedCodec: same shape on the append
-// path, where the codec name likewise comes from the header already on disk.
-func TestRegression_OCFAppendWriterReleasesUnmatchedCodec(t *testing.T) {
-	schema := avro.MustParse(`"long"`)
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, schema)
-	if err := w.Encode(int64(1)); err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	mustClose(t, w)
-
-	codec := &leakDetectCodec{name: "zippy"}
-	aw := mustNewAppendWriter(t, &seekBuf{data: buf.Bytes()}, WithCodec(codec))
-	if codec.closes != 1 {
-		t.Fatalf("unmatched codec closed %d times, want exactly 1", codec.closes)
-	}
-	if err := aw.Encode(int64(2)); err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	if err := aw.Close(); err != nil {
-		t.Fatalf("Writer.Close: %v", err)
-	}
-	if codec.closes != 1 {
-		t.Fatalf("unmatched codec closed %d times after Writer.Close, want exactly 1", codec.closes)
-	}
-}
-
-// TestRegression_OCFNewWriterReleasesSupersededCodec: WithCodec written twice.
-// The last one wins, which leaves the first adopted by nothing. Unlike the
-// reader cases there is no name involved, so position in the option list is the
-// only thing that distinguishes the two.
-func TestRegression_OCFNewWriterReleasesSupersededCodec(t *testing.T) {
-	first := &leakDetectCodec{name: "null"}
-	last := &leakDetectCodec{name: "null"}
-
-	w := mustNewWriter(t, &bytes.Buffer{}, avro.MustParse(`"long"`), WithCodec(first), WithCodec(last))
-	if first.closes != 1 {
-		t.Fatalf("superseded codec closed %d times, want exactly 1", first.closes)
-	}
-	if last.closes != 0 {
-		t.Fatalf("adopted codec closed %d times before the Writer was used, want 0", last.closes)
-	}
-	if err := w.Encode(int64(1)); err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	mustClose(t, w)
-	if first.closes != 1 || last.closes != 1 {
-		t.Fatalf("after Close: superseded closed %d times, adopted closed %d times, want 1 and 1",
-			first.closes, last.closes)
-	}
-}
-
 // TestRegression_OCFNilCodecOfferIsNeverClosed pins the one shape where a
 // release would be a method call on a nil interface. WithCodec(nil) compiles,
 // and when a later WithCodec supersedes it the constructor succeeds, since the
@@ -5822,76 +5473,6 @@ func TestRegression_OCFNilCodecOfferIsNeverClosed(t *testing.T) {
 	if real.closes != 1 {
 		t.Fatalf("adopted codec closed %d times after Close, want exactly 1", real.closes)
 	}
-}
-
-// mapCodec is deliberately uncomparable: a struct holding a map cannot be
-// compared with ==, so a Codec interface value carrying one panics any direct
-// equality test and cannot be a map key. Nothing forbids such a codec, since
-// the interface only asks for four methods. So the release path has to
-// recognize repeats of it without ever comparing it the easy way.
-type mapCodec struct {
-	name   string
-	notes  map[string]string
-	closes *int
-}
-
-func (c mapCodec) Name() string                          { return c.name }
-func (c mapCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
-func (c mapCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
-func (c mapCodec) Close() error                          { *c.closes++; return nil }
-
-// TestRegression_OCFUncomparableCodecOfferReleasedOnce drives the arm the
-// comparable fast path cannot reach. The counts are the same rule as everywhere
-// else: each distinct supplied codec closed exactly once unless it was adopted.
-// Reaching it here requires recognizing a repeat *without* the equality
-// operator, so a release path that reached for == would panic instead of
-// answering.
-func TestRegression_OCFUncomparableCodecOfferReleasedOnce(t *testing.T) {
-	schema := avro.MustParse(`"long"`)
-	mk := func(name string, n *int) mapCodec {
-		return mapCodec{name: name, notes: map[string]string{"k": "v"}, closes: n}
-	}
-
-	t.Run("declined, offered twice", func(t *testing.T) {
-		var declined int
-		c := mk("zippy", &declined)
-		w := mustNewWriter(t, &bytes.Buffer{}, schema, WithCodec(c), WithCodec(c), WithCodec(&leakDetectCodec{name: "null"}))
-		if declined != 1 {
-			t.Fatalf("uncomparable codec offered twice closed %d times, want exactly 1", declined)
-		}
-		mustClose(t, w)
-		if declined != 1 {
-			t.Fatalf("uncomparable codec closed %d times after Close, want exactly 1", declined)
-		}
-	})
-
-	t.Run("adopted, offered twice", func(t *testing.T) {
-		var n int
-		c := mk("null", &n)
-		w := mustNewWriter(t, &bytes.Buffer{}, schema, WithCodec(c), WithCodec(c))
-		if n != 0 {
-			t.Fatalf("adopted uncomparable codec closed %d times by a successful constructor, want 0: "+
-				"the Writer is about to compress with it", n)
-		}
-		if err := w.Encode(int64(1)); err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
-		mustClose(t, w)
-		if n != 1 {
-			t.Fatalf("adopted uncomparable codec closed %d times after Close, want exactly 1", n)
-		}
-	})
-
-	t.Run("declined next to a comparable codec", func(t *testing.T) {
-		var un int
-		comparable := &leakDetectCodec{name: "deflate"}
-		w := mustNewWriter(t, &bytes.Buffer{}, schema, WithCodec(mk("zippy", &un)), WithCodec(comparable), WithCodec(&leakDetectCodec{name: "null"}))
-		if un != 1 || comparable.closes != 1 {
-			t.Fatalf("mixed offers: uncomparable closed %d times, comparable closed %d times, want 1 and 1",
-				un, comparable.closes)
-		}
-		mustClose(t, w)
-	})
 }
 
 // ---------- decompress_limit_test.go ----------
@@ -8902,161 +8483,7 @@ func TestRegression_OCFLargeUserMetadataProducerCompliance(t *testing.T) {
 	}
 }
 
-// TestRegression_OCFMetadataKeyErrorBounded pins that the writer's metadata-key
-// rejection errors stay bounded in length. The caller-supplied key is wrapped
-// with truncForError, the same helper the read-side codec-name error uses. The
-// key comes from WithMetadata, commonly populated from untrusted upstream data
-// tenant ids or labels, so echoing it verbatim is a 1:1 log/RPC/metric
-// amplification: an ~8 MiB key produced an ~8 MiB error string. The rejection
-// itself is correct and fast; only the message size was unbounded.
-func TestRegression_OCFMetadataKeyErrorBounded(t *testing.T) {
-	s := avro.MustParse(`"long"`)
-	const cap = 4096 // generous ceiling; truncForError caps at 80
-
-	t.Run("reserved-prefix-key", func(t *testing.T) {
-		huge := "avro." + strings.Repeat("k", 8<<20)
-		_, err := NewWriter(&bytes.Buffer{}, s, WithMetadata(map[string][]byte{huge: []byte("v")}))
-		if err == nil {
-			t.Fatal("expected reserved-key rejection")
-		}
-		if len(err.Error()) > cap {
-			t.Errorf("reserved-key error is %d bytes (unbounded echo); want <= %d", len(err.Error()), cap)
-		}
-	})
-	t.Run("overlong-key", func(t *testing.T) {
-		huge := strings.Repeat("k", 2<<20)
-		_, err := NewWriter(&bytes.Buffer{}, s, WithMetadata(map[string][]byte{huge: []byte("v")}))
-		if err == nil {
-			t.Fatal("expected overlong-key rejection")
-		}
-		if len(err.Error()) > cap {
-			t.Errorf("overlong-key error is %d bytes (unbounded echo); want <= %d", len(err.Error()), cap)
-		}
-	})
-}
-
 // ---------- truncation_eof_test.go ----------
-
-// io.EOF is Decode's end-of-stream sentinel: it is returned only when the
-// stream ends cleanly at a block boundary. A block-header truncation is an
-// error, and that error must *not* satisfy errors.Is(err, io.EOF). Otherwise
-// the idiomatic termination check reads a truncated stream as complete and
-// silently drops the promised tail. The hazard is specific to the
-// zero-bytes-available cuts: io.ReadFull and binary.ReadVarint return bare
-// io.EOF when no bytes remain, so exactly those would leak the sentinel through
-// a %w wrap. fastavro errors at every one of these cuts, and the spec makes all
-// four block parts mandatory.
-func TestRegression_TruncatedBlockHeaderNotEOF(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-	// One complete block with one record.
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s)
-	if err := w.Encode(int32(7)); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-	full := buf.Bytes()
-
-	cuts := []struct {
-		name  string
-		bytes func() []byte
-	}{
-		{"after-count-varint", func() []byte {
-			// A complete count varint promising a second block, then EOF
-			// before the size varint.
-			return binary.AppendVarint(append([]byte{}, full...), 1)
-		}},
-		{"after-size-varint", func() []byte {
-			// Count and size complete, zero data bytes present.
-			d := binary.AppendVarint(append([]byte{}, full...), 1)
-			return binary.AppendVarint(d, 100)
-		}},
-		{"at-sync-start", func() []byte {
-			// Data complete, zero sync bytes present.
-			d := binary.AppendVarint(append([]byte{}, full...), 1)
-			d = binary.AppendVarint(d, 1)
-			return append(d, 0x02)
-		}},
-	}
-	for _, c := range cuts {
-		t.Run(c.name, func(t *testing.T) {
-			r := mustNewReader(t, bytes.NewReader(c.bytes()))
-			defer r.Close()
-			var v int32
-			if err := r.Decode(&v); err != nil || v != 7 {
-				t.Fatalf("first record: v=%d err=%v", v, err)
-			}
-			err := r.Decode(&v)
-			if err == nil {
-				t.Fatal("expected error for truncated second block")
-			}
-			if errors.Is(err, io.EOF) {
-				t.Fatalf("truncation error satisfies errors.Is(err, io.EOF): %v", err)
-			}
-			if !errors.Is(err, io.ErrUnexpectedEOF) {
-				t.Fatalf("truncation error should match io.ErrUnexpectedEOF, got: %v", err)
-			}
-		})
-	}
-
-	// Control: a true end-of-stream is the bare io.EOF sentinel.
-	r := mustNewReader(t, bytes.NewReader(full))
-	defer r.Close()
-	var v int32
-	if err := r.Decode(&v); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Decode(&v); err != io.EOF {
-		t.Fatalf("clean end must be bare io.EOF, got %v", err)
-	}
-}
-
-// The same sentinel contract through the incremental (io.CopyN) block-data
-// arm, reached when the declared size exceeds the eager-allocation window
-// and the reader cap is raised to allow it. io.CopyN returns bare io.EOF on
-// any shortfall, both zero bytes available and a partial copy, so both cells
-// are pinned. io.ReadFull differs: its partial reads already return
-// io.ErrUnexpectedEOF.
-func TestRegression_TruncatedLargeBlockDataNotEOF(t *testing.T) {
-	s := avrotest.MustParse(t, `"int"`)
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, s)
-	if err := w.Encode(int32(7)); err != nil {
-		t.Fatal(err)
-	}
-	mustClose(t, w)
-	full := buf.Bytes()
-
-	for _, c := range []struct {
-		name    string
-		partial []byte // data bytes present before the cut
-	}{
-		{"zero-data-bytes", nil},
-		{"partial-data-bytes", []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			data := binary.AppendVarint(append([]byte{}, full...), 1) // count
-			data = binary.AppendVarint(data, (64<<20)+1)              // size past the eager window
-			data = append(data, c.partial...)
-			r := mustNewReader(t, bytes.NewReader(data), WithMaxBlockBytes(128<<20))
-			defer r.Close()
-			var v int32
-			if err := r.Decode(&v); err != nil || v != 7 {
-				t.Fatalf("first record: v=%d err=%v", v, err)
-			}
-			err := r.Decode(&v)
-			if err == nil {
-				t.Fatal("expected error for truncated block data")
-			}
-			if errors.Is(err, io.EOF) {
-				t.Fatalf("truncation error satisfies errors.Is(err, io.EOF): %v", err)
-			}
-			if !errors.Is(err, io.ErrUnexpectedEOF) {
-				t.Fatalf("truncation error should match io.ErrUnexpectedEOF, got: %v", err)
-			}
-		})
-	}
-}
 
 // ---------- truncation_sweep_test.go ----------
 

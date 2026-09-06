@@ -4108,6 +4108,44 @@ func TestDoSBattery_C2_LargeCountLength(t *testing.T) {
 		return err
 	})
 
+	// The overflow extremes: a second block whose count would wrap the
+	// accumulated total past int64, on the fixed-array, slice, and skip
+	// paths. The pre-add form of the zero-byte cap is what rejects them; a
+	// post-add total wraps to MinInt64+999 and slips under the cap.
+	overflow := append(dosVarlong(4000), dosVarlong(math.MaxInt64-3000)...)
+	overflow = append(overflow, 0x00)
+	wantReject(t, "Decode/array<null>-count-overflow([3]any)", func() error {
+		var v [3]any
+		_, err := arrNull.Decode(append(dosVarlong(1), dosVarlong(math.MaxInt64)...), &v)
+		return err
+	})
+	wantReject(t, "Decode/array<null>-count-overflow([]any)", func() error {
+		var v []any
+		_, err := arrNull.Decode(overflow, &v)
+		return err
+	})
+	dropNull := mustResolve(t,
+		MustParse(`{"type":"record","name":"R","fields":[{"name":"drop","type":{"type":"array","items":"null"}},{"name":"keep","type":"int"}]}`),
+		MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`))
+	wantReject(t, "Decode/skip-array<null>-count-overflow", func() error {
+		// A wrapped total runs MaxInt64 no-op skips, so the failure shape
+		// here is a hang, and the deadline turns it into a report.
+		done := make(chan error, 1)
+		go func() {
+			var v struct {
+				Keep int32 `avro:"keep"`
+			}
+			_, err := dropNull.Decode(append(overflow, 0x54), &v)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(5 * time.Second):
+			return nil
+		}
+	})
+
 	// array<int>: minItemBytes=1, so checkArrayBlockBounds rejects any count
 	// past the remaining buffer (overflow-safe division form). Extreme:
 	// TestRegression_DeserArraySliceBlockCountOverflow and siblings.

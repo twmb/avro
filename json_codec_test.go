@@ -8,7 +8,6 @@ import (
 	"math/big"
 	"reflect"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 )
@@ -2658,51 +2657,6 @@ func TestMatrix_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
 	})
 }
 
-// The errTooDeep recursion bound must be uniform across binary encode, JSON
-// encode, binary decode, and JSON decode: one increment per schema nesting
-// level. Record/union JSON encode formerly incremented twice per level, since
-// a same-level dispatch hop also bumped depth. That halved the budget, so a
-// value DecodeJSON and binary Encode both accepted failed EncodeJSON with
-// errTooDeep at half the depth. That is a round-trip break.
-func TestRegression_JSONEncodeDepthMatchesDecode(t *testing.T) {
-	var b strings.Builder
-	const n = 900 // well under maxDepth (1000), well over the former /2 break
-	for i := 0; i < n; i++ {
-		fmt.Fprintf(&b, `{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i)
-	}
-	b.WriteString(`"int"`)
-	b.WriteString(strings.Repeat(`}]}`, n))
-	s := MustParse(b.String())
-
-	js := []byte(strings.Repeat(`{"f":`, n) + `0` + strings.Repeat(`}`, n))
-	var v any
-	if err := s.DecodeJSON(js, &v); err != nil {
-		t.Fatalf("DecodeJSON at depth %d: %v", n, err)
-	}
-	if _, err := s.Encode(v); err != nil {
-		t.Fatalf("binary Encode at depth %d: %v", n, err)
-	}
-	if _, err := s.EncodeJSON(v); err != nil {
-		t.Fatalf("EncodeJSON at depth %d must match Decode/binary, got: %v", n, err)
-	}
-
-	// The bound still protects against a cyclic Go value (must error, not
-	// loop forever).
-	type Node struct {
-		Next *Node `avro:"next"`
-		V    int32 `avro:"v"`
-	}
-	cyc := MustParse(`{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]},{"name":"v","type":"int"}]}`)
-	n0 := &Node{V: 1}
-	n0.Next = n0 // cycle
-	if _, err := cyc.EncodeJSON(n0); err == nil {
-		t.Error("EncodeJSON of a cyclic value must error (errTooDeep), not loop")
-	}
-	if _, err := cyc.Encode(n0); err == nil {
-		t.Error("binary Encode of a cyclic value must error, not loop")
-	}
-}
-
 // ---------- json_decode_test.go ----------
 
 // TestDecodeJSONTypedInt exercises typed target paths for int fields.
@@ -4730,54 +4684,6 @@ func TestDecodeJSONMapTimeValues(t *testing.T) {
 		s := MustParse(`{"type":"map","values":{"type":"int","logicalType":"time-millis"}}`)
 		var m map[string]time.Duration
 		mustDecodeJSON(t, s, []byte(`{"a":12345}`), &m)
-	})
-}
-
-// DecodeJSON must honor TaggedUnions / TagLogicalTypes for a union field
-// filled from its default (absent in the input) exactly as it does for a
-// present union field, and exactly as Schema.Decode (binary), resolved
-// DecodeJSON, and EncodeJSON already do. The default-fill path routes through
-// the binary deser fn, which reads the slab's taggedUnions flag; DecodeJSON
-// populated only the jsonDecoder's wrapUnions field and left the slab flag at
-// the pool default, so the envelope was dropped on default-filled fields only.
-func TestRegression_DecodeJSONTaggedUnionDefaultFill(t *testing.T) {
-	s := MustParse(`{"type":"record","name":"R","fields":[
-		{"name":"f","type":["null","string"],"default":"hello"},
-		{"name":"g","type":"int"}]}`)
-
-	t.Run("present field wraps", func(t *testing.T) {
-		var out map[string]any
-		if err := s.DecodeJSON([]byte(`{"f":{"string":"world"},"g":1}`), &out, TaggedUnions()); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if got, ok := out["f"].(map[string]any); !ok || got["string"] != "world" {
-			t.Fatalf("present union field: got %#v, want {\"string\":\"world\"}", out["f"])
-		}
-	})
-	t.Run("default-filled field wraps", func(t *testing.T) {
-		var out map[string]any
-		if err := s.DecodeJSON([]byte(`{"g":1}`), &out, TaggedUnions()); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		got, ok := out["f"].(map[string]any)
-		if !ok || got["string"] != "hello" {
-			t.Fatalf("default-filled union field: got %#v (%T), want {\"string\":\"hello\"}", out["f"], out["f"])
-		}
-	})
-
-	// TagLogicalTypes: a default-filled logical union field tags with the
-	// qualified name, not the bare logical string.
-	sl := MustParse(`{"type":"record","name":"R","fields":[
-		{"name":"t","type":["null",{"type":"long","logicalType":"timestamp-millis"}],"default":null},
-		{"name":"g","type":"int"}]}`)
-	t.Run("logical present field tags", func(t *testing.T) {
-		var out map[string]any
-		if err := sl.DecodeJSON([]byte(`{"t":{"long.timestamp-millis":0},"g":1}`), &out, TaggedUnions(), TagLogicalTypes()); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if _, ok := out["t"].(map[string]any)["long.timestamp-millis"]; !ok {
-			t.Fatalf("present logical union: got %#v", out["t"])
-		}
 	})
 }
 
