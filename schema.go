@@ -776,7 +776,11 @@ type aobject struct {
 	Scale     *int   `json:"scale,omitempty"`     // decimal logical type
 	Precision *int   `json:"precision,omitempty"` // decimal logical type
 
-	extra map[string]any // non-reserved properties, populated by aschema.UnmarshalJSON
+	extra map[string]any // non-reserved properties, populated by aobjectFromMap
+
+	// present records which structural and naming keys the parse arms
+	// consumed from a body of the key's shape; see presenceSet.
+	present presenceSet
 }
 
 // laxInt is an int that also accepts JSON strings containing integers,
@@ -1218,6 +1222,33 @@ func leadingDotName(name string) (string, bool) {
 	return name, false
 }
 
+// resolveScope applies the namespace rule to one named-type definition and
+// returns the fullname it registers under and the namespace its children
+// resolve in. A dotted name carries its own namespace and ignores the
+// attribute; its single leading dot spells the null-namespace escape, so
+// ".x" is the fullname "x" and "." the empty name (Java's Name constructor
+// rule). An undotted name takes the attribute when written, the explicit ""
+// form included, else the enclosing namespace. The wire builder, the
+// metadata walker, and the cache splice all derive a definition's fullname
+// here, and scopedRefKeys below derives a reference's keys, so a definition
+// and the references to it cannot bind differently.
+func resolveScope(name, nsAttr string, hasNSAttr bool, enclosing string) (fullname, ns string) {
+	if strings.Contains(name, ".") {
+		if short, ok := leadingDotName(name); ok {
+			return short, ""
+		}
+		return name, namespaceOf(name)
+	}
+	ns = enclosing
+	if hasNSAttr {
+		ns = nsAttr
+	}
+	if ns == "" {
+		return name, ""
+	}
+	return ns + "." + name, ns
+}
+
 // scopedRefKeys writes the lookup keys for a name reference into dst in
 // binding-precedence order and returns the filled prefix. A dotted reference
 // is an exact fullname lookup. A bare reference tries the
@@ -1246,29 +1277,38 @@ func scopedRefKeys(dst *[2]string, ref, ns string) []string {
 	return dst[:1]
 }
 
-// resolveNamedRef looks up a named-type reference in scopedRefKeys precedence
-// order against parentName's namespace, returning ("", nil) when unresolved.
-// Both the build-time backward references and finalize's forward-reference
-// fixups use it, so a forward reference into a namespaced scope resolves the
-// same as the byte-identical backward-ordered schema.
-func (b *builder) resolveNamedRef(name, parentName string) (string, *namedType) {
+// lookupScoped resolves a name reference against table in scopedRefKeys
+// order and returns the key that hit. Every table keyed by fullname (the
+// builder's named types, the metadata name table) resolves through it.
+func lookupScoped[V any](table map[string]V, ref, ns string) (string, V, bool) {
 	var keys [2]string
-	for _, k := range scopedRefKeys(&keys, name, namespaceOf(parentName)) {
-		if nt := b.named[k]; nt != nil {
-			return k, nt
+	for _, k := range scopedRefKeys(&keys, ref, ns) {
+		if v, ok := table[k]; ok {
+			return k, v, true
 		}
 	}
-	return "", nil
+	var zero V
+	return "", zero, false
+}
+
+// resolveNamedRef looks up a named-type reference against parentName's
+// namespace, returning ("", nil) when unresolved. Both the build-time
+// backward references and finalize's forward-reference fixups use it, so a
+// forward reference into a namespaced scope resolves the same as the
+// byte-identical backward-ordered schema.
+func (b *builder) resolveNamedRef(name, parentName string) (string, *namedType) {
+	k, nt, _ := lookupScoped(b.named, name, namespaceOf(parentName))
+	return k, nt
 }
 
 // tryAssignNamedRef resolves a named-type reference, possibly with
-// namespace qualification against parentName. Returns true on hit (with
-// b.ser / b.deser / b.meta / b.node populated and, when setCanon is
-// true, b.canon set to the resolved name). Shared by buildPrimitive's
-// bare-string named-ref path and buildComplex's wrapped-form
-// {"type":"Name"} path so the rejectCachedRefIfCustomTypeWouldMatch
-// gate and the namespace-qualified retry agree.
-func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (bool, error) {
+// namespace qualification against parentName. Returns true on hit, with
+// b.ser / b.deser / b.meta / b.node populated and b.canon set to the
+// resolved name. Shared by buildPrimitive's bare-string named-ref path and
+// buildComplex's wrapped-form {"type":"Name"} path so the
+// rejectCachedRefIfCustomTypeWouldMatch gate and the namespace-qualified
+// retry agree.
+func (b *builder) tryAssignNamedRef(name, parentName string) (bool, error) {
 	resolved, nt := b.resolveNamedRef(name, parentName)
 	if nt == nil {
 		return false, nil
@@ -1291,9 +1331,7 @@ func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (boo
 		}
 		b.overlayInheritedCustom(nt.node, b.overlayDone)
 	}
-	if setCanon {
-		b.canon = aschema{primitive: resolved}
-	}
+	b.canon = aschema{primitive: resolved}
 	b.ser = nt.node.ser
 	b.deser = nt.node.deser
 	if nt.node.serRecord != nil {
@@ -1800,11 +1838,10 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 		}
 		return nil
 	}
-	// A named type reference (record, enum, fixed). We pass setCanon for
-	// both branches: only the namespace-qualified retry needs to rewrite
-	// the canon, and the bare path overwrites it with the identical name
-	// already set above.
-	if found, err := b.tryAssignNamedRef(s.primitive, parentName, true); err != nil || found {
+	// A named type reference (record, enum, fixed). The hit rewrites the
+	// canon to the resolved name, which only the namespace-qualified retry
+	// changes.
+	if found, err := b.tryAssignNamedRef(s.primitive, parentName); err != nil || found {
 		return err
 	}
 	return &unknownPrimitiveError{s.primitive}
@@ -2270,104 +2307,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	}
 
 	if ser, isPrimitive := serPrimitive[o.Type]; isPrimitive {
-		// "bytes" is the only primitive underlying validateLogical permits for
-		// decimal; fixed is built on the named-type path. The gate matters
-		// because the CustomType resurrection above can restore a dropped
-		// decimal onto any primitive with o.Precision still nil. A resurrected
-		// logical on another primitive takes the plain path, where the
-		// CustomType wraps the base ser/deser.
-		if o.Logical == "decimal" && o.Type == "bytes" {
-			scale := 0
-			if o.Scale != nil {
-				scale = *o.Scale
-			}
-			// Per-direction suppression, as on the timestamp/uuid path: the
-			// built-in encoder stays unless you provided an Encode, while any
-			// matching CustomType suppresses the built-in decoder. One gate
-			// for both would break encoding *big.Rat with a Decode-only
-			// CustomType.
-			if b.hasMatchingCustomTypeWithEncode(o.Type, o.Logical) {
-				b.ser = ser
-			} else {
-				b.ser = (&serBytesDecimal{precision: *o.Precision, scale: scale}).ser
-			}
-			if b.hasMatchingCustomType(o.Type, o.Logical) {
-				b.deser = deserPrimitive[o.Type]
-			} else {
-				b.deser = (&deserBytesDecimal{scale: scale}).deser
-			}
-			b.canon = aschema{primitive: o.Type}
-			b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
-			nd := &schemaNode{
-				kind:      o.Type,
-				logical:   o.Logical,
-				ser:       b.ser,
-				deser:     b.deser,
-				precision: *o.Precision,
-				scale:     scale,
-			}
-			b.node = nd
-			return nil
-		}
-		if o.Logical == "big-decimal" && o.Type == "bytes" {
-			if b.hasMatchingCustomTypeWithEncode(o.Type, o.Logical) {
-				b.ser = ser
-			} else {
-				b.ser = (&serBigDecimal{}).ser
-			}
-			if b.hasMatchingCustomType(o.Type, o.Logical) {
-				b.deser = deserPrimitive[o.Type]
-			} else {
-				b.deser = (&deserBigDecimal{}).deser
-			}
-			b.canon = aschema{primitive: o.Type}
-			b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
-			nd := &schemaNode{
-				kind:    o.Type,
-				logical: o.Logical,
-				ser:     b.ser,
-				deser:   b.deser,
-			}
-			b.node = nd
-			return nil
-		}
-		b.ser = ser
-		b.deser = deserPrimitive[o.Type]
-		// The logical serializer accepts a strict superset of the base one,
-		// but only where the logical is valid for this kind: the CustomType
-		// resurrection can restore a soft-dropped logical onto a kind it is
-		// not valid for, and logicalSer keys on the name alone, so without
-		// the gate binary would apply serUUID on bytes while the JSON path
-		// stays raw. The deser gate on a matching CustomType is independent:
-		// a CustomType naming a different AvroType resurrects the logical
-		// without matching for suppression.
-		if logSer := logicalSer(o.Logical); logSer != nil && logicalUnderlyingAcceptsObject(o) {
-			b.ser = logSer
-		}
-		if !b.hasMatchingCustomType(o.Type, o.Logical) && logicalUnderlyingAcceptsObject(o) {
-			if logDeser := logicalDeser(o.Logical); logDeser != nil {
-				b.deser = logDeser
-			}
-		}
-		b.canon = aschema{primitive: o.Type}
-		b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
-		nd := &schemaNode{
-			kind:    o.Type,
-			logical: o.Logical,
-			ser:     b.ser,
-			deser:   b.deser,
-		}
-		if o.Logical == "" && origLogical != "" {
-			nd.unknownLogical = origLogical
-		}
-		// o.Precision/o.Scale are not copied here: the node
-		// fields hold validated decimal parameters only (the bytes-decimal
-		// branch above and the fixed build's decimal arm). On this path the
-		// keys were never consumed (a soft-dropped/resurrected decimal on a
-		// wrong carrier, or a stray placement), so their values are
-		// unvalidated inert metadata, surfaced through extra as props instead.
-		b.node = nd
-		return nil
+		return b.buildPrimitiveObject(o, ser, origLogical)
 	}
 
 	// A named-type reference wrapped in an object, {"type":"Node"} with no
@@ -2378,7 +2318,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	if o.Name == "" &&
 		len(o.Fields) == 0 && len(o.Symbols) == 0 &&
 		o.Items == nil && o.Values == nil && o.Size == nil {
-		if found, err := b.tryAssignNamedRef(o.Type, parentName, true); err != nil || found {
+		if found, err := b.tryAssignNamedRef(o.Type, parentName); err != nil || found {
 			return err
 		}
 		// Not a recognized base/complex type and not a declared named
@@ -2395,14 +2335,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				return &unknownPrimitiveError{o.Type}
 			}
 		}
-	}
-
-	// Preserve original aliases and enum default before canonical stripping.
-	origAliases := s.object.Aliases
-	origEnumDefault := s.object.Default
-	origFieldAliases := make([][]string, len(s.object.Fields))
-	for i, f := range s.object.Fields {
-		origFieldAliases[i] = f.Aliases
 	}
 
 	// Canonical form keeps only type, name, fields, symbols, items, values,
@@ -2428,72 +2360,8 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	b.canon = aschema{object: canonObj}
 
 	if isNamedKind(o.Type) {
-		if err := b.validFullnameErr(o.Name); err != nil {
-			return fmt.Errorf("invalid %s name %q: %w", truncForError(o.Type), truncForError(o.Name), err)
-		}
-		// The namespace attribute is a dot-separated sequence of names and
-		// owes the same grammar as the name; without this
-		// {"name":"R","namespace":"bad ns"} would skip validation while the
-		// identical fullname {"name":"bad ns.R"} is rejected, and the
-		// canonical form would fail to re-parse. A dotted name ignores the
-		// attribute per the spec, and "" is the null-namespace escape.
-		if o.Namespace != nil && *o.Namespace != "" && !strings.Contains(o.Name, ".") {
-			if err := b.validFullnameErr(*o.Namespace); err != nil {
-				return fmt.Errorf("invalid %s namespace %q: %w", truncForError(o.Type), truncForError(*o.Namespace), err)
-			}
-		}
-		// We do not name-validate aliases: the spec says any string is
-		// accepted as an alias, so evolution can alias a valid name to a
-		// writer's illegal legacy name, and fastavro validates none. Java
-		// validates type aliases but not field aliases. qualifyAliases still
-		// applies namespace qualification and the leading-dot escape.
-		ns := ""
-		hasNS := false
-		if o.Namespace != nil {
-			ns = *o.Namespace
-			hasNS = true
-		}
-		if strings.Contains(o.Name, ".") {
-			// Fullname (dot-separated): ignore parent & our own namespace.
-			parentName = ""
-			hasNS = false
-			if short, ok := leadingDotName(o.Name); ok {
-				// ".x" is the null-namespace fullname "x" and "." collapses to
-				// the empty name, reachable only under a WithLaxNames fn that
-				// accepts "". Without this the name registered verbatim while
-				// child registration and reference resolution disagreed, so a
-				// bare sibling reference inside ".x" could not resolve.
-				o.Name = short
-			}
-		}
-		if hasNS && ns != "" {
-			o.Name = ns + "." + o.Name // have namespace: prefix our name
-		} else if hasNS && ns == "" {
-			// Explicit empty namespace: clear inherited namespace.
-		} else if parentName != "" {
-			if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
-				o.Name = parentName[:dot+1] + o.Name // no namespace: prefix our name with parent namespace if there is one
-			}
-		}
-		// Per the Avro spec (Names): a primitive type name has no
-		// namespace and may not name a record/enum/fixed. o.Name is now
-		// the resolved fullname; serPrimitive's keys are exactly the 8
-		// bare primitive names, so this matches only a null-namespace
-		// bare primitive name (a namespaced "a.int" has fullname "a.int",
-		// not a key). Matches Java's NamedSchema "may not be named after
-		// primitives".
-		if _, isPrim := serPrimitive[o.Name]; isPrim {
-			return fmt.Errorf("%s may not be named after the primitive type %q", truncForError(o.Type), truncForError(o.Name))
-		}
-		o.Namespace = nil      // canonical form omits namespace
-		canonObj.Name = o.Name // use fully-qualified name
-		canonObj.Namespace = nil
-		if _, exists := b.named[o.Name]; exists {
-			if !(b.cachedNames[o.Name] && b.allowReRegister) {
-				return fmt.Errorf("duplicate named type %q", truncForError(o.Name))
-			}
-			// Inherited name re-registered by a custom (re-)parse, allowed so
-			// it gets fresh CustomType wiring.
+		if err := b.bindDefinitionName(o, parentName, canonObj); err != nil {
+			return err
 		}
 	} else {
 		// A stray "namespace" on an unnamed kind is inert metadata that never
@@ -2516,522 +2384,705 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	}
 
 	switch o.Type {
-	default:
-		return fmt.Errorf("unknown complex type %q", truncForError(o.Type))
-
 	case "record", "error":
-		if len(o.Symbols) > 0 ||
-			o.Items != nil ||
-			o.Values != nil ||
-			o.Size != nil {
-			return errors.New("invalid record has schema for other types")
-		}
-		// The fields attribute is required (Java: "Record has no fields"),
-		// while an *empty* array is the legal empty record. Same
-		// missing-vs-empty discrimination as enum symbols: we materialize
-		// "fields":[] as a non-nil empty slice and leave the attribute's
-		// absence as nil.
-		if o.Fields == nil {
-			return errors.New("record is missing fields")
-		}
+		return b.buildRecord(o)
+	case "enum":
+		return b.buildEnum(o)
+	case "array":
+		return b.buildArray(parentName, o, canonObj)
+	case "map":
+		return b.buildMap(parentName, o, canonObj)
+	case "fixed":
+		return b.buildFixed(o)
+	}
+	return fmt.Errorf("unknown complex type %q", truncForError(o.Type))
+}
 
-		// We create the record ser/deser and register early so
-		// self-referencing fields (e.g. array items, map values)
-		// can resolve the type by name during field building.
-		sr := &serRecord{}
-		dr := &deserRecord{}
-		b.ser = sr.ser
-		b.deser = dr.deser
-		b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: dr}
-
+// buildPrimitiveObject builds a primitive written in object form,
+// {"type":"int",...}: the base ser/deser, or the logical-type pair where
+// the logical is valid for the kind and no CustomType suppresses it.
+func (b *builder) buildPrimitiveObject(o *aobject, ser serfn, origLogical string) error {
+	// "bytes" is the only primitive underlying validateLogical permits for
+	// decimal; fixed is built on the named-type path. The gate matters
+	// because the CustomType resurrection above can restore a dropped
+	// decimal onto any primitive with o.Precision still nil. A resurrected
+	// logical on another primitive takes the plain path, where the
+	// CustomType wraps the base ser/deser.
+	if o.Logical == "decimal" && o.Type == "bytes" {
+		scale := 0
+		if o.Scale != nil {
+			scale = *o.Scale
+		}
+		// Per-direction suppression, as on the timestamp/uuid path: the
+		// built-in encoder stays unless you provided an Encode, while any
+		// matching CustomType suppresses the built-in decoder. One gate
+		// for both would break encoding *big.Rat with a Decode-only
+		// CustomType.
+		if b.hasMatchingCustomTypeWithEncode(o.Type, o.Logical) {
+			b.ser = ser
+		} else {
+			b.ser = (&serBytesDecimal{precision: *o.Precision, scale: scale}).ser
+		}
+		if b.hasMatchingCustomType(o.Type, o.Logical) {
+			b.deser = deserPrimitive[o.Type]
+		} else {
+			b.deser = (&deserBytesDecimal{scale: scale}).deser
+		}
+		b.canon = aschema{primitive: o.Type}
+		b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
 		nd := &schemaNode{
-			kind:        "record",
-			name:        o.Name,
-			logical:     o.Logical,
-			aliases:     qualifyAliases(origAliases, o.Name),
-			bareAliases: bareAliasShorts(origAliases),
-			ser:         b.ser,
-			deser:       b.deser,
-			serRecord:   sr,
-			deserRecord: dr,
+			kind:      o.Type,
+			logical:   o.Logical,
+			ser:       b.ser,
+			deser:     b.deser,
+			precision: *o.Precision,
+			scale:     scale,
 		}
-		// The node and the parse's skip walk back dr.fieldSkips, which
-		// compiles lazily at decode time, after every field fixup has landed.
-		dr.node = nd
-		dr.mbw = b.skipWalk
-		b.registerNamed(o.Name, &namedType{node: nd})
 		b.node = nd
-
-		// We mark this record as under construction. A field default whose
-		// type subtree references this record must defer its default-encode
-		// to finalize: encodeDefault recurses into the referenced record's
-		// fields, and nd.fields holds only the fields declared so far. The set
-		// is shared through nest so a nested record sees it.
-		if b.building == nil {
-			b.building = make(map[*schemaNode]struct{})
+		return nil
+	}
+	if o.Logical == "big-decimal" && o.Type == "bytes" {
+		if b.hasMatchingCustomTypeWithEncode(o.Type, o.Logical) {
+			b.ser = ser
+		} else {
+			b.ser = (&serBigDecimal{}).ser
 		}
-		b.building[nd] = struct{}{}
-		defer delete(b.building, nd)
+		if b.hasMatchingCustomType(o.Type, o.Logical) {
+			b.deser = deserPrimitive[o.Type]
+		} else {
+			b.deser = (&deserBigDecimal{}).deser
+		}
+		b.canon = aschema{primitive: o.Type}
+		b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
+		nd := &schemaNode{
+			kind:    o.Type,
+			logical: o.Logical,
+			ser:     b.ser,
+			deser:   b.deser,
+		}
+		b.node = nd
+		return nil
+	}
+	b.ser = ser
+	b.deser = deserPrimitive[o.Type]
+	// The logical serializer accepts a strict superset of the base one,
+	// but only where the logical is valid for this kind: the CustomType
+	// resurrection can restore a soft-dropped logical onto a kind it is
+	// not valid for, and logicalSer keys on the name alone, so without
+	// the gate binary would apply serUUID on bytes while the JSON path
+	// stays raw. The deser gate on a matching CustomType is independent:
+	// a CustomType naming a different AvroType resurrects the logical
+	// without matching for suppression.
+	if logSer := logicalSers[o.Logical]; logSer != nil && logicalUnderlyingAcceptsObject(o) {
+		b.ser = logSer
+	}
+	if !b.hasMatchingCustomType(o.Type, o.Logical) && logicalUnderlyingAcceptsObject(o) {
+		if logDeser := logicalDesers[o.Logical]; logDeser != nil {
+			b.deser = logDeser
+		}
+	}
+	b.canon = aschema{primitive: o.Type}
+	b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
+	nd := &schemaNode{
+		kind:    o.Type,
+		logical: o.Logical,
+		ser:     b.ser,
+		deser:   b.deser,
+	}
+	if o.Logical == "" && origLogical != "" {
+		nd.unknownLogical = origLogical
+	}
+	// o.Precision/o.Scale are not copied here: the node
+	// fields hold validated decimal parameters only (the bytes-decimal
+	// branch above and the fixed build's decimal arm). On this path the
+	// keys were never consumed (a soft-dropped/resurrected decimal on a
+	// wrong carrier, or a stray placement), so their values are
+	// unvalidated inert metadata, surfaced through extra as props instead.
+	b.node = nd
+	return nil
+}
 
-		var names []string
-		seenFields := make(map[string]bool, len(o.Fields))
-		for i, of := range o.Fields {
-			if err := b.validNameErr(of.Name); err != nil {
-				return fmt.Errorf("invalid field name %q: %w", truncForError(of.Name), err)
-			}
-			// We do not name-validate field aliases: per the Avro spec any
-			// string is accepted as an alias, so a reader can alias a writer's
-			// illegal/legacy field name. We match them as-is against writer
-			// field names during resolution, like Java and fastavro.
-			if seenFields[of.Name] {
-				return fmt.Errorf("duplicate record field name %q", truncForError(of.Name))
-			}
-			seenFields[of.Name] = true
-			// Written-ness, not non-emptiness, admits the value: "order":"" is
-			// a written order and not one of the spec's three, so it fails
-			// like any other non-spec spelling. The comparison is exact-case:
-			// Apache Avro upper-cases before its lookup, but reserved
-			// attribute values match by exact spelling here.
-			if of.orderSet && of.Order != "ascending" && of.Order != "descending" && of.Order != "ignore" {
-				return fmt.Errorf("invalid field order %q for field %q", truncForError(of.Order), truncForError(of.Name))
-			}
-			bf := b.nest()
-			isFwdRef, fwdRefName, err := captureFwdRef(bf.build(o.Name, of.Type), "record field")
-			if err != nil {
-				return err
-			}
-			b.unnest(bf)
-			if isFwdRef {
-				bf.canon = aschema{primitive: fwdRefName}
-			}
-			o.Fields[i] = afield{
-				Name:       of.Name,
-				Type:       &bf.canon,
-				hasDefault: len(of.Default) > 0,
-			}
-			meta := new(fieldMeta)
-			*meta = bf.meta
-			fieldIdx := len(sr.fields)
-			sr.fields = append(sr.fields, serRecordField{
-				name:    of.Name,
-				nameVal: reflect.ValueOf(of.Name),
-				fn:      bf.ser,
-				meta:    meta,
-			})
-			drf := deserRecordField{
-				name:    of.Name,
-				nameVal: reflect.ValueOf(of.Name),
-				fn:      bf.deser,
-				fnIface: ifaceFnForPrimitive(meta),
-				meta:    meta,
-			}
-			fn := fieldNode{
-				name:    of.Name,
-				nameVal: reflect.ValueOf(of.Name),
-				aliases: origFieldAliases[i],
-				node:    bf.node,
-			}
-			if isFwdRef {
-				fix := recordFieldFixup{
-					nd:         nd,
-					idx:        fieldIdx,
-					name:       fwdRefName,
-					parentName: o.Name, // fields build under the record's fullname
-				}
-				if len(of.Default) > 0 {
-					fix.defaultVal = unmarshalDefault(of.Default)
-					fix.hasDefault = true
-				}
-				b.fieldFixups = append(b.fieldFixups, fix)
+// bindDefinitionName resolves a named definition's fullname against the
+// enclosing scope, validates the name and the namespace attribute, and
+// refuses a primitive name or a duplicate. The resolved fullname replaces
+// o.Name and canonObj.Name, and the namespace attribute is consumed.
+func (b *builder) bindDefinitionName(o *aobject, parentName string, canonObj *aobject) error {
+	if err := b.validFullnameErr(o.Name); err != nil {
+		return fmt.Errorf("invalid %s name %q: %w", truncForError(o.Type), truncForError(o.Name), err)
+	}
+	// The namespace attribute is a dot-separated sequence of names and
+	// owes the same grammar as the name; without this
+	// {"name":"R","namespace":"bad ns"} would skip validation while the
+	// identical fullname {"name":"bad ns.R"} is rejected, and the
+	// canonical form would fail to re-parse. A dotted name ignores the
+	// attribute per the spec, and "" is the null-namespace escape.
+	if o.Namespace != nil && *o.Namespace != "" && !strings.Contains(o.Name, ".") {
+		if err := b.validFullnameErr(*o.Namespace); err != nil {
+			return fmt.Errorf("invalid %s namespace %q: %w", truncForError(o.Type), truncForError(*o.Namespace), err)
+		}
+	}
+	// We do not name-validate aliases: the spec says any string is
+	// accepted as an alias, so evolution can alias a valid name to a
+	// writer's illegal legacy name, and fastavro validates none. Java
+	// validates type aliases but not field aliases. qualifyAliases still
+	// applies namespace qualification and the leading-dot escape.
+	ns, hasNS := "", false
+	if o.Namespace != nil {
+		ns, hasNS = *o.Namespace, true
+	}
+	// The children build under o.Name, so their enclosing namespace is
+	// namespaceOf(o.Name), the ns resolveScope returns.
+	o.Name, _ = resolveScope(o.Name, ns, hasNS, namespaceOf(parentName))
+	// Per the Avro spec (Names): a primitive type name has no
+	// namespace and may not name a record/enum/fixed. o.Name is now
+	// the resolved fullname; serPrimitive's keys are exactly the 8
+	// bare primitive names, so this matches only a null-namespace
+	// bare primitive name (a namespaced "a.int" has fullname "a.int",
+	// not a key). Matches Java's NamedSchema "may not be named after
+	// primitives".
+	if _, isPrim := serPrimitive[o.Name]; isPrim {
+		return fmt.Errorf("%s may not be named after the primitive type %q", truncForError(o.Type), truncForError(o.Name))
+	}
+	o.Namespace = nil      // canonical form omits namespace
+	canonObj.Name = o.Name // use fully-qualified name
+	canonObj.Namespace = nil
+	if _, exists := b.named[o.Name]; exists {
+		if !(b.cachedNames[o.Name] && b.allowReRegister) {
+			return fmt.Errorf("duplicate named type %q", truncForError(o.Name))
+		}
+		// Inherited name re-registered by a custom (re-)parse, allowed so
+		// it gets fresh CustomType wiring.
+	}
+	return nil
+}
+
+// buildChild builds a child schema in a nested builder, reporting a forward
+// reference by name rather than as an error, and hands the nested builder
+// back with its canon set to the as-written name on a forward reference.
+func (b *builder) buildChild(parentName string, s *aschema, ctxLabel string) (child *builder, isFwdRef bool, fwdName string, err error) {
+	child = b.nest()
+	isFwdRef, fwdName, err = captureFwdRef(child.build(parentName, s), ctxLabel)
+	if err != nil {
+		return nil, false, "", err
+	}
+	b.unnest(child)
+	if isFwdRef {
+		child.canon = aschema{primitive: fwdName}
+	}
+	return child, isFwdRef, fwdName, nil
+}
+
+// rejectOtherKindKeys errors when o carries a structural key of a kind
+// other than kind: a non-empty fields or symbols, or items, values, or
+// size. kind labels the message; "record" covers "error" too.
+func (o *aobject) rejectOtherKindKeys(kind string) error {
+	if len(o.Fields) > 0 && kind != "record" ||
+		len(o.Symbols) > 0 && kind != "enum" ||
+		o.Items != nil && kind != "array" ||
+		o.Values != nil && kind != "map" ||
+		o.Size != nil && kind != "fixed" {
+		return fmt.Errorf("invalid %s has schema for other types", kind)
+	}
+	return nil
+}
+
+func (b *builder) buildRecord(o *aobject) error {
+	// The field aliases ride on the node; the canonical fields built below
+	// strip them.
+	fieldAliases := make([][]string, len(o.Fields))
+	for i, f := range o.Fields {
+		fieldAliases[i] = f.Aliases
+	}
+	if err := o.rejectOtherKindKeys("record"); err != nil {
+		return err
+	}
+	// The fields attribute is required (Java: "Record has no fields"),
+	// while an *empty* array is the legal empty record. Same
+	// missing-vs-empty discrimination as enum symbols: we materialize
+	// "fields":[] as a non-nil empty slice and leave the attribute's
+	// absence as nil.
+	if o.Fields == nil {
+		return errors.New("record is missing fields")
+	}
+
+	// We create the record ser/deser and register early so
+	// self-referencing fields (e.g. array items, map values)
+	// can resolve the type by name during field building.
+	sr := &serRecord{}
+	dr := &deserRecord{}
+	b.ser = sr.ser
+	b.deser = dr.deser
+	b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: dr}
+
+	nd := &schemaNode{
+		kind:        "record",
+		name:        o.Name,
+		logical:     o.Logical,
+		aliases:     qualifyAliases(o.Aliases, o.Name),
+		bareAliases: bareAliasShorts(o.Aliases),
+		ser:         b.ser,
+		deser:       b.deser,
+		serRecord:   sr,
+		deserRecord: dr,
+	}
+	// The node and the parse's skip walk back dr.fieldSkips, which
+	// compiles lazily at decode time, after every field fixup has landed.
+	dr.node = nd
+	dr.mbw = b.skipWalk
+	b.registerNamed(o.Name, &namedType{node: nd})
+	b.node = nd
+
+	// We mark this record as under construction. A field default whose
+	// type subtree references this record must defer its default-encode
+	// to finalize: encodeDefault recurses into the referenced record's
+	// fields, and nd.fields holds only the fields declared so far. The set
+	// is shared through nest so a nested record sees it.
+	if b.building == nil {
+		b.building = make(map[*schemaNode]struct{})
+	}
+	b.building[nd] = struct{}{}
+	defer delete(b.building, nd)
+
+	var names []string
+	seenFields := make(map[string]bool, len(o.Fields))
+	for i, of := range o.Fields {
+		if err := b.validNameErr(of.Name); err != nil {
+			return fmt.Errorf("invalid field name %q: %w", truncForError(of.Name), err)
+		}
+		// We do not name-validate field aliases: per the Avro spec any
+		// string is accepted as an alias, so a reader can alias a writer's
+		// illegal/legacy field name. We match them as-is against writer
+		// field names during resolution, like Java and fastavro.
+		if seenFields[of.Name] {
+			return fmt.Errorf("duplicate record field name %q", truncForError(of.Name))
+		}
+		seenFields[of.Name] = true
+		// Written-ness, not non-emptiness, admits the value: "order":"" is
+		// a written order and not one of the spec's three, so it fails
+		// like any other non-spec spelling. The comparison is exact-case:
+		// Apache Avro upper-cases before its lookup, but reserved
+		// attribute values match by exact spelling here.
+		if of.orderSet && of.Order != "ascending" && of.Order != "descending" && of.Order != "ignore" {
+			return fmt.Errorf("invalid field order %q for field %q", truncForError(of.Order), truncForError(of.Name))
+		}
+		bf, isFwdRef, fwdRefName, err := b.buildChild(o.Name, of.Type, "record field")
+		if err != nil {
+			return err
+		}
+		o.Fields[i] = afield{
+			Name:       of.Name,
+			Type:       &bf.canon,
+			hasDefault: len(of.Default) > 0,
+		}
+		meta := new(fieldMeta)
+		*meta = bf.meta
+		fieldIdx := len(sr.fields)
+		sr.fields = append(sr.fields, serRecordField{
+			name:    of.Name,
+			nameVal: reflect.ValueOf(of.Name),
+			fn:      bf.ser,
+			meta:    meta,
+		})
+		drf := deserRecordField{
+			name:    of.Name,
+			nameVal: reflect.ValueOf(of.Name),
+			fn:      bf.deser,
+			fnIface: ifaceFnForPrimitive(meta),
+			meta:    meta,
+		}
+		fn := fieldNode{
+			name:    of.Name,
+			nameVal: reflect.ValueOf(of.Name),
+			aliases: fieldAliases[i],
+			node:    bf.node,
+		}
+		if isFwdRef {
+			fix := recordFieldFixup{
+				nd:         nd,
+				idx:        fieldIdx,
+				name:       fwdRefName,
+				parentName: o.Name, // fields build under the record's fullname
 			}
 			if len(of.Default) > 0 {
-				if isFwdRef {
-					// Forward-ref: signal hasDefault so the dispatch
-					// knows a default exists. finalize() runs the full
-					// pipeline against the resolved schemaNode and
-					// overwrites defaultVal there.
-					drf.hasDefault = true
-					fn.hasDefault = true
-				} else if b.nodeAwaitsForwardRef(bf.node) {
-					// The field's outer type resolved, but a descendant
-					// encodeDefault traverses is not whole; see
-					// nodeAwaitsForwardRef. Defer the resolve+encode to
-					// finalize, after the fixups wire the descendants and every
-					// in-construction record completes. Signal hasDefault so
-					// dispatch knows a default exists; the deferred pass fills
-					// defaultVal/defaultBytes.
-					drf.hasDefault = true
-					fn.hasDefault = true
-					b.defaultFixups = append(b.defaultFixups, defaultFixup{
-						nd:         nd,
-						idx:        fieldIdx,
-						node:       bf.node,
-						defaultVal: unmarshalDefault(of.Default),
-					})
-				} else {
-					defaultVal := unmarshalDefault(of.Default)
-					defaultVal = coerceDefault(defaultVal, bf.node)
-					if err := applyResolvedDefault(
-						defaultVal, bf.node, of.Name,
-						&drf, &fn, &sr.fields[fieldIdx],
-					); err != nil {
-						return err
-					}
-				}
-			} else if bf.canon.isNullableUnion() {
-				// Per the Avro spec, a union whose first branch is "null"
-				// implicitly defaults to null when no explicit default is given.
-				// fn.defaultVal stays nil: the JSON encoder treats a nil
-				// default as the null encoding.
+				fix.defaultVal = unmarshalDefault(of.Default)
+				fix.hasDefault = true
+			}
+			b.fieldFixups = append(b.fieldFixups, fix)
+		}
+		if len(of.Default) > 0 {
+			if isFwdRef {
+				// Forward-ref: signal hasDefault so the dispatch
+				// knows a default exists. finalize() runs the full
+				// pipeline against the resolved schemaNode and
+				// overwrites defaultVal there.
 				drf.hasDefault = true
 				fn.hasDefault = true
-				sr.fields[fieldIdx].defaultBytes = []byte{0} // varint 0 = null branch
-				sr.fields[fieldIdx].hasDefault = true
-			}
-			dr.fields = append(dr.fields, drf)
-			nd.fields = append(nd.fields, fn)
-			names = append(names, of.Name)
-		}
-		sr.names = names
-		dr.names = names
-		// DecodeJSON routes record keys through fieldIdx, so every alias maps
-		// beside the canonical name; the binary side does the same through
-		// readerFieldLookup. Aliases share one namespace with names within a
-		// record, per the spec, so a later name shadowing a prior alias or a
-		// later alias shadowing a prior name both reject. Checking only the
-		// alias side would let [{name:"a",aliases:["x"]},{name:"x"}] parse and
-		// route differently from Java's applyAliases.
-		nd.fieldIdx = make(map[string]int, len(nd.fields))
-		for i, f := range nd.fields {
-			if _, exists := nd.fieldIdx[f.name]; exists {
-				return fmt.Errorf("record field name %q collides with another field name or alias", truncForError(f.name))
-			}
-			nd.fieldIdx[f.name] = i
-			for _, a := range f.aliases {
-				if _, exists := nd.fieldIdx[a]; exists {
-					return fmt.Errorf("record field alias %q collides with another field name or alias", truncForError(a))
+			} else if b.nodeAwaitsForwardRef(bf.node) {
+				// The field's outer type resolved, but a descendant
+				// encodeDefault traverses is not whole; see
+				// nodeAwaitsForwardRef. Defer the resolve+encode to
+				// finalize, after the fixups wire the descendants and every
+				// in-construction record completes. Signal hasDefault so
+				// dispatch knows a default exists; the deferred pass fills
+				// defaultVal/defaultBytes.
+				drf.hasDefault = true
+				fn.hasDefault = true
+				b.defaultFixups = append(b.defaultFixups, defaultFixup{
+					nd:         nd,
+					idx:        fieldIdx,
+					node:       bf.node,
+					defaultVal: unmarshalDefault(of.Default),
+				})
+			} else {
+				defaultVal := unmarshalDefault(of.Default)
+				defaultVal = coerceDefault(defaultVal, bf.node)
+				if err := applyResolvedDefault(
+					defaultVal, bf.node, of.Name,
+					&drf, &fn, &sr.fields[fieldIdx],
+				); err != nil {
+					return err
 				}
-				nd.fieldIdx[a] = i
 			}
+		} else if bf.canon.isNullableUnion() {
+			// Per the Avro spec, a union whose first branch is "null"
+			// implicitly defaults to null when no explicit default is given.
+			// fn.defaultVal stays nil: the JSON encoder treats a nil
+			// default as the null encoding.
+			drf.hasDefault = true
+			fn.hasDefault = true
+			sr.fields[fieldIdx].defaultBytes = []byte{0} // varint 0 = null branch
+			sr.fields[fieldIdx].hasDefault = true
 		}
-	case "enum":
-		if len(o.Fields) > 0 ||
-			o.Items != nil ||
-			o.Values != nil ||
-			o.Size != nil {
-			return errors.New("invalid enum has schema for other types")
-		}
-
-		// The symbols attribute is required (Java: "Enum has no symbols"), but
-		// an *empty* array is legal: the spec asks only for "a JSON array,
-		// listing symbols", and Java, fastavro and avro-rs all accept zero.
-		// Such an enum has no valid values, so every encode/decode errors, but
-		// the schema parses, which matters for passing through foreign schemas
-		// carrying a degenerate enum the data never uses.
-		if o.Symbols == nil {
-			return errors.New("enum is missing symbols")
-		}
-		seenSymbols := make(map[string]bool, len(o.Symbols))
-		for _, e := range o.Symbols {
-			if err := b.validNameErr(e); err != nil {
-				return fmt.Errorf("invalid enum symbol %q: %w", truncForError(e), err)
-			}
-			if seenSymbols[e] {
-				return fmt.Errorf("duplicate enum symbol %q", truncForError(e))
-			}
-			seenSymbols[e] = true
-		}
-		symbolIdx := enumSymbolIndex(o.Symbols)
-		b.ser = newSerEnum(o.Symbols, symbolIdx).ser
-		b.deser = (&deserEnum{symbols: o.Symbols}).deser
-		b.meta = fieldMeta{avroType: "enum"}
-
-		nd := &schemaNode{
-			kind:        "enum",
-			name:        o.Name,
-			logical:     o.Logical,
-			aliases:     qualifyAliases(origAliases, o.Name),
-			bareAliases: bareAliasShorts(origAliases),
-			symbols:     o.Symbols,
-			symbolIdx:   symbolIdx,
-			ser:         b.ser,
-			deser:       b.deser,
-		}
-		if len(origEnumDefault) > 0 {
-			// The default must be a JSON string token naming a symbol, decided
-			// by token type before the membership check: on a non-string body
-			// json.Unmarshal leaves "", which can be a member under a
-			// WithLaxNames validator that accepts empty components. Neither
-			// fastavro nor Java binds a non-string enum default.
-			tok := bytes.TrimSpace(origEnumDefault)
-			var defStr string
-			if len(tok) == 0 || tok[0] != '"' || json.Unmarshal(tok, &defStr) != nil {
-				return fmt.Errorf("enum default %s is not a string", truncForError(string(tok)))
-			}
-			if !seenSymbols[defStr] {
-				return fmt.Errorf("enum default %q is not a member of symbols", truncForError(defStr))
-			}
-			nd.enumDef = defStr
-			nd.hasEnumDef = true
-		}
-		b.registerNamed(o.Name, &namedType{node: nd})
-		b.node = nd
-
-	case "array":
-		if len(o.Fields) > 0 ||
-			len(o.Symbols) > 0 ||
-			o.Values != nil ||
-			o.Size != nil {
-			return errors.New("invalid array has schema for other types")
-		}
-		if o.Items == nil {
-			return errors.New("array is missing items schema")
-		}
-		af := b.nest()
-		isFwdRef, fwdRefName, err := captureFwdRef(af.build(parentName, o.Items), "array")
-		if err != nil {
-			return err
-		}
-		b.unnest(af)
-		if isFwdRef {
-			af.canon = aschema{primitive: fwdRefName}
-		}
-		o.Items = &af.canon
-		// canonObj captured o.Items by value before this recursion ran, so we
-		// repoint it at the canonicalized child, as Java's SchemaNormalization
-		// does. Record fields stay correct via the o.Fields slice alias; only
-		// the Items/Values pointers need the sync.
-		canonObj.Items = &af.canon
-		sa := &serArray{serItem: af.ser}
-		// One computation feeding both wire-side slots. They are the same
-		// question asked by the safe and the unsafe array reader, and asking
-		// it separately is how they came to hold different answers. Only
-		// da's was patched by the forward-ref fixup below.
-		itemMin := b.minBytes.minBytesOf(af.node)
-		da := &deserArray{deserItem: af.deser, minItemBytes: itemMin}
-		// Specialized array ser/deser fast paths bypass the inner
-		// schema's wrapped ser/deser functions. They are correct only
-		// when no per-element conversion is needed: no custom type,
-		// no logical type, and no forward reference. The inner ser/
-		// deser aren't wired until finalize() resolves the fwd-ref,
-		// so the fast-path closure would capture nil fns at build
-		// time.
-		if isFwdRef || af.meta.hasCustomType || af.meta.logical != "" {
-			b.ser = sa.ser
-		} else if info, ok := primFast[af.canon.primitive]; ok {
-			b.ser = info.serArrayFn(sa)
-			da.fastLoop = info.deserArrayLoop
-			da.fastElemKind = info.elemKind
-			da.fastIfaceLoop = info.deserArrayIfaceLoop
-			da.nativeLoop = info.deserArrayNative
-		} else {
-			b.ser = sa.ser
-		}
-		b.deser = da.deser
-		inner := new(fieldMeta)
-		*inner = af.meta
-		inner.minBytes = itemMin
-		b.meta = fieldMeta{avroType: "array", inner: inner}
-		arrayNode := &schemaNode{
-			kind:  "array",
-			items: af.node,
-			ser:   b.ser,
-			deser: b.deser,
-		}
-		b.node = arrayNode
-		if isFwdRef {
-			// finalize() wires the fwd-ref's resolved node. We capture
-			// pointers to all four wire-side slots that depend on the
-			// resolved type so the fixup can patch them once
-			// b.named[fwdRefName] becomes available.
-			b.containerFixups = append(b.containerFixups, containerFixup{
-				serItem:   &sa.serItem,
-				deserItem: &da.deserItem,
-				// Both slots: da backs the safe array path, inner.minBytes
-				// the unsafe one. Patching one left the other holding the
-				// build-time answer, computed while this child was still an
-				// unwired forward reference.
-				setMinBytes: func(n int) { da.minItemBytes = n; inner.minBytes = n },
-				nodeChild:   &arrayNode.items,
-				name:        fwdRefName,
-				parentName:  parentName,
-				ctxLabel:    "array",
-			})
-		}
-
-	case "map":
-		if len(o.Fields) > 0 ||
-			len(o.Symbols) > 0 ||
-			o.Items != nil ||
-			o.Size != nil {
-			return errors.New("invalid map has schema for other types")
-		}
-		if o.Values == nil {
-			return errors.New("map is missing values schema")
-		}
-		mf := b.nest()
-		isFwdRef, fwdRefName, err := captureFwdRef(mf.build(parentName, o.Values), "map")
-		if err != nil {
-			return err
-		}
-		b.unnest(mf)
-		if isFwdRef {
-			mf.canon = aschema{primitive: fwdRefName}
-		}
-		o.Values = &mf.canon
-		// See the array case above: canonObj.Values still points at the
-		// as-parsed values schema, so we repoint it at the canonicalized
-		// child. Otherwise the canonical form (and fingerprint) diverges for
-		// any map-of-wrapped-or-attribute-bearing-value schema.
-		canonObj.Values = &mf.canon
-		sm := &serMap{serItem: mf.ser}
-		// minEntryBytes = 1 (empty-key length varint) + values' minimum
-		// wire bytes. Matches deserArray.minItemBytes in spirit; bounds
-		// block-count against remaining-buffer to prevent memory
-		// amplification on hostile input.
-		dm := &deserMap{deserItem: mf.deser, minEntryBytes: mapEntryMinBytes(b.minBytes.minBytesOf(mf.node))}
-		// Same gate as the array case above: we skip specialization when
-		// values have a custom type, a logical type, or a forward
-		// reference (the fast-path closure can't capture an unresolved
-		// inner ser/deser).
-		if isFwdRef || mf.meta.hasCustomType || mf.meta.logical != "" {
-			b.ser = sm.ser
-		} else if info, ok := primFast[mf.canon.primitive]; ok {
-			b.ser = info.serMapFn(sm)
-			dm.fastBlock = info.deserMapBlock
-			dm.fastElemKind = info.elemKind
-			dm.fastIfaceVal = info.deserMapIfaceVal
-			dm.nativeBlock = info.deserMapNative
-		} else {
-			b.ser = sm.ser
-		}
-		b.deser = dm.deser
-		b.meta = fieldMeta{avroType: "map"}
-		mapNode := &schemaNode{
-			kind:   "map",
-			values: mf.node,
-			ser:    b.ser,
-			deser:  b.deser,
-		}
-		b.node = mapNode
-		if isFwdRef {
-			b.containerFixups = append(b.containerFixups, containerFixup{
-				serItem:     &sm.serItem,
-				deserItem:   &dm.deserItem,
-				setMinBytes: func(n int) { dm.minEntryBytes = mapEntryMinBytes(n) },
-				nodeChild:   &mapNode.values,
-				name:        fwdRefName,
-				parentName:  parentName,
-				ctxLabel:    "map",
-			})
-		}
-
-	case "fixed":
-		if len(o.Fields) > 0 ||
-			len(o.Symbols) > 0 ||
-			o.Items != nil ||
-			o.Values != nil {
-			return errors.New("invalid fixed has schema for other types")
-		}
-		if o.Size == nil {
-			return errors.New("fixed is missing size")
-		}
-		size := int(*o.Size)
-		// Size 0 is legal, and the upper bound is unbounded at parse as in
-		// fastavro and avro-rs; a size beyond the datum fails at encode or
-		// decode. No parse-time path may allocate proportional to this size.
-		if size < 0 {
-			return fmt.Errorf("invalid fixed size %v", size)
-		}
-		// Per-direction suppression: the built-in encoder stays unless you
-		// provided an Encode, while any matching CustomType suppresses the
-		// built-in decoder. One gate for both would route a Decode-only
-		// CustomType onto raw serSize, which cannot accept *big.Rat.
-		hasEnc := b.hasMatchingCustomTypeWithEncode("fixed", s.object.Logical)
-		hasAny := b.hasMatchingCustomType("fixed", s.object.Logical)
-		switch s.object.Logical {
-		case "duration":
-			// serDuration always emits 12 bytes, and the CustomType
-			// resurrection can restore a duration validateLogical dropped
-			// for a wrong size, so a wrong-size fixed keeps the raw serSize,
-			// matching the suppressed decoder.
-			if hasEnc || !logicalUnderlyingAccept["duration"](o) {
-				b.ser = (&serSize{size}).ser
-			} else {
-				b.ser = serDuration
-			}
-			// deserDuration always reads 12 bytes, so it is only correct for a
-			// size-12 fixed. Mirror the ser gate: a wrong-size duration (which
-			// validateLogical soft-drops and a CustomType can resurrect) keeps
-			// the raw deserFixed{size}, matching the plain fixed and the kind/
-			// size-checked JSON decode. hasAny suppresses for a matching custom;
-			// !logicalUnderlyingAccept covers a resurrection whose custom AvroType
-			// names a different kind (so it does not match for suppression).
-			if hasAny || !logicalUnderlyingAccept["duration"](o) {
-				b.deser = (&deserFixed{size}).deser
-			} else {
-				b.deser = deserDuration
-			}
-		case "decimal":
-			scale := 0
-			if o.Scale != nil {
-				scale = *o.Scale
-			}
-			if hasEnc {
-				b.ser = (&serSize{size}).ser
-			} else {
-				b.ser = (&serFixedDecimal{size: size, precision: *o.Precision, scale: scale}).ser
-			}
-			if hasAny {
-				b.deser = (&deserFixed{size}).deser
-			} else {
-				b.deser = (&deserFixedDecimal{size: size, scale: scale}).deser
-			}
-		case "uuid":
-			// serFixedUUIDReflect always emits 16 bytes, so it is only correct for
-			// a size-16 fixed. validateLogical soft-drops a uuid on a wrong
-			// size, but the CustomType resurrection can restore it. Without
-			// the size gate serFixedUUIDReflect would write 16 bytes into a
-			// size != 16 fixed, a wire this schema's own deserFixed{size}
-			// reader (and the JSON arm) cannot read. logicalUnderlyingAccept
-			// is the same size predicate validateLogical uses to soft-drop.
-			if hasEnc || !logicalUnderlyingAccept["uuid"](o) {
-				b.ser = (&serSize{size}).ser
-			} else {
-				b.ser = serFixedUUIDReflect
-			}
-			// deserFixedUUIDReflect always reads 16 bytes; mirror the ser gate so a
-			// wrong-size resurrected uuid keeps the raw deserFixed{size} (see the
-			// duration case for the hasAny / !logicalUnderlyingAccept split).
-			if hasAny || !logicalUnderlyingAccept["uuid"](o) {
-				b.deser = (&deserFixed{size}).deser
-			} else {
-				b.deser = deserFixedUUIDReflect
-			}
-		default:
-			b.ser = (&serSize{size}).ser
-			b.deser = (&deserFixed{size}).deser
-		}
-		b.meta = fieldMeta{avroType: "fixed", logical: s.object.Logical}
-		nd := &schemaNode{
-			kind:        "fixed",
-			name:        o.Name,
-			aliases:     qualifyAliases(origAliases, o.Name),
-			bareAliases: bareAliasShorts(origAliases),
-			logical:     s.object.Logical,
-			size:        size,
-			ser:         b.ser,
-			deser:       b.deser,
-		}
-		if s.object.Logical == "decimal" && s.object.Precision != nil {
-			nd.precision = *s.object.Precision
-			if s.object.Scale != nil {
-				nd.scale = *s.object.Scale
-			}
-		}
-		b.node = nd
-		b.registerNamed(o.Name, &namedType{node: nd})
+		dr.fields = append(dr.fields, drf)
+		nd.fields = append(nd.fields, fn)
+		names = append(names, of.Name)
 	}
+	sr.names = names
+	dr.names = names
+	// DecodeJSON routes record keys through fieldIdx, so every alias maps
+	// beside the canonical name; the binary side does the same through
+	// readerFieldLookup. Aliases share one namespace with names within a
+	// record, per the spec, so a later name shadowing a prior alias or a
+	// later alias shadowing a prior name both reject. Checking only the
+	// alias side would let [{name:"a",aliases:["x"]},{name:"x"}] parse and
+	// route differently from Java's applyAliases.
+	nd.fieldIdx = make(map[string]int, len(nd.fields))
+	for i, f := range nd.fields {
+		if _, exists := nd.fieldIdx[f.name]; exists {
+			return fmt.Errorf("record field name %q collides with another field name or alias", truncForError(f.name))
+		}
+		nd.fieldIdx[f.name] = i
+		for _, a := range f.aliases {
+			if _, exists := nd.fieldIdx[a]; exists {
+				return fmt.Errorf("record field alias %q collides with another field name or alias", truncForError(a))
+			}
+			nd.fieldIdx[a] = i
+		}
+	}
+	return nil
+}
+
+func (b *builder) buildEnum(o *aobject) error {
+	if err := o.rejectOtherKindKeys("enum"); err != nil {
+		return err
+	}
+
+	// The symbols attribute is required (Java: "Enum has no symbols"), but
+	// an *empty* array is legal: the spec asks only for "a JSON array,
+	// listing symbols", and Java, fastavro and avro-rs all accept zero.
+	// Such an enum has no valid values, so every encode/decode errors, but
+	// the schema parses, which matters for passing through foreign schemas
+	// carrying a degenerate enum the data never uses.
+	if o.Symbols == nil {
+		return errors.New("enum is missing symbols")
+	}
+	seenSymbols := make(map[string]bool, len(o.Symbols))
+	for _, e := range o.Symbols {
+		if err := b.validNameErr(e); err != nil {
+			return fmt.Errorf("invalid enum symbol %q: %w", truncForError(e), err)
+		}
+		if seenSymbols[e] {
+			return fmt.Errorf("duplicate enum symbol %q", truncForError(e))
+		}
+		seenSymbols[e] = true
+	}
+	symbolIdx := enumSymbolIndex(o.Symbols)
+	b.ser = newSerEnum(o.Symbols, symbolIdx).ser
+	b.deser = (&deserEnum{symbols: o.Symbols}).deser
+	b.meta = fieldMeta{avroType: "enum"}
+
+	nd := &schemaNode{
+		kind:        "enum",
+		name:        o.Name,
+		logical:     o.Logical,
+		aliases:     qualifyAliases(o.Aliases, o.Name),
+		bareAliases: bareAliasShorts(o.Aliases),
+		symbols:     o.Symbols,
+		symbolIdx:   symbolIdx,
+		ser:         b.ser,
+		deser:       b.deser,
+	}
+	if len(o.Default) > 0 {
+		// The default must be a JSON string token naming a symbol, decided
+		// by token type before the membership check: on a non-string body
+		// json.Unmarshal leaves "", which can be a member under a
+		// WithLaxNames validator that accepts empty components. Neither
+		// fastavro nor Java binds a non-string enum default.
+		tok := bytes.TrimSpace(o.Default)
+		var defStr string
+		if len(tok) == 0 || tok[0] != '"' || json.Unmarshal(tok, &defStr) != nil {
+			return fmt.Errorf("enum default %s is not a string", truncForError(string(tok)))
+		}
+		if !seenSymbols[defStr] {
+			return fmt.Errorf("enum default %q is not a member of symbols", truncForError(defStr))
+		}
+		nd.enumDef = defStr
+		nd.hasEnumDef = true
+	}
+	b.registerNamed(o.Name, &namedType{node: nd})
+	b.node = nd
+	return nil
+}
+
+func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) error {
+	if err := o.rejectOtherKindKeys("array"); err != nil {
+		return err
+	}
+	if o.Items == nil {
+		return errors.New("array is missing items schema")
+	}
+	af, isFwdRef, fwdRefName, err := b.buildChild(parentName, o.Items, "array")
+	if err != nil {
+		return err
+	}
+	o.Items = &af.canon
+	// canonObj captured o.Items by value before this recursion ran, so we
+	// repoint it at the canonicalized child, as Java's SchemaNormalization
+	// does. Record fields stay correct via the o.Fields slice alias; only
+	// the Items/Values pointers need the sync.
+	canonObj.Items = &af.canon
+	sa := &serArray{serItem: af.ser}
+	// One computation feeding both wire-side slots. They are the same
+	// question asked by the safe and the unsafe array reader, and asking
+	// it separately is how they came to hold different answers. Only
+	// da's was patched by the forward-ref fixup below.
+	itemMin := b.minBytes.minBytesOf(af.node)
+	da := &deserArray{deserItem: af.deser, minItemBytes: itemMin}
+	// Specialized array ser/deser fast paths bypass the inner
+	// schema's wrapped ser/deser functions. They are correct only
+	// when no per-element conversion is needed: no custom type,
+	// no logical type, and no forward reference. The inner ser/
+	// deser aren't wired until finalize() resolves the fwd-ref,
+	// so the fast-path closure would capture nil fns at build
+	// time.
+	if isFwdRef || af.meta.hasCustomType || af.meta.logical != "" {
+		b.ser = sa.ser
+	} else if info, ok := primFast[af.canon.primitive]; ok {
+		b.ser = info.serArrayFn(sa)
+		da.fastLoop = info.deserArrayLoop
+		da.fastElemKind = info.elemKind
+		da.fastIfaceLoop = info.deserArrayIfaceLoop
+		da.nativeLoop = info.deserArrayNative
+	} else {
+		b.ser = sa.ser
+	}
+	b.deser = da.deser
+	inner := new(fieldMeta)
+	*inner = af.meta
+	inner.minBytes = itemMin
+	b.meta = fieldMeta{avroType: "array", inner: inner}
+	arrayNode := &schemaNode{
+		kind:  "array",
+		items: af.node,
+		ser:   b.ser,
+		deser: b.deser,
+	}
+	b.node = arrayNode
+	if isFwdRef {
+		// finalize() wires the fwd-ref's resolved node. We capture
+		// pointers to all four wire-side slots that depend on the
+		// resolved type so the fixup can patch them once
+		// b.named[fwdRefName] becomes available.
+		b.containerFixups = append(b.containerFixups, containerFixup{
+			serItem:   &sa.serItem,
+			deserItem: &da.deserItem,
+			// Both slots: da backs the safe array path, inner.minBytes
+			// the unsafe one. Patching one left the other holding the
+			// build-time answer, computed while this child was still an
+			// unwired forward reference.
+			setMinBytes: func(n int) { da.minItemBytes = n; inner.minBytes = n },
+			nodeChild:   &arrayNode.items,
+			name:        fwdRefName,
+			parentName:  parentName,
+			ctxLabel:    "array",
+		})
+	}
+	return nil
+}
+
+func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) error {
+	if err := o.rejectOtherKindKeys("map"); err != nil {
+		return err
+	}
+	if o.Values == nil {
+		return errors.New("map is missing values schema")
+	}
+	mf, isFwdRef, fwdRefName, err := b.buildChild(parentName, o.Values, "map")
+	if err != nil {
+		return err
+	}
+	o.Values = &mf.canon
+	// See the array case above: canonObj.Values still points at the
+	// as-parsed values schema, so we repoint it at the canonicalized
+	// child. Otherwise the canonical form (and fingerprint) diverges for
+	// any map-of-wrapped-or-attribute-bearing-value schema.
+	canonObj.Values = &mf.canon
+	sm := &serMap{serItem: mf.ser}
+	// minEntryBytes = 1 (empty-key length varint) + values' minimum
+	// wire bytes. Matches deserArray.minItemBytes in spirit; bounds
+	// block-count against remaining-buffer to prevent memory
+	// amplification on hostile input.
+	dm := &deserMap{deserItem: mf.deser, minEntryBytes: mapEntryMinBytes(b.minBytes.minBytesOf(mf.node))}
+	// Same gate as the array case above: we skip specialization when
+	// values have a custom type, a logical type, or a forward
+	// reference (the fast-path closure can't capture an unresolved
+	// inner ser/deser).
+	if isFwdRef || mf.meta.hasCustomType || mf.meta.logical != "" {
+		b.ser = sm.ser
+	} else if info, ok := primFast[mf.canon.primitive]; ok {
+		b.ser = info.serMapFn(sm)
+		dm.fastBlock = info.deserMapBlock
+		dm.fastElemKind = info.elemKind
+		dm.fastIfaceVal = info.deserMapIfaceVal
+		dm.nativeBlock = info.deserMapNative
+	} else {
+		b.ser = sm.ser
+	}
+	b.deser = dm.deser
+	b.meta = fieldMeta{avroType: "map"}
+	mapNode := &schemaNode{
+		kind:   "map",
+		values: mf.node,
+		ser:    b.ser,
+		deser:  b.deser,
+	}
+	b.node = mapNode
+	if isFwdRef {
+		b.containerFixups = append(b.containerFixups, containerFixup{
+			serItem:     &sm.serItem,
+			deserItem:   &dm.deserItem,
+			setMinBytes: func(n int) { dm.minEntryBytes = mapEntryMinBytes(n) },
+			nodeChild:   &mapNode.values,
+			name:        fwdRefName,
+			parentName:  parentName,
+			ctxLabel:    "map",
+		})
+	}
+	return nil
+}
+
+func (b *builder) buildFixed(o *aobject) error {
+	if err := o.rejectOtherKindKeys("fixed"); err != nil {
+		return err
+	}
+	if o.Size == nil {
+		return errors.New("fixed is missing size")
+	}
+	size := int(*o.Size)
+	// Size 0 is legal, and the upper bound is unbounded at parse as in
+	// fastavro and avro-rs; a size beyond the datum fails at encode or
+	// decode. No parse-time path may allocate proportional to this size.
+	if size < 0 {
+		return fmt.Errorf("invalid fixed size %v", size)
+	}
+	// Per-direction suppression: the built-in encoder stays unless you
+	// provided an Encode, while any matching CustomType suppresses the
+	// built-in decoder. One gate for both would route a Decode-only
+	// CustomType onto raw serSize, which cannot accept *big.Rat.
+	hasEnc := b.hasMatchingCustomTypeWithEncode("fixed", o.Logical)
+	hasAny := b.hasMatchingCustomType("fixed", o.Logical)
+	switch o.Logical {
+	case "duration":
+		// serDuration always emits 12 bytes, and the CustomType
+		// resurrection can restore a duration validateLogical dropped
+		// for a wrong size, so a wrong-size fixed keeps the raw serSize,
+		// matching the suppressed decoder.
+		if hasEnc || !logicalUnderlyingAccept["duration"](o) {
+			b.ser = (&serSize{size}).ser
+		} else {
+			b.ser = serDuration
+		}
+		// deserDuration always reads 12 bytes, so it is only correct for a
+		// size-12 fixed. Mirror the ser gate: a wrong-size duration (which
+		// validateLogical soft-drops and a CustomType can resurrect) keeps
+		// the raw deserFixed{size}, matching the plain fixed and the kind/
+		// size-checked JSON decode. hasAny suppresses for a matching custom;
+		// !logicalUnderlyingAccept covers a resurrection whose custom AvroType
+		// names a different kind (so it does not match for suppression).
+		if hasAny || !logicalUnderlyingAccept["duration"](o) {
+			b.deser = (&deserFixed{size}).deser
+		} else {
+			b.deser = deserDuration
+		}
+	case "decimal":
+		scale := 0
+		if o.Scale != nil {
+			scale = *o.Scale
+		}
+		if hasEnc {
+			b.ser = (&serSize{size}).ser
+		} else {
+			b.ser = (&serFixedDecimal{size: size, precision: *o.Precision, scale: scale}).ser
+		}
+		if hasAny {
+			b.deser = (&deserFixed{size}).deser
+		} else {
+			b.deser = (&deserFixedDecimal{size: size, scale: scale}).deser
+		}
+	case "uuid":
+		// serFixedUUIDReflect always emits 16 bytes, so it is only correct for
+		// a size-16 fixed. validateLogical soft-drops a uuid on a wrong
+		// size, but the CustomType resurrection can restore it. Without
+		// the size gate serFixedUUIDReflect would write 16 bytes into a
+		// size != 16 fixed, a wire this schema's own deserFixed{size}
+		// reader (and the JSON arm) cannot read. logicalUnderlyingAccept
+		// is the same size predicate validateLogical uses to soft-drop.
+		if hasEnc || !logicalUnderlyingAccept["uuid"](o) {
+			b.ser = (&serSize{size}).ser
+		} else {
+			b.ser = serFixedUUIDReflect
+		}
+		// deserFixedUUIDReflect always reads 16 bytes; mirror the ser gate so a
+		// wrong-size resurrected uuid keeps the raw deserFixed{size} (see the
+		// duration case for the hasAny / !logicalUnderlyingAccept split).
+		if hasAny || !logicalUnderlyingAccept["uuid"](o) {
+			b.deser = (&deserFixed{size}).deser
+		} else {
+			b.deser = deserFixedUUIDReflect
+		}
+	default:
+		b.ser = (&serSize{size}).ser
+		b.deser = (&deserFixed{size}).deser
+	}
+	b.meta = fieldMeta{avroType: "fixed", logical: o.Logical}
+	nd := &schemaNode{
+		kind:        "fixed",
+		name:        o.Name,
+		aliases:     qualifyAliases(o.Aliases, o.Name),
+		bareAliases: bareAliasShorts(o.Aliases),
+		logical:     o.Logical,
+		size:        size,
+		ser:         b.ser,
+		deser:       b.deser,
+	}
+	if o.Logical == "decimal" && o.Precision != nil {
+		nd.precision = *o.Precision
+		if o.Scale != nil {
+			nd.scale = *o.Scale
+		}
+	}
+	b.node = nd
+	b.registerNamed(o.Name, &namedType{node: nd})
 	return nil
 }
 
@@ -3232,9 +3283,6 @@ var (
 	}
 )
 
-func logicalSer(logical string) serfn     { return logicalSers[logical] }
-func logicalDeser(logical string) deserfn { return logicalDesers[logical] }
-
 // unmarshalDefault parses a field's raw JSON default. Numeric literals stay
 // json.Number rather than rounding through float64, which is what the shared
 // decoder returns for every number anyway: long defaults above 2^53 would
@@ -3361,22 +3409,39 @@ func unmarshalAnyPreservePrecision(raw string) (any, error) {
 	return normalizeJSONValue(v), nil
 }
 
-func normalizeJSONValue(v any) any {
-	switch tv := v.(type) {
-	case json.Number:
-		return normalizeJSONNumber(tv)
+// mapTree returns a copy of a decoded JSON tree with leaf applied to every
+// non-container value; every map and slice in the result is fresh.
+func mapTree(node any, leaf func(any) any) any {
+	switch v := node.(type) {
 	case map[string]any:
-		for k, val := range tv {
-			tv[k] = normalizeJSONValue(val)
+		m := make(map[string]any, len(v))
+		for k, val := range v {
+			m[k] = mapTree(val, leaf)
 		}
-		return tv
+		return m
 	case []any:
-		for i, val := range tv {
-			tv[i] = normalizeJSONValue(val)
+		s := make([]any, len(v))
+		for i, e := range v {
+			s[i] = mapTree(e, leaf)
 		}
-		return tv
+		return s
 	}
-	return v
+	return leaf(node)
+}
+
+// normalizeJSONValue copies v with every json.Number resolved by
+// normalizeJSONNumber.
+func normalizeJSONValue(v any) any {
+	return mapTree(v, func(leaf any) any {
+		if n, ok := leaf.(json.Number); ok {
+			return normalizeJSONNumber(n)
+		}
+		return leaf
+	})
+}
+
+func deepCopyTree(node any) any {
+	return mapTree(node, func(leaf any) any { return leaf })
 }
 
 // normalizeJSONNumber resolves a json.Number to the idiomatic Go type by

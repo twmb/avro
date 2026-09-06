@@ -168,11 +168,11 @@ var censusRegistry = []censusQuestion{
 	{
 		id:        "Q2",
 		question:  "What fullname does this named-type DEFINITION occupy?",
-		authority: "the wire builder's registration (schema.go, `o.Name = ns + \".\" + o.Name` feeding registerNamed) — every other representation must land on the same string, because the fullname is what a reference binds to",
+		authority: "the wire builder's registration (schema.go, resolveScope feeding registerNamed) — every other representation must land on the same string, because the fullname is what a reference binds to. resolveScope is the one rule; the three representations differ only in where they read the name and the attribute from",
 		answerers: []censusAnswerer{
-			{repr: "as-written aschema → compiled schemaNode", site: "builder namespace qualification → schemaNode.name", file: "schema.go"},
-			{repr: "metadata SchemaNode", site: "nodeFullname", file: "schema_node.go"},
-			{repr: "cache raw JSON tree", site: "nodeFullnameTree", file: "cache.go"},
+			{repr: "as-written aschema → compiled schemaNode", site: "builder namespace qualification → resolveScope → schemaNode.name", file: "schema.go"},
+			{repr: "metadata SchemaNode", site: "nodeFullname → resolveScope", file: "schema_node.go"},
+			{repr: "cache raw JSON tree", site: "nodeFullnameTree → treeScope → resolveScope", file: "cache.go"},
 			{
 				repr: "pre-Parse any tree", site: "SchemaFor's namespace joins", file: "schema_for.go",
 				note: "not driven by the census: SchemaFor COMPOSES a tree rather than reading one, so it has no definition in hand to ask about. Its output is checked instead by handing the emitted schema to Parse — the authority above — in the SchemaFor round-trip suites.",
@@ -180,10 +180,8 @@ var censusRegistry = []censusQuestion{
 		},
 		tells: []censusTell{
 			{pattern: `+ "." +`, files: []string{
-				"cache.go",       // nodeFullnameTree
-				"schema_node.go", // nodeFullname
-				"schema_for.go",  // SchemaFor composition
-				"schema.go",      // builder qualification (2727); logical key (2165), not this question
+				"schema_for.go", // SchemaFor composition
+				"schema.go",     // resolveScope, the one definition-side join; the logical key join is not this question
 				// Not answerers: an error field-path join, not a schema name.
 				"compat.go",
 				"errors.go",
@@ -467,24 +465,19 @@ var censusRegistry = []censusQuestion{
 			"CONTAINS, the runtime field mapper decides what an encode/decode BINDS, and a field excluded by " +
 			"one must be excluded by the other",
 		answerers: []censusAnswerer{
-			{repr: "SchemaFor, named-field path", site: `tag == "-"`, file: "schema_for.go"},
-			{repr: "SchemaFor, anonymous-embed path", site: `tag == "-"`, file: "schema_for.go"},
-			{repr: "runtime mapper, both paths", site: `tag == "-"`, file: "reflect.go"},
+			{repr: "the one struct walk SchemaFor and the runtime mapper share", site: `tag == "-"`, file: "reflect.go"},
 			{
 				repr: "grammar guard (SchemaFor only)", site: "checkSkipDirectiveExact", file: "schema_for.go",
-				note: "different-by-design and SINGLE-answerer by intent: rejecting a tag that begins with the directive without being it is a typo SchemaFor can name while generating. The runtime mapper has never enforced tag grammar — it takes any tag as a field name, which is what it does with every other malformed tag — so extending the guard there would be a behavior change to a documented boundary, not a consistency fix. Both directions are asserted so neither side can drift into the other.",
+				note: "different-by-design and SINGLE-answerer by intent: rejecting a tag that begins with the directive without being it is a typo SchemaFor can name while generating. The runtime mapper has never enforced tag grammar — it takes any tag as a field name, which is what it does with every other malformed tag — so the shared walk asks the guard on every field and returns its verdict only on the strict (SchemaFor) walk. Both directions are asserted so neither side can drift into the other.",
 			},
 		},
 		tells: []censusTell{
 			{pattern: `tag == "-"`, files: []string{
-				// The two paths, plus one occurrence inside the guard's own
-				// doc comment describing where it is called from.
-				"schema_for.go",
-				"reflect.go", // the runtime mapper's two paths
+				"reflect.go", // the shared walk's exact-match skip
 			}},
 			{pattern: `checkSkipDirectiveExact`, files: []string{
-				// Definition, both call sites, and two doc references.
-				"schema_for.go",
+				"schema_for.go", // the definition
+				"reflect.go",    // the shared walk's one call
 			}},
 			// Rejected tell: `HasPrefix(tag` also matches the "default="
 			// option scan, a different question entirely, and it misses the
@@ -534,7 +527,7 @@ var censusRegistry = []censusQuestion{
 				repr: "the shared binding question", site: "schemaKeyBinds", file: "schema_node.go",
 				note: "not a fourth answerer but the ONE binding predicate the routing asks, which is what keeps the routing from enumerating the consumed keys as a hand-written list. An enumeration is a subset and a subset can be missing a member: the type-level \"default\" and \"order\" fell through such a list and were dropped, reaching neither a structural field nor Props.",
 			},
-			{repr: "cache splice merge", site: "schemaReservedKeyForObject (nil shape verdict)", file: "cache.go"},
+			{repr: "cache splice merge", site: "schemaReservedKeyForObject (strayPresence verdict)", file: "cache.go"},
 			{
 				repr: "tree walker", site: "strayBodyShapeOK gating stray enumeration", file: "schema_walk.go",
 				note: "different-by-design and PINNED as an asymmetry (#63(e)): the binding-kind gate is walkNodeChildren's default, and only the METADATA walker opts into stray enumeration. Collect and inline keep the bound-only view deliberately, so this site answers a deliberately narrower question than the others.",
@@ -926,17 +919,9 @@ var censusRegistry = []censusQuestion{
 			"the untagged cells are decided by Go and the tagged tier by the documented tiebreaker.",
 		answerers: []censusAnswerer{
 			{
-				repr: "Go struct type, for the inferred schema", site: "resolvePromotedFields", file: "schema_for.go",
-				placement: placementWholeSet, walk: "collectFieldsRaw",
-			},
-			{
-				repr: "Go struct type, for the shared encode/decode field map", site: "typeFieldMapping", file: "reflect.go",
-				placement: placementWholeSet, walk: "collect",
-				note: "different-by-design as a FUNCTION — it produces index paths for a schema's field names, not " +
-					"schemaFields — but it must agree cell for cell, because a schema SchemaFor built has to be one " +
-					"Encode and Decode can use. What the two share is the rule and its placement, and the placement " +
-					"is the half no verdict comparison can see: this site keeps its resolution outside its own " +
-					"recursive closure, and the other keeps it outside collectFieldsRaw.",
+				repr: "Go struct type, for the inferred schema and for the encode/decode field map alike", site: "resolvePromotedFields", file: "reflect.go",
+				placement: placementWholeSet, walk: "walkPromotedFields",
+				note: "one answerer by construction: SchemaFor's collectFields and typeFieldMapping both walk with walkPromotedFields and resolve with resolvePromotedFields, so a schema SchemaFor built is one Encode and Decode can use cell for cell. The placement is the half no verdict comparison can see: the resolution runs once over the root's complete set, outside the recursion.",
 			},
 		},
 		tells: []censusTell{
@@ -944,11 +929,9 @@ var censusRegistry = []censusQuestion{
 			// it only denotes a field when the type it is resolved against is
 			// the root. Every occurrence of that resolution is an answerer.
 			{pattern: `t.FieldByIndex(existing.index).Name`, files: []string{
-				"schema_for.go",
 				"reflect.go",
 			}},
 			{pattern: `duplicate field name`, files: []string{
-				"schema_for.go",
 				"reflect.go",
 			}},
 		},

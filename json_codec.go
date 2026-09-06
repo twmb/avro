@@ -366,18 +366,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 
 	switch node.kind {
 	case "null":
-		// A non-nil value into a "null" schema gets errNonNil, as binary
-		// serNull returns for the same shapes.
-		switch v.Kind() {
-		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
-			if !v.IsNil() {
-				return nil, errNonNil
-			}
-		default:
-			return nil, errNonNil
-		}
-		return append(buf, "null"...), nil
-
+		return appendAvroJSONNull(buf, v)
 	case "boolean":
 		if v.Kind() == reflect.Bool {
 			return strconv.AppendBool(buf, v.Bool()), nil
@@ -385,80 +374,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return nil, semErr(v, "boolean")
 
 	case "int":
-		if v.Type() == timeType {
-			t := v.Interface().(time.Time)
-			switch node.logical {
-			case "date":
-				d, err := timeToDate(t)
-				if err != nil {
-					// Same identity as serDate: a range failure of your
-					// value carries *SemanticError on both wires.
-					return nil, &SemanticError{GoType: timeType, AvroType: "date", Err: err}
-				}
-				return strconv.AppendInt(buf, int64(d), 10), nil
-			case "time-millis":
-				// Time-of-day ms (< 86.4M) never overflows int32.
-				return strconv.AppendInt(buf, timeOfDay(t).Milliseconds(), 10), nil
-			}
-		}
-		if v.Type() == durationType {
-			d := v.Interface().(time.Duration)
-			switch node.logical {
-			case "time-millis":
-				ms, err := durationToTimeMillis(d)
-				if err != nil {
-					// Same identity as serTimeMillis' duration arm.
-					return nil, &SemanticError{GoType: durationType, AvroType: "time-millis", Err: err}
-				}
-				return strconv.AppendInt(buf, int64(ms), 10), nil
-			}
-		}
-		if node.logical == "date" {
-			if t, ok := tryParseDateString(v); ok {
-				d, err := timeToDate(t)
-				if err != nil {
-					// Same identity as serDate's date-string arm. The
-					// 4-digit-year formats tryParseDateString accepts
-					// cannot express a date outside timeToDate's range,
-					// so this arm is not reachable today; it mirrors the
-					// binary twin so the two cannot drift.
-					return nil, semErrW(v, "date", err)
-				}
-				return strconv.AppendInt(buf, int64(d), 10), nil
-			}
-		}
-		n, err := jsonCoerceToInt32(v)
-		if err != nil {
-			return nil, err
-		}
-		return strconv.AppendInt(buf, int64(n), 10), nil
-
+		return appendAvroJSONInt(buf, v, node)
 	case "long":
-		if conv := timeLogicalToInt64(node.logical); conv != nil {
-			if t, ok := extractTime(v); ok {
-				n, err := conv(t)
-				if err != nil {
-					// Same identity as serTimeAsLong: a timestamp range
-					// failure carries *SemanticError on both wires.
-					return nil, semErrW(v, "long", err)
-				}
-				return strconv.AppendInt(buf, n, 10), nil
-			}
-		}
-		if node.logical == "time-micros" {
-			if v.Type() == timeType {
-				return strconv.AppendInt(buf, timeOfDay(v.Interface().(time.Time)).Microseconds(), 10), nil
-			}
-			if v.Type() == durationType {
-				return strconv.AppendInt(buf, v.Interface().(time.Duration).Microseconds(), 10), nil
-			}
-		}
-		n, err := jsonCoerceToInt64(v)
-		if err != nil {
-			return nil, err
-		}
-		return strconv.AppendInt(buf, n, 10), nil
-
+		return appendAvroJSONLong(buf, v, node)
 	case "float":
 		f, err := jsonCoerceToFloat64(v, "float")
 		if err != nil {
@@ -474,347 +392,17 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return appendJSONFloat(buf, f, 64, cfg), nil
 
 	case "string":
-		// UUID logical type: [16]byte input canonicalizes to the RFC 4122
-		// hex-dash string, matching serUUID on the binary side.
-		if node.logical == "uuid" {
-			if u, ok := uuidBytes(v); ok {
-				return appendJSONString(buf, uuidToString(u)), nil
-			}
-		}
-		// Resolution order is shared with the binary encoder via
-		// avroStringValue: json.Number rejected, reflect.String,
-		// TextAppender, TextMarshaler, []byte slice. Both encoders
-		// must agree on precedence.
-		s, err := avroStringValue(v)
-		if err != nil {
-			return nil, err
-		}
-		return appendJSONString(buf, s), nil
-
+		return appendAvroJSONStringValue(buf, v, node)
 	case "bytes":
-		// Decimal emits the spec form: the two's-complement big-endian
-		// unscaled integer as an Avro JSON byte string, as Java and fastavro
-		// do. No decimalRatFor match falls through to the generic targets
-		// below. We skip the decimal arm exactly when the binary build
-		// replaced the logical serializer with the base one, which is when a
-		// non-wildcard matching CustomType has an Encode (encodeSuppresses);
-		// the runtime proxy custom[node].encode != nil would wrongly skip it
-		// for a wildcard with Encode.
-		noCustomEnc := custom[node] == nil || !custom[node].encodeSuppresses
-		switch node.logical {
-		case "decimal":
-			if noCustomEnc {
-				r, ok, err := decimalRatFor(v)
-				if err != nil {
-					return nil, semErrW(v, "bytes", err)
-				}
-				if ok {
-					b, err := decimalUnscaledBytes(r, node.scale, node.precision, "bytes", v.Type())
-					if err != nil {
-						return nil, err
-					}
-					return appendAvroJSONBytes(buf, b), nil
-				}
-				// A non-numeric string carrier is not a valid decimal, so we
-				// reject it (numeric-text-only, symmetric with decode and with
-				// the binary serBytesDecimal path) rather than fall through to
-				// the opaque raw-bytes string arm below. []byte keeps the opaque
-				// fall-through; big-decimal (next case) stays opaque-symmetric.
-				if err := rejectNonNumericStructuredString(v, "bytes", "decimal"); err != nil {
-					return nil, err
-				}
-				if err := chargeOpaqueDecimalBytes(v, "bytes", "decimal"); err != nil {
-					return nil, err
-				}
-			}
-		case "big-decimal":
-			if noCustomEnc {
-				r, ok, err := decimalRatFor(v)
-				if err != nil {
-					return nil, semErrW(v, "bytes", err)
-				}
-				if ok {
-					inner, err := buildBigDecimalPayload(r)
-					if err != nil {
-						return nil, semErrW(v, "bytes", err)
-					}
-					return appendAvroJSONBytes(buf, inner), nil
-				}
-				// A non-numeric string carrier is not a valid big-decimal, so we
-				// reject it (numeric-text-only, symmetric with decode and the
-				// binary serBigDecimal path) rather than fall through to the
-				// opaque raw string arm below. A crafted string whose bytes form
-				// valid framing would otherwise decode to a different value.
-				// []byte keeps the opaque fall-through.
-				if err := rejectNonNumericStructuredString(v, "bytes", "big-decimal"); err != nil {
-					return nil, err
-				}
-				if err := chargeOpaqueDecimalBytes(v, "bytes", "big-decimal"); err != nil {
-					return nil, err
-				}
-			}
-		}
-		if v.Kind() == reflect.String {
-			if err := rejectJSONNumberRawTarget(v, "bytes"); err != nil {
-				return nil, err
-			}
-			// A Go string is raw UTF-8 bytes, as in serBytes. Defaults never
-			// reach this arm, since convertDefaultBytes already turned them
-			// into []byte. appendAvroJSONBytes iterates without retaining, so
-			// we alias the string data.
-			s := v.String()
-			return appendAvroJSONBytes(buf, unsafe.Slice(unsafe.StringData(s), len(s))), nil
-		}
-		if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-			return appendAvroJSONBytes(buf, v.Bytes()), nil
-		}
-		if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
-			// reflect.Value.Bytes() panics on Array kinds, so we materialize
-			// the bytes via byteArrayToSlice (element-agnostic so a named byte
-			// element [N]B does not panic). This mirrors the "fixed" arm below
-			// and serBytes (ser.go:460), which takes Array alongside Slice.
-			return appendAvroJSONBytes(buf, byteArrayToSlice(v)), nil
-		}
-		return nil, semErr(v, "bytes")
-
+		return appendAvroJSONBytesValue(buf, v, node, custom)
 	case "fixed":
-		// Decimal: the spec form padded and sign-extended to the schema size.
-		// UUID: a hex-dash string parses to 16 bytes, checked before the
-		// generic extraction so a 36-char string is not rejected as size
-		// != 16. We skip every logical arm exactly when the binary fixed
-		// build replaced the logical serializer with serSize, which is when
-		// a non-wildcard matching CustomType has an Encode (encodeSuppresses).
-		if custom[node] == nil || !custom[node].encodeSuppresses {
-			switch node.logical {
-			case "decimal":
-				r, ok, err := decimalRatFor(v)
-				if err != nil {
-					return nil, semErrW(v, "fixed", err)
-				}
-				if ok {
-					b, err := decimalUnscaledBytes(r, node.scale, node.precision, "fixed", v.Type())
-					if err != nil {
-						return nil, err
-					}
-					padded, err := appendDecimalFixed(nil, b, node.size, v.Type())
-					if err != nil {
-						return nil, err
-					}
-					return appendAvroJSONBytes(buf, padded), nil
-				}
-				// A non-numeric string carrier is not a valid decimal, so we
-				// reject it (numeric-text-only, symmetric with decode and with
-				// the binary serFixedDecimal path) rather than fall through to
-				// the size-checked opaque raw arm below. []byte keeps the opaque
-				// fall-through.
-				if err := rejectNonNumericStructuredString(v, "fixed", "decimal"); err != nil {
-					return nil, err
-				}
-				// The opaque arm below writes exactly node.size bytes, which is
-				// what the decoder charges, the same condition
-				// appendDecimalFixed applies to the numeric arm above.
-				if err := checkDecimalUnscaledSize(node.size); err != nil {
-					return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: err}
-				}
-			case "duration":
-				// Duration.Bytes() always emits 12 bytes, so it is only correct
-				// for the spec-required size-12 fixed. A CustomType-resurrected
-				// wrong-size duration (mirroring the binary fixed build) falls
-				// through to the size-checked raw path below, so JSON encode stays
-				// raw and self-readable.
-				if node.size == 12 && v.Type() == avroDurationType {
-					raw := v.Interface().(Duration).Bytes()
-					return appendAvroJSONBytes(buf, raw[:]), nil
-				}
-			case "uuid":
-				// Only emit the 16-byte UUID form for the spec-required size-16
-				// fixed; a CustomType-resurrected wrong-size uuid (mirroring the
-				// binary fixed build) breaks to the size-checked raw path below,
-				// so JSON encode stays raw and self-readable.
-				if node.size != 16 {
-					break
-				}
-				// [16]byte trusts its bytes (uuidBytes-first, matching binary
-				// serFixedUUIDReflect): the raw 16 bytes are the wire form, with
-				// no MarshalText and parseUUID round trip. Without this, a
-				// [16]byte type that also implements TextMarshaler, such as
-				// google/uuid.UUID, diverged from the binary path.
-				if u, ok := uuidBytes(v); ok {
-					return appendAvroJSONBytes(buf, u[:]), nil
-				}
-				// TextMarshaler / AppendText before the reflect.String arm
-				// (parity with serFixedUUIDReflect). MarshalText must produce a
-				// UUID hex-dash string, which parseUUID validates into 16 bytes.
-				if text, ok, err := textValue(v, "fixed"); err != nil {
-					return nil, err
-				} else if ok {
-					u, err := parseUUID(text)
-					if err != nil {
-						return nil, err
-					}
-					return appendAvroJSONBytes(buf, u[:]), nil
-				}
-				if v.Kind() == reflect.String {
-					if err := rejectJSONNumberRawTarget(v, "fixed"); err != nil {
-						return nil, err
-					}
-					u, err := parseUUID(v.String())
-					if err != nil {
-						return nil, err
-					}
-					return appendAvroJSONBytes(buf, u[:]), nil
-				}
-			}
-		}
-		var raw []byte
-		if v.Kind() == reflect.String {
-			if err := rejectJSONNumberRawTarget(v, "fixed"); err != nil {
-				return nil, err
-			}
-			// A Go string is raw UTF-8 bytes here, matching serSize on
-			// the binary side. See the bytes-string arm above for the
-			// full rationale on why codepoint mapping was wrong here.
-			// We alias v's bytes; downstream consumers iterate read-only.
-			s := v.String()
-			raw = unsafe.Slice(unsafe.StringData(s), len(s))
-		} else if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
-			raw = byteArrayToSlice(v)
-		} else if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-			raw = v.Bytes()
-		} else {
-			return nil, semErr(v, "fixed")
-		}
-		if len(raw) != node.size {
-			// The same failure of your value serSize rejects on binary; both
-			// wires carry *SemanticError identity, and the JSON message keeps
-			// the got/need detail in the chain.
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: fmt.Errorf("size mismatch: got %d bytes, need %d", len(raw), node.size)}
-		}
-		return appendAvroJSONBytes(buf, raw), nil
-
+		return appendAvroJSONFixed(buf, v, node, custom)
 	case "enum":
-		// Builtin string fast path, parity with serEnum: an unnamed string is
-		// text-less, so it *is* the symbol and we skip the textValue probe. A
-		// named string type falls through to textValue, so uniformity holds.
-		if v.Type() == stringType {
-			needle := v.String()
-			if _, ok := node.symbolIndex(needle); ok {
-				return appendJSONString(buf, needle), nil
-			}
-			// A value naming no symbol is the same user-value failure the
-			// binary encoder rejects (serEnum); both wires report it as an
-			// errors.As-able *SemanticError so you get one error identity per
-			// failure regardless of wire format. Decode-side wire-content
-			// errors, a bad ordinal or an unknown wire symbol, are plain on
-			// both wires, a separate family.
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(needle))}
-		}
-		// We try text-out first, for uniformity and name-based matching, then
-		// a named string without a text method, then the int-ordinal arm.
-		if text, ok, err := textValue(v, "enum"); err != nil {
-			return nil, err
-		} else if ok {
-			if _, ok := node.symbolIndex(text); ok {
-				return appendJSONString(buf, text), nil
-			}
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(text))}
-		}
-		if v.Kind() == reflect.String {
-			// See serEnum.ser: json.Number (Kind reflect.String) is a numeric
-			// carrier, and a stringy enum target is a type mismatch, rejected
-			// on both wire formats, symmetric with the decoder.
-			if err := rejectJSONNumberRawTarget(v, "enum"); err != nil {
-				return nil, err
-			}
-			needle := v.String()
-			if _, ok := node.symbolIndex(needle); ok {
-				return appendJSONString(buf, needle), nil
-			}
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(needle))}
-		}
-		if v.CanInt() || v.CanUint() {
-			n, err := enumOrdinalIndex(v, len(node.symbols))
-			if err != nil {
-				return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: err}
-			}
-			return appendJSONString(buf, node.symbols[n]), nil
-		}
-		return nil, semErr(v, "enum")
-
+		return appendAvroJSONEnum(buf, v, node)
 	case "array":
-		if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
-			return nil, semErr(v, "array")
-		}
-		// Native concrete fast path: a plain primitive item and an unnamed []V
-		// slice. We fall through for logical items, [N]T arrays and named slice
-		// or elem types.
-		if node.items.logical == "" && custom[node.items] == nil && v.Kind() == reflect.Slice && v.CanInterface() {
-			if out, ok := appendAvroJSONNativeArray(buf, v, node.items.kind, cfg); ok {
-				return out, nil
-			}
-		}
-		buf = append(buf, '[')
-		for i := range v.Len() {
-			if i > 0 {
-				buf = append(buf, ',')
-			}
-			var err error
-			buf, err = appendAvroJSON(buf, v.Index(i), node.items, cfg, custom, depth+1)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return append(buf, ']'), nil
-
+		return appendAvroJSONArray(buf, v, node, cfg, custom, depth)
 	case "map":
-		if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String {
-			// Avro spec: "Map keys are assumed to be strings."
-			// Without this guard, iter.Key().String() returns
-			// reflect's <int Value>-style placeholder for non-string
-			// keys, producing invalid Avro JSON. Mirrors
-			// serMapPreamble's check on the binary side.
-			return nil, semErr(v, "map")
-		}
-		// Native concrete fast path: a plain, non-logical primitive value and
-		// an exactly-string key mean the whole map is a known unnamed type, so
-		// we assert it and emit natively, with no reflect.MapRange. We fall
-		// through to reflect for logical-typed values (date, time and uuid
-		// serialize specially), named map or value types, and non-interfaceable
-		// maps.
-		if node.values.logical == "" && custom[node.values] == nil && v.Type().Key() == stringType && v.CanInterface() {
-			if out, ok := appendAvroJSONNativeMap(buf, v, node.values.kind, cfg); ok {
-				return out, nil
-			}
-		}
-		buf = append(buf, '{')
-		first := true
-		keyType := v.Type().Key()
-		// We reuse addressable Values to avoid the per-entry alloc of
-		// iter.Key() and iter.Value(); see appendMapPrimitive (ser.go).
-		keyV := reflect.New(keyType).Elem()
-		valV := reflect.New(v.Type().Elem()).Elem()
-		iter := v.MapRange()
-		for iter.Next() {
-			keyV.SetIterKey(iter)
-			key := keyV.String()
-			if err := validateJSONNumberMapKey(key, keyType, "map"); err != nil {
-				return nil, err
-			}
-			if !first {
-				buf = append(buf, ',')
-			}
-			first = false
-			buf = appendJSONString(buf, key)
-			buf = append(buf, ':')
-			valV.SetIterValue(iter)
-			var err error
-			buf, err = appendAvroJSON(buf, valV, node.values, cfg, custom, depth+1)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return append(buf, '}'), nil
-
+		return appendAvroJSONMap(buf, v, node, cfg, custom, depth)
 	case "record":
 		// depth unchanged: same-level dispatch hop (see the union case).
 		return appendAvroJSONRecord(buf, v, node, cfg, custom, depth)
@@ -824,6 +412,448 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 	default:
 		return nil, fmt.Errorf("avro json: unsupported schema kind %q", node.kind)
 	}
+}
+
+// The per-kind arms below take v already dereferenced and past the custom
+// encode hook; appendAvroJSON is the one dispatcher.
+
+func appendAvroJSONNull(buf []byte, v reflect.Value) ([]byte, error) {
+	// A non-nil value into a "null" schema gets errNonNil, as binary
+	// serNull returns for the same shapes.
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		if !v.IsNil() {
+			return nil, errNonNil
+		}
+	default:
+		return nil, errNonNil
+	}
+	return append(buf, "null"...), nil
+}
+
+func appendAvroJSONInt(buf []byte, v reflect.Value, node *schemaNode) ([]byte, error) {
+	if v.Type() == timeType {
+		t := v.Interface().(time.Time)
+		switch node.logical {
+		case "date":
+			d, err := timeToDate(t)
+			if err != nil {
+				// Same identity as serDate: a range failure of your
+				// value carries *SemanticError on both wires.
+				return nil, &SemanticError{GoType: timeType, AvroType: "date", Err: err}
+			}
+			return strconv.AppendInt(buf, int64(d), 10), nil
+		case "time-millis":
+			// Time-of-day ms (< 86.4M) never overflows int32.
+			return strconv.AppendInt(buf, timeOfDay(t).Milliseconds(), 10), nil
+		}
+	}
+	if v.Type() == durationType {
+		d := v.Interface().(time.Duration)
+		switch node.logical {
+		case "time-millis":
+			ms, err := durationToTimeMillis(d)
+			if err != nil {
+				// Same identity as serTimeMillis' duration arm.
+				return nil, &SemanticError{GoType: durationType, AvroType: "time-millis", Err: err}
+			}
+			return strconv.AppendInt(buf, int64(ms), 10), nil
+		}
+	}
+	if node.logical == "date" {
+		if t, ok := tryParseDateString(v); ok {
+			d, err := timeToDate(t)
+			if err != nil {
+				// Same identity as serDate's date-string arm. The
+				// 4-digit-year formats tryParseDateString accepts
+				// cannot express a date outside timeToDate's range,
+				// so this arm is not reachable today; it mirrors the
+				// binary twin so the two cannot drift.
+				return nil, semErrW(v, "date", err)
+			}
+			return strconv.AppendInt(buf, int64(d), 10), nil
+		}
+	}
+	n, err := jsonCoerceToInt32(v)
+	if err != nil {
+		return nil, err
+	}
+	return strconv.AppendInt(buf, int64(n), 10), nil
+}
+
+func appendAvroJSONLong(buf []byte, v reflect.Value, node *schemaNode) ([]byte, error) {
+	if conv := timeLogicalToInt64(node.logical); conv != nil {
+		if t, ok := extractTime(v); ok {
+			n, err := conv(t)
+			if err != nil {
+				// Same identity as serTimeAsLong: a timestamp range
+				// failure carries *SemanticError on both wires.
+				return nil, semErrW(v, "long", err)
+			}
+			return strconv.AppendInt(buf, n, 10), nil
+		}
+	}
+	if node.logical == "time-micros" {
+		if v.Type() == timeType {
+			return strconv.AppendInt(buf, timeOfDay(v.Interface().(time.Time)).Microseconds(), 10), nil
+		}
+		if v.Type() == durationType {
+			return strconv.AppendInt(buf, v.Interface().(time.Duration).Microseconds(), 10), nil
+		}
+	}
+	n, err := jsonCoerceToInt64(v)
+	if err != nil {
+		return nil, err
+	}
+	return strconv.AppendInt(buf, n, 10), nil
+}
+
+func appendAvroJSONStringValue(buf []byte, v reflect.Value, node *schemaNode) ([]byte, error) {
+	// UUID logical type: [16]byte input canonicalizes to the RFC 4122
+	// hex-dash string, matching serUUID on the binary side.
+	if node.logical == "uuid" {
+		if u, ok := uuidBytes(v); ok {
+			return appendJSONString(buf, uuidToString(u)), nil
+		}
+	}
+	// Resolution order is shared with the binary encoder via
+	// avroStringValue: json.Number rejected, reflect.String,
+	// TextAppender, TextMarshaler, []byte slice. Both encoders
+	// must agree on precedence.
+	s, err := avroStringValue(v)
+	if err != nil {
+		return nil, err
+	}
+	return appendJSONString(buf, s), nil
+}
+
+func appendAvroJSONBytesValue(buf []byte, v reflect.Value, node *schemaNode, custom map[*schemaNode]*customWiring) ([]byte, error) {
+	// Decimal emits the spec form: the two's-complement big-endian
+	// unscaled integer as an Avro JSON byte string, as Java and fastavro
+	// do. No decimalRatFor match falls through to the generic targets
+	// below. We skip the decimal arm exactly when the binary build
+	// replaced the logical serializer with the base one, which is when a
+	// non-wildcard matching CustomType has an Encode (encodeSuppresses);
+	// the runtime proxy custom[node].encode != nil would wrongly skip it
+	// for a wildcard with Encode.
+	noCustomEnc := custom[node] == nil || !custom[node].encodeSuppresses
+	switch node.logical {
+	case "decimal":
+		if noCustomEnc {
+			r, ok, err := decimalRatFor(v)
+			if err != nil {
+				return nil, semErrW(v, "bytes", err)
+			}
+			if ok {
+				b, err := decimalUnscaledBytes(r, node.scale, node.precision, "bytes", v.Type())
+				if err != nil {
+					return nil, err
+				}
+				return appendAvroJSONBytes(buf, b), nil
+			}
+			// A non-numeric string carrier is not a valid decimal, so we
+			// reject it (numeric-text-only, symmetric with decode and with
+			// the binary serBytesDecimal path) rather than fall through to
+			// the opaque raw-bytes string arm below. []byte keeps the opaque
+			// fall-through; big-decimal (next case) stays opaque-symmetric.
+			if err := rejectNonNumericStructuredString(v, "bytes", "decimal"); err != nil {
+				return nil, err
+			}
+			if err := chargeOpaqueDecimalBytes(v, "bytes", "decimal"); err != nil {
+				return nil, err
+			}
+		}
+	case "big-decimal":
+		if noCustomEnc {
+			r, ok, err := decimalRatFor(v)
+			if err != nil {
+				return nil, semErrW(v, "bytes", err)
+			}
+			if ok {
+				inner, err := buildBigDecimalPayload(r)
+				if err != nil {
+					return nil, semErrW(v, "bytes", err)
+				}
+				return appendAvroJSONBytes(buf, inner), nil
+			}
+			// A non-numeric string carrier is not a valid big-decimal, so we
+			// reject it (numeric-text-only, symmetric with decode and the
+			// binary serBigDecimal path) rather than fall through to the
+			// opaque raw string arm below. A crafted string whose bytes form
+			// valid framing would otherwise decode to a different value.
+			// []byte keeps the opaque fall-through.
+			if err := rejectNonNumericStructuredString(v, "bytes", "big-decimal"); err != nil {
+				return nil, err
+			}
+			if err := chargeOpaqueDecimalBytes(v, "bytes", "big-decimal"); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if v.Kind() == reflect.String {
+		if err := rejectJSONNumberRawTarget(v, "bytes"); err != nil {
+			return nil, err
+		}
+		// A Go string is raw UTF-8 bytes, as in serBytes. Defaults never
+		// reach this arm, since convertDefaultBytes already turned them
+		// into []byte. appendAvroJSONBytes iterates without retaining, so
+		// we alias the string data.
+		s := v.String()
+		return appendAvroJSONBytes(buf, unsafe.Slice(unsafe.StringData(s), len(s))), nil
+	}
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		return appendAvroJSONBytes(buf, v.Bytes()), nil
+	}
+	if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
+		// reflect.Value.Bytes() panics on Array kinds, so we materialize
+		// the bytes via byteArrayToSlice (element-agnostic so a named byte
+		// element [N]B does not panic). This mirrors the "fixed" arm below
+		// and serBytes (ser.go:460), which takes Array alongside Slice.
+		return appendAvroJSONBytes(buf, byteArrayToSlice(v)), nil
+	}
+	return nil, semErr(v, "bytes")
+}
+
+func appendAvroJSONFixed(buf []byte, v reflect.Value, node *schemaNode, custom map[*schemaNode]*customWiring) ([]byte, error) {
+	// Decimal: the spec form padded and sign-extended to the schema size.
+	// UUID: a hex-dash string parses to 16 bytes, checked before the
+	// generic extraction so a 36-char string is not rejected as size
+	// != 16. We skip every logical arm exactly when the binary fixed
+	// build replaced the logical serializer with serSize, which is when
+	// a non-wildcard matching CustomType has an Encode (encodeSuppresses).
+	if custom[node] == nil || !custom[node].encodeSuppresses {
+		switch node.logical {
+		case "decimal":
+			r, ok, err := decimalRatFor(v)
+			if err != nil {
+				return nil, semErrW(v, "fixed", err)
+			}
+			if ok {
+				b, err := decimalUnscaledBytes(r, node.scale, node.precision, "fixed", v.Type())
+				if err != nil {
+					return nil, err
+				}
+				padded, err := appendDecimalFixed(nil, b, node.size, v.Type())
+				if err != nil {
+					return nil, err
+				}
+				return appendAvroJSONBytes(buf, padded), nil
+			}
+			// A non-numeric string carrier is not a valid decimal, so we
+			// reject it (numeric-text-only, symmetric with decode and with
+			// the binary serFixedDecimal path) rather than fall through to
+			// the size-checked opaque raw arm below. []byte keeps the opaque
+			// fall-through.
+			if err := rejectNonNumericStructuredString(v, "fixed", "decimal"); err != nil {
+				return nil, err
+			}
+			// The opaque arm below writes exactly node.size bytes, which is
+			// what the decoder charges, the same condition
+			// appendDecimalFixed applies to the numeric arm above.
+			if err := checkDecimalUnscaledSize(node.size); err != nil {
+				return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: err}
+			}
+		case "duration":
+			// Duration.Bytes() always emits 12 bytes, so it is only correct
+			// for the spec-required size-12 fixed. A CustomType-resurrected
+			// wrong-size duration (mirroring the binary fixed build) falls
+			// through to the size-checked raw path below, so JSON encode stays
+			// raw and self-readable.
+			if node.size == 12 && v.Type() == avroDurationType {
+				raw := v.Interface().(Duration).Bytes()
+				return appendAvroJSONBytes(buf, raw[:]), nil
+			}
+		case "uuid":
+			// Only emit the 16-byte UUID form for the spec-required size-16
+			// fixed; a CustomType-resurrected wrong-size uuid (mirroring the
+			// binary fixed build) breaks to the size-checked raw path below,
+			// so JSON encode stays raw and self-readable.
+			if node.size != 16 {
+				break
+			}
+			// [16]byte trusts its bytes (uuidBytes-first, matching binary
+			// serFixedUUIDReflect): the raw 16 bytes are the wire form, with
+			// no MarshalText and parseUUID round trip. Without this, a
+			// [16]byte type that also implements TextMarshaler, such as
+			// google/uuid.UUID, diverged from the binary path.
+			if u, ok := uuidBytes(v); ok {
+				return appendAvroJSONBytes(buf, u[:]), nil
+			}
+			// TextMarshaler / AppendText before the reflect.String arm
+			// (parity with serFixedUUIDReflect). MarshalText must produce a
+			// UUID hex-dash string, which parseUUID validates into 16 bytes.
+			if text, ok, err := textValue(v, "fixed"); err != nil {
+				return nil, err
+			} else if ok {
+				u, err := parseUUID(text)
+				if err != nil {
+					return nil, err
+				}
+				return appendAvroJSONBytes(buf, u[:]), nil
+			}
+			if v.Kind() == reflect.String {
+				if err := rejectJSONNumberRawTarget(v, "fixed"); err != nil {
+					return nil, err
+				}
+				u, err := parseUUID(v.String())
+				if err != nil {
+					return nil, err
+				}
+				return appendAvroJSONBytes(buf, u[:]), nil
+			}
+		}
+	}
+	var raw []byte
+	if v.Kind() == reflect.String {
+		if err := rejectJSONNumberRawTarget(v, "fixed"); err != nil {
+			return nil, err
+		}
+		// A Go string is raw UTF-8 bytes here, matching serSize on
+		// the binary side. See the bytes-string arm above for the
+		// full rationale on why codepoint mapping was wrong here.
+		// We alias v's bytes; downstream consumers iterate read-only.
+		s := v.String()
+		raw = unsafe.Slice(unsafe.StringData(s), len(s))
+	} else if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
+		raw = byteArrayToSlice(v)
+	} else if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		raw = v.Bytes()
+	} else {
+		return nil, semErr(v, "fixed")
+	}
+	if len(raw) != node.size {
+		// The same failure of your value serSize rejects on binary; both
+		// wires carry *SemanticError identity, and the JSON message keeps
+		// the got/need detail in the chain.
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: fmt.Errorf("size mismatch: got %d bytes, need %d", len(raw), node.size)}
+	}
+	return appendAvroJSONBytes(buf, raw), nil
+}
+
+func appendAvroJSONEnum(buf []byte, v reflect.Value, node *schemaNode) ([]byte, error) {
+	// Builtin string fast path, parity with serEnum: an unnamed string is
+	// text-less, so it *is* the symbol and we skip the textValue probe. A
+	// named string type falls through to textValue, so uniformity holds.
+	if v.Type() == stringType {
+		needle := v.String()
+		if _, ok := node.symbolIndex(needle); ok {
+			return appendJSONString(buf, needle), nil
+		}
+		// A value naming no symbol is the same user-value failure the
+		// binary encoder rejects (serEnum); both wires report it as an
+		// errors.As-able *SemanticError so you get one error identity per
+		// failure regardless of wire format. Decode-side wire-content
+		// errors, a bad ordinal or an unknown wire symbol, are plain on
+		// both wires, a separate family.
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(needle))}
+	}
+	// We try text-out first, for uniformity and name-based matching, then
+	// a named string without a text method, then the int-ordinal arm.
+	if text, ok, err := textValue(v, "enum"); err != nil {
+		return nil, err
+	} else if ok {
+		if _, ok := node.symbolIndex(text); ok {
+			return appendJSONString(buf, text), nil
+		}
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(text))}
+	}
+	if v.Kind() == reflect.String {
+		// See serEnum.ser: json.Number (Kind reflect.String) is a numeric
+		// carrier, and a stringy enum target is a type mismatch, rejected
+		// on both wire formats, symmetric with the decoder.
+		if err := rejectJSONNumberRawTarget(v, "enum"); err != nil {
+			return nil, err
+		}
+		needle := v.String()
+		if _, ok := node.symbolIndex(needle); ok {
+			return appendJSONString(buf, needle), nil
+		}
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(needle))}
+	}
+	if v.CanInt() || v.CanUint() {
+		n, err := enumOrdinalIndex(v, len(node.symbols))
+		if err != nil {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: err}
+		}
+		return appendJSONString(buf, node.symbols[n]), nil
+	}
+	return nil, semErr(v, "enum")
+}
+
+func appendAvroJSONArray(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
+	if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
+		return nil, semErr(v, "array")
+	}
+	// Native concrete fast path: a plain primitive item and an unnamed []V
+	// slice. We fall through for logical items, [N]T arrays and named slice
+	// or elem types.
+	if node.items.logical == "" && custom[node.items] == nil && v.Kind() == reflect.Slice && v.CanInterface() {
+		if out, ok := appendAvroJSONNativeArray(buf, v, node.items.kind, cfg); ok {
+			return out, nil
+		}
+	}
+	buf = append(buf, '[')
+	for i := range v.Len() {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		var err error
+		buf, err = appendAvroJSON(buf, v.Index(i), node.items, cfg, custom, depth+1)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return append(buf, ']'), nil
+}
+
+func appendAvroJSONMap(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
+	if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String {
+		// Avro spec: "Map keys are assumed to be strings."
+		// Without this guard, iter.Key().String() returns
+		// reflect's <int Value>-style placeholder for non-string
+		// keys, producing invalid Avro JSON. Mirrors
+		// serMapPreamble's check on the binary side.
+		return nil, semErr(v, "map")
+	}
+	// Native concrete fast path: a plain, non-logical primitive value and
+	// an exactly-string key mean the whole map is a known unnamed type, so
+	// we assert it and emit natively, with no reflect.MapRange. We fall
+	// through to reflect for logical-typed values (date, time and uuid
+	// serialize specially), named map or value types, and non-interfaceable
+	// maps.
+	if node.values.logical == "" && custom[node.values] == nil && v.Type().Key() == stringType && v.CanInterface() {
+		if out, ok := appendAvroJSONNativeMap(buf, v, node.values.kind, cfg); ok {
+			return out, nil
+		}
+	}
+	buf = append(buf, '{')
+	first := true
+	keyType := v.Type().Key()
+	// We reuse addressable Values to avoid the per-entry alloc of
+	// iter.Key() and iter.Value(); see appendMapPrimitive (ser.go).
+	keyV := reflect.New(keyType).Elem()
+	valV := reflect.New(v.Type().Elem()).Elem()
+	iter := v.MapRange()
+	for iter.Next() {
+		keyV.SetIterKey(iter)
+		key := keyV.String()
+		if err := validateJSONNumberMapKey(key, keyType, "map"); err != nil {
+			return nil, err
+		}
+		if !first {
+			buf = append(buf, ',')
+		}
+		first = false
+		buf = appendJSONString(buf, key)
+		buf = append(buf, ':')
+		valV.SetIterValue(iter)
+		var err error
+		buf, err = appendAvroJSON(buf, valV, node.values, cfg, custom, depth+1)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return append(buf, '}'), nil
 }
 
 // appendJSONNativeStringMap ranges a concrete map[string]V with no

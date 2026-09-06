@@ -98,11 +98,16 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 	// below routes the raw value to props verbatim, as Java and fastavro
 	// do. A shape-OK body still parses into the field on a non-binding kind,
 	// which is how a stray key is carried as written.
-	nameIsString := false
+	//
+	// Each arm that consumes a body records the fact in o.present, which is
+	// the verdict the Props routing below reads for a key the kind does not
+	// bind: a stray-routed body parsed as its shape iff its arm set the
+	// field. Deciding it where the decode happens is what keeps a nested
+	// stray schema from being decoded once per enclosing level.
 	if v, ok := m["name"]; ok {
 		if ns, ok := v.(string); ok {
 			o.Name = ns
-			nameIsString = true
+			o.present |= presName
 		} else if strayKeyBinds(o.Type, "name") {
 			return nil, schemaTypeMismatch("name", "string")
 		}
@@ -110,6 +115,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 	if v, ok := m["namespace"]; ok {
 		if ns, ok := v.(string); ok {
 			o.Namespace = &ns
+			o.present |= presNamespace
 		} else if strayKeyBinds(o.Type, "namespace") {
 			return nil, schemaTypeMismatch("namespace", "string")
 		}
@@ -120,6 +126,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 		}
 	} else if ok {
 		o.Symbols = ss
+		o.present |= presSymbols
 	}
 	if ss, ok, err := stringSliceFrom(m, "aliases"); err != nil {
 		if strayKeyBinds(o.Type, "aliases") {
@@ -127,6 +134,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 		}
 	} else if ok {
 		o.Aliases = ss
+		o.present |= presAliases
 	}
 	if v, ok := m["items"]; ok {
 		it := &aschema{}
@@ -136,6 +144,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 			}
 		} else {
 			o.Items = it
+			o.present |= presItems
 		}
 	}
 	if v, ok := m["values"]; ok {
@@ -146,11 +155,13 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 			}
 		} else {
 			o.Values = vs
+			o.present |= presValues
 		}
 	}
 	if v, ok := m["size"]; ok {
 		if l, err := decodeLaxInt("size", v); err == nil {
 			o.Size = &l
+			o.present |= presSize
 		} else if strayKeyBinds(o.Type, "size") {
 			return nil, err
 		}
@@ -195,6 +206,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 			}
 			if ferr == nil {
 				o.Fields = fields
+				o.present |= presFields
 			} else if strayKeyBinds(o.Type, "fields") {
 				return nil, ferr
 			}
@@ -202,14 +214,9 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 			return nil, schemaTypeMismatch("fields", "array")
 		}
 	}
-	// Extra (non-reserved) properties, normalized by normalizeJSONValue. We
-	// route on the arms' recorded stray-body verdicts rather than re-decode:
-	// a second decode re-enters aschemaFromAny, which routes its own stray
-	// keys, so two decodes per level compound to O(2^depth) on a nested-stray
-	// schema.
-	shapeOK := o.strayShapeRecorded(nameIsString)
+	// Extra (non-reserved) properties, normalized by normalizeJSONValue.
 	for k, v := range m {
-		if schemaReservedKeyForObject(k, v, o.Type, o.Logical, shapeOK) {
+		if schemaReservedKeyForObject(k, v, o.Type, o.Logical, o.present) {
 			continue
 		}
 		if o.extra == nil {
@@ -459,15 +466,19 @@ func intPtrFrom(m map[string]any, key string) (*int, error) {
 // route unconsumed precision/scale already take. Only the exact lowercase
 // spelling is a reserved key: a case-variant spelling is an ordinary custom
 // property with no routing of its own.
-var strayRoutedKeys = [...]string{
-	"items", "values", "fields", "symbols", "size", "name", "namespace", "aliases",
-}
+var strayRoutedKeys = func() []string {
+	var keys []string
+	for i := range presenceBits {
+		if presenceBits[i].stray {
+			keys = append(keys, presenceBits[i].key)
+		}
+	}
+	return keys
+}()
 
 func canonicalStrayKey(k string) string {
-	for _, key := range strayRoutedKeys {
-		if k == key {
-			return key
-		}
+	if _, stray := strayKeyBit(k); stray {
+		return k
 	}
 	return ""
 }
@@ -605,39 +616,16 @@ func strayBodyShapeOKMemo(memo strayShapeMemo, key string, v any) bool {
 	}
 }
 
-// strayShapeVerdict reports whether a stray-routed reserved key's body parsed
-// as that key's schema shape. A caller that already decoded the body passes
-// its recorded verdict, so the props routing and the metadata child-surfacing
-// never re-decode a subtree, which is what would make a nested-stray schema
-// O(2^depth).
-type strayShapeVerdict func(canonKey string, v any) bool
-
-// strayShapeRecorded returns the aobject's own arm verdicts as a
-// strayShapeVerdict: a stray-routed body parsed as its schema shape iff the
-// matching arm set the field. The arms run the same decodes strayBodyShapeOK
-// runs, so this is an exact mirror of the shape check. nameIsString carries
-// the name arm's verdict, since o.Name has no presence flag and "" is a
-// valid name shape.
-func (o *aobject) strayShapeRecorded(nameIsString bool) strayShapeVerdict {
-	return func(canonKey string, _ any) bool {
-		switch canonKey {
-		case "items":
-			return o.Items != nil
-		case "values":
-			return o.Values != nil
-		case "fields":
-			return o.Fields != nil
-		case "symbols":
-			return o.Symbols != nil
-		case "size":
-			return o.Size != nil
-		case "aliases":
-			return o.Aliases != nil
-		case "namespace":
-			return o.Namespace != nil
-		case "name":
-			return nameIsString
-		}
-		return false
+// strayPresence returns the presence bit for a stray-routed key whose body
+// parses as the key's shape, else 0. It is the verdict for a key nothing
+// decoded before routing: a wrapped reference's props, which the cache
+// splice and the metadata splice merge onto the definition. That set is
+// flat, never a nested stray schema, so the one decode per key compounds
+// nothing.
+func strayPresence(k string, v any) presenceSet {
+	bit, stray := strayKeyBit(k)
+	if !stray || !strayBodyShapeOK(k, v) {
+		return 0
 	}
+	return bit
 }

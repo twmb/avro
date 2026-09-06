@@ -3,7 +3,6 @@ package avro
 import (
 	"fmt"
 	"math"
-	"math/bits"
 	"reflect"
 	"sync"
 	"time"
@@ -423,7 +422,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 
 	// Logical type fast paths for time.Time and time.Duration.
 	if f.meta != nil && f.meta.logical != "" {
-		return tryCompileLogicalSer(f.meta.logical, f.avroType(), goType)
+		return tryCompileLogical(usLogicalFast, f.meta.logical, f.avroType(), goType)
 	}
 
 	switch f.avroType() {
@@ -432,9 +431,9 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			return usBool
 		}
 	case "int":
-		return usInt(goType)
+		return usInteger[int32](goType)
 	case "long":
-		return usLong(goType)
+		return usInteger[int64](goType)
 	case "float":
 		return usFloat(k)
 	case "double":
@@ -558,7 +557,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 
 	// Logical type fast paths for time.Time and time.Duration.
 	if f.meta != nil && f.meta.logical != "" {
-		return tryCompileLogicalDeser(f.meta.logical, f.avroType(), goType)
+		return tryCompileLogical(udLogicalFast, f.meta.logical, f.avroType(), goType)
 	}
 
 	switch f.avroType() {
@@ -567,9 +566,9 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 			return udBool
 		}
 	case "int":
-		return udInt(goType)
+		return udInteger[int32](goType)
 	case "long":
-		return udLong(goType)
+		return udInteger[int64](goType)
 	case "float":
 		return udFloat(k)
 	case "double":
@@ -607,65 +606,101 @@ var usTimestampLogicals = map[string]userfn{
 	"local-timestamp-nanos":  usLocalTimestampNanos,
 }
 
-func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn {
-	if fn, ok := usTimestampLogicals[logical]; ok {
+// logicalFast is one direction's unsafe fast paths for the logical types,
+// picked by tryCompileLogical. The ser and deser tables differ only in the
+// functions they hold, so the two directions choose from one rule.
+type logicalFast[F any] struct {
+	timestamps                                                   map[string]F // the six long timestamps, time.Time target
+	date, timeMillis, timeMillisTime, timeMicros, timeMicrosTime F
+	duration                                                     F
+	uuid, uuidString                                             F // uuid on a string schema: [16]byte target, string target
+	// fixedUUID picks the target arm for uuid on a fixed schema. The two
+	// directions cover different targets there: decode handles [16]byte,
+	// encode leaves it to the default fixed serializer.
+	fixedUUID func(goType reflect.Type) F
+	// intFn and longFn are the integer fast paths a non-time target of an
+	// int- or long-carried logical takes.
+	intFn, longFn func(t reflect.Type) F
+	// stringEligible reports whether a string-kind target may take the raw
+	// string fast path; a json.Number or text-method string takes the safe
+	// path instead.
+	stringEligible func(t reflect.Type) bool
+}
+
+// tryCompileLogical returns fast's unsafe function for a logical type and
+// Go target, or the zero F for a pairing that takes the reflect path.
+func tryCompileLogical[F any](fast *logicalFast[F], logical, avroType string, goType reflect.Type) F {
+	var none F
+	if fn, ok := fast.timestamps[logical]; ok {
 		if goType == timeType {
 			return fn
 		}
-		return usLong(goType)
+		return fast.longFn(goType)
 	}
 	switch logical {
 	case "date":
 		if goType == timeType {
-			return usDate
+			return fast.date
 		}
-		return usInt(goType)
+		return fast.intFn(goType)
 	case "time-millis":
 		if goType == durationType {
-			return usTimeMillis
+			return fast.timeMillis
 		}
 		if goType == timeType {
-			return usTimeMillisTime
+			return fast.timeMillisTime
 		}
-		return usInt(goType)
+		return fast.intFn(goType)
 	case "time-micros":
 		if goType == durationType {
-			return usTimeMicros
+			return fast.timeMicros
 		}
 		if goType == timeType {
-			return usTimeMicrosTime
+			return fast.timeMicrosTime
 		}
-		return usLong(goType)
+		return fast.longFn(goType)
 	case "duration":
 		if goType == avroDurationType {
-			return usDuration
+			return fast.duration
 		}
-		return nil
 	case "uuid":
 		if avroType == "fixed" {
-			if goType.Kind() == reflect.String {
-				// Text-method and json.Number string kinds take the safe
-				// path, where serFixedUUIDReflect tries text-out first.
-				if !stringFastPathEligibleEncode(goType) {
-					return nil
-				}
-				return usFixedUUIDString
-			}
-			return nil // [16]byte, []byte handled by default fixed ser
+			return fast.fixedUUID(goType)
 		}
 		if isUUIDType(goType) {
-			return usUUID
+			return fast.uuid
 		}
 		if goType.Kind() == reflect.String {
-			// usString would emit the raw string with no validation and no
-			// text-out; the safe path's serUUID applies both.
-			if !stringFastPathEligibleEncode(goType) {
-				return nil
+			// The raw string fast path applies no validation and no text
+			// method; the safe path's serUUID and setStringValue do both.
+			if !fast.stringEligible(goType) {
+				return none
 			}
-			return usString
+			return fast.uuidString
 		}
 	}
-	return nil
+	return none
+}
+
+var usLogicalFast = &logicalFast[userfn]{
+	timestamps:     usTimestampLogicals,
+	date:           usDate,
+	timeMillis:     usTimeMillis,
+	timeMillisTime: usTimeMillisTime,
+	timeMicros:     usTimeMicros,
+	timeMicrosTime: usTimeMicrosTime,
+	duration:       usDuration,
+	uuid:           usUUID,
+	uuidString:     usString,
+	fixedUUID: func(goType reflect.Type) userfn {
+		if goType.Kind() == reflect.String && stringFastPathEligibleEncode(goType) {
+			return usFixedUUIDString
+		}
+		return nil // [16]byte and []byte take the default fixed ser
+	},
+	intFn:          usInteger[int32],
+	longFn:         usInteger[int64],
+	stringEligible: stringFastPathEligibleEncode,
 }
 
 // udTimestampLogicals maps the six long-typed timestamp logicals to their
@@ -681,64 +716,28 @@ var udTimestampLogicals = map[string]udeserfn{
 	"local-timestamp-nanos":  udTimestampNanos,
 }
 
-func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udeserfn {
-	if fn, ok := udTimestampLogicals[logical]; ok {
-		if goType == timeType {
-			return fn
-		}
-		return udLong(goType)
-	}
-	switch logical {
-	case "date":
-		if goType == timeType {
-			return udDate
-		}
-		return udInt(goType)
-	case "time-millis":
-		if goType == durationType {
-			return udTimeMillis
-		}
-		if goType == timeType {
-			return udTimeMillisTime
-		}
-		return udInt(goType)
-	case "time-micros":
-		if goType == durationType {
-			return udTimeMicros
-		}
-		if goType == timeType {
-			return udTimeMicrosTime
-		}
-		return udLong(goType)
-	case "duration":
-		if goType == avroDurationType {
-			return udDuration
-		}
-		return nil
-	case "uuid":
-		if avroType == "fixed" {
-			if isUUIDType(goType) {
-				return udFixedUUID
-			}
-			if goType.Kind() == reflect.String {
-				if !stringFastPathEligibleDecode(goType) {
-					return nil
-				}
-				return udFixedUUIDString
-			}
-			return nil // any, []byte etc. handled by reflect path
-		}
+var udLogicalFast = &logicalFast[udeserfn]{
+	timestamps:     udTimestampLogicals,
+	date:           udDate,
+	timeMillis:     udTimeMillis,
+	timeMillisTime: udTimeMillisTime,
+	timeMicros:     udTimeMicros,
+	timeMicrosTime: udTimeMicrosTime,
+	duration:       udDuration,
+	uuid:           udUUID,
+	uuidString:     udStringDeser,
+	fixedUUID: func(goType reflect.Type) udeserfn {
 		if isUUIDType(goType) {
-			return udUUID
+			return udFixedUUID
 		}
-		if goType.Kind() == reflect.String {
-			if !stringFastPathEligibleDecode(goType) {
-				return nil
-			}
-			return udStringDeser
+		if goType.Kind() == reflect.String && stringFastPathEligibleDecode(goType) {
+			return udFixedUUIDString
 		}
-	}
-	return nil
+		return nil // any, []byte etc. take the reflect path
+	},
+	intFn:          udInteger[int32],
+	longFn:         udInteger[int64],
+	stringEligible: stringFastPathEligibleDecode,
 }
 
 // usTimeAsLong is the shared body of the six unsafe time-logical "long"
@@ -812,20 +811,21 @@ func usTimeMicrosTime(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	return appendVarlong(dst, timeOfDay(*(*time.Time)(p)).Microseconds()), nil
 }
 
-func udTimeFromVarint[T any](conv func(int32) T) udeserfn {
+// udTimeFrom reads a wire W and stores conv of it into *T. The reader is
+// picked by W's width, which folds per instantiation.
+func udTimeFrom[W int32 | int64, T any](conv func(W) T) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		val, src, err := readVarint(src)
-		if err != nil {
-			return nil, err
+		var val W
+		var err error
+		if unsafe.Sizeof(val) == 4 {
+			var v32 int32
+			v32, src, err = readVarint(src)
+			val = W(v32)
+		} else {
+			var v64 int64
+			v64, src, err = readVarlong(src)
+			val = W(v64)
 		}
-		*(*T)(p) = conv(val)
-		return src, nil
-	}
-}
-
-func udTimeFromVarlong[T any](conv func(int64) T) udeserfn {
-	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		val, src, err := readVarlong(src)
 		if err != nil {
 			return nil, err
 		}
@@ -853,12 +853,12 @@ func udTimeFromVarlongChecked[T any](conv func(int64) (T, error)) udeserfn {
 // epoch midnight (UTC). We use them when your struct field is a time.Time
 // but the schema is time-millis or time-micros.
 var (
-	udTimestampMillis = udTimeFromVarlong(timestampMillisToTime)
-	udTimestampMicros = udTimeFromVarlong(timestampMicrosToTime)
-	udTimestampNanos  = udTimeFromVarlong(timestampNanosToTime)
-	udDate            = udTimeFromVarint(dateToTime)
-	udTimeMillis      = udTimeFromVarint(timeMillisToDuration)
-	udTimeMillisTime  = udTimeFromVarint(func(v int32) time.Time {
+	udTimestampMillis = udTimeFrom(timestampMillisToTime)
+	udTimestampMicros = udTimeFrom(timestampMicrosToTime)
+	udTimestampNanos  = udTimeFrom(timestampNanosToTime)
+	udDate            = udTimeFrom(dateToTime)
+	udTimeMillis      = udTimeFrom(timeMillisToDuration)
+	udTimeMillisTime  = udTimeFrom(func(v int32) time.Time {
 		return timeOfDayToTime(timeMillisToDuration(v))
 	})
 	udTimeMicros     = udTimeFromVarlongChecked(timeMicrosToDuration)
@@ -951,107 +951,111 @@ func usBool(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-// usVarintFrom is udVarintTo's serialize-side mirror: read a typed integer
-// through an unsafe pointer, range-check it, write it as an Avro int. t is the
-// Go field type, which we set on the SemanticError so the unsafe struct-field
-// path reports the same GoType as reflect does (appendAvroInt in ser.go).
-func usVarintFrom[T intLike](lo, hi int64, t reflect.Type) userfn {
-	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-		n := int64(*(*T)(p))
-		if n < lo || n > hi {
-			return nil, &SemanticError{GoType: t, AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-		}
-		return appendVarint(dst, int32(n)), nil
-	}
+// intLike is the set of Go integer kinds the unsafe int and long paths
+// read through a pointer.
+type intLike interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64
 }
 
-func usVarlongFrom[T intLike](lo, hi int64, t reflect.Type) userfn {
-	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-		n := int64(*(*T)(p))
-		if n < lo || n > hi {
-			return nil, &SemanticError{GoType: t, AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
+// intRange returns T's value range in int64 space, an unsigned T's top
+// end clamped to MaxInt64 (the decode side needs no more, since no wire
+// value exceeds it; the encode side asks intFits instead). Both ends derive
+// from unsafe.Sizeof and the sign of a complemented zero, which fold per
+// instantiation, so int and uint come out right on 32-bit as well.
+func intRange[T intLike]() (lo, hi int64) {
+	bits := unsafe.Sizeof(T(0)) * 8
+	if ^T(0) > 0 {
+		if bits == 64 {
+			return 0, math.MaxInt64
 		}
-		return appendVarlong(dst, n), nil
+		return 0, int64(uint64(1)<<bits - 1)
 	}
+	hi = int64(uint64(1)<<(bits-1) - 1)
+	return -hi - 1, hi
 }
 
-// usVarlongFromUnsigned is usVarlongFrom for unsigned T. We check the upper
-// bound in uint64 space, since a uint64 above MaxInt64 cannot round-trip
-// through int64.
-func usVarlongFromUnsigned[T uint | uint8 | uint16 | uint32 | uint64](t reflect.Type) userfn {
+// intFits reports whether every T value fits the signed wire integer W: a
+// signed T no wider than W, or an unsigned T strictly narrower.
+func intFits[W int32 | int64, T intLike]() bool {
+	if ^T(0) > 0 {
+		return unsafe.Sizeof(T(0)) < unsafe.Sizeof(W(0))
+	}
+	return unsafe.Sizeof(T(0)) <= unsafe.Sizeof(W(0))
+}
+
+// wireName returns the Avro and Go type names of a wire integer width, for
+// error messages.
+func wireName[W int32 | int64]() (avroType, goType string) {
+	if unsafe.Sizeof(W(0)) == 4 {
+		return "int", "int32"
+	}
+	return "long", "int64"
+}
+
+// usIntegerFrom serializes a Go T read through an unsafe pointer as the
+// wire integer W. Where every T fits W the closure only converts; otherwise
+// it range-checks first, an unsigned T in uint64 space since a uint64 above
+// MaxInt64 has no int64 form. t is the Go field type, set on the
+// SemanticError so this path reports the same GoType as the reflect path.
+//
+// Each closure selects the width's append by unsafe.Sizeof inline, which
+// folds per instantiation to the one direct call the hand-written closures
+// made. A helper wrapping that choice would not inline into the closure and
+// would cost a second call per value.
+func usIntegerFrom[W int32 | int64, T intLike](t reflect.Type) userfn {
+	if intFits[W, T]() {
+		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
+			if unsafe.Sizeof(W(0)) == 4 {
+				return appendVarint(dst, int32(*(*T)(p))), nil
+			}
+			return appendVarlong(dst, int64(*(*T)(p))), nil
+		}
+	}
+	wlo, whi := intRange[W]()
+	avroType, wireGo := wireName[W]()
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-		n := uint64(*(*T)(p))
-		if n > math.MaxInt64 {
-			return nil, &SemanticError{GoType: t, AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
+		n := *(*T)(p)
+		if ^T(0) > 0 {
+			if uint64(n) > uint64(whi) {
+				return nil, &SemanticError{GoType: t, AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", n, wireGo)}
+			}
+		} else if int64(n) < wlo || int64(n) > whi {
+			return nil, &SemanticError{GoType: t, AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", n, wireGo)}
+		}
+		if unsafe.Sizeof(W(0)) == 4 {
+			return appendVarint(dst, int32(n)), nil
 		}
 		return appendVarlong(dst, int64(n)), nil
 	}
 }
 
-func usInt(t reflect.Type) userfn {
+// usInteger picks the usIntegerFrom instantiation for t's kind, or nil for a
+// non-integer kind.
+func usInteger[W int32 | int64](t reflect.Type) userfn {
 	switch t.Kind() {
 	case reflect.Int:
-		// On 64-bit int can exceed int32; bound check applies.
-		return usVarintFrom[int](math.MinInt32, math.MaxInt32, t)
+		return usIntegerFrom[W, int](t)
 	case reflect.Int8:
-		return usVarintFrom[int8](math.MinInt64, math.MaxInt64, t)
+		return usIntegerFrom[W, int8](t)
 	case reflect.Int16:
-		return usVarintFrom[int16](math.MinInt64, math.MaxInt64, t)
+		return usIntegerFrom[W, int16](t)
 	case reflect.Int32:
-		return usVarintFrom[int32](math.MinInt64, math.MaxInt64, t)
+		return usIntegerFrom[W, int32](t)
 	case reflect.Int64:
-		return usVarintFrom[int64](math.MinInt32, math.MaxInt32, t)
+		return usIntegerFrom[W, int64](t)
 	case reflect.Uint:
-		// uint as int64 max. The bound applies on 64-bit too, where a uint
-		// can exceed MaxInt32.
-		return usVarintFrom[uint](0, math.MaxInt32, t)
+		return usIntegerFrom[W, uint](t)
 	case reflect.Uint8:
-		return usVarintFrom[uint8](math.MinInt64, math.MaxInt64, t)
+		return usIntegerFrom[W, uint8](t)
 	case reflect.Uint16:
-		return usVarintFrom[uint16](math.MinInt64, math.MaxInt64, t)
+		return usIntegerFrom[W, uint16](t)
 	case reflect.Uint32:
-		return usVarintFrom[uint32](0, math.MaxInt32, t)
+		return usIntegerFrom[W, uint32](t)
 	case reflect.Uint64:
-		// A uint64 above MaxInt64 has no int64 form, and usVarintFrom's int64
-		// cast already truncates values that reinterpret as negative, so we
-		// use the unsigned-aware bound directly.
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*uint64)(p)
-			if n > math.MaxInt32 {
-				return nil, &SemanticError{GoType: t, AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			return appendVarint(dst, int32(n)), nil
-		}
-	default:
-		return nil
+		return usIntegerFrom[W, uint64](t)
 	}
-}
-
-func usLong(t reflect.Type) userfn {
-	switch t.Kind() {
-	case reflect.Int:
-		return usVarlongFrom[int](math.MinInt64, math.MaxInt64, t)
-	case reflect.Int8:
-		return usVarlongFrom[int8](math.MinInt64, math.MaxInt64, t)
-	case reflect.Int16:
-		return usVarlongFrom[int16](math.MinInt64, math.MaxInt64, t)
-	case reflect.Int32:
-		return usVarlongFrom[int32](math.MinInt64, math.MaxInt64, t)
-	case reflect.Int64:
-		return usVarlongFrom[int64](math.MinInt64, math.MaxInt64, t)
-	case reflect.Uint:
-		return usVarlongFromUnsigned[uint](t)
-	case reflect.Uint8:
-		return usVarlongFromUnsigned[uint8](t)
-	case reflect.Uint16:
-		return usVarlongFromUnsigned[uint16](t)
-	case reflect.Uint32:
-		return usVarlongFromUnsigned[uint32](t)
-	case reflect.Uint64:
-		return usVarlongFromUnsigned[uint64](t)
-	default:
-		return nil
-	}
+	return nil
 }
 
 func usFloat(k reflect.Kind) userfn {
@@ -1111,17 +1115,44 @@ func udBool(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src[1:], nil
 }
 
-type intLike interface {
-	~int | ~int8 | ~int16 | ~int32 | ~int64 |
-		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64
-}
-
-// udVarintTo reads a varint (int32 wire), range-checks it against [lo, hi] in
-// int64 space, and stores the narrowed result into *T. lo=MinInt64 and
-// hi=MaxInt64 turn the range check off.
-func udVarintTo[T intLike](lo, hi int64, avroType string, t reflect.Type) udeserfn {
+// udIntegerTo reads the wire integer W and stores it into *T. Where every
+// W fits T the closure only converts; otherwise it range-checks against T's
+// own range first, in int64 space.
+func udIntegerTo[W int32 | int64, T intLike](t reflect.Type) udeserfn {
+	lo, hi := intRange[T]()
+	if wlo, whi := intRange[W](); lo <= wlo && hi >= whi {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+			var v W
+			var err error
+			if unsafe.Sizeof(v) == 4 {
+				var v32 int32
+				v32, src, err = readVarint(src)
+				v = W(v32)
+			} else {
+				var v64 int64
+				v64, src, err = readVarlong(src)
+				v = W(v64)
+			}
+			if err != nil {
+				return nil, err
+			}
+			*(*T)(p) = T(v)
+			return src, nil
+		}
+	}
+	avroType, _ := wireName[W]()
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		v, src, err := readVarint(src)
+		var v W
+		var err error
+		if unsafe.Sizeof(v) == 4 {
+			var v32 int32
+			v32, src, err = readVarint(src)
+			v = W(v32)
+		} else {
+			var v64 int64
+			v64, src, err = readVarlong(src)
+			v = W(v64)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1133,85 +1164,32 @@ func udVarintTo[T intLike](lo, hi int64, avroType string, t reflect.Type) udeser
 	}
 }
 
-func udVarlongTo[T intLike](lo, hi int64, avroType string, t reflect.Type) udeserfn {
-	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		v, src, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if v < lo || v > hi {
-			return nil, &SemanticError{GoType: t, AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", v, t)}
-		}
-		*(*T)(p) = T(v)
-		return src, nil
-	}
-}
-
-func udInt(t reflect.Type) udeserfn {
+// udInteger picks the udIntegerTo instantiation for t's kind, or nil for a
+// non-integer kind.
+func udInteger[W int32 | int64](t reflect.Type) udeserfn {
 	switch t.Kind() {
 	case reflect.Int:
-		// int32 wire always fits in int (int is int32 or int64).
-		return udVarintTo[int](math.MinInt64, math.MaxInt64, "int", t)
+		return udIntegerTo[W, int](t)
 	case reflect.Int8:
-		return udVarintTo[int8](math.MinInt8, math.MaxInt8, "int", t)
+		return udIntegerTo[W, int8](t)
 	case reflect.Int16:
-		return udVarintTo[int16](math.MinInt16, math.MaxInt16, "int", t)
+		return udIntegerTo[W, int16](t)
 	case reflect.Int32:
-		return udVarintTo[int32](math.MinInt64, math.MaxInt64, "int", t)
+		return udIntegerTo[W, int32](t)
 	case reflect.Int64:
-		return udVarintTo[int64](math.MinInt64, math.MaxInt64, "int", t)
+		return udIntegerTo[W, int64](t)
 	case reflect.Uint:
-		// The varint wire is int32 and uint is always wide enough, so only
-		// the lower bound (v < 0) matters. hi=MaxInt64 is unbounded here.
-		return udVarintTo[uint](0, math.MaxInt64, "int", t)
+		return udIntegerTo[W, uint](t)
 	case reflect.Uint8:
-		return udVarintTo[uint8](0, math.MaxUint8, "int", t)
+		return udIntegerTo[W, uint8](t)
 	case reflect.Uint16:
-		return udVarintTo[uint16](0, math.MaxUint16, "int", t)
+		return udIntegerTo[W, uint16](t)
 	case reflect.Uint32:
-		return udVarintTo[uint32](0, math.MaxInt64, "int", t)
+		return udIntegerTo[W, uint32](t)
 	case reflect.Uint64:
-		return udVarintTo[uint64](0, math.MaxInt64, "int", t)
-	default:
-		return nil
+		return udIntegerTo[W, uint64](t)
 	}
-}
-
-func udLong(t reflect.Type) udeserfn {
-	switch t.Kind() {
-	case reflect.Int:
-		// On 64-bit, int holds any int64. On 32-bit, int is int32, so the
-		// bound check is real. math.MinInt/MaxInt resolve per platform.
-		return udVarlongTo[int](math.MinInt, math.MaxInt, "long", t)
-	case reflect.Int8:
-		return udVarlongTo[int8](math.MinInt8, math.MaxInt8, "long", t)
-	case reflect.Int16:
-		return udVarlongTo[int16](math.MinInt16, math.MaxInt16, "long", t)
-	case reflect.Int32:
-		return udVarlongTo[int32](math.MinInt32, math.MaxInt32, "long", t)
-	case reflect.Int64:
-		return udVarlongTo[int64](math.MinInt64, math.MaxInt64, "long", t)
-	case reflect.Uint:
-		// On 64-bit, uint = uint64 holds any non-negative int64. On 32-bit,
-		// uint = uint32, so we cap at MaxUint32. bits.UintSize is a
-		// compile-time constant, so the branch is dead code on the
-		// non-matching platform.
-		hi := int64(math.MaxInt64)
-		if bits.UintSize == 32 {
-			hi = math.MaxUint32
-		}
-		return udVarlongTo[uint](0, hi, "long", t)
-	case reflect.Uint8:
-		return udVarlongTo[uint8](0, math.MaxUint8, "long", t)
-	case reflect.Uint16:
-		return udVarlongTo[uint16](0, math.MaxUint16, "long", t)
-	case reflect.Uint32:
-		return udVarlongTo[uint32](0, math.MaxUint32, "long", t)
-	case reflect.Uint64:
-		return udVarlongTo[uint64](0, math.MaxInt64, "long", t)
-	default:
-		return nil
-	}
+	return nil
 }
 
 func udFloat(k reflect.Kind) udeserfn {

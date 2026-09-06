@@ -2153,13 +2153,6 @@ var magnitudeSites = []magnitudeSite{
 			"non-positive branch mean what it says, since only a genuinely zero-byte element can reach it now",
 	},
 	{
-		where: "schema.go::builder.buildComplex", count: 1, verdict: magNotAMagnitude,
-		reason: "`make(_, len(nd.fields))`, whose length is a field COUNT — bounded by the input, since every " +
-			"field costs bytes to write. The per-entry `1 + <minimum>` that used to live here (and separately " +
-			"in resolveMap and skipMap) is now the single mapEntryMinBytes rowed above: three sites each " +
-			"reasoning out the same ceiling is the shape that leaves the question with no owner",
-	},
-	{
 		where: "schema.go::maxDecimalDigits", count: 3, verdict: magSaturated,
 		reason: "`8*size - 1` and the float scale that follows. Asks the shared accessor rather than clamping to a " +
 			"ceiling of its own; magnitudeWidestMultiplier is this site's factor and is what the ceiling is chosen against",

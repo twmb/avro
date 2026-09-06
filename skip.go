@@ -3,7 +3,6 @@ package avro
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"sync"
 )
 
@@ -250,10 +249,4 @@ func buildSkip(w *schemaNode, mbw *minBytesWalk) skipfn {
 // input, so it errors rather than dereferencing nil.
 func skipUnbuildable(_ []byte, _ *slab) ([]byte, error) {
 	return nil, errors.New("avro: internal: record field has no skipper")
-}
-
-func skipToDeser(skip skipfn) deserfn {
-	return func(src []byte, _ reflect.Value, sl *slab) ([]byte, error) {
-		return skip(src, sl)
-	}
 }

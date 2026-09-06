@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -406,148 +407,26 @@ func typeFieldMappingSkip(fieldNames []string, cache *sync.Map, t reflect.Type, 
 		}
 	}
 
-	type fieldInfo struct {
-		name     string
-		index    []int
-		tagged   bool
-		omitzero bool
-	}
-
-	// collect walks the struct tree depth-first, recording fields in
-	// encounter order. We see shallower fields first, which is what the
-	// priority logic below rests on.
-	var fields []fieldInfo
-	var collect func(t reflect.Type, index []int, visited map[reflect.Type]bool)
-	collect = func(t reflect.Type, index []int, visited map[reflect.Type]bool) {
-		if visited[t] {
-			return // prevent infinite recursion on embedded struct cycles
-		}
-		// Per-path marking: the same type reached through two sibling embed
-		// paths is not a cycle, and each occurrence must be collected so the
-		// shallower one reaches the shallowest-wins dedup below. Marking
-		// forever pruned the sibling occurrence and picked the deeper field.
-		visited[t] = true
-		defer delete(visited, t)
-		for i := 0; i < t.NumField(); i++ {
-			sf := t.Field(i)
-			idx := make([]int, len(index)+1)
-			copy(idx, index)
-			idx[len(index)] = i
-
-			if sf.Anonymous {
-				ft := sf.Type
-				if ft.Kind() == reflect.Pointer {
-					ft = ft.Elem()
-				}
-				// Recurse into embedded structs (even unexported
-				// ones, since they can have exported fields).
-				if ft.Kind() == reflect.Struct {
-					tag := sf.Tag.Get("avro")
-					if tag == "-" {
-						continue
-					}
-					// An embedded struct with an explicit avro tag
-					// is a named field, not an inline of its own
-					// fields.
-					parts := splitFieldTag(tag)
-					name := parts[0]
-					if name != "" {
-						_, oz := parseTagOptions(parts[1:])
-						fields = append(fields, fieldInfo{
-							name:     name,
-							index:    idx,
-							tagged:   true,
-							omitzero: oz,
-						})
-						continue
-					}
-					collect(ft, idx, visited)
-					continue
-				}
-				if !sf.IsExported() {
-					continue
-				}
-			} else if !sf.IsExported() {
-				continue
-			}
-
-			tag := sf.Tag.Get("avro")
-			if tag == "-" {
-				continue
-			}
-			parts := splitFieldTag(tag)
-			name := parts[0]
-			tagged := name != ""
-			inline, oz := parseTagOptions(parts[1:])
-
-			if inline {
-				ft := sf.Type
-				if ft.Kind() == reflect.Pointer {
-					ft = ft.Elem()
-				}
-				if ft.Kind() == reflect.Struct {
-					collect(ft, idx, visited)
-					continue
-				}
-			}
-
-			if name == "" {
-				name = sf.Name
-			}
-			fields = append(fields, fieldInfo{
-				name:     name,
-				index:    idx,
-				tagged:   tagged,
-				omitzero: oz,
-			})
-		}
-	}
-	collect(t, nil, make(map[reflect.Type]bool))
-
-	type entry struct {
-		index    []int
-		tagged   bool
-		omitzero bool
-	}
-	m := make(map[string]entry, len(fields))
-	ambiguous := make(map[string][2]string) // name -> the two colliding Go field names
-	for _, f := range fields {
-		if existing, ok := m[f.name]; ok {
-			if f.tagged && !existing.tagged {
-				m[f.name] = entry{f.index, f.tagged, f.omitzero}
-				delete(ambiguous, f.name)
-				continue
-			}
-			if !f.tagged && existing.tagged {
-				continue
-			}
-			if len(f.index) < len(existing.index) {
-				m[f.name] = entry{f.index, f.tagged, f.omitzero}
-				delete(ambiguous, f.name)
-				continue
-			}
-			if len(f.index) == len(existing.index) {
-				// Equal depth, same tagged status: ambiguous. encoding/json
-				// drops such a field; we defer the error to lookup, so a
-				// collision on a name the schema never references does not
-				// break the whole struct. SchemaFor's collectFields rejects
-				// eagerly because it must emit every field.
-				ambiguous[f.name] = [2]string{t.FieldByIndex(existing.index).Name, t.FieldByIndex(f.index).Name}
-			}
-			continue
-		}
-		m[f.name] = entry{f.index, f.tagged, f.omitzero}
+	// The walk is lenient: a tag SchemaFor refuses never stopped an encode
+	// or decode, and a name the schema never asks for costs nothing.
+	var fields []promotedField
+	walkPromotedFields(t, nil, make(map[reflect.Type]bool), false, func(f promotedField) error {
+		fields = append(fields, f)
+		return nil
+	})
+	winners, ambiguous := resolvePromotedFields(t, fields)
+	byName := make(map[string]int, len(winners))
+	for _, w := range winners {
+		byName[fields[w].name()] = w
 	}
 
 	ats := make([][]int, 0, len(fieldNames))
 	ozs := make([]bool, 0, len(fieldNames))
 	for _, name := range fieldNames {
 		if names, amb := ambiguous[name]; amb {
-			return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf(
-				"duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
-				truncForError(name), t.String(), truncForError(names[0]), truncForError(names[1]))}
+			return nil, &SemanticError{GoType: t, AvroType: "record", Err: ambiguousFieldError(t, name, names)}
 		}
-		e, exists := m[name]
+		w, exists := byName[name]
 		if !exists {
 			if skipUnknown {
 				ats = append(ats, nil)
@@ -558,8 +437,8 @@ func typeFieldMappingSkip(fieldNames []string, cache *sync.Map, t reflect.Type, 
 			// not truncate, so we bound it here.
 			return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf("missing field %s", truncForError(name))}
 		}
-		ats = append(ats, e.index)
-		ozs = append(ozs, e.omitzero)
+		ats = append(ats, fields[w].index)
+		ozs = append(ozs, fields[w].hasOption("omitzero"))
 	}
 
 	result := &cachedMapping{indices: ats, omitzero: ozs}
@@ -569,37 +448,203 @@ func typeFieldMappingSkip(fieldNames []string, cache *sync.Map, t reflect.Type, 
 	return result, nil
 }
 
-// splitFieldTag tokenizes an avro struct tag with the grammar SchemaFor uses
-// (splitTag): top-level commas separate options, default= takes the rest
-// verbatim, and bracketed alias=[...] and decimal(...) values do not split on
-// their internal commas, so `alias=[x,inline,y]` cannot fire inline. A
-// malformed tag (unbalanced brackets) does not error, since encode and decode
-// never did, but fires no options at all: we map the field under the tag text
-// up to the first comma and drop the rest, rather than let a bracket typo
-// flip a field between nested and inlined.
-func splitFieldTag(tag string) []string {
-	parts, err := splitTag(tag)
-	if err != nil {
-		name, _, _ := strings.Cut(tag, ",")
-		return []string{name}
-	}
-	return parts
+// promotedField is one field a struct type promotes to the Avro record: the
+// Go field, its index path from the root type, and its avro tag split into
+// the name and the options.
+type promotedField struct {
+	sf    reflect.StructField
+	index []int
+	parts []string // parts[0] is the tag name, "" when untagged
 }
 
-// parseTagOptions reports whether "inline" and "omitzero" appear in the tag
-// options after the field name. Input comes from [splitFieldTag], so an option
-// carrying a value (default=..., alias=...) arrives as one part that can never
-// equal a bare keyword.
-func parseTagOptions(opts []string) (inline, omitzero bool) {
-	for _, o := range opts {
-		switch o {
-		case "inline":
-			inline = true
-		case "omitzero":
-			omitzero = true
+func (f *promotedField) name() string {
+	if f.parts[0] != "" {
+		return f.parts[0]
+	}
+	return f.sf.Name
+}
+
+func (f *promotedField) tagged() bool { return f.parts[0] != "" }
+
+func (f *promotedField) hasOption(opt string) bool { return slices.Contains(f.parts[1:], opt) }
+
+// structBehind returns t through one pointer and whether that is a struct.
+func structBehind(t reflect.Type) (reflect.Type, bool) {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return t, t.Kind() == reflect.Struct
+}
+
+// walkPromotedFields walks t depth-first and calls visit for every field t
+// promotes to the Avro record: exported fields, and the fields of embedded
+// and inline-tagged structs, flattened. Fields arrive in encounter order,
+// shallower first, which is what resolvePromotedFields rests on. SchemaFor
+// and the runtime field mapper share the walk, so the schema SchemaFor
+// infers names exactly the fields Encode and Decode reach.
+//
+// strict refuses the tags SchemaFor rejects: a skip directive with a suffix,
+// unbalanced brackets, inline beside a name or another option, and inline on
+// a non-struct. The mapper walks lenient, since encode and decode never
+// rejected them: a malformed tag keeps its name up to the first comma and no
+// options, and inline flattens a struct field whatever else the tag says.
+//
+// visited marks the type on the current path only. The same type reached
+// through two sibling embed paths is collected at each occurrence, so the
+// shallower one reaches the shallowest-wins resolution and a type inlined
+// twice surfaces as the collision it is. Marking forever pruned the sibling
+// occurrence and picked the deeper field.
+func walkPromotedFields(t reflect.Type, index []int, visited map[reflect.Type]bool, strict bool, visit func(promotedField) error) error {
+	if visited[t] {
+		return nil
+	}
+	visited[t] = true
+	defer delete(visited, t)
+	for i := range t.NumField() {
+		sf := t.Field(i)
+		ft, isStruct := structBehind(sf.Type)
+		// We recurse into an unexported embedded struct too, since it can
+		// carry exported fields.
+		embedded := sf.Anonymous && isStruct
+		if !embedded && !sf.IsExported() {
+			continue
+		}
+		tag := sf.Tag.Get("avro")
+		if tag == "-" {
+			continue
+		}
+		if err := checkSkipDirectiveExact(sf.Name, tag); err != nil && strict {
+			return err
+		}
+		parts, err := splitTag(tag)
+		if err != nil {
+			if strict {
+				return err
+			}
+			name, _, _ := strings.Cut(tag, ",")
+			parts = []string{name}
+		}
+		idx := make([]int, len(index)+1)
+		copy(idx, index)
+		idx[len(index)] = i
+		f := promotedField{sf: sf, index: idx, parts: parts}
+		inline := f.hasOption("inline")
+		switch {
+		case embedded && f.tagged():
+			// An embedded struct with an explicit name is a field, not an
+			// inline of its own fields; inline says the opposite.
+			if strict && inline {
+				return inlineNameError(sf, tag)
+			}
+		case embedded:
+			// An anonymous embed flattens. It has no Avro field of its own
+			// at this position, so an option that applies to a field has no
+			// target; we reject rather than drop.
+			if strict {
+				for _, p := range parts[1:] {
+					if p != "inline" {
+						return inlineOptionError(sf, tag, p, "the anonymous embed flattens")
+					}
+				}
+			}
+			if err := walkPromotedFields(ft, idx, visited, strict, visit); err != nil {
+				return err
+			}
+			continue
+		case inline:
+			if strict {
+				if f.tagged() {
+					return inlineNameError(sf, tag)
+				}
+				for _, p := range parts[1:] {
+					if p != "inline" {
+						return inlineOptionError(sf, tag, p, "inline flattens the embed")
+					}
+				}
+				if !isStruct {
+					return fmt.Errorf("avro: field %s has tag %q: inline requires a struct or pointer-to-struct field type; got %s (inline flattens the embed; there is no struct here to flatten)",
+						sf.Name, truncForError(tag), ft)
+				}
+			}
+			if isStruct {
+				if err := walkPromotedFields(ft, idx, visited, strict, visit); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		if err := visit(f); err != nil {
+			return err
 		}
 	}
-	return
+	return nil
+}
+
+func inlineNameError(sf reflect.StructField, tag string) error {
+	return fmt.Errorf("avro: field %s has tag %q: inline is incompatible with an explicit field name (inline flattens the embed; there is no field at this position to name)",
+		sf.Name, truncForError(tag))
+}
+
+func inlineOptionError(sf reflect.StructField, tag, opt, why string) error {
+	return fmt.Errorf("avro: field %s has tag %q: inline is incompatible with option %q (%s; there is no field at this position for the option to apply to)",
+		sf.Name, truncForError(tag), truncForError(opt), why)
+}
+
+// resolvePromotedFields decides which promoted field owns each Avro name over
+// the complete set walkPromotedFields collected from t, so the inferred
+// schema and the runtime mapping pick the same Go field for every name.
+// Tagged beats untagged at any depth; among same-tagged-status fields the
+// shallower wins; and only a collision that survives at the winning depth is
+// ambiguous, as Java's setFields and hamba treat it. The rule ranges over the
+// whole set rather than per recursion level, because a shallower field
+// declared later resolves a same-depth deep collision, as Go's own promotion
+// does.
+//
+// winners holds the owning fields' positions, one per name in the order the
+// names were first encountered; ambiguous maps each unresolved name to the
+// two colliding Go field names.
+func resolvePromotedFields(t reflect.Type, fields []promotedField) (winners []int, ambiguous map[string][2]string) {
+	owner := make(map[string]int, len(fields))
+	ambiguous = make(map[string][2]string)
+	for i := range fields {
+		f := &fields[i]
+		name := f.name()
+		cur, ok := owner[name]
+		if !ok {
+			owner[name] = i
+			continue
+		}
+		existing := &fields[cur]
+		switch {
+		case f.tagged() && !existing.tagged():
+			owner[name] = i
+			delete(ambiguous, name)
+		case !f.tagged() && existing.tagged():
+		case len(f.index) < len(existing.index):
+			owner[name] = i
+			delete(ambiguous, name)
+		case len(f.index) == len(existing.index):
+			ambiguous[name] = [2]string{t.FieldByIndex(existing.index).Name, t.FieldByIndex(f.index).Name}
+		}
+	}
+	seen := make(map[string]bool, len(owner))
+	for i := range fields {
+		name := fields[i].name()
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		winners = append(winners, owner[name])
+	}
+	return winners, ambiguous
+}
+
+// ambiguousFieldError reports an Avro name that two promoted fields of t
+// claim at the winning depth. SchemaFor prefixes it and the mapper wraps it
+// in a SemanticError, so the two report one message.
+func ambiguousFieldError(t reflect.Type, name string, fields [2]string) error {
+	return fmt.Errorf("duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
+		truncForError(name), t.String(), truncForError(fields[0]), truncForError(fields[1]))
 }
 
 // valueIsZero reports whether v is the zero value for its type, or implements

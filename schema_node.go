@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // SchemaNode is a read-write representation of an Avro schema. You get one
@@ -477,13 +479,14 @@ func (s *Schema) Root() *SchemaNode {
 		panic("avro: Schema.Root: invalid stored JSON: " + err.Error())
 	}
 	// One shape memo for the whole walk: stray bodies nest, so re-validating
-	// each subtree once per enclosing level would be O(depth^2).
-	n := nodeFromJSON(raw, "", make(strayShapeMemo))
-	table := fixupNameRefDefaults(&n)
+	// each subtree once per enclosing level would be O(depth^2). The wire
+	// node tree rides alongside so each field default is read from the node
+	// the parse validated it against.
+	n := nodeFromJSON(raw, "", make(strayShapeMemo), s.node)
 	// We stamp each name-reference node with its resolved target so an
-	// extracted subtree converts even when the definition lives outside it. It
-	// is the same table the default fixup resolved through, so the two paths
-	// cannot bind a reference differently.
+	// extracted subtree converts even when the definition lives outside it.
+	table := map[string]*SchemaNode{}
+	collectNamedTypes(&n, table)
 	stampNameRefs(&n, table, "")
 	return &n
 }
@@ -1064,29 +1067,9 @@ func jsonEscapedLen(s string, limit int) int {
 
 // jsonEscapedLenBytes is jsonEscapedLen over a byte slice, for text a
 // TextMarshaler returned (the emitter runs it through the same escaper).
+// The count only reads, so a string view of the bytes is safe.
 func jsonEscapedLenBytes(s []byte, limit int) int {
-	n := 0
-	for i := 0; i < len(s); {
-		if b := s[i]; b < utf8.RuneSelf {
-			n += asciiEscapedLen(b)
-			i++
-		} else {
-			c, size := utf8.DecodeRune(s[i:])
-			switch {
-			case c == utf8.RuneError && size == 1:
-				n += jsonInvalidUTF8EmitLen
-			case c == ' ' || c == ' ':
-				n += 6
-			default:
-				n += size
-			}
-			i += size
-		}
-		if n > limit {
-			return n
-		}
-	}
-	return n
+	return jsonEscapedLen(unsafe.String(unsafe.SliceData(s), len(s)), limit)
 }
 
 // avroCodepointEscapedLen is the emitted length of a byte slice that the JSON
@@ -1421,7 +1404,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 							continue
 						}
 						pv := boundedSerializableValue(d, depth, b, v)
-						if schemaReservedKeyForObject(k, pv, defTyp, defLogical, nil) {
+						if schemaReservedKeyForObject(k, pv, defTyp, defLogical, strayPresence(k, pv)) {
 							continue
 						}
 						if _, has := m2[k]; has {
@@ -1606,22 +1589,63 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 
 // nodeFromJSON converts a parsed JSON value into a SchemaNode. parentNS
 // is the enclosing namespace scope; named types without an explicit
-// "namespace" attribute resolve into it (see [SchemaNode].Namespace).
-func nodeFromJSON(v any, parentNS string, memo strayShapeMemo) SchemaNode {
+// "namespace" attribute resolve into it (see [SchemaNode].Namespace). wire
+// is the compiled node at this position, or nil where the parse built none
+// (a stray body); the walk descends the two in step, since the JSON is what
+// the node tree was built from.
+func nodeFromJSON(v any, parentNS string, memo strayShapeMemo, wire *schemaNode) SchemaNode {
 	switch s := v.(type) {
 	case string:
 		return SchemaNode{Type: s}
 	case []any:
 		branches := make([]SchemaNode, len(s))
 		for i, b := range s {
-			branches[i] = nodeFromJSON(b, parentNS, memo)
+			branches[i] = nodeFromJSON(b, parentNS, memo, wireBranch(wire, i))
 		}
 		return SchemaNode{Type: "union", Branches: branches}
 	case map[string]any:
-		return nodeFromJSONObject(s, parentNS, memo)
+		return nodeFromJSONObject(s, parentNS, memo, wire)
 	default:
 		return SchemaNode{}
 	}
+}
+
+// wireField, wireItems, wireValues and wireBranch return the compiled node
+// at one child position of n, or nil when n is nil or its kind does not
+// bind that position: a stray body has no compiled twin.
+func wireField(n *schemaNode, i int) *fieldNode {
+	if n == nil || !isRecordKind(n.kind) || i >= len(n.fields) {
+		return nil
+	}
+	return &n.fields[i]
+}
+
+func wireFieldNode(n *schemaNode, i int) *schemaNode {
+	if f := wireField(n, i); f != nil {
+		return f.node
+	}
+	return nil
+}
+
+func wireItems(n *schemaNode) *schemaNode {
+	if n == nil || n.kind != "array" {
+		return nil
+	}
+	return n.items
+}
+
+func wireValues(n *schemaNode) *schemaNode {
+	if n == nil || n.kind != "map" {
+		return nil
+	}
+	return n.values
+}
+
+func wireBranch(n *schemaNode, i int) *schemaNode {
+	if n == nil || n.kind != "union" || i >= len(n.branches) {
+		return nil
+	}
+	return n.branches[i]
 }
 
 // Known schema keys that are *not* custom properties.
@@ -1704,186 +1728,13 @@ func isNamedKind(typ string) bool {
 	return typ == "record" || typ == "error" || typ == "enum" || typ == "fixed"
 }
 
-// coerceMetadataDefault is the metadata parallel of coerceDefault: it puts a
-// parsed-JSON default into the Go form the wire pipeline materializes, so
-// SchemaField.Default's type matches the wire bytes. Numbers become the
-// schema-width Go type, as in Java. A string default on bytes/fixed becomes
-// []byte through the codepoint mapping, so encoding f.Default back works for
-// fixed+uuid too. We walk unions and nested containers. A string-form
-// numeric default coerces to float only on an outer float/double field,
-// never a union branch, as in Java.
-func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode, ns string) any {
-	if t == nil {
-		return val
-	}
-	// Name-ref resolution: with a non-nil table, a bare name-reference Type
-	// resolves to the named node and recurses inside the *target's* own
-	// namespace scope. table == nil is the best-effort inline pass during
-	// nodeFromJSON, where the full tree, and so the name table, does not
-	// exist yet.
-	if resolved := lookupNameRef(t, table, ns); resolved != nil {
-		return coerceMetadataDefault(val, resolved, table, nodeEffNS(resolved))
-	}
-	if t.Type == "union" {
-		// On the best-effort first pass we cannot resolve the name-referenced
-		// branches. A greedy earlier branch (bytes accepting a string) would
-		// destructively coerce string to []byte and lock out the enum branch
-		// the table-populated pass would pick, since the enum arm takes only a
-		// string. So we defer all branch selection to coerceTreeDefaults.
-		if table == nil {
-			return val
-		}
-		// The *first* branch that accepts val's Go type, matching
-		// coerceDefault's validateDefault selection and Java's parseField.
-		// "First branch that transforms" would diverge on ["string","float"]
-		// default "1.5": the wire picks string, while a transform check picks
-		// float because string to string looks like a no-op.
-		if branch := firstMetadataBranchAcceptingDefault(t, val, table, ns); branch != nil {
-			return coerceMetadataDefault(val, branch, table, nsForChildren(branch, ns))
-		}
-		return val
-	}
-	if val == nil {
-		return val
-	}
-	if t.Type == "int" {
-		// Every numeric form routes through the range-checked defaultAsInt32.
-		// During union-branch selection a wider sibling makes the schema
-		// parse-valid, so this can run on an out-of-int32 value; a blind cast
-		// would wrap it and select the int branch the wire rejects. Leaving it
-		// alone lets defaultAsInt32 reject so selection falls to the sibling.
-		switch val := val.(type) {
-		case int32:
-			return val
-		case int64, json.Number, string, float64:
-			if n, err := defaultAsInt32(val); err == nil {
-				return n
-			}
-			return val
-		}
-		return val
-	}
-	if t.Type == "long" {
-		// Coerce non-int64 numeric inputs (json.Number, string,
-		// float64-whole-number) to int64. int64 inputs pass through.
-		// Schema parse rejects out-of-int64 via defaultAsInt64.
-		switch val := val.(type) {
-		case int64:
-			return val
-		case int32:
-			return int64(val)
-		case json.Number, string, float64:
-			if n, err := defaultAsInt64(val); err == nil {
-				return n
-			}
-			return val
-		}
-		return val
-	}
-	if t.Type == "float" || t.Type == "double" {
-		// Width-faithful narrowing, as in Java: a float schema gives float32,
-		// finite overflows and mantissa rounding included, so Default is what
-		// the wire encoder emits. Strings parse inline rather than through
-		// defaultAsFloat, which stays strict for union matching and encode;
-		// this is the outer-field text-to-float coercion.
-		var f float64
-		switch val := val.(type) {
-		case float64:
-			f = val
-		case float32:
-			f = float64(val)
-		case string:
-			var err error
-			if f, err = parseFloatAcceptOverflow(val, 64); err != nil {
-				return val
-			}
-		case int64, int32, json.Number:
-			var err error
-			if f, err = defaultAsFloat(val); err != nil {
-				return val
-			}
-		default:
-			return val
-		}
-		if t.Type == "float" {
-			return float32(f)
-		}
-		return f
-	}
-	if t.Type == "bytes" || t.Type == "fixed" {
-		if s, ok := val.(string); ok {
-			if b, err := avroJSONBytesToBytes(s); err == nil {
-				return b
-			}
-		}
-		return val
-	}
-	if isRecordKind(t.Type) {
-		if m, ok := val.(map[string]any); ok {
-			childNS := nsForChildren(t, ns)
-			out := make(map[string]any, len(m))
-			for k, v := range m {
-				inner := v
-				for i := range t.Fields {
-					if t.Fields[i].Name == k {
-						inner = coerceMetadataDefault(v, &t.Fields[i].Type, table, childNS)
-						break
-					}
-				}
-				out[k] = inner
-			}
-			return out
-		}
-		return val
-	}
-	if t.Type == "array" && t.Items != nil {
-		if a, ok := val.([]any); ok {
-			out := make([]any, len(a))
-			for i, v := range a {
-				out[i] = coerceMetadataDefault(v, t.Items, table, ns)
-			}
-			return out
-		}
-		return val
-	}
-	if t.Type == "map" && t.Values != nil {
-		if m, ok := val.(map[string]any); ok {
-			out := make(map[string]any, len(m))
-			for k, v := range m {
-				out[k] = coerceMetadataDefault(v, t.Values, table, ns)
-			}
-			return out
-		}
-		return val
-	}
-	return val
-}
-
-// nodeEffNS returns n's effective namespace: a dotted Name carries its
-// own namespace (taking precedence per the spec); otherwise Namespace,
-// which is already resolved ("" means the null namespace).
-func nodeEffNS(n *SchemaNode) string {
-	if i := strings.LastIndexByte(n.Name, '.'); i >= 0 {
-		return n.Name[:i]
-	}
-	return n.Namespace
-}
-
-// nodeFullname returns n's fullname: the dotted Name verbatim, or the resolved
-// namespace joined to the name. A single *leading* dot collapses per the
-// null-namespace escape the parser normalizes at build (leadingDotName), so
-// ".x" is the fullname "x" and "." is the bare empty name.
+// nodeFullname returns n's fullname by resolveScope over the node's own
+// Name and Namespace. Namespace is already resolved, so it stands in for a
+// written attribute and "" means the null namespace; a dotted Name takes
+// precedence over it, as at parse.
 func nodeFullname(n *SchemaNode) string {
-	if strings.Contains(n.Name, ".") {
-		if short, ok := leadingDotName(n.Name); ok {
-			return short
-		}
-		return n.Name
-	}
-	if n.Namespace != "" {
-		return n.Namespace + "." + n.Name
-	}
-	return n.Name
+	fullname, _ := resolveScope(n.Name, n.Namespace, true, "")
+	return fullname
 }
 
 // nsForChildren returns the namespace scope in effect inside n: a named
@@ -1891,23 +1742,22 @@ func nodeFullname(n *SchemaNode) string {
 // through.
 func nsForChildren(n *SchemaNode, enclosing string) string {
 	// Named *kinds* open their own scope even with an empty short name (a user
-	// WithLaxNames fn can accept ""; nodeEffNS carries the resolved namespace
+	// WithLaxNames fn can accept ""; Namespace carries the resolved namespace
 	// either way). The Name != "" arm keeps hand-built names on non-named kinds
-	// scoping as before.
+	// scoping as before. The scope is resolveScope's, as for nodeFullname.
 	if n != nil && (n.Name != "" || isNamedKind(n.Type)) {
-		return nodeEffNS(n)
+		_, ns := resolveScope(n.Name, n.Namespace, true, "")
+		return ns
 	}
 	return enclosing
 }
 
 // lookupNameRef returns the named target of t when t.Type is a name reference
-// (not a structural or primitive kind) and table has it, else nil. A nil table
-// always returns nil: synchronous-build callers disable name-ref resolution
-// because the tree isn't fully walked yet. ns is the enclosing namespace scope
-// at the reference site. The key order comes from scopedRefKeys (schema.go), so
-// the metadata binding cannot drift from the wire's.
+// (not a structural or primitive kind) and table has it, else nil. ns is the
+// enclosing namespace scope at the reference site. The lookup is
+// lookupScoped, the wire's own, so the metadata binding cannot drift from it.
 func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *SchemaNode {
-	if t == nil || table == nil {
+	if t == nil {
 		return nil
 	}
 	// Structural kinds (primitives, "record"/"error", "enum", "fixed",
@@ -1921,29 +1771,8 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *Sche
 		"bytes", "string", "record", "error", "enum", "fixed", "array", "map", "union":
 		return nil
 	}
-	var keys [2]string
-	for _, k := range scopedRefKeys(&keys, t.Type, ns) {
-		if r, ok := table[k]; ok {
-			return r
-		}
-	}
-	return nil
-}
-
-// fixupNameRefDefaults walks the SchemaNode tree once to populate a name-table
-// of every reachable record/enum/fixed, then re-coerces HasDefault fields with
-// the table. Name-referenced defaults, and defaults whose union contains a
-// name-ref branch, then materialize the way inline-typed siblings already do
-// via the synchronous coerce. We return the table for Root's reference
-// stamping, so both paths resolve through the identical name set.
-func fixupNameRefDefaults(root *SchemaNode) map[string]*SchemaNode {
-	table := map[string]*SchemaNode{}
-	collectNamedTypes(root, table)
-	if len(table) == 0 {
-		return table
-	}
-	coerceTreeDefaults(root, table, "")
-	return table
+	_, r, _ := lookupScoped(table, t.Type, ns)
+	return r
 }
 
 // stampNameRefs records, on every node whose Type is a name reference that
@@ -2029,10 +1858,20 @@ func nodeCarriesNothingBut(n *SchemaNode, exempt func(*SchemaNode, string) bool)
 	return true
 }
 
-// presenceSet is a bit per attribute that can be written with a body its
-// destination stores as that destination's own zero. One field rather than
-// one bool each keeps the hidden state on the public struct at a single
-// member, and keeps every consumer asking the same question.
+// nodePresenceSet reports whether the named exported field carries content
+// by presence alone.
+func nodePresenceSet(n *SchemaNode, field string) bool {
+	b, ok := presenceBitFor(field)
+	return ok && n.present.has(b)
+}
+
+// presenceSet is a bit per attribute a decoding arm consumed from a body of
+// the attribute's shape. On a SchemaNode it tells a written zero from an
+// unwritten one (a doc written as "", an aliases written as []), which the
+// field alone cannot. On both the SchemaNode and the parser's aobject it is
+// the stray-key routing verdict: a structural key the kind does not bind
+// stays out of Props iff its arm set the bit. One field rather than one
+// bool each keeps every consumer asking the same question.
 type presenceSet uint16
 
 const (
@@ -2044,6 +1883,8 @@ const (
 	presSymbols
 	presSize
 	presFields
+	presItems
+	presValues
 )
 
 func (p presenceSet) has(b presenceSet) bool { return p&b != 0 }
@@ -2054,40 +1895,47 @@ func (p *presenceSet) setIf(cond bool, b presenceSet) {
 	}
 }
 
-// presenceBitFor maps an exported SchemaNode field name to its bit, so the
-// emptiness walk, the emitter and the guards all key on one vocabulary.
+// presenceBits is the one table behind the presence vocabulary: each bit's
+// JSON key, the exported SchemaNode field it lands on, and whether the key
+// is stray-routed (carried as written on a kind that does not bind it, when
+// its body has the key's shape). The emptiness walk, the emitter, the
+// guards, and the Props routing all key on it.
+var presenceBits = [...]struct {
+	key, field string
+	bit        presenceSet
+	stray      bool
+}{
+	{"doc", "Doc", presDoc, false},
+	{"logicalType", "LogicalType", presLogicalType, false},
+	{"name", "Name", presName, true},
+	{"namespace", "Namespace", presNamespace, true},
+	{"aliases", "Aliases", presAliases, true},
+	{"symbols", "Symbols", presSymbols, true},
+	{"size", "Size", presSize, true},
+	{"fields", "Fields", presFields, true},
+	{"items", "Items", presItems, true},
+	{"values", "Values", presValues, true},
+}
+
+// presenceBitFor maps an exported SchemaNode field name to its bit.
 func presenceBitFor(field string) (presenceSet, bool) {
-	switch field {
-	case "Doc":
-		return presDoc, true
-	case "LogicalType":
-		return presLogicalType, true
-	case "Name":
-		return presName, true
-	case "Namespace":
-		return presNamespace, true
-	case "Aliases":
-		return presAliases, true
-	case "Symbols":
-		return presSymbols, true
-	case "Size":
-		return presSize, true
-	case "Fields":
-		return presFields, true
+	for i := range presenceBits {
+		if presenceBits[i].field == field {
+			return presenceBits[i].bit, true
+		}
 	}
 	return 0, false
 }
 
-// nodePresenceSet reports whether the named exported field carries content
-// its value cannot show: an attribute written as the field's own zero.
-// Without it the emptiness walk and the emitter disagree, since a doc
-// written as "" reads as an empty node and collapses to a bare type name.
-// It is keyed by field name so it composes with the exemption sets: at a
-// name-reference splice Doc and LogicalType are exempt usage-site
-// attributes, so we ignore their presence as we ignore their value.
-func nodePresenceSet(n *SchemaNode, field string) bool {
-	b, ok := presenceBitFor(field)
-	return ok && n.present.has(b)
+// strayKeyBit returns the presence bit a stray-routed key's decoding arm
+// records, and false for any other key.
+func strayKeyBit(k string) (presenceSet, bool) {
+	for i := range presenceBits {
+		if presenceBits[i].stray && presenceBits[i].key == k {
+			return presenceBits[i].bit, true
+		}
+	}
+	return 0, false
 }
 
 // bareEmissionExempt classifies the fields whose value cannot be lost by
@@ -2198,203 +2046,19 @@ func collectNamedTypes(n *SchemaNode, table map[string]*SchemaNode) {
 	}
 }
 
-func coerceTreeDefaults(n *SchemaNode, table map[string]*SchemaNode, ns string) {
-	if n == nil {
-		return
-	}
-	childNS := nsForChildren(n, ns)
-	for i := range n.Fields {
-		f := &n.Fields[i]
-		if f.HasDefault {
-			f.Default = coerceMetadataDefault(f.Default, &f.Type, table, childNS)
-		}
-		coerceTreeDefaults(&f.Type, table, childNS)
-	}
-	if n.Items != nil {
-		coerceTreeDefaults(n.Items, table, childNS)
-	}
-	if n.Values != nil {
-		coerceTreeDefaults(n.Values, table, childNS)
-	}
-	for i := range n.Branches {
-		coerceTreeDefaults(&n.Branches[i], table, childNS)
-	}
-}
-
-// defaultMatchesBytesOrFixedKind mirrors the wire pipeline's validateLeaf for
-// bytes and fixed: the codepoint range and, for fixed, the exact size.
-// Without the size check, [fixed:8,"string"] with a 4-char default would
-// metadata-match fixed while the wire matches string.
-func defaultMatchesBytesOrFixedKind(t *SchemaNode, val any) bool {
-	switch v := val.(type) {
-	case string:
-		if err := validateAvroByteString(v, t.Type); err != nil {
-			return false
-		}
-		if t.Type == "fixed" && len([]rune(v)) != t.Size {
-			return false
-		}
-		return true
-	case []byte:
-		if t.Type == "fixed" && len(v) != t.Size {
-			return false
-		}
-		return true
-	}
-	return false
-}
-
-// branchAcceptsDefault reports whether the Avro type t accepts val as a
-// default, with the same compatibility validateDefault enforces on the wire
-// side, so union selection picks the same branch on both sides. The
-// numeric arms delegate to the defaultAs helpers: float/double accept any
-// numeric input and reject strings. The structural arms recurse, so a record
-// enforces required-field presence and containers require every element to
-// accept; otherwise [{record needing X}, {record needing nothing}] with
-// default {} would metadata-match the first while the wire picks the second.
-func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, ns string) bool {
-	// Resolve a bare name-reference if the caller supplied a name-table.
-	if resolved := lookupNameRef(t, table, ns); resolved != nil {
-		return branchAcceptsDefault(resolved, val, table, nodeEffNS(resolved))
-	}
-	switch t.Type {
-	case "null":
-		return val == nil
-	case "boolean":
-		_, ok := val.(bool)
-		return ok
-	case "int":
-		_, err := defaultAsInt32(val)
-		return err == nil
-	case "long":
-		_, err := defaultAsInt64(val)
-		return err == nil
-	case "float", "double":
-		_, err := defaultAsFloat(val)
-		return err == nil
-	case "string":
-		_, ok := val.(string)
-		return ok
-	case "enum":
-		sym, ok := val.(string)
-		if !ok {
-			return false
-		}
-		// The wire rejects non-member symbols, so enum needs its own arm; the
-		// string arm would accept any string. An empty enum accepts nothing.
-		return slices.Contains(t.Symbols, sym)
-	case "bytes", "fixed":
-		return defaultMatchesBytesOrFixedKind(t, val)
-	case "record", "error":
-		m, ok := val.(map[string]any)
-		if !ok {
-			return false
-		}
-		childNS := nsForChildren(t, ns)
-		for i := range t.Fields {
-			f := &t.Fields[i]
-			fv, present := m[f.Name]
-			if !present {
-				if !f.HasDefault {
-					return false
-				}
-				continue
-			}
-			// We coerce the child before the accept check, as the wire
-			// selector does, so a string in a nested float/double field
-			// selects the container branch on both sides. Fresh containers
-			// keep a rejected sibling's value unmutated. The scalar
-			// float/double arm is not coerced, so ["double","string"] default
-			// "5" still picks string.
-			fv = coerceMetadataDefault(fv, &f.Type, table, childNS)
-			if !branchAcceptsDefault(&f.Type, fv, table, childNS) {
-				return false
-			}
-		}
-		return true
-	case "array":
-		arr, ok := val.([]any)
-		if !ok {
-			return false
-		}
-		if t.Items == nil {
-			return true
-		}
-		for _, item := range arr {
-			// Coerce each element to mirror the wire selector; see the
-			// record arm above.
-			item = coerceMetadataDefault(item, t.Items, table, ns)
-			if !branchAcceptsDefault(t.Items, item, table, ns) {
-				return false
-			}
-		}
-		return true
-	case "map":
-		m, ok := val.(map[string]any)
-		if !ok {
-			return false
-		}
-		if t.Values == nil {
-			return true
-		}
-		for _, v := range m {
-			// Coerce each value to mirror the wire selector; see the
-			// record arm above.
-			v = coerceMetadataDefault(v, t.Values, table, ns)
-			if !branchAcceptsDefault(t.Values, v, table, ns) {
-				return false
-			}
-		}
-		return true
-	case "union":
-		return firstMetadataBranchAcceptingDefault(t, val, table, ns) != nil
-	}
-	return false
-}
-
-// firstMetadataBranchAcceptingDefault returns the first branch of union t
-// whose branchAcceptsDefault accepts val, name refs resolved, or nil: the
-// *SchemaNode twin of firstUnionBranchAcceptingDefault.
-func firstMetadataBranchAcceptingDefault(t *SchemaNode, val any, table map[string]*SchemaNode, ns string) *SchemaNode {
-	for i := range t.Branches {
-		branch := &t.Branches[i]
-		if resolved := lookupNameRef(branch, table, ns); resolved != nil {
-			branch = resolved
-		}
-		if branchAcceptsDefault(branch, val, table, nsForChildren(branch, ns)) {
-			return branch
-		}
-	}
-	return nil
-}
-
-func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) SchemaNode {
+func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo, wire *schemaNode) SchemaNode {
 	n := SchemaNode{}
 
 	getString(m, "type", &n.Type)
 	n.present.setIf(getString(m, "name", &n.Name), presName)
-	// Namespace resolves at build. An explicit attribute wins, the explicit
-	// "namespace":"" form included, which is a different type than one
-	// inheriting the enclosing namespace. A dotted name carries its own
-	// namespace; we preserve any attribute beside it but ignore it, as the
-	// parser does.
-	explicitNS, hasExplicitNS := "", false
-	if s, ok := m["namespace"].(string); ok {
-		explicitNS, hasExplicitNS = s, true
-	}
-	n.present.setIf(hasExplicitNS, presNamespace)
-	switch {
-	// Named kinds with an empty short name inherit/take-explicit exactly
-	// like any undotted name (the parser resolves "name":"" under an
-	// enclosing namespace to fullname "ns.").
-	case (n.Name != "" || isNamedKind(n.Type)) && !strings.Contains(n.Name, "."):
-		if hasExplicitNS {
-			n.Namespace = explicitNS
-		} else {
-			n.Namespace = parentNS
-		}
-	case hasExplicitNS:
-		n.Namespace = explicitNS
+	// Namespace resolves at build through resolveScope, the parser's rule.
+	// A dotted name carries its own namespace; we preserve any attribute
+	// beside it as written but it scopes nothing. Named kinds with an empty
+	// short name resolve like any undotted name (the parser registers
+	// "name":"" under an enclosing namespace as fullname "ns.").
+	n.present.setIf(getString(m, "namespace", &n.Namespace), presNamespace)
+	if (n.Name != "" || isNamedKind(n.Type)) && !strings.Contains(n.Name, ".") {
+		_, n.Namespace = resolveScope(n.Name, n.Namespace, n.present.has(presNamespace), parentNS)
 	}
 	childNS := nsForChildren(&n, parentNS)
 	// getString consumes only a string body, so recording presence off the
@@ -2415,11 +2079,9 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	// arms run, so a structural field is set exactly when the parse consumes
 	// the key. A malformed stray body rides to Props verbatim as its only
 	// surface.
-	sizeOK := false
 	if v, ok := m["size"]; ok {
 		if l, err := decodeLaxInt("size", v); err == nil {
 			n.Size = int(l)
-			sizeOK = true
 			n.present |= presSize
 		}
 	}
@@ -2451,14 +2113,14 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 		strayShapeMemo: memo,
 		fields:         func(arr []any) { n.Fields = make([]SchemaField, len(arr)); n.present |= presFields },
 		field: func(i int, fm map[string]any, typeKey, scope string) {
-			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope, memo), nil)
+			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope, memo, wireFieldNode(wire, i)), nil, wireField(wire, i))
 		},
 		fieldNoType: func(i int, fm map[string]any) {
 			// Typeless element inside a stray "fields": we carry the
 			// written attributes (name / doc / aliases / order / default
 			// / props) on the field with a zero Type, as-written, never
 			// a fabricated zero element.
-			n.Fields[i] = metadataField(fm, SchemaNode{}, nil)
+			n.Fields[i] = metadataField(fm, SchemaNode{}, nil, nil)
 		},
 		flatField: func(i int, fm map[string]any, kind, scope string) {
 			// Flat goavro-style field format: the wire parser lifts the
@@ -2466,41 +2128,26 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 			// and the metadata tree must describe that same post-lift schema
 			// or the rebuild emits an empty shell.
 			flatType := flatLiftTypeMap(fm, kind)
-			n.Fields[i] = metadataField(fm, nodeFromJSONObject(flatType, scope, memo), flatType)
+			n.Fields[i] = metadataField(fm, nodeFromJSONObject(flatType, scope, memo, wireFieldNode(wire, i)), flatType, wireField(wire, i))
 		},
 		items: func(key, scope string) {
-			node := nodeFromJSON(m[key], scope, memo)
+			node := nodeFromJSON(m[key], scope, memo, wireItems(wire))
 			n.Items = &node
+			n.present |= presItems
 		},
 		values: func(key, scope string) {
-			node := nodeFromJSON(m[key], scope, memo)
+			node := nodeFromJSON(m[key], scope, memo, wireValues(wire))
 			n.Values = &node
+			n.present |= presValues
 		},
 	})
 
 	// Collect custom properties: anything not reserved, with precision/scale
-	// reserved only on a recognized decimal carrier. The structural keys
-	// already recorded their shape verdicts above, so we route on those
-	// rather than decode a second time.
-	shapeOK := func(key string, v any) bool {
-		switch key {
-		case "items":
-			return n.Items != nil
-		case "values":
-			return n.Values != nil
-		case "fields":
-			return n.Fields != nil
-		case "symbols":
-			return n.Symbols != nil
-		case "aliases":
-			return n.Aliases != nil
-		case "size":
-			return sizeOK
-		}
-		return strayBodyShapeOK(key, v)
-	}
+	// reserved only on a recognized decimal carrier. The structural reads
+	// above recorded their verdicts in n.present, so the routing decodes
+	// nothing a second time.
 	for k, v := range m {
-		if schemaReservedKeyForObject(k, v, n.Type, n.LogicalType, shapeOK) {
+		if schemaReservedKeyForObject(k, v, n.Type, n.LogicalType, n.present) {
 			continue
 		}
 		if n.Props == nil {
@@ -2516,16 +2163,17 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 // already-built type node. flatType, non-nil for a flat-form field, is the
 // lifted key set. We keep the keys the lift routed into the type out of Props,
 // and the routed doc belongs to the lifted type rather than the field, as
-// the wire lift routes it.
-func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) SchemaField {
+// the wire lift routes it. wf is the compiled field, whose default the
+// parse validated and coerced; a field inside a stray body has none and
+// carries its default as written.
+func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any, wf *fieldNode) SchemaField {
 	sf := SchemaField{Type: typ}
 	getString(fm, "name", &sf.Name)
 	if d, ok := fm["default"]; ok {
-		// String defaults coerce to float64 for float/double fields, as
-		// Java and the wire pipeline do. The nil name table makes this
-		// best-effort; fixupNameRefDefaults re-coerces at the end of Root
-		// with a populated table.
-		sf.Default = coerceMetadataDefault(d, &sf.Type, nil, "")
+		sf.Default = d
+		if wf != nil {
+			sf.Default = metadataDefault(wf.defaultVal, wf.node)
+		}
 		sf.HasDefault = true
 	}
 	if flatType == nil {
@@ -2557,6 +2205,76 @@ func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) S
 		sf.Props[k] = v
 	}
 	return sf
+}
+
+// metadataDefault converts a field's wire default, which the parse validated
+// and coerced, into the Go form [SchemaField.Default] promises: int32 for
+// int, int64 for long, float32 for float, float64 for double, with
+// containers rebuilt leaf by leaf. A union narrows along the branch the wire
+// selected, so the metadata cannot report a branch the encoder does not
+// fill. Every container and byte slice is a fresh copy: the wire value is
+// shared by every Root call and must not be reachable through the tree we
+// hand back.
+func metadataDefault(val any, node *schemaNode) any {
+	if node == nil {
+		return deepCopyTree(val)
+	}
+	switch node.kind {
+	case "int":
+		if n, err := defaultAsInt32(val); err == nil {
+			return n
+		}
+	case "long":
+		if n, err := defaultAsInt64(val); err == nil {
+			return n
+		}
+	case "float":
+		if f, err := defaultAsFloat(val); err == nil {
+			return float32(f)
+		}
+	case "double":
+		if f, err := defaultAsFloat(val); err == nil {
+			return f
+		}
+	case "bytes", "fixed":
+		if b, ok := val.([]byte); ok {
+			return bytes.Clone(b)
+		}
+	case "union":
+		if branch := firstUnionBranchAcceptingDefault(val, node); branch != nil {
+			return metadataDefault(val, branch)
+		}
+	case "record":
+		if m, ok := val.(map[string]any); ok {
+			out := make(map[string]any, len(m))
+			for k, v := range m {
+				out[k] = deepCopyTree(v)
+			}
+			for _, f := range node.fields {
+				if v, ok := m[f.name]; ok {
+					out[f.name] = metadataDefault(v, f.node)
+				}
+			}
+			return out
+		}
+	case "array":
+		if a, ok := val.([]any); ok {
+			out := make([]any, len(a))
+			for i, v := range a {
+				out[i] = metadataDefault(v, node.items)
+			}
+			return out
+		}
+	case "map":
+		if m, ok := val.(map[string]any); ok {
+			out := make(map[string]any, len(m))
+			for k, v := range m {
+				out[k] = metadataDefault(v, node.values)
+			}
+			return out
+		}
+	}
+	return val
 }
 
 // decimalConsumesPrecisionScale reports whether a type object with the given
@@ -2598,22 +2316,16 @@ func schemaKeyBinds(k string, v any, typ, logical string) bool {
 // field, which needs both a field and a body of that key's shape. A key that
 // is neither goes only to Props, which is where type-level
 // "default" and "order" go; Java and fastavro keep both as properties too.
-// shapeOK answers the stray-body shape question from a verdict the caller
-// already computed, since a fresh decode would re-enter aschemaFromAny and
-// compound to O(2^depth) on nested strays. A nil shapeOK takes a fresh
-// decode, for the cache splice merge, which has no nested strays.
-func schemaReservedKeyForObject(k string, v any, typ, logical string, shapeOK strayShapeVerdict) bool {
+// present carries the shape verdicts the caller's decoding arms recorded,
+// so the routing never decodes a body itself; a caller with no arms asks
+// strayPresence for the one key in hand.
+func schemaReservedKeyForObject(k string, v any, typ, logical string, present presenceSet) bool {
 	if !schemaReservedKeys[k] {
 		return false
 	}
 	if schemaKeyBinds(k, v, typ, logical) {
 		return true
 	}
-	if canonicalStrayKey(k) == "" {
-		return false
-	}
-	if shapeOK != nil {
-		return shapeOK(k, v)
-	}
-	return strayBodyShapeOK(k, v)
+	bit, stray := strayKeyBit(k)
+	return stray && present.has(bit)
 }

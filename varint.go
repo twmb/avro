@@ -3,6 +3,7 @@ package avro
 import (
 	"errors"
 	"math/bits"
+	"unsafe"
 )
 
 func appendUint32(dst []byte, u uint32) []byte {
@@ -88,29 +89,47 @@ func appendVarlong(dst []byte, i int64) []byte {
 	}
 }
 
-func readUvarint(src []byte) (uint32, []byte, error) {
-	var u uint32
-	for i := range 4 {
+// readUvar reads an unsigned varint of U's width: at most five bytes for
+// uint32, ten for uint64. The width picks the loop bound and the last byte's
+// overflow mask, and both fold to constants per instantiation, so each width
+// compiles to the direct loop the two hand-written readers had. The body
+// calls nothing on its hot path: a call inside a generic body is not
+// inlined, so a helper here would cost a call per varint.
+func readUvar[U uint32 | uint64](src []byte) (U, []byte, error) {
+	width := int(unsafe.Sizeof(U(0))) * 8
+	last := width / 7 // index of the byte that cannot carry a continuation
+	name, overflow := "uvarint", "uvarint overflows 32 bits"
+	if width == 64 {
+		name, overflow = "uvarlong", "uvarlong overflows 64 bits"
+	}
+	var u U
+	for i := range last {
 		if i >= len(src) {
-			return 0, nil, &ShortBufferError{Type: "uvarint"}
+			return 0, nil, &ShortBufferError{Type: name}
 		}
 		b := src[i]
-		u |= uint32(b&0x7f) << (7 * i)
+		u |= U(b&0x7f) << (7 * i)
 		if b&0x80 == 0 {
 			return u, src[i+1:], nil
 		}
 	}
-	if len(src) < 5 {
-		return 0, nil, &ShortBufferError{Type: "uvarint"}
+	if len(src) <= last {
+		return 0, nil, &ShortBufferError{Type: name}
 	}
-	b := src[4]
-	if b > 0x0f {
-		return 0, nil, errors.New("uvarint overflows 32 bits")
+	b := src[last]
+	if b > 1<<(width-7*last)-1 {
+		return 0, nil, errors.New(overflow)
 	}
-	u |= uint32(b) << 28
-	return u, src[5:], nil
+	u |= U(b) << (7 * last)
+	return u, src[last+1:], nil
 }
 
+func readUvarint(src []byte) (uint32, []byte, error)  { return readUvar[uint32](src) }
+func readUvarlong(src []byte) (uint64, []byte, error) { return readUvar[uint64](src) }
+
+// readVarint and readVarlong stay two plain functions: each inlines its
+// readUvar wrapper and so calls the instantiation directly on the multi-byte
+// path, where a shared generic body would add a call.
 func readVarint(src []byte) (int32, []byte, error) {
 	if len(src) > 0 && src[0] < 0x80 {
 		u := uint32(src[0])
@@ -121,29 +140,6 @@ func readVarint(src []byte) (int32, []byte, error) {
 		return 0, nil, err
 	}
 	return int32(u>>1) ^ -int32(u&1), src, nil
-}
-
-func readUvarlong(src []byte) (uint64, []byte, error) {
-	var u uint64
-	for i := range 9 {
-		if i >= len(src) {
-			return 0, nil, &ShortBufferError{Type: "uvarlong"}
-		}
-		b := src[i]
-		u |= uint64(b&0x7f) << (7 * i)
-		if b&0x80 == 0 {
-			return u, src[i+1:], nil
-		}
-	}
-	if len(src) < 10 {
-		return 0, nil, &ShortBufferError{Type: "uvarlong"}
-	}
-	b := src[9]
-	if b > 0x01 {
-		return 0, nil, errors.New("uvarlong overflows 64 bits")
-	}
-	u |= uint64(b) << 63
-	return u, src[10:], nil
 }
 
 func readVarlong(src []byte) (int64, []byte, error) {

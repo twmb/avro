@@ -226,29 +226,18 @@ func avroNamedRef(typ string) bool {
 	return typ != ""
 }
 
-// nodeNamespace returns the namespace in scope inside a named-type object:
-// the prefix of a dotted name, else its "namespace" attribute, else
-// inherited. We read keys by exact name, mirroring the parser.
-func nodeNamespace(obj map[string]any, enclosingNS string) string {
-	// A dotted name carries its own namespace and suppresses the attribute
-	// even when the prefix is empty (".x"), so presence of the dot decides,
-	// not a non-empty split. namespaceOf performs the split.
-	if name, ok := obj["name"].(string); ok && strings.ContainsRune(name, '.') {
-		return namespaceOf(name)
-	}
-	if ns, ok := obj["namespace"].(string); ok {
-		return ns
-	}
-	return enclosingNS
+// treeScope resolves a raw named-type object's fullname and the namespace
+// in scope inside it, by resolveScope over the "name" and "namespace" keys
+// read by exact name, as the parser reads them.
+func treeScope(obj map[string]any, enclosingNS string) (fullname, ns string) {
+	name, _ := obj["name"].(string)
+	nsAttr, hasNS := obj["namespace"].(string)
+	return resolveScope(name, nsAttr, hasNS, enclosingNS)
 }
 
 func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
-	name, _ := obj["name"].(string)
-	short := unqualified(name)
-	if ns := nodeNamespace(obj, enclosingNS); ns != "" {
-		return ns + "." + short
-	}
-	return short
+	fullname, _ := treeScope(obj, enclosingNS)
+	return fullname
 }
 
 // collectTreeDefs calls visit for every named-type definition in the tree
@@ -340,11 +329,8 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 			if def, isMap := resolved.(map[string]any); isMap {
 				defTyp, _ := def["type"].(string)
 				defLogical, _ := def["logicalType"].(string)
-				// The wrapper's props are a flat key set, never a nested
-				// stray schema, so a nil verdict costs one shape check per
-				// key and nothing compounds.
 				for k, wv := range v {
-					if schemaReservedKeyForObject(k, wv, defTyp, defLogical, nil) {
+					if schemaReservedKeyForObject(k, wv, defTyp, defLogical, strayPresence(k, wv)) {
 						continue
 					}
 					if _, has := def[k]; has {
@@ -468,23 +454,4 @@ func defWithExplicitNamespace(def any, fullname string) any {
 		obj["namespace"] = namespaceOf(fullname)
 	}
 	return cp
-}
-
-func deepCopyTree(node any) any {
-	switch v := node.(type) {
-	case map[string]any:
-		m := make(map[string]any, len(v))
-		for k, val := range v {
-			m[k] = deepCopyTree(val)
-		}
-		return m
-	case []any:
-		s := make([]any, len(v))
-		for i, e := range v {
-			s[i] = deepCopyTree(e)
-		}
-		return s
-	default:
-		return v
-	}
 }

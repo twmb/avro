@@ -209,7 +209,7 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 
 	switch node.kind {
 	case "null":
-		return ctx.decodeNull(v, toAny)
+		return ctx.decodeNull(v)
 	case "boolean":
 		return ctx.decodeBool(v, toAny)
 	case "int":
@@ -316,7 +316,7 @@ func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, er
 	}
 }
 
-func (ctx *jsonDecoder) decodeNull(v reflect.Value, _ bool) error {
+func (ctx *jsonDecoder) decodeNull(v reflect.Value) error {
 	if err := ctx.scanner.consumeNull(); err != nil {
 		return err
 	}
@@ -570,21 +570,29 @@ func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode) error {
 	return setEnumTarget(v, idx, s)
 }
 
-func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny, raw bool) error {
-	// A decimal takes a bare JSON number as well as the byte string, so
-	// hand-edited JSON stays convenient. A suppressed logical skips this: a
-	// bare number has no raw-bytes form.
+// consumeByteString reads the JSON form of a bytes or fixed value: a
+// decimal takes a bare JSON number as well as the byte string, so
+// hand-edited JSON stays convenient, and anything else is the codepoint
+// string. handled reports that the bare-number arm decoded into v itself. A
+// suppressed logical skips that arm, since a bare number has no raw-bytes
+// form.
+func (ctx *jsonDecoder) consumeByteString(v reflect.Value, node *schemaNode, toAny, raw bool) (b []byte, handled bool, err error) {
 	if !raw && hasDecimalBareNumberArm(node) {
 		if handled, err := ctx.decodeBareDecimal(v, node, toAny); handled {
-			return err
+			return nil, true, err
 		}
 	}
 	start, end, _, err := ctx.scanner.consumeStringRaw()
 	if err != nil {
-		return err
+		return nil, false, err
 	}
-	b, err := scanAvroJSONBytes(ctx.scanner.data[start:end])
-	if err != nil {
+	b, err = scanAvroJSONBytes(ctx.scanner.data[start:end])
+	return b, false, err
+}
+
+func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny, raw bool) error {
+	b, handled, err := ctx.consumeByteString(v, node, toAny, raw)
+	if handled || err != nil {
 		return err
 	}
 	if toAny {
@@ -601,18 +609,8 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny, ra
 }
 
 func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny, raw bool) error {
-	// A decimal takes a bare JSON number, as in decodeBytes.
-	if !raw && hasDecimalBareNumberArm(node) {
-		if handled, err := ctx.decodeBareDecimal(v, node, toAny); handled {
-			return err
-		}
-	}
-	start, end, _, err := ctx.scanner.consumeStringRaw()
-	if err != nil {
-		return err
-	}
-	b, err := scanAvroJSONBytes(ctx.scanner.data[start:end])
-	if err != nil {
+	b, handled, err := ctx.consumeByteString(v, node, toAny, raw)
+	if handled || err != nil {
 		return err
 	}
 	// The JSON string for a fixed must have exactly node.size code points;

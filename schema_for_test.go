@@ -6211,9 +6211,9 @@ func fieldNamesOf(t reflect.Type) []string {
 // The reflect collectors' cost is a product, and only one of its factors was
 // ever driven.
 //
-// Both collectors, collectFieldsRaw (behind SchemaFor) and typeFieldMapping's
-// collect (behind a record decode/encode), mark the type they are descending
-// per path and unmark on the way out. That is correct for embed cycles and
+// walkPromotedFields, the one struct walk behind SchemaFor and behind a record
+// decode/encode, marks the type it is descending per path and unmarks on the
+// way out. That is correct for embed cycles and
 // deliberate: a type reached through two sibling embed paths has to be
 // collected at each occurrence, so the shallower one reaches the
 // shallowest-wins dedup and a type genuinely inlined twice surfaces as the
@@ -6223,10 +6223,10 @@ func fieldNamesOf(t reflect.Type) []string {
 //
 // That is a cost, not a bug: the carrier is a Go type fixed at compile time, so
 // nothing an attacker sends can grow it. What made it worth a permanent cell is
-// that the ruling closing it rested on the two collectors being equivalent, and
+// that the ruling closing it rested on the two callers being equivalent, and
 // they are not. The cost is paths-through-the-embed-DAG x calls, and the second
 // factor differs. typeFieldMapping's result is memoized per reflect.Type in a
-// sync.Map, so a decode pays the walk once; collectFieldsRaw has no memo, so
+// sync.Map, so a decode pays the walk once; collectFields has no memo, so
 // every SchemaFor call re-pays it in full. Driving depth alone cannot see that.
 //
 // Sibling-embed diamond: T_k embeds A_k and B_k, both embedding T_{k+1}, so T1
