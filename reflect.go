@@ -80,21 +80,16 @@ func tryTextUnmarshal(v reflect.Value, b []byte) (bool, error) {
 	return true, v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText(b)
 }
 
-// textOutFor returns the strongest text-out method on v. We prefer TextAppender
-// (alloc-free) and fall back to TextMarshaler. We check both v.Interface() (the
-// value method set) and v.Addr().Interface() (the pointer method set on
-// addressable values), so your pointer-receiver MarshalText/AppendText on an
-// addressable struct field is reachable. That mirrors tryTextUnmarshal's
-// discovery via v.Addr(). Neither method needs the type to also implement
-// TextUnmarshaler.
+// textOutFor returns v's text-out methods, preferring TextAppender
+// (alloc-free) over TextMarshaler. We check both the value method set and,
+// on an addressable value, the pointer method set, so a pointer-receiver
+// method on an addressable struct field is reachable, as tryTextUnmarshal
+// does for the other direction.
 //
-// We try text-out *before* the reflect.String and enum int-ordinal arms at
-// every encode site, so this runs on every plain string and enum encode. The
-// alloc-free type check short-circuits before the v.Interface() boxing for
-// types that cannot implement a text-out method, which keeps the common
-// plain-string/enum path allocation-free: if implementsTextMarshaler is false,
-// neither method set has the method, so the body below would return (nil, nil)
-// anyway.
+// Every encode site tries text-out before the reflect.String and enum arms,
+// so this runs on every plain string and enum encode. The type check up front
+// short-circuits before the v.Interface() boxing for types with no text-out
+// method, which keeps that common path allocation-free.
 func textOutFor(v reflect.Value) (encoding.TextAppender, encoding.TextMarshaler) {
 	if !implementsTextMarshaler(v.Type()) {
 		return nil, nil
@@ -153,7 +148,7 @@ func textValue(v reflect.Value, avroType string) (string, bool, error) {
 // implements TextMarshaler or TextAppender. The fast string-encode paths read
 // the underlying string directly and bypass appendAvroString's text-out arm.
 // Keeping text-method types off them is what makes your type encode its
-// marshaled form in a struct field exactly as it does as a scalar. We evaluate
+// marshaled form in a struct field as it does as a scalar. We evaluate
 // this once per type at compile time, never per value.
 func implementsTextMarshaler(t reflect.Type) bool {
 	// The pointer method set is a superset of the value one, so an empty
@@ -177,15 +172,10 @@ func implementsTextUnmarshaler(t reflect.Type) bool {
 }
 
 // stringFastPathEligibleEncode reports whether a reflect.String-kind Go type
-// may take a fast string-encode path (usString, usFixedUUIDString, the
-// container loops). It must take reflect when it is json.Number
-// (appendAvroString's RFC 8259 reject) or implements a text-out method
-// (appendAvroString's text-out arm), since the fast paths bypass both. You have
-// already established Kind()==String.
-//
-// This is the one authority on which string-kind types are fast-path-ineligible
-// on encode. Every encode gate asks it, so a new slow-path-only concern lands
-// once instead of being swept across all of them.
+// may take a fast string-encode path. It must take reflect when it is
+// json.Number (appendAvroString's RFC 8259 reject) or implements a text-out
+// method (appendAvroString's text-out arm), since the fast paths bypass both.
+// Every encode gate asks this one function.
 func stringFastPathEligibleEncode(t reflect.Type) bool {
 	return t != jsonNumberType && !implementsTextMarshaler(t)
 }
@@ -193,8 +183,7 @@ func stringFastPathEligibleEncode(t reflect.Type) bool {
 // stringFastPathEligibleDecode is the decode-side counterpart: a
 // reflect.String-kind target is fast-path-ineligible when it is json.Number
 // (setStringValue's RFC 8259 guard) or implements TextUnmarshaler
-// (setStringValue's UnmarshalText arm). One authority for the decode gates
-// (udStringDeser, udFixedUUIDString, fastPathSafeForElem).
+// (setStringValue's UnmarshalText arm).
 func stringFastPathEligibleDecode(t reflect.Type) bool {
 	return t != jsonNumberType && !implementsTextUnmarshaler(t)
 }
@@ -215,7 +204,7 @@ func indirect(v reflect.Value) (reflect.Value, error) {
 		switch v.Kind() {
 		case reflect.Invalid:
 			// Defensive: an invalid Value (reflect.ValueOf(nil) somewhere
-			// internally) lands here instead of panicking on a later
+			// internally) ends up here instead of panicking on a later
 			// v.Type() call. We treat it as nil.
 			return v, errIndirectNil
 		case reflect.Pointer, reflect.Interface:
@@ -227,15 +216,10 @@ func indirect(v reflect.Value) (reflect.Value, error) {
 			return v, nil
 		}
 	}
-	// After maxIndirectDepth unwraps the value may already be a non-pointer
-	// base reached at exactly the cap, so we accept it. That matches
-	// indirectAlloc, isNilValue, and serNull, which peel in the loop body and
-	// inspect the base afterward, accepting a chain of maxIndirectDepth levels.
-	// Inspecting only inside the loop's default arm would reject such a base,
-	// because confirming it costs one more iteration than the loop has: an
-	// encode/decode off-by-one where a maxIndirectDepth-deep pointer value
-	// decodes but fails to encode. Only a still-indirect value, a cyclic
-	// interface (var p any; p = &p) included, is genuinely too deep.
+	// A base reached at exactly the cap is accepted, matching indirectAlloc,
+	// isNilValue, and serNull; otherwise a maxIndirectDepth-deep pointer
+	// value would decode but fail to encode. Only a still-indirect value is
+	// too deep.
 	switch v.Kind() {
 	case reflect.Invalid:
 		return v, errIndirectNil
@@ -438,13 +422,10 @@ func typeFieldMappingSkip(fieldNames []string, cache *sync.Map, t reflect.Type, 
 		if visited[t] {
 			return // prevent infinite recursion on embedded struct cycles
 		}
-		// Per-path marking: a cycle revisits a type while it is still on the
-		// current path, so the on-path check above ends it. But the *same*
-		// type reached through two sibling embed paths is not a cycle. We
-		// must collect it at each occurrence so the shallower one reaches the
-		// shallowest-wins dedup below. Marking forever pruned the sibling
-		// occurrence, silently picking the deeper field and breaking doc.go's
-		// promotion contract. Same idiom as toJSONWalk (schema_node.go).
+		// Per-path marking: the same type reached through two sibling embed
+		// paths is not a cycle, and each occurrence must be collected so the
+		// shallower one reaches the shallowest-wins dedup below. Marking
+		// forever pruned the sibling occurrence and picked the deeper field.
 		visited[t] = true
 		defer delete(visited, t)
 		for i := 0; i < t.NumField(); i++ {
@@ -546,13 +527,11 @@ func typeFieldMappingSkip(fieldNames []string, cache *sync.Map, t reflect.Type, 
 				continue
 			}
 			if len(f.index) == len(existing.index) {
-				// Equal depth, same tagged status, no tiebreaker: ambiguous.
-				// encoding/json silently drops such a field. We defer the
-				// error to lookup, so a collision on a name the schema never
-				// references does not break your whole struct, while one the
-				// schema does reference errors loudly. SchemaFor's
-				// collectFields rejects eagerly because it must emit every
-				// field; here we are schema-driven.
+				// Equal depth, same tagged status: ambiguous. encoding/json
+				// drops such a field; we defer the error to lookup, so a
+				// collision on a name the schema never references does not
+				// break the whole struct. SchemaFor's collectFields rejects
+				// eagerly because it must emit every field.
 				ambiguous[f.name] = [2]string{t.FieldByIndex(existing.index).Name, t.FieldByIndex(f.index).Name}
 			}
 			continue
@@ -575,12 +554,8 @@ func typeFieldMappingSkip(fieldNames []string, cache *sync.Map, t reflect.Type, 
 				ozs = append(ozs, false)
 				continue
 			}
-			// truncForError: name is a schema field name with no length cap
-			// (validName grammar / WithLaxNames). It rides in .Err, not the
-			// render-truncated .Field, so SemanticError.Error() echoes it
-			// raw. We bound it at construction, like the sibling
-			// duplicate-name error above and the composed-sentence echoes in
-			// json_codec and json_decode.
+			// name has no length cap and rides in .Err, which Error() does
+			// not truncate, so we bound it here.
 			return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf("missing field %s", truncForError(name))}
 		}
 		ats = append(ats, e.index)
@@ -594,27 +569,17 @@ func typeFieldMappingSkip(fieldNames []string, cache *sync.Map, t reflect.Type, 
 	return result, nil
 }
 
-// splitFieldTag tokenizes an avro struct tag with the same grammar SchemaFor
-// uses ([splitTag]): top-level commas separate options, default= takes the rest
-// verbatim, and bracketed alias=[...] / decimal(...) values do not split on
-// their internal commas. A naive strings.Split would read `default=a,omitzero`
-// or `alias=[x,inline,y]` as separate options and fire omitzero/inline that
-// SchemaFor never sees. A malformed tag falls back to the naive split, so we
-// never newly error on a tag your hand-written schema relies on.
+// splitFieldTag tokenizes an avro struct tag with the grammar SchemaFor uses
+// (splitTag): top-level commas separate options, default= takes the rest
+// verbatim, and bracketed alias=[...] and decimal(...) values do not split on
+// their internal commas, so `alias=[x,inline,y]` cannot fire inline. A
+// malformed tag (unbalanced brackets) does not error, since encode and decode
+// never did, but fires no options at all: we map the field under the tag text
+// up to the first comma and drop the rest, rather than let a bracket typo
+// flip a field between nested and inlined.
 func splitFieldTag(tag string) []string {
 	parts, err := splitTag(tag)
 	if err != nil {
-		// The tag is malformed (unbalanced brackets or parens), so splitTag's
-		// grammar cannot tokenize it. A naive strings.Split here would
-		// surface interior tokens as options, firing inline/omitzero out of
-		// an alias=[...] / decimal(...) value or any other comma-bearing
-		// fragment. That is the exact spurious firing we adopted splitTag to
-		// prevent, and you would see it as a bracket typo silently flipping a
-		// field between nested-record and inline-flattened. We stay lenient,
-		// since your malformed tag must not newly error, but fire *no*
-		// options: we map the field under its name (the tag text up to the
-		// first comma; an Avro field name contains no comma) and drop the
-		// unparseable option fragments.
 		name, _, _ := strings.Cut(tag, ",")
 		return []string{name}
 	}

@@ -39,18 +39,12 @@ func promoteRead[Wire any](
 }
 
 // promoteIntFloatMantissa is the int->float conversion shared by the four
-// int/long->float/double promotion arms. A float/double reader schema opts
-// into IEEE precision, so we silently IEEE-round any wire magnitude it cannot
-// hold exactly. Java's ResolvingDecoder.readDouble, fastavro's maybe_promote
-// and hamba's createDoubleConverter all do the same.
-//
-// This is asymmetric with the same-schema decode: s.Decode(wire, &f float64)
-// against MustParse("long") still rejects. Lossiness is fine when the *reader
-// schema* is lossy. When only your Go type is, the wire held a value you
-// should not silently lose.
-//
-// The float64 cast keeps the long's full value; setFloatValue's SetFloat
-// narrows to float32 for the bitSize=32 arm.
+// int/long->float/double promotion arms. A float or double reader schema opts
+// into IEEE precision, so we round any wire magnitude it cannot hold exactly,
+// as Java's ResolvingDecoder.readDouble, fastavro's maybe_promote and hamba's
+// createDoubleConverter all do. Note that the same-schema decode is stricter:
+// decoding a long schema into a float64 still rejects, because there only
+// your Go type is lossy, not the reader schema.
 func promoteIntFloatMantissa(v reflect.Value, n int64, avroType string, bitSize int) error {
 	var f float64
 	if bitSize == 32 {
@@ -122,17 +116,13 @@ func promotionDeserForLogical(writerKind string, r *schemaNode) deserfn {
 	if r.logical == "" {
 		return nil
 	}
-	// We key on the promotion, using the same "writer>reader" key the
-	// promotions table uses, *not* on the reader kind alone. Each wrapper
-	// below reads the writer's wire form (a varint for int->long, a varlong
-	// length prefix for string<->bytes) before applying the reader's
-	// conversion. So it is correct only for the exact pair we wrote it for.
-	// Keying on the pair makes that structural. Add a promotion to the table
-	// with no arm here and it falls through to the bare widening deser,
-	// rather than reaching a wrapper that would misread the wire. The pairs
-	// absent here have no reachable logical reader: long->float, long->double
-	// and float->double all land on float/double, which carry no logical
-	// types.
+	// We key on the writer>reader pair, the same key the promotions table
+	// uses, not on the reader kind alone: each wrapper reads the writer's
+	// wire form (a varint for int->long, a length prefix for string<->bytes)
+	// and is correct only for its pair. A promotion added to the table with
+	// no arm here falls through to the bare widening deser. long->float,
+	// long->double and float->double end on kinds that carry no logical
+	// type, so they have no arm.
 	switch writerKind + ">" + r.kind {
 	case "int>long":
 		switch r.logical {

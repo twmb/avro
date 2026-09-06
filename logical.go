@@ -24,7 +24,7 @@ func timeToTimestampScaled(t time.Time, scale, subScale int64, unit string) (int
 	maxSec := math.MaxInt64 / scale
 	if sec < 0 && nsec > 0 {
 		// Adjustment branch: scaled = (sec+1)*scale + (nsec/sub - scale).
-		// Both terms are ≤ 0; only underflow is possible.
+		// Both terms are <= 0; only underflow is possible.
 		if sec+1 < -maxSec {
 			return 0, fmt.Errorf("time %v overflows int64 %s since epoch", t, unit)
 		}
@@ -85,13 +85,12 @@ func timeToLocalTimestampNanos(t time.Time) (int64, error) {
 // timeToTimestampNanos passes subScale=1: the unit *is* nanoseconds, so
 // nsec/1 == nsec.
 //
-// We deliberately diverge from Java's TimestampNanosConversion.toLong. Its
-// adjustment branch (TimeConversions.java:238) subtracts `nanos - 1_000_000`
-// where the millis/micros branches subtract `scale`, an off-by-1000 typo that
-// corrupts every negative-second instant by ~999ms. We implement the
-// spec-correct sec*1e9 + nsec, the same formula as Java's correct branches.
-// No other impl corroborates: fastavro has no timestamp-nanos at all, and
-// avro-rs stores the raw int64 without converting.
+// We diverge from Java's TimestampNanosConversion.toLong, whose adjustment
+// branch subtracts nanos - 1_000_000 where the millis and micros branches
+// subtract the scale: an off-by-1000 that corrupts every negative-second
+// instant by about 999ms. We use the spec's sec*1e9 + nsec, the formula
+// Java's other branches use. fastavro has no timestamp-nanos and avro-rs
+// stores the raw int64, so neither corroborates either way.
 func timeToTimestampNanos(t time.Time) (int64, error) {
 	return timeToTimestampScaled(t, 1_000_000_000, 1, "nanoseconds")
 }
@@ -125,7 +124,7 @@ func dateToTime(val int32) time.Time { return time.Unix(int64(val)*86400, 0).UTC
 // way.
 //
 // We error when the day count leaves int32 range, reachable for a year
-// outside roughly ±5.8 million. Without the check, int32() truncation
+// outside roughly +/-5.8 million. Without the check, int32() truncation
 // silently corrupts the wire value.
 func timeToDate(t time.Time) (int32, error) {
 	utc := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
@@ -171,9 +170,8 @@ func timeOfDayToTime(d time.Duration) time.Time {
 }
 
 // timeOfDay returns the time-of-day portion of t as a Duration since midnight
-// in t's wall-clock fields, ignoring date and zone offset. We discard the
-// date deliberately: the Avro time-millis / time-micros wire form cannot
-// represent it.
+// in t's wall-clock fields, ignoring date and zone offset, which the Avro
+// time-millis and time-micros wire forms cannot represent.
 func timeOfDay(t time.Time) time.Duration {
 	return time.Duration(t.Hour())*time.Hour +
 		time.Duration(t.Minute())*time.Minute +

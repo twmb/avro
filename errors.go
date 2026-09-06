@@ -26,14 +26,10 @@ func (e *SemanticError) Error() string {
 	var s string
 	switch {
 	case e.Field != "" && gt != "":
-		// Field is the dotted record-field path, built from parsed schema
-		// field names: registry or remote controlled and unbounded in length
-		// (validName is pure grammar, and WithLaxNames permits any non-empty
-		// string). We render-truncate it so a hostile multi-megabyte field
-		// name cannot amplify into an equally large error string on every
-		// type-mismatched datum (1:1 log / RPC / metric-label blowup). The
-		// public e.Field keeps its full value for you to inspect, matching the
-		// sibling CompatibilityError.Error() single-value policy.
+		// Field is built from schema field names, which have no length cap
+		// (WithLaxNames admits any non-empty string), so we truncate it here
+		// rather than let a hostile name amplify into an equally large error
+		// on every mismatched datum. The public e.Field keeps the full value.
 		s = fmt.Sprintf("avro: field %s: cannot use %s with Avro type %s", truncForError(e.Field), gt, e.AvroType)
 	case gt != "" && e.AvroType != "":
 		s = fmt.Sprintf("avro: cannot use %s with Avro type %s", gt, e.AvroType)
@@ -59,8 +55,6 @@ func formatGoType(t reflect.Type) string {
 
 func (e *SemanticError) Unwrap() error { return e.Err }
 
-// semErr is the one helper for the ~60 trivial two-field error sites across
-// ser.go, deser.go, and json_codec.go.
 func semErr(v reflect.Value, avroType string) error {
 	return &SemanticError{GoType: v.Type(), AvroType: avroType}
 }
@@ -123,14 +117,10 @@ type CompatibilityError struct {
 }
 
 func (e *CompatibilityError) Error() string {
-	// We bound the rendered message: Path, ReaderType, and WriterType carry
-	// user-controlled type and field names, which have no length cap at
-	// parse, so a hostile schema with a megabyte-long name would otherwise
-	// produce a megabyte error string (1:1 log/RPC/metric amplification).
-	// truncForError is a no-op under its cap, so normal-length names render
-	// unchanged, and the public fields keep their full values for you to
-	// inspect. Detail is a composed sentence whose own embedded names are
-	// truncated at construction.
+	// Path, ReaderType, and WriterType carry user-controlled names with no
+	// length cap at parse, so we truncate them here; the public fields keep
+	// their full values. Detail truncates its own embedded names when it is
+	// built.
 	return fmt.Sprintf("avro: incompatible at %s: reader %s vs writer %s: %s",
 		truncForError(e.Path), truncForError(e.ReaderType), truncForError(e.WriterType), e.Detail)
 }

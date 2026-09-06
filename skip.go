@@ -17,11 +17,8 @@ func skipNull(src []byte, _ *slab) ([]byte, error) {
 }
 
 // needLen reports a ShortBufferError when src is too short to read n bytes.
-// This is our sole constructor of the fixed-size {Type + Need + Have}
-// short-buffer shape, so every fixed-length read and skip agrees on it. Skip
-// paths reach it through skipBytesN; deserFixed, deserDuration,
-// deserFixedDecimal, deserFixedUUIDReflect, udDuration and readFixedUUID call
-// it directly.
+// It is the only constructor of the fixed-size short-buffer error, so every
+// fixed-length read and skip agrees on the shape.
 func needLen(src []byte, n int, typ string) error {
 	if len(src) < n {
 		return &ShortBufferError{Type: typ, Need: n, Have: len(src)}
@@ -78,17 +75,11 @@ func skipRecord(w *schemaNode, mbw *minBytesWalk) skipfn {
 		sl.depth++
 		defer func() { sl.depth-- }()
 		s.once.Do(func() {
-			// We use the *operation's* walk, threaded down from Resolve,
-			// not a fresh one. A record is not a cost boundary. The schema
-			// chooses how many records a dropped subtree references, each
-			// reference compiles its own skipRecordFields, and a per-record
-			// walk would multiply the per-walk allowance by a count the
-			// schema picks. Reaching each one costs O(1) wire bytes, so "the
-			// wire bounds how many compile" bounds the count, not the work.
-			//
-			// This runs at decode time and the walk is shared, so minBytesOf
-			// locks; see minBytesWalk.mu for why that is uncontended and why a
-			// nondeterministic drain order is safe here.
+			// We use the operation's walk, threaded down from Resolve, not a
+			// fresh one: the schema chooses how many records a dropped
+			// subtree references, and a per-record walk would multiply the
+			// per-walk allowance by that count. This runs at decode time on
+			// a shared walk, so minBytesOf locks; see minBytesWalk.mu.
 			s.fields = make([]skipfn, len(s.node.fields))
 			for i := range s.node.fields {
 				s.fields[i] = buildSkip(s.node.fields[i].node, s.mbw)
@@ -165,20 +156,16 @@ func skipArray(w *schemaNode, mbw *minBytesWalk) skipfn {
 
 func skipMap(w *schemaNode, mbw *minBytesWalk) skipfn {
 	valueSkip := buildSkip(w.values, mbw)
-	// minEntryBytes = 1 (key length varint, ≥1 byte for an empty key) plus
+	// minEntryBytes = 1 (key length varint, >=1 byte for an empty key) plus
 	// the value's minimum wire bytes, identical to deserMap.minEntryBytes.
 	minEntryBytes := mapEntryMinBytes(mbw.minBytesOf(w.values))
 	return func(src []byte, sl *slab) ([]byte, error) {
 		return skipBlocks(src, sl, "map",
-			// We bound the block count against the remaining buffer, matching
-			// deserMap (deser.go) and skipArray's checkArrayBlockBounds.
-			// Without it, skipBlocks' `for range int(count)` loop truncates a
-			// count above 2^31 on a 32-bit build and mis-frames the skip of
-			// subsequent bytes. On 64-bit the loop is buffer-bounded already,
-			// but this keeps deserMap, skipArray and skipMap on one rule.
-			// minEntryBytes ≥ 1, so this is always the buffer-relative bound
-			// and never false-rejects a legitimate block (each entry occupies
-			// at least minEntryBytes wire bytes).
+			// Bound the block count against the remaining buffer, as deserMap
+			// and skipArray do. Without it the `for range int(count)` loop
+			// truncates a count above 2^31 on a 32-bit build and mis-frames
+			// what follows. minEntryBytes is at least 1, so a legitimate
+			// block is never rejected.
 			func(count, _ int64, srcLen int) error {
 				return checkMapBlockBounds(count, srcLen, minEntryBytes)
 			},
@@ -228,13 +215,12 @@ var primitiveSkips = map[string]skipfn{
 	"string": skipBytes,
 }
 
-// buildSkip compiles a skipper for writer node w. mbw is the *one* min-bytes
-// walk of the operation that reached here (resolveCtx.minBytes), and every arm
-// passes it down. That includes the record arm, whose compile is deferred to
-// decode time but still joins this walk rather than starting a fresh one.
-// Nothing along the way is a cost boundary. The schema counts the containers,
-// union branches and records, so any per-unit allowance is the per-walk bound
-// multiplied by a number the schema author picks.
+// buildSkip compiles a skipper for writer node w. mbw is the one min-bytes
+// walk of the operation that reached here, and every arm passes it down,
+// including the record arm, whose compile is deferred to decode time. The
+// schema picks how many containers, branches and records there are, so a
+// per-unit allowance would be the per-walk bound times a number the schema
+// author chooses.
 func buildSkip(w *schemaNode, mbw *minBytesWalk) skipfn {
 	if f, ok := primitiveSkips[w.kind]; ok {
 		return f

@@ -109,7 +109,7 @@
 //
 // Precision follows the reader schema. A float or double schema rounds
 // silently on both encode and decode, and a finite value out of range
-// becomes ±Inf on the wire. An int, long, bytes, or string schema never
+// becomes +/-Inf on the wire. An int, long, bytes, or string schema never
 // loses precision silently: decoding into a Go type that cannot hold the
 // value exactly, such as a long above 2^53 into a float64, is an error. If
 // you need large integers to round-trip exactly, keep the reader schema long
