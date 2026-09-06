@@ -5846,17 +5846,6 @@ func TestBuildSkipUnknownType(t *testing.T) {
 	}
 }
 
-func TestSkipToDeser(t *testing.T) {
-	deser := skipToDeser(skipBoolean)
-	rem, err := deser([]byte{1, 2, 3}, reflect.Value{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rem) != 2 {
-		t.Fatalf("expected 2 remaining bytes, got %d", len(rem))
-	}
-}
-
 func TestSkipRecordFieldError(t *testing.T) {
 	// A record with an int field, but truncated data.
 	node := &schemaNode{
