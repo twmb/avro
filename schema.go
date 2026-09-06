@@ -27,50 +27,27 @@ type Schema struct {
 	node *schemaNode // full metadata tree (aliases, defaults, etc.) for schema introspection and evolution
 	full string      // original schema JSON, returned by String()
 
-	// soe is the Single Object Encoding header: 2-byte magic (0xC3, 0x01)
-	// + 8-byte LE CRC64-Avro fingerprint of the canonical form. Computed on
-	// first use by soeHeader (soe.go), never at parse: hashing the canonical
-	// form was 11-31% of Parse depending on schema shape, and only the three
-	// SOE entry points ever read it. Read it only through soeHeader: a bare
-	// field read races with a concurrent first use, and we document Schema as
-	// safe for concurrent use.
-	//
-	// The header is a pure function of c, so the two sites that adopt
-	// another schema's canonical form (Resolve, SchemaCache's self-contained
-	// splice) adopt its header by assigning c and leaving soe alone.
+	// soe is the single-object encoding header: the 2-byte magic and the
+	// little-endian CRC-64-AVRO fingerprint of the canonical form. It is
+	// computed on first use by soeHeader, never at parse, since hashing was
+	// up to a third of Parse. Read it only through soeHeader; a bare read
+	// races with a concurrent first use. The header is a function of c, so a
+	// site adopting another schema's canonical form adopts its header too.
 	soeHashed atomic.Bool
 	soeOnce   sync.Once
 	soe       [10]byte
 
-	// resolveWriter is the writer schema, populated only by
-	// Resolve(writer, reader) when the writer and reader differ (an identity
-	// resolution returns the reader schema directly, leaving this nil). It
-	// lets DecodeJSON apply writer-to-reader resolution to writer-shaped JSON,
-	// matching Java's ResolvingDecoder-over-JsonDecoder (the JsonDecoder is
-	// constructed with the writer schema). Binary Decode resolves via s.deser;
-	// JSON resolution composes the writer's JSON decode + binary re-encode with
-	// that same resolving s.deser. nil means not resolved: DecodeJSON decodes
-	// directly against s.node.
-	//
-	// DecodeSingleObject reads it too, to accept wire bearing the *writer's*
-	// fingerprint (see acceptsWriterSOE). That is a second question asked of
-	// one field rather than a second copy of it. Two fields that must always
-	// hold the same schema can drift with nothing to notice, while one field
-	// two callers ask cannot.
+	// resolveWriter is the writer schema, set by Resolve when the writer and
+	// reader differ. DecodeJSON uses it to apply writer-to-reader resolution
+	// to writer-shaped JSON, and DecodeSingleObject uses it to accept wire
+	// bearing the writer's fingerprint. nil means not resolved.
 	resolveWriter *Schema
 
-	// resolveWriterRaw is a custom-free view of the writer, used solely by
-	// decodeJSONResolved for the JSON wire-shape round-trip (writer-JSON ->
-	// writer-binary). That intermediate must hold raw Avro-native values. If
-	// the writer carries its own CustomType decoders, decoding writer-JSON
-	// through resolveWriter would run them, producing Go-domain values. The
-	// re-encode would then need the writer's custom *encoder* to invert them,
-	// which fails for a Decode-only custom, or any custom whose Encode cannot
-	// reproduce the decoded type. Binary Decode never re-encodes through the
-	// writer (it reads raw writer bytes and applies the *reader's* custom), so
-	// it is unaffected; this custom-free view makes the JSON path match it.
-	// Equal to resolveWriter when the writer has no custom types (nothing to
-	// suppress); set alongside resolveWriter by Resolve.
+	// resolveWriterRaw is a custom-free view of the writer, used only by
+	// decodeJSONResolved to round-trip writer JSON into writer binary. That
+	// intermediate must hold raw Avro-native values: a writer CustomType's
+	// Decode would produce Go-domain values the re-encode cannot invert.
+	// Equal to resolveWriter when the writer has no custom types.
 	resolveWriterRaw *Schema
 
 	// Per-schema custom type overlay. Keyed by *schemaNode so we do not
@@ -79,26 +56,16 @@ type Schema struct {
 	custom map[*schemaNode]*customWiring
 
 	// customBaked reports custom-conversion effects reachable through this
-	// schema's node tree even when the custom overlay above is empty. A
-	// reference to a SchemaCache-inherited named type whose *defining* parse
-	// wired custom types carries the binary callback wraps composed inside
-	// the inherited ser/deser, plus the JSON wrap baked on the shared
-	// node.decodeJSON. It has no entry in *this* parse's overlay, since
-	// applyCustomTypes visits only newly built nodes. We must build Resolve's
-	// custom-free writer view whenever either signal is set: keying on
-	// len(custom) alone resurrected the decode-only re-encode failure
-	// (3333e9b) for cache-parsed custom-typed writers.
+	// schema's node tree even when the custom overlay above is empty: a
+	// reference to a SchemaCache-inherited named type whose defining parse
+	// wired custom types carries them inside the inherited ser/deser.
+	// Resolve builds its custom-free writer view whenever either is set.
 	customBaked bool
 
-	// slabFree marks a schema whose compiled deser provably never touches
-	// the per-call *slab: a scalar leaf kind (see slabFreeKinds) with no
-	// custom-decoder wiring anywhere (customBaked covers both this parse's
-	// overlay and cache-inherited wraps). Decode skips the slab pool for
-	// such schemas and passes a nil slab, so scalar decodes stay
-	// allocation-free even when GC has drained the pool (issue #41). The
-	// zero value false is the safe default: a construction path that does
-	// not classify (Resolve's non-identity path, whose promote/skip
-	// routines do use the slab) keeps the pool.
+	// slabFree marks a schema whose compiled deser never touches the per-call
+	// slab: a scalar leaf kind with no custom-decoder wiring. Decode then
+	// passes a nil slab, so scalar decodes stay allocation-free even when GC
+	// has drained the pool. false is the safe default.
 	slabFree bool
 }
 
@@ -126,16 +93,12 @@ type customWiring struct {
 	// Carried here so resolved nodes (resolve.go) reuse the parse-time
 	// decision without re-running the gate.
 	suppressLogical bool
-	// encodeSuppresses mirrors the binary *encoder*-suppression decision
-	// (hasMatchingCustomTypeWithEncode). The JSON encode arms (decimal /
-	// big-decimal on bytes; all logicals on fixed) must skip the built-in
-	// logical coercion arm iff the binary build replaced the logical
-	// serializer with the base (raw-bytes) serializer. That is iff a
-	// non-wildcard matching CustomType has an Encode. If we gated the JSON
-	// arms on the runtime proxy `custom[node].encode != nil` instead, we
-	// would wrongly skip the arm for a wildcard-with-Encode: the binary
-	// keeps the logical ser for wildcards. That rejects *big.Rat on JSON
-	// while binary accepts it. Use this exact predicate, not the proxy.
+	// encodeSuppresses mirrors the binary encoder-suppression decision
+	// (hasMatchingCustomTypeWithEncode): the JSON logical encode arms skip
+	// the built-in coercion iff the binary build replaced the logical
+	// serializer with the base one, which is iff a non-wildcard matching
+	// CustomType has an Encode. The runtime proxy custom[node].encode != nil
+	// would wrongly skip the arm for a wildcard with Encode.
 	encodeSuppresses bool
 }
 
@@ -176,14 +139,10 @@ type schemaNode struct {
 	tags      *unionTags     // union: see unionTags
 	symbolIdx map[string]int // enum: symbol to ordinal; nil below enumIndexMin
 
-	// unknownLogical preserves the schema's original logicalType value when
-	// it failed validateLogical (no built-in handler matched and no
-	// registered CustomType matched at this Parse). The runtime ignores it:
-	// we chose built-in handlers from the validated (possibly cleared)
-	// logical, and runtime dispatches use `logical`. Only the cache-reference
-	// rejection check (rejectCachedRefIfCustomTypeWouldMatch) consults it, so
-	// a later Parse registering a CustomType for this logical can detect the
-	// silent-drop scenario and error loudly.
+	// unknownLogical preserves the original logicalType when it failed
+	// validateLogical. Only rejectCachedRefIfCustomTypeWouldMatch consults
+	// it, so a later Parse registering a CustomType for this logical can
+	// detect the silent drop and error.
 	unknownLogical string
 }
 
@@ -219,18 +178,11 @@ func (parseOptLax) schemaOpt() {}
 func WithLaxNames(fn func(string) error) SchemaOpt { return parseOptLax{fn} }
 
 // internalReparseNames is the name validator for our own re-parses of schema
-// text we produced ourselves: Resolve's custom-free writer view (resolve.go)
-// and SchemaCache's self-contained splice rebuild (cache.go). Both sites
-// re-parse text whose names the original parse already validated under your
-// chosen validator (strict, or any WithLaxNames fn), so validating again has
-// no safety role: it can only wrongly reject names you accepted. So we accept
-// everything. WithLaxNames(nil), the previous validator at both sites,
-// rejected empty name components (namespace "a..b"). That is the one class
-// your fn can accept that lax(nil) does not, so it hard-failed Resolve on an
-// already-parsed, wire-valid writer and silently degraded the cache's
-// metadata forms to a dangling reference. Validation never transforms names:
-// they pass through verbatim, so the canonical/fingerprint/wire bytes match a
-// standalone parse of the same schema under your validator.
+// text we produced: Resolve's custom-free writer view and SchemaCache's
+// self-contained splice. The original parse already validated the names
+// under your validator, so we accept everything; WithLaxNames(nil) rejected
+// empty name components your fn may have accepted. Names pass through
+// verbatim, so the canonical and wire bytes match a standalone parse.
 var internalReparseNames = WithLaxNames(func(string) error { return nil })
 
 // MustParse is like [Parse] but panics on error.
@@ -296,7 +248,7 @@ func applySchemaOpts(b *builder, opts []SchemaOpt) {
 }
 
 func parse(schema string, b *builder) (*Schema, error) {
-	// We bound nesting depth with a single linear scan BEFORE building. The
+	// We bound nesting depth with a single linear scan before building. The
 	// build's maxDepth guard fires per schema node, but the JSON bracket
 	// nesting can run deeper than the node depth (and json.Decode has its
 	// own ~10000 limit). This O(input) pre-scan rejects pathologically deep
@@ -328,18 +280,12 @@ func parse(schema string, b *builder) (*Schema, error) {
 	return s, nil
 }
 
-// maxSchemaJSONDepth bounds the raw JSON bracket nesting of a schema string.
-// It is a coarse DoS backstop, NOT the semantic depth limit. The build's
-// maxDepth caps schema-node nesting, and one schema level can carry up to
-// three JSON brackets (a record's object + its "fields" array + a field
-// object). So a build-acceptable schema (<= maxDepth nodes) reaches a JSON
-// bracket depth of at most 3*maxDepth. The 4*maxDepth limit clears that
-// provable ceiling by a full maxDepth, so the pre-scan never rejects a schema
-// the builder would accept. It short-circuits input deeper than the builder
-// accepts (and deeper than json's own ~10000 nesting cap) in one O(input)
-// pass. Parse itself is O(n) (see parseSchemaTree and canonicalBytes), so
-// this is a cheap early-reject rather than the defense the DoS bound rests
-// on, as it was when the unmarshal and canonical marshal were quadratic.
+// maxSchemaJSONDepth bounds the raw JSON bracket nesting of a schema string,
+// a coarse early reject rather than the semantic depth limit. One schema
+// level carries at most three JSON brackets (a record object, its fields
+// array, a field object), so a build-acceptable schema reaches a bracket
+// depth of at most 3*maxDepth and the pre-scan never rejects a schema the
+// builder would accept.
 const maxSchemaJSONDepth = maxDepth * 4
 
 // checkSchemaNestingDepth is one linear pass counting '{'/'[' nesting against
@@ -380,18 +326,11 @@ func checkSchemaNestingDepth(schema string) error {
 
 // canonicalFirstOccurrence rewrites the parse-time canon tree so each named
 // type's full definition is emitted at its first occurrence in field-walk
-// order, bare fullname references afterward: Apache Avro's
-// SchemaNormalization rule. The parse-time tree instead puts the body at the
-// textual definition site. The two agree for the common
-// define-before-reference shape, where the definition is the first
-// occurrence. They diverge only on a forward reference (which we accept):
-// there the untransformed tree emits the body at the *second* occurrence,
-// producing a PCF, and so a fingerprint, that differs from Java's. That
-// breaks single-object and registry interop.
-//
-// We also normalize references to the resolved fullname, since a bare forward
-// reference stores the as-written short name. That matches PCF's fullname rule
-// and keeps emission consistent across orderings.
+// order and referenced by bare fullname afterward, Apache Avro's
+// SchemaNormalization rule. The parse-time tree puts the body at the textual
+// definition site; the two differ only on a forward reference, where the
+// untransformed tree would produce a fingerprint that differs from Java's.
+// We also normalize references to the resolved fullname.
 func canonicalFirstOccurrence(s aschema) aschema {
 	defs := map[string]*aobject{}
 	shortCount := map[string]int{}
@@ -581,20 +520,11 @@ type aschema struct {
 	union     []aschema
 }
 
-// isNullBranch reports whether s is the "null" type in either spelling the
-// grammar admits: bare "null" or the wrapped {"type":"null"}. They are the
-// same type, same union branch, same bytes, so every decision that matches a
-// branch's written spelling routes through here rather than seeing only the
-// bare form.
-//
-// Props and a logicalType on a wrapped null are inert and do NOT make it a
-// non-null branch: Avro defines no null logical type, so nothing downstream
-// can consume either key. Deciding otherwise would make
-// [{"type":"null","x":1},T] a two-non-null-branch union whose first branch
-// encodes zero bytes, a shape no other reader agrees with.
-//
-// schemaNode.kind answers the same question on the compiled tree, normalizing
-// both spellings; this is the as-written (pre-build) view of that same fact.
+// isNullBranch reports whether s is the "null" type in either spelling, bare
+// "null" or the wrapped {"type":"null"}. Props and a logicalType on a wrapped
+// null are inert and do not make it a non-null branch: Avro defines no null
+// logical type, and deciding otherwise would make [{"type":"null","x":1},T]
+// a two-non-null-branch union no other reader agrees with.
 func (s *aschema) isNullBranch() bool {
 	if s.primitive == "null" {
 		return true
@@ -609,8 +539,8 @@ func (s *aschema) isNullableUnion() bool {
 }
 
 // aschema, aobject, and afield are populated by parseSchemaTree
-// (schema_parse.go) from a single generic decode. They are deliberately
-// NOT json.Marshaler / json.Unmarshaler, so the stdlib decoder does not
+// (schema_parse.go) from a single generic decode. They are
+// not json.Marshaler / json.Unmarshaler, so the stdlib decoder does not
 // re-scan each nested node's subtree (which made Parse O(depth*size)).
 // canonicalBytes (schema_canonical.go) writes the canonical form.
 
@@ -624,13 +554,10 @@ type afield struct {
 	Default json.RawMessage `json:"default,omitempty"`
 	Order   string          `json:"order,omitempty"`
 
-	// orderSet records that "order" was written, which Order alone cannot.
-	// The empty string is its zero, so a validator reading `Order != ""` as
-	// "you chose an order" skips exactly the one written value that is not a
-	// legal order. Apache Avro has no such gap because it decides on the
-	// node: `if (orderNode != null) Order.valueOf(...)`
-	// (Schema.java:1895-1897), where an empty string reaches valueOf and
-	// throws. This restores that: presence and validity are one question.
+	// orderSet records that "order" was written, which Order alone cannot:
+	// the empty string is its zero, so a validator reading Order != "" would
+	// skip the one written value that is not a legal order. Java decides on
+	// the node's presence, and so do we.
 	orderSet bool
 
 	// Field-level logical type annotations: the Java/JDBC idiom putting
@@ -659,15 +586,10 @@ var afieldComplexKeys = map[string]string{
 	"size":    "fixed",
 }
 
-// liftTarget returns the aschema a field-level logicalType annotation lands
-// on, or nil when the field carries none or nothing can receive it.
-//
-// This is the one navigation for the field-level lift:
-// liftFieldLogicalIntoType moves the annotation through it, and
-// fieldDecimalLiftConsumesPrecisionScale reads through it. Keeping both on one
-// function is what stops the verdict from validating parameters against a type
-// the lift never addressed; the two drifted apart once already, on the
-// wrapped-null branch.
+// liftTarget returns the aschema that receives a field-level logicalType
+// annotation, or nil when the field carries none or nothing can receive it.
+// Both the lift and its precision/scale verdict navigate through here so
+// they cannot address different types.
 func (f *afield) liftTarget() *aschema {
 	if f.Logical == "" || f.Type == nil {
 		return nil
@@ -689,15 +611,11 @@ func (f *afield) liftTarget() *aschema {
 	return nil
 }
 
-// liftEffectiveLogical reports the lift target's kind and the logical type in
-// effect there once the lift has run. That is the target's own annotation when
-// it has one (closer to the type wins, so we drop the field's), otherwise the
-// field's.
-//
-// Consumption is a question about what *lands*, not about where the lift
-// points. A field-level "decimal" that never reaches its target cannot make
-// that target read precision/scale, so the pair is inert metadata there and
-// rides to Props like any custom property.
+// liftEffectiveLogical reports the lift target's kind and the logical type
+// in effect there once the lift has run: the target's own annotation when it
+// has one, otherwise the field's. A field-level "decimal" that never reaches
+// its target cannot make that target read precision/scale, so the pair is
+// inert metadata there.
 func (f *afield) liftEffectiveLogical() (kind, logical string, ok bool) {
 	t := f.liftTarget()
 	if t == nil {
@@ -717,28 +635,22 @@ func (f *afield) liftEffectiveLogical() (kind, logical string, ok bool) {
 	return "", "", false
 }
 
-// liftFieldLogicalIntoType moves a field-level logicalType annotation (with
-// optional precision/scale for the decimal case) into the field's type
-// definition, so the rest of the parser sees the canonical nested form.
-// The form
+// liftFieldLogicalIntoType moves a field-level logicalType annotation, with
+// precision/scale for decimal, into the field's type definition, so the
+// rest of the parser sees the canonical nested form. The form
 //
 //	{"name":"ts","type":"long","logicalType":"timestamp-millis"}
-//	{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"}
 //
-// is a documented common user error (AVRO-2015 / AVRO-3014). Apache Avro warns
-// but does not lift; fastavro, hamba and goavro keep it as a field property
-// applied to no branch. Hand-written .avsc files, older Java tooling and
-// tutorial code emit it widely, so we lift it. The wire encoding is identical
-// either way; only the JSON layout differs.
-//
-// An annotation already inside the type definition wins, being closer to the
-// type. The field-level copies are cleared after lifting so canonical re-emit
-// does not duplicate them.
+// is a common error (AVRO-2015, AVRO-3014) that hand-written .avsc files and
+// older Java tooling emit widely. Apache Avro warns but does not lift;
+// fastavro, hamba and goavro keep it as an inert field property. The wire
+// encoding is identical either way. An annotation already inside the type
+// definition wins.
 func (f *afield) liftFieldLogicalIntoType() {
 	// The target comes from the shared navigation, so the lift and the
 	// consume verdict can never address different types. It is the first
 	// non-null union branch, the type object, or the bare primitive. We do
-	// NOT fall through to a later non-null branch. That would silently mutate
+	// not fall through to a later non-null branch. That would silently mutate
 	// a different type than the spec-equivalent nested form would have
 	// addressed, and on the `[null, T+logical, T]` shape it would even
 	// synthesize a duplicate union member.
@@ -747,14 +659,9 @@ func (f *afield) liftFieldLogicalIntoType() {
 		return
 	}
 
-	// The annotation and its parameters are separate questions, and
-	// conflating them made the two spellings of one schema disagree.
-	// Closer-to-the-type wins the annotation: a target that already declares
-	// its own logicalType keeps it and the field's is dropped. The field
-	// still completes missing parameters, but only where they mean something:
-	// where the effective logical (the target's own if it has one, else the
-	// field's) is "decimal". Anywhere else precision/scale annotate nothing,
-	// so copying them in would write inert keys into the type.
+	// Closer to the type wins the annotation. The field still completes
+	// missing precision/scale, but only where the effective logical is
+	// "decimal"; anywhere else they annotate nothing.
 	_, effLogical, _ := f.liftEffectiveLogical()
 	fillParams := effLogical == "decimal"
 
@@ -788,14 +695,9 @@ func (f *afield) liftFieldLogicalIntoType() {
 }
 
 // fieldDecimalLiftConsumesPrecisionScale reports whether the field-level
-// logical lift consumes "precision"/"scale" as decimal parameters. That takes
-// two things: the field declares logicalType "decimal", and the lift's target
-// (the field's primitive type name, the first non-null union branch's kind, or
-// the type object's kind) is a bytes/fixed carrier. We match as-written, like
-// the type level's decimalConsumesPrecisionScale: a named reference is not a
-// carrier spelling, and the target's own logicalType annotation does not
-// change where the lift points. Everywhere else the pair is inert field
-// metadata and a malformed body rides to the field's props verbatim.
+// logical lift consumes "precision"/"scale" as decimal parameters: the field
+// declares logicalType "decimal" and the lift's target is a bytes/fixed
+// carrier as written. Everywhere else the pair is inert field metadata.
 func (f *afield) fieldDecimalLiftConsumesPrecisionScale() bool {
 	kind, logical, ok := f.liftEffectiveLogical()
 	return ok && decimalConsumesPrecisionScale(kind, logical)
@@ -809,14 +711,10 @@ func clonePtrInt(p *int) *int {
 	return &v
 }
 
-// maxParseErrorLen bounds the assembled length of a schema-parse error
-// message. The build/finalize walkers wrap per nesting level (e.g.
-// "invalid array: %v" at each of up to maxDepth levels), so a deeply
-// nested schema can otherwise produce a multi-KB message from a small
-// input. That is the same log/RPC/metric amplification the per-value trunc
-// helpers prevent, but accumulated over the wrap chain rather than in one
-// value. truncForError caps individual interpolated values; this caps the
-// whole chain.
+// maxParseErrorLen bounds the assembled length of a schema-parse error. The
+// walkers wrap per nesting level, so a deeply nested schema can otherwise
+// produce a multi-KB message from a small input; truncForError caps
+// individual values and this caps the chain.
 const maxParseErrorLen = 1024
 
 // boundErrorLen returns err unchanged if its message fits maxParseErrorLen,
@@ -835,14 +733,10 @@ func boundErrorLen(err error) error {
 	return errors.New(msg[:half] + " ...[truncated]... " + msg[len(msg)-half:])
 }
 
-// boundJSONErrorEcho truncates user-controllable input echoed verbatim by
-// stdlib json / strconv error types, so a hostile MiB-sized literal cannot
-// produce a MiB-sized [Parse] error. Reaches *json.UnmarshalTypeError and
-// *strconv.NumError.
-//
-// We walk the chain with [errors.As] and mutate in place. That must happen
-// before the caller wraps with fmt.Errorf("%w"): that call caches its formatted
-// message and locks in the pre-truncation content of every descendant.
+// boundJSONErrorEcho truncates user-controlled input echoed verbatim by
+// json and strconv error types, so a hostile MiB-sized literal cannot
+// produce a MiB-sized Parse error. It must run before the caller wraps with
+// fmt.Errorf, which caches the formatted message.
 func boundJSONErrorEcho(err error) error {
 	if err == nil {
 		return nil
@@ -890,16 +784,10 @@ type aobject struct {
 // that "size" may appear as a quoted integer.
 type laxInt int
 
-// maxLaxIntDataLen caps the raw JSON bytes accepted by [laxInt.UnmarshalJSON].
-// Legit int64 representations fit in 20 chars (-9223372036854775808); the
-// quoted-string form (per the Avro [INTEGERS] rule) adds 2 chars; +2 chars
-// of headroom covers the Go-style +sign that strconv.Atoi accepts. We reject
-// hostile MiB-sized literals at entry so neither strconv.Atoi nor stdlib
-// json.Unmarshal-into-int produces a multi-MB error string (both embed the
-// failing input verbatim in *strconv.NumError.Num /
-// *json.UnmarshalTypeError.Value). The string-arm's [fmt.Errorf] wrap
-// caches the formatted message in *fmt.wrapError, defeating downstream
-// truncation of the inner error; the only reliable defense is at entry.
+// maxLaxIntDataLen caps the raw JSON bytes laxInt.UnmarshalJSON accepts. An
+// int64 fits in 20 chars, the quoted form adds 2, and 2 more cover a leading
+// sign. We reject hostile literals at entry because both strconv.Atoi and
+// json.Unmarshal embed the failing input verbatim in their errors.
 const maxLaxIntDataLen = 24
 
 func (l *laxInt) UnmarshalJSON(data []byte) error {
@@ -952,7 +840,7 @@ func validName(s string) bool {
 // unionMissing patches a union's ser and deser branch function tables
 // (plus its branch nodes and name tables) when any branch type was a
 // forward reference. One fixup record per union keeps the paired
-// structures updated together by construction.
+// structures updated together.
 type unionMissing struct {
 	ser        *serUnion
 	deser      *deserUnion
@@ -1018,16 +906,12 @@ type containerFixup struct {
 	ctxLabel    string       // "array" or "map" for error messages
 }
 
-// defaultFixup defers a record field's default-value resolution + encoding
-// to finalize, for a field whose outer type resolved at build time but whose
-// type tree contains a forward-referenced descendant (e.g. array<fwd-ref>
-// items, map<fwd-ref> values, or an inline record with a fwd-ref field).
-// encodeDefault recurses into items/values/fields and dereferences each
-// child's kind, so running it at build time against a not-yet-wired child
-// node panics; deferring runs it after every container/field fixup has wired
-// the descendants. recordFieldFixup handles the fwd-ref-outer case instead
-// (the whole field type is a bare forward-ref name); it also carries the
-// default and resolves the node by name in finalize.
+// defaultFixup defers a record field's default-value encoding to finalize,
+// for a field whose outer type resolved at build time but whose type tree
+// contains a forward-referenced descendant. encodeDefault dereferences each
+// child's kind, so running it against a not-yet-wired child panics.
+// recordFieldFixup handles the case where the whole field type is a forward
+// reference.
 type defaultFixup struct {
 	nd         *schemaNode // enclosing record; its serRecord/deserRecord are the field tables
 	idx        int
@@ -1053,18 +937,13 @@ func captureFwdRef(err error, ctxLabel string) (isFwdRef bool, fwdName string, w
 // namedType holds the compiled artifacts for a named Avro type (record,
 // enum, fixed) so they can be looked up by name during schema building.
 type namedType struct {
-	// node carries the type's compiled artifacts as well as its metadata:
-	// node.ser / node.deser are the wire functions, and node.serRecord /
-	// node.deserRecord are the record tables (nil for enum and fixed). We
-	// read through here rather than copying beside it because a copy taken at
-	// registration and a node read later are two answers to one question, and
-	// only one of them can be re-pointed. A custom-typed reference wraps
-	// b.ser while deliberately leaving node.ser bare (applyCustomTypes), so
-	// the two spellings already mean different things elsewhere in this file.
-	// A reader cannot tell from the name which one a copy froze.
+	// node carries the type's compiled artifacts as well as its metadata. We
+	// read ser/deser through it rather than copy them beside it, since a
+	// custom-typed reference wraps b.ser while leaving node.ser bare, and a
+	// copy could not be re-pointed.
 	node *schemaNode
 	// hadCustomType is true when this named type was defined by a parse that
-	// wired at least one CustomType anywhere (deliberately coarse: every
+	// wired at least one CustomType anywhere (coarse: every
 	// definition of a custom-wired parse counts; stamped at finalize, see
 	// registerNamed). The cache-reference boundary guard compares it against
 	// the referencing parse's registrations to allow consistent reuse and
@@ -1081,14 +960,11 @@ type builder struct {
 	building     map[*schemaNode]struct{} // record/error nodes whose field loop is in progress (shared across nest, like named)
 	definedNamed []*namedType             // named types defined by this parse (vs inherited); stamped custom-affected at finalize
 	// definedSet is the membership form of this-parse definitions. Unlike
-	// definedNamed (a per-builder accumulator merged up only at unnest), it is
-	// shared by reference across nest(), like named/building/cachedNames, so a
-	// guard running in a nested builder (e.g. while building a ["null","Self"]
-	// field) can test whether a resolved reference points at a name this parse
-	// defined, before unnest would have propagated definedNamed upward. A
-	// re-registered cached name's fresh *namedType lands here; cachedNames
-	// cannot make that distinction (it marks such a name as both inherited and
-	// redefined).
+	// definedNamed, which merges up only at unnest, it is shared by reference
+	// across nest(), so a guard running in a nested builder can test whether
+	// a reference points at a name this parse defined. A re-registered
+	// cached name's fresh *namedType is here; cachedNames cannot make that
+	// distinction.
 	definedSet      map[*namedType]bool
 	missing         []unionMissing
 	mfixups         []metaFixup
@@ -1109,23 +985,15 @@ type builder struct {
 	// Schema.customBaked.
 	sawInheritedCustom bool
 	// customMatch memoizes custom-match subtree verdicts per node for this
-	// parse ("" = proven match-free, non-"" = a matched-type location; key
-	// presence marks a computed verdict, so "" is a valid entry). Allocated
-	// by applySchemaOpts only when CustomTypes are registered, and shared
-	// by reference across nest() so the finalize stamping loop and the
-	// per-reference cache walks collapse to one walk per node per parse.
-	// See customMatchInSubtree for the soundness rules. Nil on white-box
-	// test builders; every write is guarded, degrading to unshared walks.
+	// parse: "" is proven match-free, non-"" names a matched-type location,
+	// and key presence marks a computed verdict. Allocated only when
+	// CustomTypes are registered and shared across nest(); every write is
+	// nil-guarded for white-box test builders.
 	customMatch map[*schemaNode]string
 	// overlayDone marks inherited subtrees overlayInheritedCustom has
-	// completed, so N references to the same cached type overlay its nodes
-	// once per parse instead of re-walking per reference. Sharing one set
-	// across references is sound because the walk's effect is idempotent
-	// and order-independent within a parse. buildCustomWiring is
-	// deterministic (b.customTypes is fixed after applySchemaOpts) and we
-	// keep existing overlay entries, so a second walk over the same nodes
-	// could only rebuild identical wiring. Allocated alongside
-	// customMatch; nil-tolerated the same way.
+	// completed, so N references to one cached type overlay its nodes once
+	// per parse. Sharing is sound because the walk is idempotent: customTypes
+	// is fixed after applySchemaOpts and existing entries are kept.
 	overlayDone map[*schemaNode]bool
 	cachedNames map[string]bool // names inherited from SchemaCache, not from this parse
 	// allowReRegister permits re-defining an inherited (cachedNames) type
@@ -1134,16 +1002,12 @@ type builder struct {
 	// (custom parses, and re-parses of a previously-custom-parsed schema).
 	allowReRegister bool
 	depth           int // current build recursion depth, bounded by maxDepth
-	// minBytes is the one min-bytes walk shared across every container built in
-	// this parse (shared across nests, like named/building). A backward name
-	// reference resolves to the fully-built node, so a container whose element
-	// is a cyclic type defined earlier pays a full walk at build. And a schema
-	// can point any number of containers at that one type, so a fresh walk per
-	// container would make the build cost the container count times the
-	// per-walk bound. Sharing caps it once. We keep it separate from
-	// finalize's walk: build-time calls can run over subtrees whose forward
-	// references are not yet wired (provisional), so their memo must not leak
-	// into finalize, which recomputes on the fully-wired graph.
+	// minBytes is the one min-bytes walk shared across every container built
+	// in this parse. A backward reference to a cyclic type pays a full walk
+	// at build, and a schema can point any number of containers at it, so a
+	// fresh walk per container would multiply the bound by the container
+	// count. It stays separate from finalize's walk, whose memo must not see
+	// provisional results computed before forward references are wired.
 	minBytes *minBytesWalk
 	// skipWalk is the parse's walk for [SkipUnknown]'s per-field skippers,
 	// which compile at decode time. Separate from minBytes for the same reason
@@ -1255,16 +1119,12 @@ func (b *builder) customWrappedSer(node *schemaNode, base serfn) serfn {
 	return base
 }
 
-// customWrappedDeser is the decode dual of customWrappedSer: it returns base
-// wrapped with node's custom-Decode chain when one is registered (the same wrap
-// applyCustomTypes installs for an in-order reference), else base unchanged.
-// The forward-ref fixups in finalize call this so a forward reference to a
-// custom-decoded named type applies the CustomType on the binary path.
-// Otherwise the forward-referenced field decodes raw on binary while the JSON
-// decoder applies the custom via the patched node.decodeJSON, the decode twin
-// of the encode divergence. Logical-suppression with no Decode callback needs
-// no wrap here: the suppressed (raw) deser is already baked onto the shared
-// leaf node, so a forward reference inherits it on both wire formats.
+// customWrappedDeser is the decode dual of customWrappedSer: base wrapped with
+// node's custom-Decode chain when one is registered, else base unchanged.
+// The forward-ref fixups in finalize call it so a forward reference to a
+// custom-decoded named type applies the CustomType on the binary path as the
+// JSON path already does. Logical suppression with no Decode callback needs
+// no wrap, since the raw deser is baked onto the shared leaf node.
 func (b *builder) customWrappedDeser(node *schemaNode, base deserfn) deserfn {
 	if w := b.custom[node]; w != nil && len(w.decoders) > 0 {
 		return wrapDeserWithCustomDecoders(base, w.decoders, w.sn)
@@ -1347,16 +1207,10 @@ func (b *builder) registerNamed(name string, nt *namedType) {
 }
 
 // leadingDotName reports whether name spells the explicit null-namespace
-// escape (a single leading dot with no other dot) and returns the fullname
-// it denotes: ".x" is the null-namespace fullname "x", and "." is the bare
-// empty name "". This is Java's Name
-// constructor rule (Schema.java ~1455, release-1.12.0: lastDot split,
-// then `if ("".equals(space)) space = null`), the same rule
-// qualifyAliases applies to aliases; a name whose namespace part is
-// non-empty (".a.b", "a.b") is a fullname verbatim. Shared by the
-// definition build (aobject naming), reference resolution
-// (scopedRefKeys), and the metadata fullname computation
-// (nodeFullname) so the escape cannot drift between them.
+// escape, a single leading dot with no other dot, and returns the fullname
+// it denotes: ".x" is the null-namespace fullname "x", and "." is the empty
+// name. This is Java's Name constructor rule. The definition build, reference
+// resolution, and the metadata fullname computation all share it.
 func leadingDotName(name string) (string, bool) {
 	if strings.LastIndexByte(name, '.') == 0 {
 		return name[1:], true
@@ -1367,24 +1221,17 @@ func leadingDotName(name string) (string, bool) {
 // scopedRefKeys writes the lookup keys for a name reference into dst in
 // binding-precedence order and returns the filled prefix. A dotted reference
 // is an exact fullname lookup. A bare reference tries the
-// enclosing-namespace-qualified key first, then the bare key (the
-// null-namespace type, when one exists). This is the name-binding rule:
-// Java's Names.get order (Schema.java: new Name(o, space) looked up
-// before the null-space retry) and fastavro's schema_name qualification.
-// Checking the bare key first would bind a null-namespace type in
-// preference to the in-scope one whenever the two share a short name,
-// silently changing the wire contract of every field using the reference.
-// Every resolver derives its key order here, so the precedence cannot
-// drift between them: wire build/finalize (resolveNamedRef), canonical
-// (lookupCanonDef), and metadata (lookupNameRef).
+// enclosing-namespace-qualified key first, then the bare key, the order Java
+// and fastavro use; the reverse would bind a null-namespace type over the
+// in-scope one whenever the two share a short name. Every resolver derives
+// its key order here.
 func scopedRefKeys(dst *[2]string, ref, ns string) []string {
 	if strings.Contains(ref, ".") {
 		if short, ok := leadingDotName(ref); ok && short != "" {
 			// ".x" is the null-namespace escape: an exact lookup of the
-			// fullname "x", never qualified into the enclosing namespace.
-			// A bare "." stays as-written and can only miss, since nothing
-			// registers ".", keeping the empty-name type unreferenceable in
-			// spelling (NOT_BUGS #60).
+			// fullname "x", never qualified into the enclosing namespace. A
+			// bare "." stays as written and can only miss, since nothing
+			// registers ".".
 			dst[0] = short
 			return dst[:1]
 		}
@@ -1401,14 +1248,9 @@ func scopedRefKeys(dst *[2]string, ref, ns string) []string {
 
 // resolveNamedRef looks up a named-type reference in scopedRefKeys precedence
 // order against parentName's namespace, returning ("", nil) when unresolved.
-//
-// Shared by tryAssignNamedRef (build-time, backward references) and
-// finalize (forward-reference fixups) so the qualification rule lives in
-// one place. A bare b.named[name] lookup with no qualified retry fails a
-// forward reference into a namespaced scope ("unknown type"), even though the
-// byte-identical backward-ordered schema resolves through
-// tryAssignNamedRef's retry. That is an order-dependent parse rejection of a
-// valid schema.
+// Both the build-time backward references and finalize's forward-reference
+// fixups use it, so a forward reference into a namespaced scope resolves the
+// same as the byte-identical backward-ordered schema.
 func (b *builder) resolveNamedRef(name, parentName string) (string, *namedType) {
 	var keys [2]string
 	for _, k := range scopedRefKeys(&keys, name, namespaceOf(parentName)) {
@@ -1439,14 +1281,10 @@ func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (boo
 	if nt.hadCustomType {
 		b.sawInheritedCustom = true
 	}
-	// Cross-parse inherited subtree (same condition family as the guard
-	// above: not defined this parse, name inherited from the cache):
-	// complete the overlay so resolve-time custom re-application sees the
-	// inherited nodes. applyCustomTypes wires locally defined types at their
-	// own build. The visited set is the per-parse b.overlayDone,
-	// so repeated references to the same inherited type walk its subtree
-	// once per parse, not once per reference (see the field's soundness
-	// note). The nil fallback covers white-box test builders only.
+	// A cross-parse inherited subtree: complete the overlay so
+	// resolve-time custom re-application sees the inherited nodes.
+	// b.overlayDone makes repeated references walk the subtree once per
+	// parse.
 	if len(b.customTypes) > 0 && !b.definedSet[nt] && b.cachedNames[resolved] {
 		if b.overlayDone == nil {
 			b.overlayDone = make(map[*schemaNode]bool)
@@ -1524,17 +1362,10 @@ func (b *builder) finalize() error {
 		m.nd.fields[m.idx].node = nt.node
 	}
 	// Phase 1b: wire every forward-referenced array/map container child.
-	//
-	// We share one walk across the whole loop rather than one per fixup. A
-	// schema can point any number of containers at one forward-referenced
-	// subtree (N array fields all of items "L0"), and each is a distinct fixup
-	// here. A fresh walk per fixup would recompute that subtree N times, and
-	// for a cyclic one, N times the full allowance. The loop's cost would then
-	// be the container count times the per-walk bound, with only the second
-	// factor capped. The graph is fully wired by this phase (phase 1a
-	// resolved every field reference), so the shared memo caches exact values
-	// for the acyclic case and the shared allowance bounds the cyclic residue
-	// once.
+	// One walk is shared across the loop: a schema can point any number of
+	// containers at one forward-referenced subtree, and a fresh walk per
+	// fixup would recompute it that many times. The graph is fully wired
+	// by this phase, so the shared memo is exact.
 	mbw := newMinBytesWalk()
 	for _, m := range b.containerFixups {
 		_, nt := b.resolveNamedRef(m.name, m.parentName)
@@ -1548,13 +1379,9 @@ func (b *builder) finalize() error {
 	}
 	// Phase 2: deferred field defaults, in two passes. encodeDefault fills
 	// an absent nested record field from its resolved f.defaultVal, so we
-	// must record every field's default value (phase 2a) before encoding any
-	// default's binary bytes (phase 2b). Otherwise a field default that
-	// nests into a sibling-defaulted record reads a nil f.defaultVal and
-	// mis-encodes. Both deferral kinds participate: fwd-ref-outer fields
-	// (recordFieldFixup, node resolved by name) and container/nested fields
-	// whose outer type resolved but whose descendant was a fwd-ref
-	// (defaultFixup, node already known).
+	// record every field's default value before encoding any default's
+	// bytes; otherwise a default nesting into a sibling-defaulted record
+	// reads a nil defaultVal. Both deferral kinds participate.
 	type pendingDefault struct {
 		node      *schemaNode
 		name      string
@@ -1604,23 +1431,15 @@ func (b *builder) finalize() error {
 		}
 	}
 	// We stamp each named type this parse defined as custom-affected iff a
-	// non-wildcard registration matches somewhere in its own subtree. That is
-	// exactly when baked effects live inside the type: logical suppression on
-	// shared leaf nodes, callback wraps in the composed ser/deser. The
-	// predicate is findCustomTypeMatchInSubtree, the same one the
-	// cache-boundary guard applies on the reference side, so stamp and guard
-	// cannot disagree either way. Asking about the type's own subtree has two
-	// consequences. The walk crosses into inherited subtrees, so a wrapper
-	// around an inherited custom-baked reference is stampable; a
-	// wired-this-parse test instead
-	// makes the guard's "re-parse with the CustomType first" remediation
-	// unsatisfiable for transitive chains. And a sibling whose subtree has no
-	// match is not stamped merely because the parse wired something elsewhere,
-	// which would false-reject later no-custom references to it.
-	//
-	// Taken at finalize, after the tree is built, because registration happens
-	// early to support self-references. Inherited entries are not in
-	// definedNamed and keep the flag from their defining parse.
+	// non-wildcard registration matches somewhere in its own subtree,
+	// which is when baked effects live inside the type. The predicate is
+	// the same one the cache-boundary guard applies on the reference side,
+	// so stamp and guard cannot disagree. Asking about the type's own
+	// subtree crosses into inherited subtrees, so a wrapper around an
+	// inherited custom-baked reference is stampable, and a sibling with
+	// no match is not stamped merely because the parse wired something
+	// elsewhere. Taken at finalize, after the tree is built, because
+	// registration happens early to support self-references.
 	if len(b.customTypes) > 0 {
 		for _, nt := range b.definedNamed {
 			if b.customMatchInSubtree(nt.node) != "" {
@@ -1724,16 +1543,9 @@ func buildCustomSN(node *schemaNode) *SchemaNode {
 
 // hasMatchingCustomType reports whether any registered custom type would
 // match a node with the given kind and logical type. We use it to skip the
-// built-in logical-type *decoder* when a custom type replaces it. That is the
-// deser side of the suppression contract; see [CustomType.Decode]: "If nil,
-// the built-in logical type handler is bypassed and the base Avro type decoder
-// is used directly".
-//
-// The encode side has different semantics ([CustomType.Encode]: "If nil, the
-// built-in logical type encoder is used"), so encoder-suppression uses
-// [hasMatchingCustomTypeWithEncode] instead, suppressing the built-in
-// encoder only when you actually provided an Encode callback to wrap it
-// with.
+// built-in logical-type decoder when a custom type replaces it. The encode
+// side suppresses only when you provided an Encode callback, so it uses
+// hasMatchingCustomTypeWithEncode instead.
 func (b *builder) hasMatchingCustomType(kind, logical string) bool {
 	return b.hasMatchingCustomTypeCond(kind, logical, false)
 }
@@ -1789,7 +1601,7 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 
 	if wiring.encode != nil {
 		// Wrap the binary serializer. We update b.ser (which becomes the
-		// Schema's ser) but NOT node.ser, so named types in the cache
+		// Schema's ser) but not node.ser, so named types in the cache
 		// keep their unwrapped ser/deser. The wrap closure is built by
 		// makeCustomSer, shared with the forward-ref finalize fixups
 		// (customWrappedSer) so an in-order reference and a forward reference
@@ -1809,16 +1621,10 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		// recursion guard, no shared mutable state.
 		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(wiring.decoders, wiring.sn, wiring.suppressLogical)
 	} else if jsonAppliesLogical {
-		// No Decode callback (Encode-only, or no callbacks at all) on a
-		// logical node that the binary path suppresses (non-wildcard): you
-		// receive the raw Avro-native value (CustomType.Decode: "If nil, the
-		// built-in logical type handler is bypassed ... the base Avro type
-		// decoder is used directly, producing raw values"). decodeKind
-		// applies the logical transform unless suppressed, so install the
-		// raw-decode wrapper with an empty decoder chain to produce the same
-		// raw value through DecodeJSON. A wildcard (suppressLogical false, so
-		// jsonAppliesLogical false) skips this: decodeKind keeps the logical
-		// transform, matching the binary wildcard.
+		// No Decode callback on a logical node the binary path suppresses: you
+		// receive the raw Avro-native value, so we install the raw-decode
+		// wrapper with an empty chain to produce the same raw value through
+		// DecodeJSON. A wildcard keeps the logical transform on both paths.
 		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(nil, wiring.sn, wiring.suppressLogical)
 	}
 
@@ -1827,16 +1633,11 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 	return nil
 }
 
-// buildCustomWiring collects the per-node custom-type wiring from this
-// parse's registrations: the encode chain closure, the decoder chain, the
-// callback SchemaNode, and the suppression flags. Returns nil when no
-// registration matches or applies. Pure with respect to the builder and the
-// node: no ser/deser wraps, no node mutation, no overlay insertion. That is
-// what lets applyCustomTypes (newly built nodes: wraps + overlay) and
-// overlayInheritedCustom share it. The SchemaCache-inherited nodes get the
-// overlay only; their wraps already live inside the inherited composition,
-// baked by the type's own defining parse under the guard-enforced identical
-// registrations.
+// buildCustomWiring collects the per-node custom-type wiring from this parse's
+// registrations, or nil when none matches. It is pure with respect to the
+// builder and the node, which lets applyCustomTypes and
+// overlayInheritedCustom share it; inherited nodes get the overlay only,
+// since their wraps already live inside the inherited composition.
 func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 	// Collect all matching encoders and decoders for this node.
 	type encoder struct {
@@ -1858,14 +1659,9 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 		}
 	}
 
-	// suppressLogical mirrors the binary decoder-suppression gate
-	// (hasMatchingCustomType, the same predicate the primitive/decimal/fixed
-	// builds use to decide between the raw and logical deserializer). The
-	// binary build replaces the built-in logical deserializer with the raw one
-	// whenever any non-wildcard CustomType matches, including a matcher with
-	// no Encode/Decode callbacks (per CustomType.Decode: "If nil, the built-in
-	// logical type handler is bypassed ... producing raw Avro-native values").
-	// Wildcards (empty LogicalType and AvroType) are excluded by the gate.
+	// suppressLogical mirrors the binary decoder-suppression gate: the binary
+	// build replaces the logical deserializer with the raw one whenever any
+	// non-wildcard CustomType matches, callbacks or not.
 	suppressLogical := b.hasMatchingCustomType(node.kind, node.logical)
 	// jsonAppliesLogical narrows that to nodes whose JSON decoder actually
 	// transforms the raw value (a logical decodeKind would apply): only those
@@ -1950,7 +1746,7 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 	}
 
 	wiring.suppressLogical = suppressLogical
-	// encodeSuppresses mirrors the binary *encoder*-suppression gate exactly
+	// encodeSuppresses mirrors the binary *encoder*-suppression gate
 	// (hasMatchingCustomTypeWithEncode, which excludes wildcards), so the JSON
 	// encode arms suppress the built-in logical coercion iff the binary build
 	// did. See customWiring.encodeSuppresses.
@@ -1962,25 +1758,14 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 	return wiring
 }
 
-// overlayInheritedCustom completes this parse's custom overlay (b.custom) for a
+// overlayInheritedCustom completes this parse's custom overlay for a
 // SchemaCache-inherited subtree. applyCustomTypes visits only newly built
 // nodes, so a reference to an inherited type left its matching nodes without
-// overlay entries. The callback wraps still fire on a direct decode, since
-// the defining parse composed them into the inherited ser/deser. But every
-// consumer that re-applies customs from the overlay skipped them silently:
-// Resolve dropped the reader's custom, and the no-callback logical suppression
-// gate with it. A resolved decode then returned raw values where a direct
-// decode returned wrapped ones. We insert pure wiring only: no ser/deser
-// wraps, no node mutation, since the composition already carries them. We
-// keep existing entries, since a node can be reached through several
-// references.
-//
-// visited is the per-parse b.overlayDone set, shared across every reference.
-// That is sound because the walk is idempotent and order-independent within a
-// parse: b.customTypes is fixed after applySchemaOpts, so buildCustomWiring is
-// deterministic and a re-visit could only rebuild identical wiring. Skipping
-// it changes cost, one subtree walk per parse rather than per reference, never
-// outcome.
+// overlay entries: the wraps still fired on a direct decode, but Resolve,
+// which re-applies customs from the overlay, dropped the reader's custom and
+// returned raw values. We insert wiring only, no wraps, and keep existing
+// entries. visited is the per-parse b.overlayDone set; sharing it is sound
+// because the walk is idempotent within a parse.
 func (b *builder) overlayInheritedCustom(node *schemaNode, visited map[*schemaNode]bool) {
 	if node == nil || visited[node] {
 		return
@@ -2026,50 +1811,29 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 }
 
 // rejectCachedRefIfCustomTypeWouldMatch errors when this Parse registered a
-// CustomType that would match a node inside a cached named type's subtree. The
-// cached node's handlers were baked at the original Parse with no knowledge of
-// this one's customTypes, so reusing them silently drops your CustomType on
-// the cached fields. Failing at Parse time, with instructions, beats handing
-// back unwrapped raw bytes at runtime. Per our intentional asymmetries,
-// CustomTypes are scoped to the resulting Schema, which includes its
-// referenced types.
+// CustomType that would match a node inside a cached named type's subtree.
+// The cached node's handlers were baked at the original Parse, so reusing
+// them would silently drop your CustomType on the cached fields.
 func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *namedType) error {
 	if nt == nil || nt.node == nil {
 		return nil
 	}
-	// This guard is only about types inherited across Parses. A name defined in
-	// the current Parse, self- and forward references included, has this
-	// Parse's CustomTypes in scope and applies them to its single definition,
-	// so it is never a stale cross-parse cache.
-	//
-	// definedSet is the authoritative "defined this parse" test: it holds the
-	// *namedType of every definition this parse registered, a cached name
-	// re-registered under allowReRegister included. cachedNames cannot make
-	// the distinction, since a re-registered name is in cachedNames and
-	// defines a fresh node here. Keying the skip on it false-rejects a
-	// re-parse of a cached self-referential schema the moment a matching
-	// CustomType is added.
-	// definedSet is also shared by reference across nest(), so it is already
-	// populated when the guard runs in the nested builder building a
-	// self-referential field; definedNamed would not be, merging up only at
-	// unnest. The cachedNames return below then handles only a name never
-	// inherited at all, and a genuine cross-parse reference falls through both
-	// returns to the match check.
+	// Only types inherited across Parses are in question. definedSet is the
+	// authoritative "defined this parse" test: it holds every definition this
+	// parse registered, a re-registered cached name included, and it is
+	// shared across nest(), so it is populated when the guard runs while
+	// building a self-referential field. cachedNames cannot make either
+	// distinction.
 	if b.definedSet[nt] {
 		return nil
 	}
 	if !b.cachedNames[refName] {
 		return nil
 	}
-	// A cached named type and the Parse referencing it must agree on whether a
-	// matching CustomType is registered. The CustomType's effect is baked onto
-	// the shared cached node: the binary logical-codec suppression bakes the
-	// raw ser/deser onto node.ser/node.deser at the build sites, and the JSON
-	// wrapper sets node.decodeJSON. A named-type reference resolves through
-	// those node fields, with no per-Schema overlay. So a mismatch silently
-	// changes what the referencing Schema decodes/encodes, on both wire
-	// formats. We reject both directions with the same "make them consistent"
-	// remediation.
+	// A cached named type and the Parse referencing it must agree on whether
+	// a matching CustomType is registered, since the CustomType's effect is
+	// baked onto the shared cached node with no per-Schema overlay. We reject
+	// both directions with the same remediation.
 	currentMatches := ""
 	if len(b.customTypes) > 0 {
 		currentMatches = b.customMatchInSubtree(nt.node)
@@ -2097,25 +1861,13 @@ func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *name
 // customMatchInSubtree is the memoized entry point over
 // findCustomTypeMatchInSubtree: one walk per node per parse, shared by the
 // finalize stamping loop, the cache boundary guard, and the overlay
-// completion's guard twin. Without the memo each caller re-walks from
-// scratch: O(defs × reachable nodes) at finalize, quadratic on a
-// backward-reference chain, and O(references × subtree) on a SchemaCache
-// parse.
-//
-// Sound because b.customTypes is fixed for the builder's lifetime and every
-// queried subtree is fully built when walked. Two write rules keep verdicts
-// exact on cyclic graphs:
-//
-//   - A clean completion writes "" for every visited node: reachability is
-//     transitive, so each one's reachable set is a subset of the root's, just
-//     proved match-free. A "" that merely bubbled up mid-walk is NOT written
-//     per-node; a completed child can still reach a match through a back-edge
-//     to a node higher on the stack.
-//   - A match writes the location for the nodes it unwinds through, each of
-//     which reaches that match inside its own subtree.
-//
-// The location string is whichever match the walk order found first. Callers
-// branch only on emptiness; the string just names a type in the guard's error.
+// completion. Without the memo, finalize is quadratic on a
+// backward-reference chain. Two write rules keep verdicts exact on cyclic
+// graphs: a clean completion writes "" for every visited node, since each
+// one's reachable set is a subset of the root's; a "" that merely bubbled up
+// mid-walk is not written, since a completed child can still reach a match
+// through a back-edge to a node higher on the stack. A match writes its
+// location for the nodes it unwinds through.
 func (b *builder) customMatchInSubtree(node *schemaNode) string {
 	if m, ok := b.customMatch[node]; ok {
 		return m
@@ -2261,19 +2013,13 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		if err != nil {
 			return err
 		}
-		// Per Avro spec ("Unions"): "Names of named types must be
-		// defined exactly once across all the schemas of the union."
-		// We key by the resolved fullname when available, so an inline
-		// definition + a name reference to the same named type collide.
-		// Primitives still collide on kind. We do NOT key
-		// forward-referenced branches here. Their as-written name is not
-		// yet bound (resolveNamedRef may qualify it in-scope or fall back
-		// to the null namespace). Keying it would both miss real duplicates
-		// ("Inner" vs the inline "n.Inner" it resolves to) and false-
-		// reject valid unions (a fwd "Inner" destined for "n.Inner"
-		// colliding with a null-namespace "Inner" branch). Every
-		// fwd-ref-bearing union is re-checked over the resolved names in
-		// finalize via finalizeUnionNames.
+		// Per the spec, named types must be defined once across a union. We
+		// key by resolved fullname when available, so an inline definition
+		// and a reference to the same type collide, and primitives collide on
+		// kind. A forward-referenced branch is not keyed here: its as-written
+		// name is not yet bound, and keying it would both miss real
+		// duplicates and false-reject valid unions. finalizeUnionNames
+		// re-checks over the resolved names.
 		if missing[i] == "" {
 			key := typ
 			if u.node != nil && u.node.name != "" {
@@ -2304,16 +2050,11 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		unionLog = append(unionLog, ln)
 	}
 	fillUnionTagTables(tags, deser, branchNodes, unionStd, unionLog)
-	// Populate byKind for type-name dispatch in serUnion.ser /
-	// appendAvroJSONUnion / encodeDefault's union case (see
-	// unionTypeNameForValue). Primitive kinds only: record/enum/fixed
-	// branches go through tagged-union dispatch, and the spec
-	// guarantees primitive kinds are unique within a union (so this
-	// map is unambiguous by construction).
-	//
-	// Not rebuilt by finalizeUnionNames: a branch is nil there only while a
-	// forward reference is unbound, and a forward reference always names a
-	// named type, which none of the kinds below can be.
+	// byKind serves type-name dispatch in the encoders and encodeDefault (see
+	// unionTypeNameForValue). Primitive kinds only: named branches go through
+	// tagged dispatch, and the spec guarantees primitive kinds are unique
+	// within a union. finalizeUnionNames need not rebuild it, since a forward
+	// reference always names a named type.
 	for i, branch := range branchNodes {
 		if branch == nil {
 			continue
@@ -2362,20 +2103,13 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 	return nil
 }
 
-// unionTags is a union's parse-time name lookup: "which branch does this name
-// select?", answered once and asked by both wires.
-//
-// byName is findUnionBranch's accept-set: we build it by offering every branch
-// to every unionTagTiers tier. byKind routes a value whose Go type names an
-// Avro primitive kind, and routes nil to the null branch.
-//
-// We allocate once per union and refill in place, never reassigning:
-// finalizeUnionNames rebuilds after forward references bind, and every holder
-// must see that rebuild. Reassigning a field would leave whichever holder was
-// wired first on the pre-finalize table.
-//
-// The methods tolerate a nil receiver so a table-less node, hand-assembled in
-// a test, takes the scan without every caller repeating the check.
+// unionTags is a union's parse-time name lookup, answered once and asked by
+// both wires. byName is findUnionBranch's accept set, built by offering every
+// branch to every unionTagTiers tier; byKind routes a value whose Go type
+// names an Avro primitive kind. We allocate once per union and refill in
+// place, since finalizeUnionNames rebuilds after forward references bind and
+// every holder must see that rebuild. The methods tolerate a nil receiver
+// for hand-assembled nodes.
 type unionTags struct {
 	byName map[string]int // the tag you write, to branch index
 	byKind map[string]int // primitive branch kind to branch index; first wins
@@ -2398,14 +2132,9 @@ func (t *unionTags) branchByKind(kind string) (int, bool) {
 }
 
 // fillUnionTagTables builds a union's three tag tables: the two the decoder
-// emits (deser.branchNames / deser.logicalNames) and the one both encoders and
-// the JSON decoder resolve a tag you wrote through (tags.byName).
-//
-// The emit tables carry one precedence rule, an exact branch name outranks a
-// logical qualifier (the order findUnionBranch resolves in), so a branch never
-// emits a tag the decoder would hand to a different branch. We build the
-// accept table by asking unionTagTiers instead of restating any of it; see
-// below.
+// emits and the one the encoders and the JSON decoder resolve a written tag
+// through. An exact branch name outranks a logical qualifier, so a branch
+// never emits a tag the decoder would hand to a different branch.
 func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNode, standard, logical []string) {
 	deser.branchNames = append(deser.branchNames[:0], standard...)
 	deser.logicalNames = deser.logicalNames[:0]
@@ -2415,34 +2144,20 @@ func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNo
 		}
 		deser.logicalNames = append(deser.logicalNames, ln)
 	}
-	// The degrade above is the operative guard for the emit tables:
-	// deser.logicalNames is the tag the binary decoder wraps a value in, and
-	// nothing else recomputes it.
-	//
-	// We build the accept table below by asking unionTagTiers rather than
-	// restating it, offering every branch to every tier in order, so this
-	// accept-set is findUnionBranch's by construction. Two resolver rules ride
-	// along: across tiers first write wins, and within a guarded tier a name
-	// two branches could claim is registered *nowhere*. That refusal must hold
-	// on both wire formats, or you get a value on one and an error on the
-	// other.
-	//
-	// A nil branch node is a forward reference buildUnion has not bound. Its
-	// exact name registers from `standard` so the table works meanwhile, and
-	// finalizeUnionNames rebuilds over the resolved nodes.
+	// We build the accept table by offering every branch to every tier in
+	// order, so it is the same set findUnionBranch accepts: across tiers
+	// first write wins, and within a guarded tier a name two branches could
+	// claim is registered nowhere, on both wire formats. A nil branch node
+	// is an unbound forward reference; its exact name registers from
+	// standard and finalizeUnionNames rebuilds later.
 	if tags.byName == nil {
 		tags.byName = make(map[string]int, len(standard))
 	} else {
 		clear(tags.byName)
 	}
-	// One scratch set for the whole walk, not one per tier. The branch count is
-	// set by the schema text: a twenty-thousand-branch union is legal Avro a
-	// registry or OCF header can carry. So "does another branch claim this
-	// name" must answer in constant time per branch. Scanning the branch slice
-	// would be a scan inside a loop over that same slice, quadratic in a number
-	// you pick; counting claims once per tier is linear. The count map is
-	// allocated on first use and reused, so an ordinary union pays one
-	// allocation and a union with no guarded tier pays none.
+	// One scratch set for the whole walk. A union can carry any number of
+	// branches, so "does another branch claim this name" must answer in
+	// constant time per branch; the count map is allocated on first use.
 	claims := make([]string, len(branches))
 	claimed := make([]bool, len(branches))
 	var claimCount map[string]int
@@ -2492,18 +2207,11 @@ func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNo
 }
 
 // finalizeUnionNames re-derives a union's name-dependent artifacts after
-// every forward-referenced branch node is wired. A named reference is
-// position-independent, so nothing observable may depend on whether a branch
-// was defined before or after it. But buildUnion runs before forward refs
-// resolve, and captured the unresolved as-written name in both the
-// duplicate-branch key and the branch-name tables. We re-run both:
-//
-//   - Duplicate detection (spec, "Unions": no named type twice), keyed by
-//     resolved fullname for named branches and kind for unnamed ones. A
-//     short-name forward reference and an inline definition of the same type
-//     now collide where their parse-time keys "Inner" and "n.Inner" did not.
-//   - branchNames/logicalNames rebuild on the resolved full name, matching the
-//     JSON side and making the tables identical to an in-order reference's.
+// every forward-referenced branch node is wired, since buildUnion captured
+// the unresolved as-written name in both the duplicate-branch key and the
+// branch-name tables. Duplicate detection re-keys by resolved fullname, so a
+// short-name forward reference and an inline definition of the same type now
+// collide, and the tag tables rebuild on the resolved full name.
 func finalizeUnionNames(tags *unionTags, deser *deserUnion, branches []*schemaNode) error {
 	saw := make(map[string]bool, len(branches))
 	for _, n := range branches {
@@ -2562,33 +2270,22 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	}
 
 	if ser, isPrimitive := serPrimitive[o.Type]; isPrimitive {
-		// "bytes" is the only primitive underlying that validateLogical
-		// permits for decimal/big-decimal ("fixed" is built on the
-		// named-type path below, never here). The o.Type=="bytes" gate
-		// matters because the CustomType-resurrection above can restore a
-		// dropped "decimal"/"big-decimal" logical onto any primitive.
-		// validateLogical soft-drops decimal on a wrong underlying type
-		// BEFORE its precision-required check, so o.Precision stays nil.
-		// Without the gate a `{"type":"int","logicalType":"decimal"}` +
-		// decimal CustomType would enter this branch and dereference nil
-		// o.Precision. A resurrected logical on a non-bytes primitive
-		// instead falls through to the plain-primitive path, where the
-		// base ser/deser carry the value and the CustomType wraps them.
+		// "bytes" is the only primitive underlying validateLogical permits for
+		// decimal; fixed is built on the named-type path. The gate matters
+		// because the CustomType resurrection above can restore a dropped
+		// decimal onto any primitive with o.Precision still nil. A resurrected
+		// logical on another primitive takes the plain path, where the
+		// CustomType wraps the base ser/deser.
 		if o.Logical == "decimal" && o.Type == "bytes" {
 			scale := 0
 			if o.Scale != nil {
 				scale = *o.Scale
 			}
-			// Per-direction suppression mirrors the timestamp/uuid path
-			// below. We preserve the built-in encoder whenever you did
-			// not provide an Encode callback (per CustomType.Encode, "If
-			// nil, the built-in logical type encoder is used"). We
-			// suppress the built-in decoder whenever any matching
-			// CustomType exists (per CustomType.Decode, "If nil, the
-			// built-in logical type handler is bypassed and the base Avro
-			// type decoder is used directly"). A single-gate suppression
-			// on any match would break encode of *big.Rat with a
-			// Decode-only CustomType.
+			// Per-direction suppression, as on the timestamp/uuid path: the
+			// built-in encoder stays unless you provided an Encode, while any
+			// matching CustomType suppresses the built-in decoder. One gate
+			// for both would break encoding *big.Rat with a Decode-only
+			// CustomType.
 			if b.hasMatchingCustomTypeWithEncode(o.Type, o.Logical) {
 				b.ser = ser
 			} else {
@@ -2636,27 +2333,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.ser = ser
 		b.deser = deserPrimitive[o.Type]
-		// Use the logical serializer when the logical is spec-valid for this
-		// underlying kind, where it is a strict superset of the base one
-		// (accepting time.Time etc. as well as raw values).
-		//
-		// The kind gate matters because the CustomType resurrection near the top
-		// of buildComplex can restore a soft-dropped logical onto a kind it is
-		// NOT valid for (uuid on bytes, timestamp-millis on string).
-		// logicalSer/logicalDeser key on the logical name alone. Without the
-		// gate the binary codec would apply serUUID/serTimestamp* on the wrong
-		// kind while the per-kind JSON paths stay raw, diverging binary from
-		// JSON and, for the string case, emitting a wire this schema's own
-		// decoder cannot read. logicalUnderlyingAcceptsObject is the predicate
-		// validateLogical soft-drops with, so encode and decode gate alike.
-		//
-		// The deser also suppresses on a matching CustomType, so a custom
-		// decoder sees the raw Avro-native value. The two gates are
-		// independent. A CustomType whose AvroType names a different kind
-		// resurrects the logical (resurrection keys on LogicalType only) yet
-		// does not match for suppression, so !hasMatchingCustomType alone
-		// would apply the wrong-kind deser on binary while the kind-gated
-		// JSON path stays raw.
+		// The logical serializer accepts a strict superset of the base one,
+		// but only where the logical is valid for this kind: the CustomType
+		// resurrection can restore a soft-dropped logical onto a kind it is
+		// not valid for, and logicalSer keys on the name alone, so without
+		// the gate binary would apply serUUID on bytes while the JSON path
+		// stays raw. The deser gate on a matching CustomType is independent:
+		// a CustomType naming a different AvroType resurrects the logical
+		// without matching for suppression.
 		if logSer := logicalSer(o.Logical); logSer != nil && logicalUnderlyingAcceptsObject(o) {
 			b.ser = logSer
 		}
@@ -2676,7 +2360,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if o.Logical == "" && origLogical != "" {
 			nd.unknownLogical = origLogical
 		}
-		// o.Precision/o.Scale are deliberately NOT copied here: the node
+		// o.Precision/o.Scale are not copied here: the node
 		// fields hold validated decimal parameters only (the bytes-decimal
 		// branch above and the fixed build's decimal arm). On this path the
 		// keys were never consumed (a soft-dropped/resurrected decimal on a
@@ -2686,18 +2370,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		return nil
 	}
 
-	// Named-type reference wrapped in an object: {"type":"Node"} where
-	// "Node" is a record/enum/fixed and no type-defining fields are
-	// present. Java's parser accepts this form; see apache/avro's
-	// TestUnionSelfReference. The bare-string form "Node" is the canonical
-	// reference shape; this branch handles the equivalent wrapped form for
-	// interop with producers that emit it. Forward references, names not yet
-	// declared, return unknownPrimitiveError so the field/union/array/map
-	// dispatch can queue a fixup, mirroring the bare-string forward-reference
-	// path in buildPrimitive. Any of
-	// Fields/Symbols/Items/Values/Size/Name being set means you are trying
-	// to *define* a new type: we fall through and let the regular dispatch
-	// handle (or error on) that case.
+	// A named-type reference wrapped in an object, {"type":"Node"} with no
+	// type-defining keys, which Java's parser accepts. A forward reference
+	// returns unknownPrimitiveError so the caller can queue a fixup, as on
+	// the bare-string path. Any type-defining key present means you are
+	// defining a new type, so we fall through to the regular dispatch.
 	if o.Name == "" &&
 		len(o.Fields) == 0 && len(o.Symbols) == 0 &&
 		o.Items == nil && o.Values == nil && o.Size == nil {
@@ -2711,7 +2388,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		switch o.Type {
 		case "record", "error", "enum", "fixed", "array", "map":
 			// real complex-type-without-required-fields: fall through
-			// to the existing switch which will surface the right error.
+			// to the existing switch which reports the right error.
 		default:
 			if _, isPrim := serPrimitive[o.Type]; !isPrim {
 				b.canon = aschema{primitive: o.Type}
@@ -2728,18 +2405,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		origFieldAliases[i] = f.Aliases
 	}
 
-	// Canonical form: per the Avro spec's Parsing Canonical Form STRIP rule,
-	// we keep only type, name, fields, symbols, items, values, and size. We
-	// strip all others: logicalType, precision, scale, doc, aliases, and so on.
-	//
-	// "error" normalizes to "record" so the canonical form, and every
-	// Fingerprint from it, matches Java's SchemaNormalization and fastavro's
-	// _to_parsing_canonical_form, both of which emit "record" for both. Without
-	// it, error-typed schemas fingerprint differently and break Single Object
-	// interop and registry fingerprint indexing.
-	//
-	// Root().Type, String() and the SchemaNode.Schema round trip still preserve
-	// the as-written "error"; only the canonical surface normalizes.
+	// Canonical form keeps only type, name, fields, symbols, items, values,
+	// and size, per the spec's STRIP rule. "error" normalizes to "record" so
+	// the fingerprint matches Java and fastavro; Root().Type and String()
+	// still preserve the as-written "error".
 	canonType := o.Type
 	if canonType == "error" {
 		canonType = "record"
@@ -2762,35 +2431,22 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if err := b.validFullnameErr(o.Name); err != nil {
 			return fmt.Errorf("invalid %s name %q: %w", truncForError(o.Type), truncForError(o.Name), err)
 		}
-		// The namespace attribute is itself a dot-separated sequence of names
-		// (spec §Names) and owes the same grammar. The check above saw only the
-		// name attribute, so without this {"name":"R","namespace":"bad ns"}
-		// skips validation entirely while the identical inline fullname
-		// {"name":"bad ns.R"} is rejected. And since the canonical form
-		// inlines the namespace into the fullname, the accepted schema's
-		// Canonical() would then fail to re-parse in the same mode. Validating
-		// here also routes namespace components through a WithLaxNames
-		// validator, honoring its "called for each name component" contract. A
-		// dotted name ignores the attribute per the spec, and "" is the
-		// explicit null-namespace escape; both are exempt.
+		// The namespace attribute is a dot-separated sequence of names and
+		// owes the same grammar as the name; without this
+		// {"name":"R","namespace":"bad ns"} would skip validation while the
+		// identical fullname {"name":"bad ns.R"} is rejected, and the
+		// canonical form would fail to re-parse. A dotted name ignores the
+		// attribute per the spec, and "" is the null-namespace escape.
 		if o.Namespace != nil && *o.Namespace != "" && !strings.Contains(o.Name, ".") {
 			if err := b.validFullnameErr(*o.Namespace); err != nil {
 				return fmt.Errorf("invalid %s namespace %q: %w", truncForError(o.Type), truncForError(*o.Namespace), err)
 			}
 		}
-		// We do NOT name-validate aliases: the Avro spec (§Aliases) states
-		// "any string is accepted as an alias", precisely so evolution can
-		// alias a reader's valid name to a writer's illegal/legacy name.
-		// fastavro does no alias validation (a "123 !bad" alias parses,
-		// observed 1.12.2), and Java stores field aliases as raw strings
-		// (Field.addAlias, Schema.java:674-677). Java's default parser
-		// does run its NameValidator over type aliases (parseAliases into
-		// NamedSchema.addAlias into new Name, Schema.java:2000-2004/:847,
-		// rejecting e.g. digit-start), its own divergence from the spec
-		// sentence; we follow the spec and fastavro. qualifyAliases
-		// (below) still applies namespace qualification and the
-		// leading-dot null-namespace escape; resolution matches aliases
-		// as plain strings.
+		// We do not name-validate aliases: the spec says any string is
+		// accepted as an alias, so evolution can alias a valid name to a
+		// writer's illegal legacy name, and fastavro validates none. Java
+		// validates type aliases but not field aliases. qualifyAliases still
+		// applies namespace qualification and the leading-dot escape.
 		ns := ""
 		hasNS := false
 		if o.Namespace != nil {
@@ -2802,17 +2458,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			parentName = ""
 			hasNS = false
 			if short, ok := leadingDotName(o.Name); ok {
-				// ".x" is the null-namespace fullname "x" and "."
-				// collapses to the bare empty name "" (leadingDotName).
-				// Reachable only under a WithLaxNames fn accepting ""
-				// (validFullnameErr already rejected the empty component
-				// for strict parses, above), so strict acceptance is
-				// unchanged. Without this the name registered verbatim
-				// while child registration prefixed parentName[:dot+1]
-				// and reference resolution used namespaceOf. Those are
-				// three rules that disagree exactly when the namespace
-				// part is empty, so a bare sibling reference inside
-				// ".x" could not resolve at all.
+				// ".x" is the null-namespace fullname "x" and "." collapses to
+				// the empty name, reachable only under a WithLaxNames fn that
+				// accepts "". Without this the name registered verbatim while
+				// child registration and reference resolution disagreed, so a
+				// bare sibling reference inside ".x" could not resolve.
 				o.Name = short
 			}
 		}
@@ -2846,24 +2496,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			// it gets fresh CustomType wiring.
 		}
 	} else {
-		// A stray "namespace" on an unnamed kind is inert metadata. We never
-		// consume it (only the named branch above reads o.Namespace), and it
-		// never scopes: children resolve in the enclosing scope on every
-		// path, since the walkers' nodeChildScope/nsForChildren are
-		// kind-keyed. The metadata tree surfaces it as-written, matching the
-		// primitive type-object posture and both references (Java
-		// SCHEMA_RESERVED ignores it on every schema object; fastavro
-		// accepts it and scopes a named type under such an array in the
-		// enclosing scope, executed).
-		//
-		// A stray "name" on a container kind still rejects. The metadata
-		// walkers deliberately scope children by any non-empty
-		// SchemaNode.Name (nsForChildren's hand-built posture), so a parsed
-		// stray name on a kind with child positions would make Root() scope
-		// named descendants differently than we do here. That is the same
-		// walker-parity rationale the structural-key exclusivity rejects
-		// rest on. Primitive objects keep accepting a stray name: they have
-		// no child positions for that arm to act on.
+		// A stray "namespace" on an unnamed kind is inert metadata that never
+		// scopes children, and the metadata tree carries it as written; Java
+		// ignores it on every schema object and fastavro accepts it. A stray
+		// "name" on a container kind still rejects: the metadata walkers scope
+		// children by any non-empty SchemaNode.Name, so a parsed stray name
+		// would make Root() scope named descendants differently than the
+		// parser does. Primitive objects have no child positions, so they
+		// keep accepting one.
 		if o.Name != "" {
 			return errors.New("only record, enum, and fixed can have a name")
 		}
@@ -2923,18 +2563,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.node = nd
 
 		// We mark this record as under construction. A field default whose
-		// type subtree references this record (a self- or mutual-recursive
-		// reference) must defer its binary default-encode to finalize rather
-		// than encode inline now. encodeDefault recurses into the referenced
-		// record's fields, and nd.fields holds only the fields declared
-		// before the current one until the loop below completes, so encoding
-		// inline against it emits truncated, non-decodable default bytes.
-		// nodeAwaitsForwardRef consults this set, so we treat an
-		// in-construction record like a not-yet-wired forward-ref child. We
-		// clear it when the build returns and nd is whole. Lazily created
-		// (the public entry points seed it, but an internally-constructed
-		// builder may not) and shared through nest, so a nested record built
-		// while this one is open sees the same in-construction set.
+		// type subtree references this record must defer its default-encode
+		// to finalize: encodeDefault recurses into the referenced record's
+		// fields, and nd.fields holds only the fields declared so far. The set
+		// is shared through nest so a nested record sees it.
 		if b.building == nil {
 			b.building = make(map[*schemaNode]struct{})
 		}
@@ -2947,7 +2579,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			if err := b.validNameErr(of.Name); err != nil {
 				return fmt.Errorf("invalid field name %q: %w", truncForError(of.Name), err)
 			}
-			// We do NOT name-validate field aliases: per the Avro spec any
+			// We do not name-validate field aliases: per the Avro spec any
 			// string is accepted as an alias, so a reader can alias a writer's
 			// illegal/legacy field name. We match them as-is against writer
 			// field names during resolution, like Java and fastavro.
@@ -3062,20 +2694,13 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		sr.names = names
 		dr.names = names
-		// JSON DecodeJSON uses fieldIdx to route record-field keys to their
-		// schema slot. We register every alias-to-index mapping alongside the
-		// canonical name so JSON producers that emit using an alias name
-		// route to the right field. The binary path's resolve.go does the
-		// equivalent alias-aware lookup via readerFieldLookup.
-		//
-		// Per Avro spec ("Aliases are alternative names, and thus subject
-		// to the same uniqueness constraints as names"), a field name and
-		// alias share one namespace within a record. We reject symmetrically:
-		// either a later name shadowing a prior alias, or a later alias
-		// shadowing a prior name/alias, breaks uniqueness. Checking only the
-		// alias side lets [{name:"a",aliases:["x"]},{name:"x"}] parse and then
-		// route differently from Java's applyAliases, which rewrites a writer's
-		// "x" to "a" before the literal-named field can claim it.
+		// DecodeJSON routes record keys through fieldIdx, so every alias maps
+		// beside the canonical name; the binary side does the same through
+		// readerFieldLookup. Aliases share one namespace with names within a
+		// record, per the spec, so a later name shadowing a prior alias or a
+		// later alias shadowing a prior name both reject. Checking only the
+		// alias side would let [{name:"a",aliases:["x"]},{name:"x"}] parse and
+		// route differently from Java's applyAliases.
 		nd.fieldIdx = make(map[string]int, len(nd.fields))
 		for i, f := range nd.fields {
 			if _, exists := nd.fieldIdx[f.name]; exists {
@@ -3133,19 +2758,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			deser:       b.deser,
 		}
 		if len(origEnumDefault) > 0 {
-			// The default must be a JSON string token naming a symbol,
-			// and we decide by token type BEFORE the membership check.
-			// On a non-string body json.Unmarshal leaves the zero value
-			// "" (for an explicit null it is even a no-error no-op), and
-			// "" can be a legitimate member under a WithLaxNames
-			// validator that accepts empty name components. Membership
-			// alone would then silently bind such garbage to the ""
-			// symbol, and schema evolution would fill it. fastavro rejects
-			// every non-member (hence every non-string) enum default at parse;
-			// Java binds no default for a non-text token
-			// (Schema.java:1921-1925, a null textValue() skips
-			// EnumSchema's containment check). Neither reference ever
-			// binds one.
+			// The default must be a JSON string token naming a symbol, decided
+			// by token type before the membership check: on a non-string body
+			// json.Unmarshal leaves "", which can be a member under a
+			// WithLaxNames validator that accepts empty components. Neither
+			// fastavro nor Java binds a non-string enum default.
 			tok := bytes.TrimSpace(origEnumDefault)
 			var defStr string
 			if len(tok) == 0 || tok[0] != '"' || json.Unmarshal(tok, &defStr) != nil {
@@ -3180,15 +2797,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			af.canon = aschema{primitive: fwdRefName}
 		}
 		o.Items = &af.canon
-		// canonObj captured o.Items by value before this recursion ran, so
-		// it still points at the as-parsed (possibly {"type":"X"}-wrapped or
-		// attribute-bearing) items schema. We repoint it at the canonicalized
-		// child so the Parsing Canonical Form's [PRIMITIVES] and [STRIP]
-		// rules apply inside array items. That matches Java's
-		// SchemaNormalization.build (which recurses into getElementType) and
-		// every other top-level/field/branch site that already uses the
-		// child's canon. Record fields stay correct via the o.Fields slice
-		// alias; only the Items/Values pointer fields need the explicit sync.
+		// canonObj captured o.Items by value before this recursion ran, so we
+		// repoint it at the canonicalized child, as Java's SchemaNormalization
+		// does. Record fields stay correct via the o.Fields slice alias; only
+		// the Items/Values pointers need the sync.
 		canonObj.Items = &af.canon
 		sa := &serArray{serItem: af.ser}
 		// One computation feeding both wire-side slots. They are the same
@@ -3325,43 +2937,24 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			return errors.New("fixed is missing size")
 		}
 		size := int(*o.Size)
-		// Size 0 is legal: the spec requires only "an integer", and Java,
-		// fastavro, and avro-rs all accept it: every value of a size-0
-		// fixed is the empty byte string. We reject only negatives. The upper
-		// bound is intentionally unbounded at parse, matching fastavro and
-		// avro-rs, which defer the size to value/wire time. A size beyond the
-		// actual datum simply fails at encode/decode where it is value- and
-		// buffer-bounded. (Java is stricter, capping size at
-		// Integer.MAX_VALUE-8 in FixedSchema's ctor via
-		// SystemLimitException.checkMaxBytesLength, but we follow the lenient
-		// majority. No parse-time path may allocate proportional to this size;
-		// see maxFixedLogicalLen in json_decode.go.)
+		// Size 0 is legal, and the upper bound is unbounded at parse as in
+		// fastavro and avro-rs; a size beyond the datum fails at encode or
+		// decode. No parse-time path may allocate proportional to this size.
 		if size < 0 {
 			return fmt.Errorf("invalid fixed size %v", size)
 		}
-		// Per-direction suppression. We preserve the built-in encoder when
-		// you did not provide Encode (per CustomType.Encode, "If nil, the
-		// built-in logical type encoder is used"). We suppress the built-in
-		// decoder whenever any matching CustomType exists (per
-		// CustomType.Decode, "If nil, the built-in logical type handler
-		// is bypassed and the base Avro type decoder is used
-		// directly"). A single-gate suppression on any match would
-		// route a Decode-only CustomType for fixed.decimal /
-		// fixed.duration / fixed.uuid onto raw serSize which can't
-		// accept *big.Rat / avro.Duration as input.
+		// Per-direction suppression: the built-in encoder stays unless you
+		// provided an Encode, while any matching CustomType suppresses the
+		// built-in decoder. One gate for both would route a Decode-only
+		// CustomType onto raw serSize, which cannot accept *big.Rat.
 		hasEnc := b.hasMatchingCustomTypeWithEncode("fixed", s.object.Logical)
 		hasAny := b.hasMatchingCustomType("fixed", s.object.Logical)
 		switch s.object.Logical {
 		case "duration":
-			// serDuration always emits 12 bytes, so it is only correct for a
-			// size-12 fixed. validateLogical soft-drops a duration on a wrong
-			// size, but the CustomType resurrection near the top of
-			// buildComplex can restore it. Without the size gate serDuration
-			// would write 12 bytes into a size != 12 fixed, a wire this
-			// schema's own deserFixed{size} reader (and the JSON arm) cannot
-			// read. logicalUnderlyingAccept is the same size predicate
-			// validateLogical uses to soft-drop, so a resurrected wrong-size
-			// logical keeps the raw serSize, matching the suppressed decoder.
+			// serDuration always emits 12 bytes, and the CustomType
+			// resurrection can restore a duration validateLogical dropped
+			// for a wrong size, so a wrong-size fixed keeps the raw serSize,
+			// matching the suppressed decoder.
 			if hasEnc || !logicalUnderlyingAccept["duration"](o) {
 				b.ser = (&serSize{size}).ser
 			} else {
@@ -3373,7 +2966,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			// the raw deserFixed{size}, matching the plain fixed and the kind/
 			// size-checked JSON decode. hasAny suppresses for a matching custom;
 			// !logicalUnderlyingAccept covers a resurrection whose custom AvroType
-			// names a different kind (so it does NOT match for suppression).
+			// names a different kind (so it does not match for suppression).
 			if hasAny || !logicalUnderlyingAccept["duration"](o) {
 				b.deser = (&deserFixed{size}).deser
 			} else {
@@ -3443,17 +3036,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 }
 
 // bareAliasShorts collects the aliases declared without any dot, as written.
-// A dotted alias (including the ".Name" null-namespace escape) is an explicit
-// fullname spelling and matches only exactly, via the qualifyAliases output.
-// An alias declared bare also short-name-matches a writer type in any
-// namespace: fastavro's raw-string tier (match_schemas: `w_unqual_name in
-// r_aliases`) and the permissive side of the reference behaviors (Java's
-// applyAliases map is fullname-keyed and has no short tier).
-//
-// Distinguishing bare from qualified requires the declared spelling.
-// Reconstructing it from the qualified form would over-widen an
-// explicitly-written same-namespace alias ("a.Old" declared on a type in
-// namespace a is indistinguishable from bare "Old" after qualification).
+// A dotted alias is an explicit fullname and matches only exactly; a bare
+// alias also short-name-matches a writer type in any namespace, fastavro's
+// raw-string tier. The declared spelling is required: after qualification a
+// same-namespace "a.Old" is indistinguishable from bare "Old".
 func bareAliasShorts(aliases []string) []string {
 	var shorts []string
 	for _, a := range aliases {
@@ -3476,18 +3062,12 @@ func qualifyAliases(aliases []string, fullname string) []string {
 	for i, a := range aliases {
 		switch {
 		case strings.ContainsRune(a, '.'):
-			// Dotted aliases follow the names' dot rule, via the same
-			// helper (leadingDotName). A single leading dot with a dotless
-			// remainder is the explicit null-namespace escape (".x" is the
-			// fullname "x", "." the empty name), never qualified into the
-			// type's own namespace. Any other dotted spelling is a fullname
-			// verbatim. Java's Name constructor nulls the space only when
-			// it is empty (Schema.java ~1455: lastDot split, then
-			// `if ("".equals(space)) space = null`). So ".a.b" keeps its
-			// non-empty space ".a" and denotes ".a.b" as written, a name
-			// only a lax-parsed writer can carry. Stripping any leading dot
-			// here made alias ".a.b" match writer "a.b", a match neither
-			// Java (space kept) nor fastavro (raw-string comparison) makes.
+			// Dotted aliases follow the names' dot rule: a single leading dot
+			// with a dotless remainder is the null-namespace escape, and any
+			// other dotted spelling is a fullname verbatim. Java's Name
+			// constructor nulls the space only when it is empty, so ".a.b"
+			// keeps its space; stripping any leading dot here made alias
+			// ".a.b" match writer "a.b", which neither Java nor fastavro does.
 			short, _ := leadingDotName(a)
 			out[i] = short
 		default:
@@ -3497,14 +3077,10 @@ func qualifyAliases(aliases []string, fullname string) []string {
 	return out
 }
 
-// logicalUnderlyingAccept maps known logical types to the predicate
-// that decides whether the carrier's Avro type is permitted. Mismatches
-// soft-drop the logical (returning the bare underlying type) per spec
-// and Java/fastavro/hamba parity; see the soft-drop comment in
-// validateLogical for the rationale.
-//
-// We handle "decimal" inline in validateLogical instead: its precision/scale
-// validation is too involved to fit a one-line predicate.
+// logicalUnderlyingAccept maps known logical types to the predicate deciding
+// whether the carrier's Avro type is permitted. A mismatch soft-drops the
+// logical, per spec. "decimal" is handled inline in validateLogical, since
+// its precision/scale validation does not fit a predicate.
 var logicalUnderlyingAccept = map[string]func(o *aobject) bool{
 	"uuid": func(o *aobject) bool {
 		return o.Type == "string" || (o.Type == "fixed" && o.Size != nil && int(*o.Size) == 16)
@@ -3519,27 +3095,18 @@ var logicalUnderlyingAccept = map[string]func(o *aobject) bool{
 	"local-timestamp-micros": func(o *aobject) bool { return o.Type == "long" },
 	"local-timestamp-nanos":  func(o *aobject) bool { return o.Type == "long" },
 	"big-decimal":            func(o *aobject) bool { return o.Type == "bytes" },
-	// Duration on non-fixed, or fixed with size != 12, soft-drops.
-	// Java's Duration.validate at LogicalTypes.java:323-327 throws
-	// IllegalArgumentException for `type != FIXED || size != 12`;
-	// fromSchemaIgnoreInvalid catches and drops. hamba's
-	// parseFixedLogicalType at schema_parse.go:517 only matches
-	// `ltyp == Duration && size == 12` and drops everything else.
+	// Duration on non-fixed, or fixed with size != 12, soft-drops, as in
+	// Java and hamba.
 	"duration": func(o *aobject) bool {
 		return o.Type == "fixed" && o.Size != nil && int(*o.Size) == 12
 	},
 }
 
-// logicalUnderlyingAcceptsObject reports whether o.Logical is spec-valid on
-// o's Avro underlying (type + size), the single predicate the primitive
-// build's logical ser/deser selection gates on, identical for both directions.
-// Returns false for "decimal"/"big-decimal", whose underlying validity
-// validateLogical and the dedicated bytes-decimal build handle inline rather
-// than through this table. Returns false too for any logical with no
-// specialized name-keyed codec, which is correct: logicalSer/logicalDeser are
-// nil there, so the gate's result is moot. A CustomType-resurrected
-// wrong-kind logical returns false here, so we keep the raw base ser/deser,
-// matching validateLogical's soft-drop.
+// logicalUnderlyingAcceptsObject reports whether o.Logical is valid on o's
+// Avro underlying type and size, the one predicate the primitive build's
+// logical ser/deser selection gates on. It is false for decimal, which
+// validateLogical handles inline, and for any logical with no name-keyed
+// codec, where the gate is moot.
 func logicalUnderlyingAcceptsObject(o *aobject) bool {
 	accept := logicalUnderlyingAccept[o.Logical]
 	return accept != nil && accept(o)
@@ -3552,15 +3119,10 @@ func (o *aobject) validateLogical() error {
 		// see the note below the switch.
 
 	case "decimal":
-		// Wrong underlying type is the one fall-back-on-mismatch case
-		// the spec implies: an unknown logical on the wrong primitive should
-		// not block the parse. Precision/scale constraints are explicit Avro
-		// 1.12 rules, so violating them is malformed and hard-rejects here.
-		// fastavro raises the same way (its truthiness guards skip 0-or-missing
-		// values, observed 1.12.2). Java's LogicalTypes.Decimal.validate throws
-		// too, but fromSchemaIgnoreInvalid catches it at parse and soft-drops
-		// to bare bytes/fixed. Rejecting beats that: a producer-declared
-		// decimal quietly becoming plain bytes is a silent interop divergence.
+		// A wrong underlying type soft-drops, as the spec implies, but
+		// precision/scale constraints are explicit rules, so violating them
+		// hard-rejects, as fastavro does. Java soft-drops to bare bytes,
+		// which would turn a producer-declared decimal into plain bytes.
 		if o.Type != "bytes" && o.Type != "fixed" {
 			o.Logical = ""
 			return nil
@@ -3597,14 +3159,9 @@ func (o *aobject) validateLogical() error {
 		}
 		return nil
 
-	// Wrong-underlying-type soft-drop, mirroring the decimal arm and the spec:
-	// "If a logical type is invalid, ...then implementations should ignore the
-	// logical type and use the underlying Avro type." Java catches the
-	// validate() throw in fromSchemaIgnoreInvalid and drops silently; fastavro
-	// returns None for an unknown (rt, lt) and falls through to bare; hamba
-	// returns nil for any combo outside its switch. Three impls and the spec
-	// agree, so hard-rejecting would break interop with producers emitting
-	// evolution or legacy combos.
+	// A wrong underlying type soft-drops, per the spec: "implementations
+	// should ignore the logical type and use the underlying Avro type". Java,
+	// fastavro and hamba all agree.
 	default:
 		if accept, known := logicalUnderlyingAccept[o.Logical]; known {
 			if !accept(o) {
@@ -3617,15 +3174,10 @@ func (o *aobject) validateLogical() error {
 		}
 	}
 
-	// Leftover precision/scale, at any placement but the decimal arm above
-	// (which consumes and validates them), are inert metadata, NOT a parse
-	// error. The spec permits undefined attributes as metadata, Java never
-	// consults precision without a logicalType, and fastavro accepts every
-	// such placement (executed 1.12.2). They surface as custom properties and
-	// no wire codec reads them. Rejecting here would also make us disagree
-	// with ourselves: the same stray keys parse when an unknown logical or
-	// wrong-carrier decimal soft-drops above, and the field level always keeps
-	// them as inert props.
+	// Leftover precision/scale anywhere but the decimal arm are inert
+	// metadata, not a parse error: the spec permits undefined attributes,
+	// Java never consults precision without a logicalType, and fastavro
+	// accepts every placement. They ride to Props.
 	return nil
 }
 
@@ -3636,18 +3188,13 @@ func maxDecimalDigits(size int) int {
 	if size <= 0 {
 		return 0
 	}
-	// Saturate before the bit multiply. A fixed size can exceed 2^60 on a
-	// 64-bit build (we accept sizes Java's int32 cannot), where 8*size-1 wraps
-	// the platform int negative and the capacity comes back negative, falsely
-	// rejecting a valid precision. The ceiling is
-	// maxSchemaMagnitude, shared with every other consumer of a
-	// schema-declared magnitude and chosen against the multiply below, rather
-	// than a second ceiling reasoned out here. The verdict is unchanged either
-	// way: validateLogical rejects a precision above decimalScaleLimit before
-	// calling in, and the saturated capacity is far larger than that.
+	// Saturate before the bit multiply: a fixed size can exceed 2^60 on a
+	// 64-bit build, where 8*size-1 wraps negative and falsely rejects a valid
+	// precision. The verdict is unchanged, since validateLogical already
+	// rejects a precision above decimalScaleLimit.
 	size = saturateSchemaMagnitude(size)
 	bits := magnitudeWidestMultiplier*size - 1 // sign bit excluded
-	// log10(2^bits - 1) ≈ bits * log10(2)
+	// log10(2^bits - 1) ~ bits * log10(2)
 	return int(math.Floor(float64(bits) * math.Log10(2)))
 }
 
@@ -3701,23 +3248,11 @@ func unmarshalDefault(raw json.RawMessage) any {
 }
 
 // nodeAwaitsForwardRef reports whether node has any child encodeDefault would
-// traverse that is not yet whole. encodeDefault recurses into items / values /
-// fields / branches and dereferences each child's kind, so two child shapes
-// must defer the default pipeline to finalize:
-//
-//   - a nil child: an unwired forward reference to a type declared later.
-//     Dereferencing it panics.
-//   - a partial record/error still in b.building: a self- or mutually
-//     recursive reference back into a record whose field loop is unfinished.
-//     Its fields slice holds only the fields declared so far, so encoding
-//     inline drops the rest and emits truncated, non-decodable default bytes.
-//
-// True here means the caller defers the whole resolve+encode-default pipeline
-// to finalize rather than running it inline.
-//
-// Cycle-safe via a seen set: a back-edge to an already-built node (a recursive
-// schema whose referenced record finished building) is a wired pointer not in
-// b.building, so it is correctly not treated as pending.
+// traverse that is not yet whole: a nil child, an unwired forward reference
+// whose dereference would panic, or a partial record still in b.building,
+// whose fields slice holds only the fields declared so far. True means the
+// caller defers the default pipeline to finalize. A seen set makes the walk
+// cycle-safe.
 func (b *builder) nodeAwaitsForwardRef(node *schemaNode) bool {
 	return nodeAwaitsForwardRefSeen(node, b.building, map[*schemaNode]struct{}{})
 }
@@ -3754,20 +3289,14 @@ func nodeAwaitsForwardRefSeen(node *schemaNode, building, seen map[*schemaNode]s
 	return false
 }
 
-// resolveFieldDefaultValue runs the validate + convertDefaultBytes half of
+// resolveFieldDefaultValue runs the validate and convertDefaultBytes half of
 // the default pipeline against a coerced default value and its resolved
-// schemaNode, recording the (converted) default on the deser/field metadata.
-// We deliberately do NOT encode the binary defaultBytes here; that is
-// [encodeFieldDefaultBytes], which must run only after every field's default
-// value is recorded, because encodeDefault fills absent nested record fields
-// from their f.defaultVal. We return the converted value for the caller to
-// hand to encodeFieldDefaultBytes.
-//
-// convertDefaultBytes maps bytes/fixed string defaults to []byte so the JSON
-// encoder sees the wire form directly and its logical-type-aware arms can't
-// misinterpret the string as decimal / UUID / etc. Walks the resolved
-// schemaNode tree (not the aschema canon) so name-references, forward and
-// backward, follow into the real type.
+// node, recording the converted default on the field metadata. It does not
+// encode the binary defaultBytes; encodeFieldDefaultBytes must run only after
+// every field's default value is recorded, since encodeDefault fills absent
+// nested record fields from their defaultVal. convertDefaultBytes maps
+// bytes/fixed string defaults to []byte so the JSON encoder's logical arms
+// cannot misinterpret the string.
 func resolveFieldDefaultValue(defaultVal any, node *schemaNode, fieldName string,
 	drf *deserRecordField, fn *fieldNode,
 ) (any, error) {
@@ -3797,7 +3326,7 @@ func encodeFieldDefaultBytes(defaultVal any, node *schemaNode, fieldName string,
 	// Recorded, not returned: a default that cannot be *written* must not stop
 	// the schema parsing, because a reader that drops this field never writes
 	// it and reads such data correctly today. The encode-side consumers of
-	// defaultBytes surface this at the moment the default would reach the wire.
+	// defaultBytes report this at the moment the default would reach the wire.
 	// The verdict comes from inside the walk, where each leaf asked the same
 	// predicate its serializer asks; asking here instead would answer for the
 	// field's kind and miss every cap nested inside a container.
@@ -3805,16 +3334,10 @@ func encodeFieldDefaultBytes(defaultVal any, node *schemaNode, fieldName string,
 	return nil
 }
 
-// applyResolvedDefault runs the full validate + convertDefaultBytes +
-// encodeDefault pipeline for a coerced default value against its resolved
-// schemaNode, writing the result into the three field slots
-// (deserRecordField, fieldNode, serRecordField).
-//
-// Used by the build-time path for fields whose type tree is fully resolved
-// (no pending forward reference: [nodeAwaitsForwardRef] is false). Fields
-// with an unresolved forward-referenced descendant defer to finalize via the
-// split resolveFieldDefaultValue / encodeFieldDefaultBytes pair so
-// encodeDefault never dereferences a not-yet-wired child node.
+// applyResolvedDefault runs the full validate, convert and encode pipeline
+// for a coerced default value against its resolved node. The build-time path
+// uses it for fields with no pending forward reference; the rest defer to
+// finalize through the split pair above.
 func applyResolvedDefault(defaultVal any, node *schemaNode, fieldName string,
 	drf *deserRecordField, fn *fieldNode, srf *serRecordField,
 ) error {
@@ -3825,20 +3348,11 @@ func applyResolvedDefault(defaultVal any, node *schemaNode, fieldName string,
 	return encodeFieldDefaultBytes(converted, node, fieldName, srf)
 }
 
-// unmarshalAnyPreservePrecision parses raw JSON into a Go value with the same
-// shape as encoding/json's default any decode: map[string]any, []any, string,
-// bool, nil for the structural pieces. It preserves integer precision, so
-// integer-valued JSON numbers materialize as int64 instead of float64. That
-// lifts the silent 2^53 round-down that bare json.Unmarshal(&v any) applies.
-// Fractional / exponent-form numbers stay float64 since their natural domain
-// is float64-precision anyway. Integers that overflow int64 come back as
-// json.Number, so the caller still has arbitrary-precision access via
-// .String() / .Int().
-//
-// Used by the metadata surfaces, record-level extras feeding SchemaNode.Props
-// and Root()'s re-parse, where a bare Unmarshal silently rounds JSON ints
-// above 2^53. unmarshalDefault already gives the encode/decode path the same
-// guarantee.
+// unmarshalAnyPreservePrecision parses raw JSON into the same shape as
+// encoding/json's any decode, except integer-valued numbers become int64
+// rather than float64, and integers past int64 stay json.Number. The
+// metadata paths use it so a JSON int above 2^53 is not silently
+// rounded.
 func unmarshalAnyPreservePrecision(raw string) (any, error) {
 	v, err := decodeSchemaAnyStrict(raw)
 	if err != nil {
@@ -3865,24 +3379,12 @@ func normalizeJSONValue(v any) any {
 	return v
 }
 
-// normalizeJSONNumber resolves a UseNumber-preserved json.Number to the
-// idiomatic Go type by value, not by literal syntax:
-//
-//   - An exact integer fitting int64 becomes int64. Covers 42, 1.5e1 (= 15)
-//     and 9.5e17 alike; the literal's syntax does not matter.
-//   - An exact integer exceeding int64 in pure-digit syntax stays
-//     json.Number, preserving arbitrary precision.
-//   - Anything else becomes float64, with ±Inf for magnitudes past float64's
-//     exponent range ("1e1000" gives +Inf).
-//
-// Going by value rather than syntax is what removes a metadata-vs-wire
-// divergence at the int64 boundary: syntax-based dispatch gave
-// "9.2233720368547758e18" a wire value of int64(9223372036854775800) and a
-// metadata value of float64 rounded to 2^63. Both are now the int64.
-//
-// The overflow path routes through [parseFloatAcceptOverflow] so the metadata
-// surface agrees with the encode/decode/parse arms on ErrRange-with-Inf, as
-// Java's Jackson and fastavro's float() both do.
+// normalizeJSONNumber resolves a json.Number to the idiomatic Go type by
+// value, not by literal syntax: an exact integer fitting int64 becomes
+// int64 whatever its spelling, an integer past int64 stays json.Number, and
+// anything else becomes float64, with +/-Inf past float64's range. Going by
+// value keeps the metadata value equal to the wire value at the int64
+// boundary.
 func normalizeJSONNumber(n json.Number) any {
 	s := string(n)
 	// Integer-syntax fast path: no decimal point, no exponent, so strconv
@@ -3894,20 +3396,14 @@ func normalizeJSONNumber(n json.Number) any {
 		// Overflows int64; preserve as json.Number for arbitrary precision.
 		return n
 	}
-	// Fractional or exponent syntax. Value-based dispatch: parse with
-	// arbitrary precision and check if the value is an exact integer.
-	// Without this, a literal like "1.5e1" (= 15) or "9.5e17"
-	// (= 950000000000000000) surfaces as float64, silently rounding for
-	// values exceeding float64's 53-bit mantissa and diverging from the
-	// wire-encode pipeline's exact-integer parse for integer-defaultable
-	// schemas. Going through boundedRatFromString lets metadata and wire
-	// agree on the same int64 value regardless of how you wrote the
-	// literal.
+	// Fractional or exponent syntax: parse with arbitrary precision and check
+	// whether the value is an exact integer, so "1.5e1" is int64(15) here as
+	// on the wire.
 	if r, ok, err := boundedRatFromString(s); err == nil && ok && r.IsInt() {
 		// Negative zero in float syntax ("-0.0", "-0e5") is the one exact
 		// integer whose IEEE sign the int64 collapse would erase (a big.Rat
 		// has no signed zero). The wire encoder parses it via ParseFloat and
-		// preserves the sign, and Java's Jackson surfaces a DoubleNode(-0.0);
+		// preserves the sign, and Java's Jackson produces a DoubleNode(-0.0);
 		// keep the sign by falling through to parseFloatAcceptOverflow below
 		// (giving -0.0) so the metadata Default matches the wire and re-parses
 		// sign-stable. Integer syntax ("-0") stays integer 0 (no sign) above.
@@ -3917,8 +3413,8 @@ func normalizeJSONNumber(n json.Number) any {
 				return bi.Int64()
 			}
 		}
-		// Exact integer beyond int64: surface as float64 when the magnitude
-		// fits float64's exponent, ±Inf when it does not. Both match what an
+		// Exact integer beyond int64: return float64 when the magnitude
+		// fits float64's exponent, +/-Inf when it does not. Both match what an
 		// encode against a float/double schema puts on the wire.
 	}
 	if f, err := parseFloatAcceptOverflow(s, 64); err == nil {
@@ -3928,24 +3424,12 @@ func normalizeJSONNumber(n json.Number) any {
 }
 
 // numericDefault extracts a typed integer default, the shared body of
-// defaultAsInt32 / defaultAsInt64. A JSON number arrives from unmarshalDefault
-// as json.Number at full precision; callers may also pass float64, e.g.
-// round-tripped through coerceDefault.
-//
-// We accept whole numbers written in fractional or exponent form ("1.0",
-// "4e1"), matching the runtime's existing "whole-number floats encode
-// against int/long" divergence from Java's isIntegralNumber gate and
-// fastavro's isinstance check, which both reject "1.0". Tightening only at
-// parse would create a within-package encode-vs-parse asymmetry.
-//
-// The precision guard rejects exactly the subset where the metadata path
-// (normalizeJSONNumber, which surfaces such literals as float64) would round
-// to a *different* integer than the wire fill (parseInt{32,64}Lenient, exact
-// via big.Rat). "1.0" and "4e1" represent exactly in float64, so both surfaces
-// agree and it accepts. "9.2233720368547758e18" does not: wire gives
-// 9223372036854775800, float64 rounds to 9223372036854775808+. Rejecting keeps
-// a schema from carrying a default whose metadata and wire values disagree,
-// while accepted defaults still produce Java/fastavro-identical wire bytes.
+// defaultAsInt32 and defaultAsInt64. We accept whole numbers written in
+// fractional or exponent form ("1.0", "4e1"), which Java and fastavro
+// reject, matching what the runtime encoders already accept. The precision
+// guard rejects the literals where the metadata path, which goes through
+// float64, would round to a different integer than the exact wire fill, so a
+// schema never carries a default whose metadata and wire values disagree.
 func numericDefault[T int32 | int64](val any, parse func(string) (T, error), fromFloat func(float64) (T, error), fromInt64 func(int64) (T, error)) (T, error) {
 	switch v := val.(type) {
 	case json.Number:
@@ -3995,7 +3479,7 @@ func floatMantissaLimit(bitSize int) int64 {
 // represented exactly in the target float (float32 or float64). Used
 // by decode-time arms that write a long-wire value into a Go float
 // target: you explicitly chose a smaller-precision Go type, so we
-// surface the precision loss rather than silently rounding. Encode-time
+// report the precision loss rather than round. Encode-time
 // arms use the lossy-destination policy and silently round; see
 // [appendAvroFloat32] / [appendAvroFloat64].
 func intFitsFloat(n int64, bitSize int) (float64, error) {
@@ -4006,23 +3490,12 @@ func intFitsFloat(n int64, bitSize int) (float64, error) {
 	return float64(n), nil
 }
 
-// parseFloatAcceptOverflow is [strconv.ParseFloat] with one twist:
-// ErrRange-with-±Inf counts as success, since Java/fastavro return the Inf and
-// the wire format permits it. Other parse errors propagate.
-//
-// It is the single source of truth for every ParseFloat-on-user-input caller
-// (binary encode, JSON encode, schema parse, the metadata API, and JSON
-// decode), so the length cap covers them all. ParseFloat is O(n) at
-// ~30-50ms/MiB, and schema parse calls this twice per float field, so a 1 MiB
-// hostile literal would cost ~130ms, past the 100ms per-entry-point bound.
-// Legitimate float64 literals, hex-float and max-exponent forms included, fit
-// well under 350 chars, so the 1024-byte cap rejects hostile input in O(1)
-// without touching real ones. Same pattern as boundedRatFromString and
-// parseInt64Lenient.
-//
-// bitSize is 64 everywhere except the JSON decode of a "float" schema, which
-// passes 32 to parse at float32 precision directly and avoid a double
-// rounding through float64.
+// parseFloatAcceptOverflow is strconv.ParseFloat with ErrRange on +/-Inf
+// counting as success, since Java and fastavro return the Inf and the wire
+// permits it. Every ParseFloat on user input routes through it, so the
+// length cap covers them all: a legitimate float64 literal fits well under
+// 350 chars, and ParseFloat is linear in the input. bitSize is 32 only for
+// the JSON decode of a "float" schema, avoiding a double rounding.
 func parseFloatAcceptOverflow(s string, bitSize int) (float64, error) {
 	if len(s) > maxParseFloatLen {
 		return 0, fmt.Errorf("float literal exceeds %d byte length cap", maxParseFloatLen)
@@ -4042,24 +3515,11 @@ func parseFloatAcceptOverflow(s string, bitSize int) (float64, error) {
 // literal fits in ~320 chars, so this leaves comfortable headroom.
 const maxParseFloatLen = 1024
 
-// defaultAsFloat extracts a numeric default for a float or double field.
-// Accepts json.Number / float64 / int64 / int32, i.e. the Go types produced
-// by UseNumber-parsed JSON literals plus any post-coerce numerics. We do NOT
-// accept a Go string: the spec 1.12 §"Record" default-values table requires
-// the JSON type of a float/double default to be `number`, never a JSON
-// string.
-// The narrow Java-deployed exception, Schema.java:1899-1902's parseField
-// text-to-DoubleNode coercion for outer float/double field types, we handle
-// upstream in [coerceDefault] so the string never reaches this validator.
-// Union branches and any downstream caller (encodeDefault, validateLeaf, the
-// metadata-side branchAcceptsDefault path) see only post-coerce typed values;
-// a string here is invalid by construction and rejected via the default
-// `expected number, got %T` error.
-//
-// Encoding into a float/double field is lossy by destination: int64/int32
-// inputs exceeding the mantissa precision silently IEEE-round (matches Java's
-// Schema.parseField text-to-DoubleNode coercion and fastavro's float()). The
-// float32 narrowing to ±Inf happens at the caller's float64-to-float32 cast.
+// defaultAsFloat extracts a numeric default for a float or double field. It
+// accepts json.Number, float64, int64 and int32 but not a string: the spec
+// requires a JSON number, and Java's text-to-double carveout for outer
+// float/double fields is applied upstream in coerceDefault. Integers past
+// the mantissa IEEE-round, as in Java and fastavro.
 func defaultAsFloat(val any) (float64, error) {
 	switch v := val.(type) {
 	case json.Number:
@@ -4071,49 +3531,25 @@ func defaultAsFloat(val any) (float64, error) {
 	case int32:
 		return float64(v), nil
 	case float32:
-		// A float32 reaches this predicate only on the metadata side: the
-		// union-branch selector branchAcceptsDefault coerces a container's
-		// nested float/double child through coerceMetadataDefault before the
-		// accept-check, and coerceMetadataDefault narrows a "float" schema to
-		// float32 (schema_node.go). float32-to-float64 widening is exact, so the
-		// value is a valid float default. The wire path never reaches here with
-		// a float32 (coerceDefault yields float64 and the parsed default tree
-		// has no float32), so this arm does not change wire or parse behavior.
+		// A float32 arrives only from the metadata side, where
+		// coerceMetadataDefault narrows a "float" schema; widening is exact.
 		return float64(v), nil
 	}
 	return 0, fmt.Errorf("expected number, got %T", val)
 }
 
 // firstUnionBranchAcceptingDefault returns the first union branch whose
-// validateDefault accepts val, or nil if none match. Shared by coerceDefault
-// and walkDefault's union arms: both implement Avro's "first matching branch
-// wins" default-resolution rule (1.12 relaxed from "first branch" to "any
-// branch," with deterministic first-match tie-break). Keeping the iteration
-// in one place keeps coerceDefault and walkDefault in lockstep if
-// validateDefault's semantics change. coerceMetadataDefault (schema_node.go)
-// uses the analogous branchAcceptsDefault predicate on the *SchemaNode public
-// type; the pattern is the same but the type split prevents direct reuse.
-//
-// String defaults are matched only by branches whose Avro type's permitted
-// JSON type is `string` per spec 1.12 §"Record" default-values table (string,
-// bytes, enum, fixed). Numeric branches (int, long, float, double) reject
-// string defaults at this layer: [defaultAsFloat] has no string-acceptance
-// arm, and Java's parseField text-to-DoubleNode coercion fires only for the
-// outer float/double field type (handled in [coerceDefault] below), never for
-// union branches.
+// validateDefault accepts val, or nil. coerceDefault and walkDefault share it
+// so both implement the "first matching branch" rule the same way. A string
+// default matches only branches whose permitted JSON type is string (string,
+// bytes, enum, fixed); Java's text-to-double coercion fires only for an
+// outer float/double field, never a union branch.
 func firstUnionBranchAcceptingDefault(val any, node *schemaNode) *schemaNode {
 	for _, branch := range node.branches {
-		// validateDefault coerces in place: validateLeaf's record/array/map
-		// arms rewrite fields via coerceDefault (e.g. a string "5" -> float64
-		// against a double field, the documented outer-float carveout). We
-		// validate a *copy* so a failed branch's partial coercion cannot leak
-		// into the next branch's check. Otherwise acceptance is order-dependent
-		// (a later string-typed branch sees a float64 a prior failed branch
-		// left behind), violating Avro 1.12's order-independent "default
-		// matches any branch" (Java isValidDefault is anyMatch over an
-		// immutable node). The caller re-coerces the original val against the
-		// returned branch, so the selected branch and its coerced value are
-		// unchanged for any default that already parsed.
+		// validateDefault coerces in place, so we validate a copy: a failed
+		// branch's partial coercion must not leak into the next branch's
+		// check, or acceptance becomes order-dependent. The caller re-coerces
+		// the original val against the returned branch.
 		if validateDefault(deepCopyTree(val), branch) == nil {
 			return branch
 		}
@@ -4122,29 +3558,14 @@ func firstUnionBranchAcceptingDefault(val any, node *schemaNode) *schemaNode {
 }
 
 // coerceDefault converts a string default to float64 when the field type is
-// literally float or double. The spec's default-values table calls a JSON
-// string invalid there; this is an interop carveout for legacy Java-generated
-// schemas, modeled on parseField's TextNode-to-DoubleNode special case
-// (Schema.java:1899-1902). avro-rs and goavro do not implement it.
-//
-// A direct scalar float/double union branch does NOT coerce. Only a node
-// whose kind is literally float/double transforms, and a union recurses into
-// its first validateDefault-accepting branch, where the scalar leaf has no
-// string arm. So ["double"] default "5" rejects at parse and
-// ["double","string"] picks string, matching Java/avro-rs/goavro (NOT_BUGS
-// #10).
-//
-// A float/double field nested in a record/array/map does coerce,
-// container-in-a-union included, because validateLeaf's container arms call
-// coerceDefault on each child. That is deliberate leniency beyond Java, whose
-// coercion is outer-field-only. It is safe because the metadata selector
-// applies the same coercion via coerceMetadataDefault, so Root().Default
-// reports the branch the wire auto-fills on both formats, with no
-// metadata/wire divergence. Do not re-file this as a Java mismatch; revisit
-// only on a real interop breakage with evidence.
-//
-// Walks *schemaNode, the resolved type tree, so name-referenced nested fields
-// coerce too; name-refs lose their type info on the canon side.
+// literally float or double, an interop carveout for legacy Java-generated
+// schemas modeled on Java's parseField; avro-rs and goavro do not implement
+// it. A direct scalar float/double union branch does not coerce, so
+// ["double"] default "5" rejects and ["double","string"] picks string, as
+// Java does. A float/double field nested in a container does coerce, which
+// is leniency beyond Java; the metadata selector applies the same coercion,
+// so Root().Default reports the branch the wire fills. Walks the resolved
+// node tree so name-referenced nested fields coerce too.
 func coerceDefault(val any, node *schemaNode) any {
 	if node == nil {
 		return val
@@ -4177,28 +3598,14 @@ func coerceDefault(val any, node *schemaNode) any {
 	return val
 }
 
-// walkDefault drives the (val, node) recursion shared by the
-// default-tree walkers. visit is called once per non-union node and
-// may mutate val; for union nodes walkDefault picks the first
-// validateDefault-accepting branch (skipping visit at the union
-// itself) and recurses into the matched branch. If no union branch
-// matches, walkDefault returns the canonical "default does not match
-// any union branch" error so callers that don't care (the mutator
-// walker convertDefaultBytes) can discard it while validateDefault
-// surfaces it.
-//
-// Container arms wrap nested errors with "field %q:", "array element
-// %d:", or "map key %q:" so the per-element error path is identical
-// across walkers.
-//
-// You must make visit idempotent. The union arm calls validateDefault to
-// pick a branch and then re-invokes visit at every node of the matched
-// branch, so a non-idempotent visit (e.g. one that increments a counter)
-// would double-fire at every union depth.
-//
-// Walks *schemaNode (the resolved type tree) so name-references,
-// forward and backward, follow into the real type. Returns
-// immediately for a nil node so fwd-ref-deferred validation is a
+// walkDefault drives the (val, node) recursion shared by the default-tree
+// walkers. visit is called once per non-union node and may mutate val; at a
+// union, walkDefault picks the first validateDefault-accepting branch and
+// recurses into it, returning the "does not match any union branch" error
+// when none accepts. Container arms wrap nested errors with the field, index
+// or key so every walker reports the same path. visit must be idempotent,
+// since the union arm re-invokes it at every node of the matched branch.
+// A nil node returns immediately, so forward-ref-deferred validation is a
 // no-op.
 func walkDefault(val any, node *schemaNode, visit func(any, *schemaNode) (any, error)) (any, error) {
 	if node == nil {
@@ -4260,21 +3667,11 @@ func walkDefault(val any, node *schemaNode, visit func(any, *schemaNode) (any, e
 	return val, nil
 }
 
-// convertDefaultBytes walks a parsed-then-validated default value and
-// converts string defaults to []byte for bytes/fixed schema nodes,
-// recursively descending into records/arrays/maps/unions. The Avro
-// JSON spec specifies that bytes/fixed defaults are codepoint-mapped
-// strings; binary encodeDefault already takes the codepoint route via
-// avroJSONBytesToBytes, while the JSON encoder's appendAvroJSON
-// logical-type-aware arms (decimal, big-decimal, uuid) would otherwise
-// misinterpret the string semantically. Storing the wire-form []byte
-// up front makes both encode paths agree without per-arm special cases.
-//
-// Called after validateDefault has succeeded for non-fwd-ref fields;
-// for fwd-ref fields validation is deferred and the conversion is
-// best-effort. We discard the walkDefault union-no-match error:
-// validateDefault would have caught it for non-fwd-ref defaults, and
-// fwd-ref defaults shouldn't surface conversion-time errors.
+// convertDefaultBytes walks a validated default and converts string defaults
+// to []byte for bytes/fixed nodes, so the JSON encoder's logical-type arms
+// cannot misinterpret the codepoint string and both encode paths agree. For
+// a forward-ref field validation is deferred, so the conversion is
+// best-effort and the union-no-match error is discarded.
 func convertDefaultBytes(val any, node *schemaNode) any {
 	out, _ := walkDefault(val, node, func(val any, node *schemaNode) (any, error) {
 		if node.kind != "bytes" && node.kind != "fixed" {
@@ -4304,13 +3701,9 @@ func validateAvroByteString(s, fieldType string) error {
 }
 
 // validateDefault checks a parsed JSON default against the schema, driving
-// walkDefault with the validateLeaf visit. The recursion, union branch-matching
-// and per-element error wrapping stay in walkDefault so the validate / convert
-// / coerce walkers cannot drift on them.
-//
-// Mutates record/array/map structures in place via coerceDefault, propagating
-// float-from-string coercions into nested fields reached through name-refs.
-// Returns nil for a nil node; fwd-refs defer validation to finalize.
+// walkDefault with the validateLeaf visit. It coerces record, array and map
+// structures in place. A nil node returns nil; forward refs defer to
+// finalize.
 func validateDefault(val any, node *schemaNode) error {
 	_, err := walkDefault(val, node, validateLeaf)
 	return err
@@ -4386,15 +3779,11 @@ func validateLeaf(val any, node *schemaNode) (any, error) {
 		if !ok {
 			return val, fmt.Errorf("expected string for enum default, got %T", val)
 		}
-		// Unconditional membership: a non-nil enum node always carries its
-		// final symbols, so an empty enum rejects every default. Stricter
-		// than both references: Java checks containment only for the
-		// enum-level "default" attribute and accepts any textual field
-		// default (Schema.java:1755-1759), and fastavro 1.12.2 parses a
-		// non-member outright (observed). Failing at parse is right because a
-		// non-member default can never encode, and it makes union-default
-		// selection skip an empty or non-member enum branch so a later one
-		// can accept.
+		// A non-nil enum node always carries its final symbols, so an empty
+		// enum rejects every default. Java and fastavro both accept a
+		// non-member field default; we fail at parse because it can never
+		// encode, and so a union-default selection can skip to a later
+		// branch.
 		if !slices.Contains(node.symbols, sym) {
 			return val, fmt.Errorf("enum default %q is not a member of symbols", truncForError(sym))
 		}

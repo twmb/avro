@@ -16,7 +16,7 @@ import (
 )
 
 // Opt configures encoding and decoding. Each option's doc says which functions
-// it affects; we silently ignore an option that does not apply.
+// it affects; we ignore an option that does not apply.
 type Opt interface{ opt() }
 
 type taggedUnions struct{}
@@ -119,7 +119,7 @@ type linkedinFloats struct{}
 
 func (linkedinFloats) opt() {}
 
-// LinkedinFloats encodes NaN as JSON null and ±Infinity as ±1e999 in
+// LinkedinFloats encodes NaN as JSON null and +/-Infinity as +/-1e999 in
 // [Schema.EncodeJSON], the linkedin/goavro convention, overriding our default
 // of the JSON strings "NaN", "Infinity" and "-Infinity" (the Java convention).
 //
@@ -128,7 +128,7 @@ func (linkedinFloats) opt() {}
 // that a NaN inside a *bare* union does not round-trip: it encodes as a bare
 // null, and on decode the union's null branch claims that null (or the union
 // rejects it if it has no null branch) before we try the float branch. Use
-// [TaggedUnions] if you need NaN to round-trip through a union. ±Infinity is
+// [TaggedUnions] if you need NaN to round-trip through a union. +/-Infinity is
 // a number token and round-trips in a bare union regardless.
 func LinkedinFloats() Opt { return linkedinFloats{} }
 
@@ -164,7 +164,7 @@ func parseOpts(opts []Opt) optConfig {
 // \uXXXX; see [Opt] for the options that change the output.
 //
 // We encode NaN and Infinity as the JSON strings "NaN", "Infinity" and
-// "-Infinity" (the Java convention), or as null and ±1e999 with
+// "-Infinity" (the Java convention), or as null and +/-1e999 with
 // [LinkedinFloats]. A generic JSON encoder rejects non-finite floats outright;
 // these forms keep the output valid JSON for any strict parser.
 //
@@ -222,7 +222,7 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 	sl := slabPool.Get().(*slab)
 	// A record field filled from its schema default routes through the
 	// binary deser fn (applyFieldDefault), which reads the slab's
-	// taggedUnions and tagLogicalTypes flags, so we set them here exactly as
+	// taggedUnions and tagLogicalTypes flags, so we set them here as
 	// Schema.Decode does. Without this, a present union field wraps in its
 	// {branch: value} envelope but a default-filled one emits the bare
 	// value, a JSON-vs-binary and intra-call inconsistency on the option.
@@ -251,28 +251,17 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 // the writer schema, re-encode that to writer binary, then run the resolving
 // binary decode. Java does the same, wrapping a JsonDecoder built with the
 // writer schema in a ResolvingDecoder. Resolution is not throughput-critical,
-// so reusing the binary resolver keeps the surface small and correct by
+// so reusing the binary resolver keeps the code small and correct by
 // construction.
 func (s *Schema) decodeJSONResolved(src []byte, rv reflect.Value, opts ...Opt) error {
 	w := s.resolveWriterRaw
-	// The custom-free writer view: this is a pure wire-shape transform, so the
-	// intermediate must hold *raw* Avro-native values. The writer's own
-	// CustomType decoders would produce Go-domain values the re-encode cannot
-	// invert, since a Decode-only custom has no Encode. The reader's customs
-	// and your opts apply only in the final resolving s.Decode.
-	//
-	// TaggedUnions on the intermediate keeps the {"branch": value} envelope, so
-	// the re-encode routes each value back to its exact branch. The envelope is
-	// the only carrier of the writer's branch choice. Bare, the re-encode
-	// re-derives the branch by first-match and silently rewrites branch
-	// identity whenever a later branch's value also satisfies an earlier one
-	// (two records, two enums sharing a symbol, enum vs string). That changes
-	// the decoded value wherever resolution differs per branch. Java's
-	// JsonDecoder.readIndex reads the tag straight to the branch index, and
-	// this envelope round-trip is the composed-path equivalent. Bare,
-	// untagged, writer JSON is unaffected in substance: its decode commits
-	// to the documented first-match branch and the envelope then pins that
-	// same branch through the re-encode.
+	// The custom-free writer view: this is a wire-shape transform, so the
+	// intermediate must hold raw Avro-native values; the reader's customs
+	// and your opts apply only in the final resolving s.Decode. TaggedUnions
+	// on the intermediate keeps the branch envelope, the only carrier of the
+	// writer's branch choice: bare, the re-encode would re-derive the branch
+	// by first match and rewrite branch identity whenever a later branch's
+	// value also satisfies an earlier one.
 	var inter any
 	if err := w.DecodeJSON(src, &inter, TaggedUnions()); err != nil {
 		return err
@@ -325,50 +314,28 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 					return append(buf, "null"...), nil
 				}
 			}
-			// A union without a null branch can't represent nil, so we
-			// reject rather than emit "null". So does the binary path
-			// (serUnion.ser to tryAll to "no matching branch"), Java
-			// (UnresolvedUnionException), fastavro ("do not match") and
-			// our own DecodeJSON. An untyped nil is a failure of your
-			// value, so it carries *SemanticError identity exactly like
-			// the binary entry guard (AppendEncode) and serUnion's
-			// no-match wrap. A *typed* nil pointer never reaches here:
-			// the peel loop hands it to the branch encoders, which
-			// surface the plain indirection sentinel on both wires.
+			// A union without a null branch cannot represent nil, so we
+			// reject rather than emit null, as the binary path, Java and
+			// fastavro do. An untyped nil carries *SemanticError identity
+			// like the binary entry guard; a typed nil pointer never reaches
+			// here.
 			return nil, &SemanticError{AvroType: "union", Err: errors.New("avro json: nil value for union without a null branch")}
 		}
 		return nil, &SemanticError{AvroType: node.kind, Err: fmt.Errorf("avro json: nil value for non-nullable type %q", node.kind)}
 	}
-	// We dispatch unions *before* dereferencing and the custom hook: the
-	// branch encoders must receive the un-peeled value so a branch's custom
-	// encoder with a pointer or interface GoType matches at the pointer level.
-	// Binary serUnion (ser.go) does the same, passing the un-peeled value to
-	// the branch serializers, whose customEncode peels and GoType-checks at
-	// each level, as does the decode side (decodeKind), which dispatches union
-	// before indirectAlloc. A custom type never matches a union container node
-	// (applyCustomTypes skips unions), so we do not bypass the custom hook
-	// below for unions; unionTypeNameForValue and isNilValue inside
-	// appendAvroJSONUnion peel internally for the branch-selection decision.
+	// We dispatch unions before dereferencing and the custom hook, as the
+	// binary serUnion does: the branch encoders must receive the un-peeled
+	// value so a branch's custom encoder with a pointer GoType matches. A
+	// custom type never matches a union node itself.
 	if node.kind == "union" {
-		// We pass depth unchanged: appendAvroJSONUnion is a same-level
-		// dispatch hop, a function split rather than a schema-nesting
-		// level, and it recurses into branches at depth+1. Incrementing
-		// here too would cost a union 2 depth units per level, halving
-		// the bound against binary encode, decode and parse, which all
-		// count 1 per level (see ser.go's serUnion). That asymmetry
-		// breaks JSON round-trips for values decode takes but encode
-		// then rejects.
+		// depth passes unchanged: appendAvroJSONUnion is a same-level
+		// dispatch hop and recurses into branches at depth+1.
 		return appendAvroJSONUnion(buf, v, node, cfg, custom, depth)
 	}
-	// We apply the custom encode conversion *before* dereferencing, so a
-	// custom type with a pointer GoType (*url.URL, say) matches before we
-	// strip the pointer. customEncode (schema.go) peels and checks GoType
-	// at each level itself. It returns either the encoded result or a
-	// pass-through value dereferenced as far as it peeled. The loop below
-	// then turns nil into null and handles any remaining indirection on a
-	// pass-through value. The binary path does the same, wrapping the
-	// serializer with this same customEncode closure on the un-peeled
-	// value (schema.go).
+	// The custom encode conversion runs before dereferencing, so a custom
+	// type with a pointer GoType matches; customEncode peels and checks
+	// GoType at each level itself and returns either the encoded result or
+	// a pass-through value, as on the binary path.
 	if w := custom[node]; w != nil && w.encode != nil {
 		var err error
 		v, err = w.encode(v)
@@ -385,14 +352,10 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			break
 		}
 		if v.IsNil() {
-			// A nil pointer or interface layer inside a *typed* value:
-			// the "null" schema takes it as JSON null, mirroring
-			// serNull's isNilValue accept. Every other kind rejects it
-			// with the same plain indirection sentinel the binary
-			// encoders surface from indirect(), *not* the *SemanticError
-			// the untyped-nil entry arms above carry. Unions never reach
-			// this loop, dispatching before the peel, so the two arms
-			// cannot disagree on a union's nil handling.
+			// A nil pointer or interface layer inside a typed value: the
+			// "null" schema takes it as JSON null, and every other kind
+			// rejects it with the plain indirection sentinel the binary
+			// encoders return.
 			if node.kind == "null" {
 				return append(buf, "null"...), nil
 			}
@@ -403,14 +366,8 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 
 	switch node.kind {
 	case "null":
-		// We validate v is nil-equivalent, mirroring serNull on the
-		// binary side. A non-nil value into a "null" schema gets
-		// errNonNil at top level (Schema.EncodeJSON(42, "null")), as a
-		// null-typed record field, and via tagged-union dispatch
-		// ({"null": 42} against ["null", T]). Binary serNull (ser.go)
-		// returns errNonNil for the same shapes; matching it here keeps
-		// EncodeJSON and AppendEncode in parity and prevents silent
-		// input loss.
+		// A non-nil value into a "null" schema gets errNonNil, as binary
+		// serNull returns for the same shapes.
 		switch v.Kind() {
 		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
 			if !v.IsNil() {
@@ -527,7 +484,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		// Resolution order is shared with the binary encoder via
 		// avroStringValue: json.Number rejected, reflect.String,
 		// TextAppender, TextMarshaler, []byte slice. Both encoders
-		// must stay in lockstep on precedence.
+		// must agree on precedence.
 		s, err := avroStringValue(v)
 		if err != nil {
 			return nil, err
@@ -535,29 +492,14 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return appendJSONString(buf, s), nil
 
 	case "bytes":
-		// Decimal emits the spec form: the underlying two's-complement
-		// big-endian unscaled integer as an Avro JSON byte string, code points
-		// 0-255 mapping to byte values (Avro 1.12 "Logical Types" plus the
-		// bytes/fixed JSON rule), matching Java's JsonEncoder and fastavro's
-		// write_bytes. We also take bare numbers on decode, so a 0.33 you
-		// hand-edited still feeds DecodeJSON.
-		//
-		// No decimalRatFor match falls through to the generic
-		// string/slice/array targets below. big-decimal (AVRO-4124) wraps the
-		// binary inner payload in the same codepoint-string form; binary and
-		// JSON share buildBigDecimalPayload to stay in lockstep.
-		//
-		// We skip the decimal and big-decimal coercion arm exactly when the
-		// binary build replaced serBytesDecimal/serBigDecimal with the
-		// base-bytes serializer, that is, when a non-wildcard matching
-		// CustomType has an Encode (encodeSuppresses =
-		// hasMatchingCustomTypeWithEncode). Then we write a value matching the
-		// custom GoType as its raw []byte, and the base-bytes targets below
-		// reject a non-matching pass-through such as *big.Rat. We gate on the
-		// threaded predicate, *not* the runtime proxy custom[node].encode !=
-		// nil. A wildcard CustomType (empty LogicalType and AvroType) has an
-		// Encode wrapper but is excluded from the binary gate, so it keeps the
-		// decimal arm, which accepts *big.Rat, on both paths.
+		// Decimal emits the spec form: the two's-complement big-endian
+		// unscaled integer as an Avro JSON byte string, as Java and fastavro
+		// do. No decimalRatFor match falls through to the generic targets
+		// below. We skip the decimal arm exactly when the binary build
+		// replaced the logical serializer with the base one, which is when a
+		// non-wildcard matching CustomType has an Encode (encodeSuppresses);
+		// the runtime proxy custom[node].encode != nil would wrongly skip it
+		// for a wildcard with Encode.
 		noCustomEnc := custom[node] == nil || !custom[node].encodeSuppresses
 		switch node.logical {
 		case "decimal":
@@ -616,16 +558,10 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			if err := rejectJSONNumberRawTarget(v, "bytes"); err != nil {
 				return nil, err
 			}
-			// We treat the Go string as raw UTF-8 bytes, matching serBytes
-			// (ser.go's string arm appends the string bytes verbatim).
-			// Binary and JSON agree: "é" encodes as c3 a9 on both paths.
-			// Defaults don't reach this arm, because convertDefaultBytes
-			// (schema.go) already turns JSON-parsed default strings into
-			// []byte, so only your runtime input lands here, where the Go
-			// convention is UTF-8. appendAvroJSONBytes then maps between
-			// codepoint and byte on the wire form. It iterates
-			// byte-by-byte without retaining, so we alias v's string data
-			// instead of copying.
+			// A Go string is raw UTF-8 bytes, as in serBytes. Defaults never
+			// reach this arm, since convertDefaultBytes already turned them
+			// into []byte. appendAvroJSONBytes iterates without retaining, so
+			// we alias the string data.
 			s := v.String()
 			return appendAvroJSONBytes(buf, unsafe.Slice(unsafe.StringData(s), len(s))), nil
 		}
@@ -642,24 +578,12 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return nil, semErr(v, "bytes")
 
 	case "fixed":
-		// Decimal: spec form padded and sign-extended to the schema size.
-		// UUID: hex-dash string input parses to 16 bytes, checked before
-		// the generic raw extraction so a 36-char string is not rejected
-		// as size != 16. Fall-through lands on the generic targets below.
-		//
-		// We skip *all* logical coercion arms exactly when the binary fixed
-		// build replaced serFixedDecimal, serDuration or serFixedUUIDReflect
-		// with the base serSize, that is, when a non-wildcard matching
-		// CustomType has an Encode (encodeSuppresses =
-		// hasMatchingCustomTypeWithEncode). Then we write a value matching the
-		// custom GoType as its raw bytes, and a non-matching pass-through falls
-		// through to the size-checked base targets below. We gate on the
-		// threaded predicate, *not* the runtime proxy custom[node].encode !=
-		// nil. A wildcard CustomType has an Encode wrapper but is excluded from
-		// the binary gate, so it keeps the logical arm on both paths. Non-fixed
-		// logicals (uuid-on-string, timestamp and so on) keep their logical
-		// serializer wrapped by the custom encoder on the binary side, so only
-		// the fixed arms are gated here.
+		// Decimal: the spec form padded and sign-extended to the schema size.
+		// UUID: a hex-dash string parses to 16 bytes, checked before the
+		// generic extraction so a 36-char string is not rejected as size
+		// != 16. We skip every logical arm exactly when the binary fixed
+		// build replaced the logical serializer with serSize, which is when
+		// a non-wildcard matching CustomType has an Encode (encodeSuppresses).
 		if custom[node] == nil || !custom[node].encodeSuppresses {
 			switch node.logical {
 			case "decimal":
@@ -778,7 +702,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				return appendJSONString(buf, needle), nil
 			}
 			// A value naming no symbol is the same user-value failure the
-			// binary encoder rejects (serEnum); both wires surface it as an
+			// binary encoder rejects (serEnum); both wires report it as an
 			// errors.As-able *SemanticError so you get one error identity per
 			// failure regardless of wire format. Decode-side wire-content
 			// errors, a bad ordinal or an unknown wire symbol, are plain on
@@ -1011,34 +935,14 @@ func appendAvroJSONNativeArray(buf []byte, v reflect.Value, kind string, cfg *op
 }
 
 // appendJSONFieldDefault appends a missing record field's default: JSON null
-// for a nil defaultVal, otherwise recursive appendAvroJSON. It errors with
-// "missing key" when the field has no default. Both map arms of
-// appendAvroJSONRecord share it, so the missing-required, nil-default-to-null
-// and default sequence agrees. Defaults route through appendAvroJSON rather
-// than a pre-marshalled splice, so encoder options apply to them too.
-//
-// The recursive entries pass a nil custom map, bypassing CustomType.Encode as
-// binary's encodeDefault does. Encoders convert a user Go type to Avro-native,
-// and defaults are already stored Avro-native, so there is nothing to apply.
-//
-// Union defaults dispatch with a declaration-order try-each that mirrors the
-// binary side's encodeDefault (resolve.go). The runtime appendAvroJSONUnion
-// dispatcher uses unionTypeNameForValue, a kind-match fast path. That is right
-// for a value you supply, where the Go type names the intended branch, and
-// wrong for a stored default. Parse time already chose a branch via the
-// declaration-order accept rule, and the JSON tagged-form wrap must name that
-// same branch for parity with the binary defaultBytes. Without this,
-// [enum, string] default "A" emits {"v":{"string":"A"}} under TaggedUnions
-// while validate chose enum and the binary defaultBytes encode against the enum
-// branch.
-//
-// firstUnionBranchAcceptingDefault isn't reusable here because
-// convertDefaultBytes has already rewritten string to []byte for bytes and
-// fixed branches, and validateDefault's bytes/fixed arm only accepts string.
-// Declaration-order try-each on appendAvroJSON itself has the right
-// post-convert acceptance set (the bytes/fixed appendAvroJSON arms accept
-// []byte) and matches encodeDefault's try-each loop on the binary side
-// branch-by-branch.
+// for a nil defaultVal, otherwise recursive appendAvroJSON, so encoder
+// options apply to defaults too. It errors when the field has no default.
+// The recursion passes a nil custom map, bypassing CustomType.Encode as the
+// binary encodeDefault does, since defaults are already Avro-native. A
+// union default dispatches with the same declaration-order try-each as
+// encodeDefault, so the tagged form names the branch the binary
+// defaultBytes encode against; the runtime type-name fast path would name
+// a different one for [enum, string] default "A".
 func appendJSONFieldDefault(buf []byte, f fieldNode, cfg *optConfig, depth int) ([]byte, error) {
 	if !f.hasDefault {
 		// The callers wrap through recordFieldError, so this renders with
@@ -1054,15 +958,10 @@ func appendJSONFieldDefault(buf []byte, f fieldNode, cfg *optConfig, depth int) 
 	if f.node != nil && f.node.kind == "union" {
 		v := reflect.ValueOf(f.defaultVal)
 		for _, branch := range f.node.branches {
-			// We select the branch exactly as binary encodeDefault does, so
-			// the JSON wire names the branch Encode, Decode-fill and the
-			// metadata API name. appendAvroJSON success alone is too lenient
-			// a test. Its bytes/fixed arm writes a default string as raw
-			// UTF-8, so it would claim a codepoint>255 default that binary
-			// correctly passes to a later branch. A bytes/fixed JSON default
-			// maps each codepoint 0-255 to one byte. encodeDefault applies
-			// that rule, and accepts both the converted ([]byte) and raw
-			// (string) forms.
+			// We select the branch as binary encodeDefault does.
+			// appendAvroJSON success alone is too lenient: its bytes/fixed
+			// arm writes a default string as raw UTF-8, so it would claim a
+			// codepoint>255 default that binary passes to a later branch.
 			if _, err := encodeDefault(nil, f.defaultVal, branch); err != nil {
 				continue
 			}
@@ -1182,15 +1081,9 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 }
 
 // appendUnionBranch wraps encoded in the tagged form {type_name: value} when
-// cfg.tagged is set and the branch is non-null. It holds the "wrap iff
-// non-null" invariant in one place, so the four dispatcher sites in
-// appendAvroJSONUnion (tagged-form, nil-first, type-name, try-each) can't drift
-// on it.
-//
-// This mirrors Java's JsonEncoder.writeIndex. The spec defines a union null as
-// bare `null`, and TaggedUnions documents "wraps non-null union values", so the
-// null branch stays bare even under cfg.tagged. Without the guard,
-// EncodeJSON((*int)(nil)) emits {"null":null} instead of bare null.
+// cfg.tagged is set and the branch is non-null, holding the "wrap iff
+// non-null" rule in one place for the four dispatcher sites. The spec
+// defines a union null as bare null, as Java's JsonEncoder.writeIndex does.
 func appendUnionBranch(buf []byte, union, branch *schemaNode, encoded []byte, cfg *optConfig) []byte {
 	if cfg.tagged && branch.kind != "null" {
 		return appendTaggedUnion(buf, union, branch, encoded, cfg.tagLogical)
@@ -1243,16 +1136,9 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 		}
 	}
 
-	// Nil-first dispatch: if v is nil-equivalent and the union has a null
-	// branch, we pick null regardless of arity. This mirrors the binary
-	// 2-branch optimization serNullUnionAt (ser.go) and the corresponding
-	// serUnion.ser nil-first check. It generalizes "Go nil means absent, so
-	// take the null branch" across all union arities, so 2-branch and N-branch
-	// agree on what counts as null. Without it, a nil []byte against
-	// ["null","bytes"] routes via unionTypeNameForValue to "bytes" and then the
-	// bytes branch, emitting empty bytes, while binary 2-branch picks null.
-	// That is a binary-vs-JSON parity gap for the 2-branch case and a binary
-	// 2-branch-vs-3-branch inconsistency for the N-branch case.
+	// Nil-first dispatch: a nil-equivalent v takes the null branch whatever
+	// the arity, as the binary serNullUnionAt and serUnion.ser do, so a nil
+	// []byte against ["null","bytes"] emits null rather than empty bytes.
 	if isNilValue(v) {
 		if branch := unionBranchOfKind(node, "null"); branch != nil {
 			return appendUnionBranch(buf, node, branch, []byte("null"), cfg), nil
@@ -1280,29 +1166,13 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 	}
 
 tryAll:
-	// We try each branch, mirroring serUnion.ser. The case "null" arm of
-	// appendAvroJSON rejects non-nil values with errNonNil, so a non-nil v
-	// cleanly falls through to the next branch. The nil-first dispatch above
-	// already routed nil-equivalent values to the null branch, so v here is
-	// non-nil and the null branch can never succeed for a value.
-	//
-	// Null handling is arity-dependent, mirroring the binary side exactly so a
-	// wildcard custom encode hook, installed on every branch including null,
-	// fires the same number of times on both paths:
-	//   - 2-branch [null,T] or [T,null]: binary dispatches via the
-	//     serNullUnionAt fast path (ser.go), which for a non-nil value goes
-	//     straight to the non-null branch and *never* trials null. We skip
-	//     null here too. Otherwise the wildcard hook on the null node fires
-	//     spuriously, and a side-effecting wildcard Encode (the logging or
-	//     property-dispatch pattern) runs an extra time on EncodeJSON vs
-	//     Encode.
-	//   - N>=3: binary uses serUnion.ser's try-each (ser.go), which does trial
-	//     the null branch, firing the hook on it, before rejecting the non-nil
-	//     value, so JSON must trial null too for parity.
-	//
-	// We keep the last concrete error so the final message names the closest
-	// reason a branch failed, mirroring decodeUnionBare's lastErr plumbing on
-	// the decode side and serUnion.ser on the binary encode side.
+	// We try each branch, mirroring serUnion.ser; v is non-nil here, since
+	// the nil-first dispatch ran. Null handling is arity-dependent so a
+	// wildcard custom encode hook fires the same number of times on both
+	// paths: the binary 2-branch fast path never trials null for a non-nil
+	// value, so we skip it too, while the N>=3 try-each does trial it. We
+	// keep the last concrete error so the final message names the closest
+	// reason.
 	var lastErr error
 	for _, branch := range node.branches {
 		if len(node.branches) == 2 && branch.kind == "null" {
@@ -1320,15 +1190,10 @@ tryAll:
 		}
 		lastErr = err
 	}
-	// No-match identity mirrors the binary dispatch split exactly. A 2-branch
-	// null union takes serNullUnionAt on the binary side, which hands a non-nil
-	// value straight to the value branch and returns *that* branch's error
-	// unwrapped, with AvroType being the branch's own type, so we surface
-	// lastErr bare here. Every other union shape goes through serUnion.ser,
-	// whose no-match verdict wraps unconditionally in the union's own
-	// *SemanticError, never inherited from lastErr's chain: a typed nil's
-	// per-branch failure is the plain indirection sentinel, which must not
-	// leave the no-match plain.
+	// No-match identity mirrors the binary dispatch split: a 2-branch null
+	// union returns the value branch's own error unwrapped, as
+	// serNullUnionAt does, and every other shape wraps in the union's own
+	// *SemanticError, as serUnion.ser does.
 	if len(node.branches) == 2 &&
 		(node.branches[0].kind == "null" || node.branches[1].kind == "null") &&
 		lastErr != nil {
@@ -1354,12 +1219,9 @@ func unionBranchName(node *schemaNode) string {
 }
 
 // unionBranchNames returns a branch's standard and logical names. The
-// "<kind>.<logicalType>" qualifier applies only to a primitive-backed logical,
-// a branch whose standard name is its kind. A *named* type carrying a logical,
-// only a fixed with uuid, decimal or duration, keeps its declared name as both.
-// Both tagged-union-producing references emit the fixed's name rather than
-// "fixed.<logicalType>": goavro keys the envelope by the codec's
-// typeName.fullName, and Java's JsonEncoder by getFullName().
+// "<kind>.<logicalType>" qualifier applies only to a primitive-backed
+// logical; a named fixed carrying a logical keeps its declared name as both,
+// as goavro and Java emit it.
 func unionBranchNames(node *schemaNode) (standard, logical string) {
 	standard = unionBranchName(node)
 	// standard != node.kind exactly when the branch is a named type
@@ -1373,21 +1235,11 @@ func unionBranchNames(node *schemaNode) (standard, logical string) {
 }
 
 // unionLogicalTagOwnedElsewhere reports whether ln, the "<kind>.<logicalType>"
-// qualifier computed for branch i, is some *other* branch's exact name. The two
-// spellings share one tag namespace: "bytes.decimal" is the qualifier for a
-// decimal-on-bytes branch and also the fullname of a fixed named "decimal" in
-// namespace "bytes". findUnionBranch resolves an exact name before it tries
-// the qualifier fallback. Emitting the qualifier there hands the decoder a tag
-// it routes to the other branch, and the schema's own output stops decoding
-// against the schema that produced it.
-//
-// The rule this expresses, applied identically by every tag table and by the
-// JSON emitter: an exact branch name outranks a logical qualifier. A branch
-// whose qualifier is taken falls back to its unqualified name, which is what
-// TagLogicalTypes emits for that branch anyway when no logical type is present.
-// Nothing else about the union changes: the schema still parses, since it is
-// legal Avro and Java accepts it too, and only the tag spelling degrades, only
-// for the colliding branch.
+// qualifier computed for branch i, is some other branch's exact name: a
+// fixed named "decimal" in namespace "bytes" has the fullname
+// "bytes.decimal". An exact branch name outranks a logical qualifier, so
+// emitting the qualifier would hand the decoder a tag it routes to the other
+// branch; the colliding branch falls back to its unqualified name instead.
 func unionLogicalTagOwnedElsewhere(standard []string, i int, ln string) bool {
 	for j, bn := range standard {
 		if j != i && bn == ln {
@@ -1433,13 +1285,10 @@ func appendTaggedUnion(buf []byte, union, branch *schemaNode, encoded []byte, ta
 	return append(buf, '}')
 }
 
-// unionTagTier is one tier of the union tag namespace: the rule by which a tag
-// you wrote names a branch. A tier answers one question: which name it makes
-// this branch answer to. Both consumers of the namespace walk this same slice
-// in this same order, so we ask the set of tiers rather than restate it.
-// findUnionBranch resolves a name through it, and fillUnionTagTables
-// (schema.go) builds the binary tagged-map lookup through it. Adding a tier
-// here reaches both; adding one by hand inside either reaches neither.
+// unionTagTier is one tier of the union tag namespace: the rule by which a
+// tag you wrote names a branch. findUnionBranch resolves a name through the
+// tiers and fillUnionTagTables builds the binary tagged-map lookup through
+// them, so adding a tier here reaches both.
 type unionTagTier struct {
 	name string
 	// guarded marks a tier where a name two branches could claim resolves
@@ -1492,17 +1341,11 @@ var unionTagTiers = []unionTagTier{
 		},
 	},
 	{
-		// "<kind>.<logicalType>", the goavro-interop spelling that
-		// TagLogicalTypes emits for a primitive-backed logical. We accept it
-		// for a named fixed carrying a logical too, where the emitted tag is
-		// the fixed's *name* instead: the decoder has always taken this legacy
-		// form and the encoder has to take the same input shape.
-		//
-		// Matching the (kind, logicalType) pair rather than the kind alone is
-		// what keeps [long, {long, timestamp-millis}] from misrouting. We keep
-		// the kind list here and nowhere else: it is the one set of kinds this
-		// spelling is defined for, and `fixed` is in it as the only named kind
-		// that can carry a logical type.
+		// "<kind>.<logicalType>", the goavro spelling TagLogicalTypes emits
+		// for a primitive-backed logical. We accept it for a named fixed
+		// carrying a logical too. Matching the (kind, logicalType) pair
+		// rather than the kind alone keeps [long, {long, timestamp-millis}]
+		// from misrouting.
 		name:    "logical qualifier",
 		guarded: true,
 		sep:     ".",
@@ -1534,35 +1377,15 @@ var unionTagTiers = []unionTagTier{
 	},
 }
 
-// findUnionBranch finds a union branch by type name.
-//
-// We accept three tag conventions on input for cross-implementation interop,
-// in order:
-//
-//  1. Exact match against the spec and Java fullname, "long" or
-//     "com.example.User". This is what we emit on output, and the only form
-//     the references emit or read. Java's JsonEncoder keys by getFullName().
-//     fastavro 1.12.2's json_writer emits the fullname, and its
-//     AvroJSONDecoder.read_index exact-matches branch labels, where a
-//     short-name tag raises, observed.
-//  2. goavro's "type.logicalType" form, "long.timestamp-millis": match the
-//     base primitive before the dot.
-//  3. Unqualified short-name form for named types, "User" instead of
-//     "com.example.User", a leniency of ours for hand-written JSON; no
-//     reference implementation emits or reads it, and fastavro's short-name
-//     matching exists only in schema *resolution*, match_schemas'
-//     unqualified-name tier, not in union-tag decoding. Applied only when the
-//     input has no namespace and exactly one branch matches by short name; an
-//     ambiguous case returns no match rather than guessing.
+// findUnionBranch finds a union branch by type name, accepting three tag
+// conventions in order: the exact fullname, which is what we emit and the
+// only form Java and fastavro read; goavro's "type.logicalType" form; and an
+// unqualified short name for a named type, a leniency of ours for
+// hand-written JSON, applied only when exactly one branch matches.
 func findUnionBranch(union *schemaNode, name string) *schemaNode {
-	// The tier walk below is the rule; unionTags.byName is that rule applied
-	// once at parse time. Asking the table keeps this O(1) per value: branch
-	// count is schema-chosen and this is asked per union value, so a scan
-	// multiplies two numbers you picked.
-	//
-	// A table-less node, hand-assembled and never parsed, falls through to the
-	// walk for the same answer computed slowly. No parsed or resolved node
-	// reaches that fallback.
+	// unionTags.byName is the tier walk below applied once at parse time,
+	// which keeps this constant per value. A hand-assembled node with no
+	// table falls through to the walk.
 	if union.tags != nil {
 		i, ok := union.tags.byName[name]
 		if !ok {
@@ -1621,17 +1444,11 @@ func scanUnionBranch(union *schemaNode, name string) *schemaNode {
 	return nil
 }
 
-// parseSpecialFloat parses the NaN and Infinity string forms. We accept Java's
-// exact set {"NaN", "Infinity", "INF", "-Infinity", "-INF"}, from JsonDecoder's
-// isNaNString and is*InfinityString equality checks, which only ever see
-// *quoted* strings. We add Go strconv-style "Inf"/"-Inf". fastavro's accept set
-// is the bare-token subset Python json takes: NaN, Infinity, -Infinity, not
-// INF/-INF, and it does not parse the quoted forms at all (observed 1.12.2).
-// Everything rejects lowercase (Java exact-equals, Python json, goavro), and a
-// lowercase 'n' would collide with the JSON null literal in the union
-// dispatcher, so case-strictness matters here. The goavro conventions of null
-// for NaN and ±1e999 for ±Inf are handled separately by the bare-token and
-// number paths in decodeJSONFloat.
+// parseSpecialFloat parses the NaN and Infinity string forms: Java's exact
+// set of "NaN", "Infinity", "INF", "-Infinity" and "-INF", plus Go's "Inf"
+// and "-Inf". Every implementation rejects lowercase, and a lowercase 'n'
+// would collide with the JSON null literal in the union dispatcher. The
+// goavro conventions of null and +/-1e999 are handled in decodeJSONFloat.
 func parseSpecialFloat(s string) (float64, error) {
 	switch s {
 	case "NaN":
@@ -1705,12 +1522,10 @@ func appendJSONString(buf []byte, s string) []byte {
 		}
 		r, size := utf8.DecodeRuneInString(s[i:])
 		if r == utf8.RuneError && size == 1 {
-			// Replace an invalid UTF-8 byte with raw U+FFFD bytes
-			// (efbfbd) rather than the literal `�` escape, so
-			// encode is idempotent: a re-decoded escape produces
-			// the U+FFFD codepoint, which would then re-encode as
-			// raw UTF-8, different from the escape. Using raw here
-			// makes both paths converge.
+			// Replace an invalid byte with the raw U+FFFD bytes rather than
+			// the six-byte escape, so encode is idempotent: a re-decoded
+			// escape produces the U+FFFD codepoint, which would re-encode as
+			// raw UTF-8.
 			buf = utf8.AppendRune(buf, utf8.RuneError)
 			i++
 			continue
@@ -1743,26 +1558,16 @@ func avroJSONBytesToBytes(s string) ([]byte, error) {
 	return b, nil
 }
 
-// bytesToAvroJSONString encodes raw bytes into the Avro JSON bytes
-// codepoint-string form: each byte 0x00-0xFF becomes a rune at the same
-// codepoint, a 1-byte UTF-8 sequence for 0x00-0x7F and a 2-byte sequence for
-// 0x80-0xFF. The Go string this returns serializes as either `\uXXXX`, for
-// control chars, or the literal UTF-8 bytes, for printable codepoints. Both
-// forms re-parse back to the original codepoint, which [avroJSONBytesToBytes]
-// then maps back to the original byte.
-//
-// Inverse pair with [avroJSONBytesToBytes]: round-trip
-// `avroJSONBytesToBytes(bytesToAvroJSONString(b)) == b` for every []byte.
-// [jsonSerializableValue] (schema_node.go) uses it to re-emit []byte
-// SchemaField.Default / SchemaNode.Props values in the Avro JSON spec's
-// codepoint form rather than the default base64 a generic []byte marshal
-// would produce. The Avro parser would silently re-read that base64 as the
-// literal ASCII bytes of its alphabet.
+// bytesToAvroJSONString encodes raw bytes into the Avro JSON codepoint form:
+// each byte becomes the rune at the same codepoint, so 0x80-0xFF become
+// 2-byte UTF-8 sequences. avroJSONBytesToBytes is the inverse for every
+// []byte. The metadata render uses it for []byte Props and Defaults, since
+// the base64 a generic marshal would produce re-reads as its ASCII bytes.
 func bytesToAvroJSONString(b []byte) string {
 	// strings.Builder.WriteRune calls utf8.EncodeRune internally and
 	// uses unsafe to return the underlying buffer as a string without
 	// a final copy. Grow(len(b)) is the all-ASCII lower bound; bytes
-	// ≥ 0x80 take 2 UTF-8 bytes, so the worst-case output is 2*len(b),
+	// >= 0x80 take 2 UTF-8 bytes, so the worst-case output is 2*len(b),
 	// which append's geometric growth absorbs with at most one realloc.
 	var sb strings.Builder
 	sb.Grow(len(b))
@@ -1772,14 +1577,10 @@ func bytesToAvroJSONString(b []byte) string {
 	return sb.String()
 }
 
-// appendJSONFloat formats a float for JSON output, handling special values.
-// With LinkedinFloats, NaN encodes as null and ±Infinity as ±1e999 (goavro
-// convention). Otherwise NaN/Infinity encode as JSON strings (Java convention).
-//
-// When bits==32 and f is a finite float64 that overflows float32's range,
-// the value narrows to ±Inf and emits as "Infinity"/"-Infinity" per the
-// lossy-destination policy (matches Java's writeFloat(Number.floatValue())
-// silent narrowing).
+// appendJSONFloat formats a float for JSON output. NaN and Infinity encode
+// as JSON strings, or as null and +/-1e999 with LinkedinFloats. When bits is
+// 32, a finite float64 past float32's range narrows to +/-Inf, as Java's
+// writeFloat does.
 func appendJSONFloat(buf []byte, f float64, bits int, cfg *optConfig) []byte {
 	if bits == 32 {
 		f = float64(float32(f))
@@ -1806,14 +1607,9 @@ func appendJSONFloat(buf []byte, f float64, bits int, cfg *optConfig) []byte {
 }
 
 // jsonCoerceToFloat64 converts a reflect.Value to float64, accepting float,
-// int, uint and json.Number types. Encoding into a float or double schema is
-// lossy by destination. An integer input exceeding the mantissa precision
-// silently IEEE-rounds, and a float32-target overflow silently narrows to ±Inf
-// at your float64-to-float32 cast. Java's GenericDatumWriter.writeFloat and
-// writeDouble and fastavro's encoder do the same.
-// avroType ("float" or "double") tags coercion failures as a SemanticError so
-// EncodeJSON's type-mismatch errors are errors.As-able and carry a dotted field
-// path through recordFieldError, matching the binary encoder.
+// int, uint and json.Number. Encoding into a float schema is lossy by
+// destination, as in Java and fastavro. avroType tags failures as a
+// SemanticError carrying the field path, as the binary encoder does.
 func jsonCoerceToFloat64(v reflect.Value, avroType string) (float64, error) {
 	switch {
 	case v.CanFloat():
@@ -1835,18 +1631,10 @@ func jsonCoerceToFloat64(v reflect.Value, avroType string) (float64, error) {
 	return 0, semErr(v, avroType)
 }
 
-// jsonCoerceInt converts a reflect.Value to an integer T, with overflow and
-// whole-number checks, mirroring Encode's serInt and serLong coercion. It is
-// the shared body of jsonCoerceToInt32 and jsonCoerceToInt64.
-//
-// hi bounds the signed int range, MaxInt32 for an int32 target and MaxInt64 for
-// an int64 target; the CanInt path applies a symmetric -hi-1 lo bound
-// (math.MinInt32 or math.MinInt64). floatFits and parseLenient are the matching
-// int-narrowed helpers.
-//
-// avroType ("int" or "long") tags coercion failures as a SemanticError so
-// EncodeJSON's type-mismatch errors are errors.As-able and carry a dotted field
-// path through recordFieldError, matching the binary encoder.
+// jsonCoerceInt converts a reflect.Value to an integer T with the overflow
+// and whole-number checks of serInt and serLong. hi bounds the signed range
+// and the CanInt path applies the symmetric -hi-1 low bound. avroType tags
+// failures as a SemanticError carrying the field path.
 func jsonCoerceInt[T int32 | int64](v reflect.Value, hi int64, avroType string,
 	floatFits func(float64, int) (T, error),
 	parseLenient func(string) (T, error),

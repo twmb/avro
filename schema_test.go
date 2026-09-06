@@ -13878,16 +13878,15 @@ type minBytesCallSite struct {
 var minBytesCallSites = []minBytesCallSite{
 	{file: "schema.go", count: 3, entry: "Parse / MustParse / SchemaCache.Parse / SchemaFor",
 		why: "the parse-time derivations: an array's per-item minimum (ONE computation, assigned to both " +
-			"the deserArray slot and its fieldMeta twin — they are the same question, and computing it twice " +
+			"the deserArray slot and its fieldMeta twin; they are the same question, and computing it twice " +
 			"is how the two came to disagree when only one was patched by the fixup), a map's minEntryBytes, " +
 			"and the container fixup that re-derives them once a forward reference resolves"},
 	{file: "resolve.go", count: 2, entry: "Resolve, and ocf.NewReader when the file's schema differs from the reader's",
 		why: "the resolver rebuilds the bound against the WRITER's wire format for a resolved array and map"},
 	{file: "skip.go", count: 2, entry: "Resolve when a writer field is dropped",
 		why: "the skip compiled for a dropped writer field derives the same two bounds"},
-	{file: "deser.go", count: 4, entry: "n/a — not callers",
-		why: "the definition plus two doc references (schemaMinBytes' own doc and deserMap's " +
-			"field comment naming its bound), plus the one real delegation: schemaMinBytes " +
+	{file: "deser.go", count: 2, entry: "n/a, not callers",
+		why: "the definition plus the one real delegation: schemaMinBytes " +
 			"spins up a fresh walk and calls minBytesOf on it for a single standalone node"},
 }
 

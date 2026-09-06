@@ -195,34 +195,24 @@ func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 	return s.data[start:s.pos], nil
 }
 
-// skipValue skips an entire JSON value, for unknown record fields.
-//
-// We accept the same bare special-float tokens decodeJSONFloat does (NaN,
-// Infinity, -Infinity, INF, -INF, Inf, -Inf), so a fastavro-written record
-// (json.dumps with allow_nan=True emits them bare, observed) decodes against a
-// reader lacking that field. Java emits the quoted form, which the string arm
-// already skips. We dispatch on the value path's [isBareSpecialFloatStart] and
-// parseSpecialFloat's exact-match gate, so "Naive" and lowercase "nan" still
-// error and the two paths cannot drift.
+// skipValue skips an entire JSON value, for unknown record fields. We accept
+// the same bare special-float tokens decodeJSONFloat does (NaN, Infinity,
+// -Infinity and their case variants), since fastavro writes them bare and
+// Java writes the quoted form the string arm already skips. Both paths share
+// isBareSpecialFloatStart and parseSpecialFloat, so they cannot drift.
 func (s *jsonScanner) skipValue() error {
 	return s.skipValueDepth(0)
 }
 
-// skipValueDepth skips one JSON value while *validating* its full grammar, not
-// merely delimiting it. Unknown record fields route here. A delimit-only skip
-// would be a second, lax JSON parser taking input the value path (and Java,
-// fastavro, encoding/json) rejects: the number arm would take 1.2.3/1e/5., a
-// blind escape skip would pass "\q", and bracket-depth counting would call
-// [}] / {"a" 1} / [1,2,] balanced. We recurse where a delimiter could loop, so
-// depth bounds us and a pathologically deep skipped value errors rather than
-// overflowing the stack.
+// skipValueDepth skips one JSON value while validating its full grammar, not
+// merely delimiting it. A delimit-only skip would be a second, lax JSON
+// parser accepting input the value path (and Java, fastavro, encoding/json)
+// rejects: 1.2.3, "\q", or [1,2,]. We recurse where a delimiter could loop,
+// so depth bounds a pathologically deep skipped value.
 func (s *jsonScanner) skipValueDepth(depth int) error {
-	// We use the value path's >= maxDepth (trips at the maxDepth-th level),
-	// not >, so the two recursion guards agree on the bound. depth restarts at
-	// 0 per skipped value rather than threading the enclosing decode depth: a
-	// skipped value is a self-contained sub-parse that discards its data, so a
-	// fresh maxDepth budget is fine. The worst case, a deep value with a deep
-	// skipped tail, is still ~2*maxDepth frames, bounded for stack and DoS.
+	// >= maxDepth like the value path, so the two guards agree. depth
+	// restarts at 0 per skipped value, since a skipped value is a
+	// self-contained sub-parse; the worst case is about 2*maxDepth frames.
 	if depth >= maxDepth {
 		return errTooDeep
 	}
@@ -245,11 +235,8 @@ func (s *jsonScanner) skipValueDepth(depth int) error {
 	case '{':
 		return s.skipObjectStrict(depth)
 	default:
-		// A bare NaN/Infinity token and a number share this arm because
-		// they share a first byte: '-' begins both -Infinity and every
-		// negative number. isBareSpecialFloatStart is the value path's own
-		// predicate (json_decode.go), so the skip path splits them exactly
-		// where decodeJSONFloat does.
+		// A bare NaN/Infinity token and a number share a first byte: '-'
+		// begins both -Infinity and every negative number.
 		if isBareSpecialFloatStart(s, p) {
 			t, err := s.consumeBareSpecialFloat()
 			if err != nil {
@@ -390,7 +377,7 @@ func parseJSONInt64(b []byte) (int64, error) {
 	}
 	// Per-digit pre-multiply guard. The naive "n*10+d wrapped if it went
 	// down" check has a gap once n nears 2^64/9: n*10+d can wrap mod 2^64
-	// to a value still >= prev, e.g. "20496382304121724020" lands at
+	// to a value still >= prev, e.g. "20496382304121724020" ends at
 	// 2049638230412172404 with no post-multiply wrap visible. Java's
 	// JsonParser.getLongValue throws InputCoercionException and goavro
 	// uses strconv.ParseInt; we bound before the multiply instead.
@@ -496,12 +483,9 @@ func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 				}
 			}
 		default:
-			// Unrecognized escape sequence. JSON defines exactly eight
-			// (" \ / b f n r t) plus \uXXXX; anything else is malformed.
-			// We reject rather than silently drop the backslash, which
-			// corrupts content: "C:\dir" would become "C:dir". Java's
-			// JsonDecoder (Jackson, "Unrecognized character escape") and
-			// fastavro (Python json, "Invalid \escape") both reject too.
+			// JSON defines eight escapes plus \uXXXX; anything else is
+			// malformed, and Java and fastavro reject it too. Dropping the
+			// backslash instead would corrupt content.
 			return fmt.Errorf("avro json: invalid escape sequence \\%c", raw[i])
 		}
 		if err := emit(r); err != nil {
@@ -525,7 +509,7 @@ func resolveJSONEscapes(raw []byte) (string, error) {
 }
 
 // scanAvroJSONBytes resolves a raw JSON string content into Avro bytes.
-// In Avro's convention, each code point maps to a single byte (≤ 255).
+// In Avro's convention, each code point maps to a single byte (<= 255).
 func scanAvroJSONBytes(raw []byte) ([]byte, error) {
 	if len(raw) == 0 {
 		return []byte{}, nil

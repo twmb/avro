@@ -277,7 +277,7 @@ func WithReaderSchema(s *avro.Schema) ReaderOpt { return optReaderSchema{s} }
 //
 // A non-nil schema is resolved against the writer schema via [avro.Resolve],
 // and [Reader.Decode] then uses the result. (nil, nil) means no resolution:
-// records decode against the writer schema directly, exactly as if you passed
+// records decode against the writer schema directly, as if you passed
 // no reader-schema option at all. A non-nil error is returned from
 // [NewReader].
 //
@@ -293,17 +293,11 @@ func WithReaderSchemaFunc(fn func(rd *Reader) (*avro.Schema, error)) ReaderOpt {
 // or corrupt files that declare very large blocks.
 func WithMaxBlockBytes(n int64) ReaderOpt { return optMaxBlockBytes{n} }
 
-// defaultMaxDecompressedBytes bounds the *decompressed* size of a single
-// block. It is the twin of the 64 MiB compressed limit (WithMaxBlockBytes).
-// We read a block compressed off the wire and then inflate it, and a built-in
-// codec allocates the inflated size from a length declared inside the
-// compressed payload. Without this, an ~89-byte snappy frame can demand ~200
-// MiB (up to ~4 GiB at the format ceiling), and deflate's streaming reader is
-// unbounded. 64 MiB is 1024x any default-writer block (64 KiB) and still
-// keeps a hostile block's footprint and decode time small: a crafted block of
-// 1-byte records decodes in ~3s rather than the tens of seconds a larger cap
-// allows. Producers writing larger blocks raise it with
-// WithMaxDecompressedBlockBytes.
+// defaultMaxDecompressedBytes bounds the decompressed size of a single block,
+// the twin of the compressed limit. A built-in codec allocates the inflated
+// size from a length declared inside the compressed payload, so without this
+// an ~89-byte snappy frame can demand ~200 MiB. 64 MiB is 1024x any
+// default-writer block and keeps a hostile block's decode time to seconds.
 const defaultMaxDecompressedBytes = 64 << 20
 
 // defaultMaxBlockBytes is the reader's default ceiling on a block's *declared
@@ -315,13 +309,11 @@ const defaultMaxDecompressedBytes = 64 << 20
 const defaultMaxBlockBytes = 1 << 26
 
 // ocfEagerBlockAllocLimit is the largest declared compressed block size that
-// readBlock allocates in one shot (make + ReadFull, the fast common path).
-// It *is* the default WithMaxBlockBytes, derived rather than restated, so the
-// property it rests on (a reader at the default cap never leaves the eager
-// path) cannot break when someone changes one of two spellings of the same
-// number. A larger block is reachable only once you raise WithMaxBlockBytes;
-// we read those incrementally, so a declared-but-absent size cannot force an
-// allocation up to the raised cap. See readBlock.
+// readBlock allocates in one shot. It is the default WithMaxBlockBytes,
+// derived rather than restated, so a reader at the default cap never leaves
+// the eager path; a larger block, reachable only once you raise the cap, is
+// read incrementally so a declared-but-absent size cannot force an
+// allocation up to the raised cap.
 const ocfEagerBlockAllocLimit = defaultMaxBlockBytes
 
 // WithMaxDecompressedBlockBytes sets the maximum decompressed size in bytes
@@ -446,16 +438,10 @@ const defaultBlockBytes = 64 << 10 // 64 KiB
 
 func (w *Writer) shouldFlush() bool {
 	// The third clause keeps every written block within the Reader's
-	// zero-byte bounds: readBlock rejects count > len(block)+
-	// maxOCFZeroByteSlack, and Decode caps a *consecutive* zero-byte run at
-	// the same slack (both strict >). Datums that encode to >=1 byte keep
-	// count <= len(buf), so this clause fires only when zero-byte datums
-	// (top-level "null", all-null records, size-0 fixed) accumulate. Without
-	// it they never grow the buffer, the byte-driven flush never triggers,
-	// and the whole file lands in one block the Reader rejects. Flushing at
-	// equality is exact: each datum raises count by 1 and the buffer by >=0,
-	// so the boundary cannot be jumped, and a block sealed at
-	// count == len+slack passes both reader checks.
+	// zero-byte bounds: zero-byte datums never grow the buffer, so without
+	// it the byte-driven flush never triggers and the whole file ends up in
+	// one block the Reader rejects. Flushing at equality is exact, since
+	// each datum raises count by 1.
 	return (w.maxCount > 0 && w.count >= w.maxCount) ||
 		len(w.buf) >= w.maxBytes ||
 		w.count >= len(w.buf)+maxOCFZeroByteSlack
@@ -472,30 +458,21 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (_ *Writer, err e
 		schema: s,
 		codec:  nullCodec{},
 	}
-	// Any error return from here on must release whatever codec wr holds. A
-	// failing constructor returns no Writer, so you have nothing left to
-	// Close, and the codec is commonly built inline in the call,
-	// WithCodec(MustZstdCodec(nil, nil)), leaving no handle either. Named
-	// return so the deferred check sees the final err value; NewReader carries
-	// the same defer for the same reason. We register this *before* the option
-	// loop: the closure reads wr.codec when it runs, so this covers the codec
-	// whenever the loop adopts it, and an error return added inside the loop
-	// later is guarded without anyone noticing. Until WithCodec is seen
-	// wr.codec is nullCodec, whose Close is a no-op, and a codec you share
-	// across writers is wrapped in NopCloser, likewise a no-op.
+	// Any error return from here on must release whatever codec wr holds: a
+	// failing constructor returns no Writer, and the codec is commonly built
+	// inline in the call, leaving no handle to close. We register the defer
+	// before the option loop so it covers the codec whenever the loop adopts
+	// it. NewReader carries the same defer.
 	defer func() {
 		if err != nil {
 			wr.codec.Close()
 		}
 	}()
 
-	// The other half of the same rule: WithCodec written more than once adopts
-	// the last and drops the rest, and a dropped codec has no owner at all;
-	// see releaseUnadopted. Registered before the loop for the same reason the
-	// defer above is: the closure reads both variables when it runs, so it
-	// covers whatever the loop collected however the loop exits. An error
-	// return added inside the loop leaves adopted at -1, which releases every
-	// codec collected so far rather than none of them.
+	// The other half of the same rule: WithCodec written more than once
+	// adopts the last and drops the rest, and a dropped codec has no owner;
+	// see releaseUnadopted. An error return inside the loop leaves adopted
+	// at -1, which releases every codec collected so far.
 	var supplied []Codec
 	adopted := -1
 	defer func() { releaseUnadopted(supplied, adopted) }()
@@ -519,19 +496,11 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (_ *Writer, err e
 			wr.schemaJSON = o.s
 		}
 	}
-	// Last WithCodec wins, as it always has. Adopting after the loop rather than
-	// inside it is what makes the supersede case observable: the superseded
-	// codecs stay in supplied with adopted pointing past them, so the deferred
-	// sweep can tell "dropped" from "taken" instead of watching one field be
-	// overwritten.
-	//
-	// Last non-nil wins. This is the writer's half of the question resolveCodec
-	// answers by name: a nil offer is not a codec, so it cannot win. Adopting it
-	// would install a nil in wr.codec and defer the crash to writeHeader's
-	// Name() call, and the reader side skips nils in its scan, so WithCodec(nil)
-	// would be ignored by NewReader and fatal to NewWriter. That split is what
-	// this predicate exists to close. All offers nil leaves adopted at -1 and
-	// wr.codec at nullCodec, exactly as if you had not written WithCodec.
+	// Last non-nil WithCodec wins. Adopting after the loop keeps the
+	// superseded codecs in supplied with adopted pointing past them, so the
+	// deferred sweep can tell dropped from taken. A nil offer is not a
+	// codec and cannot win, as resolveCodec skips nils on the reader side;
+	// adopting it would defer the crash to writeHeader.
 	for i := len(supplied) - 1; i >= 0; i-- {
 		if !isNilCodec(supplied[i]) {
 			adopted = i
@@ -570,17 +539,10 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (_ *Writer, err e
 }
 
 func (w *Writer) writeHeader() error {
-	// The spec's `avro.schema` entry is the schema as JSON, unqualified. Java
-	// writes Schema.toString() and fastavro json.dumps(schema), both the full
-	// schema, logicalType/precision/scale/doc/aliases/default included.
-	//
-	// *Not* Canonical(), which the spec defines for fingerprinting and whose
-	// [STRIP] rule removes all of those. Stripping them costs the header its
-	// logical types, so a CustomType passed through WithSchemaOpts never
-	// matches and Root().Fields[i].Type.Precision reads 0.
-	//
-	// Schema.String() is the original JSON you passed to Parse. WithSchema
-	// (w.schemaJSON) overrides it when you want different header text.
+	// The spec's avro.schema entry is the schema as JSON, and Java and
+	// fastavro both write the full schema, logical types and docs included.
+	// Not Canonical(), whose STRIP rule would cost the header its logical
+	// types. WithSchema overrides the text.
 	schemaBytes := []byte(w.schema.String())
 	if w.schemaJSON != "" {
 		schemaBytes = []byte(w.schemaJSON)
@@ -591,13 +553,9 @@ func (w *Writer) writeHeader() error {
 	}
 	meta = append(meta, w.userMeta...)
 
-	// Producer-side compliance with decodeMap's caps: we refuse to write
-	// metadata the reader would reject (and which NewAppendWriter, which
-	// re-reads the header, would also reject), since emitting it would be a
-	// self-incompatible file. decodeMap caps three things, so we mirror all
-	// three: the per-block entry count, each key length, and each value length
-	// (avro.schema gets the larger schema ceiling; every other key and all
-	// values the generic 1 MiB cap).
+	// We refuse to write metadata the reader would reject, since emitting it
+	// would be a self-incompatible file: decodeMap caps the entry count, each
+	// key length, and each value length, so we mirror all three.
 	if int64(len(meta)) > ocfMetadataSafetyLimit {
 		return fmt.Errorf("ocf: %d metadata entries exceed the %d-entry limit", len(meta), ocfMetadataSafetyLimit)
 	}
@@ -742,7 +700,7 @@ func (w *Writer) flush() error {
 // already closed the Writer, since its codec is no longer usable.
 //
 // If Reset fails after switching to dst, on either a sync-marker generation
-// error or a header write error, we poison the Writer exactly as a failed
+// error or a header write error, we poison the Writer as a failed
 // [Writer.Encode] or [Writer.Flush] does: every subsequent Encode, Flush, and
 // Close returns the error until a later successful Reset clears it. (A failed
 // flush of the old destination also poisons.) Otherwise, ignoring Reset's
@@ -856,16 +814,10 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 	return wr, nil
 }
 
-// checkedReader converts an io.Reader contract violation, a returned count
-// outside [0, len(p)] with a nil error, into a named error before bufio's
-// buffer arithmetic sees it. Unguarded, a negative count trips bufio's own
-// panic and an over-length count drives the buffer slice out of range: a
-// panic through NewReader or NewAppendWriter that you cannot recover from.
-//
-// It also bounds a reader stuck returning (0, nil). bufio applies its
-// io.ErrNoProgress bound only on its buffered path and hands large direct
-// reads through verbatim, where the block-data io.ReadFull would spin
-// forever. A contract-abiding Read passes through untouched.
+// checkedReader converts an io.Reader contract violation, a count outside
+// [0, len(p)] with a nil error, into a named error before bufio's buffer
+// arithmetic panics on it. It also bounds a reader stuck returning (0, nil),
+// which bufio hands through verbatim on large direct reads.
 type checkedReader struct {
 	r          io.Reader
 	emptyReads int
@@ -929,16 +881,10 @@ type Reader struct {
 }
 
 // noEOF converts a bare io.EOF from a mid-structure read into
-// io.ErrUnexpectedEOF before the caller wraps it with %w. io.EOF is Decode's
-// end-of-stream sentinel, so it must be reachable only from the clean-end
-// path (the block-count read at the top of readBlock, with zero bytes
-// consumed); a stream that ends after a complete count varint, after the
-// size varint, mid block data, or at the sync boundary promised more bytes
-// and is truncated, not ended. The stdlib readers return bare io.EOF for
-// exactly those cuts (io.ReadFull and binary.ReadVarint when zero bytes
-// remain, and io.CopyN on *any* shortfall, partial copies included), and a
-// %w wrap keeps errors.Is(err, io.EOF) true, which would make the idiomatic
-// termination check read a truncated file as a clean, complete one.
+// io.ErrUnexpectedEOF. io.EOF is Decode's end-of-stream sentinel, so it must
+// be reachable only from the block-count read at the top of readBlock; the
+// stdlib readers return bare io.EOF for any other cut, and a %w wrap would
+// make the idiomatic termination check read a truncated file as complete.
 func noEOF(err error) error {
 	if errors.Is(err, io.EOF) {
 		return io.ErrUnexpectedEOF
@@ -1102,18 +1048,14 @@ func (rd *Reader) Decode(v any) error {
 	rest, err := rd.schema.Decode(rd.block, v, rd.decodeOpts...)
 	if err != nil {
 		// noEOF: a datum error matching io.EOF (e.g. a CustomType decode
-		// callback returning it) must not surface as the clean-end sentinel.
+		// callback returning it) must not come back as the clean-end sentinel.
 		return fmt.Errorf("ocf: decoding datum: %w", noEOF(err))
 	}
-	// Bound zero-byte records. A datum that consumes 0 wire bytes (the "null"
-	// schema, or a record whose every field is null-typed) lets a block's
-	// declared count drive the decode loop without ever exhausting the block,
-	// so a hostile count amplifies a tiny input into a multi-second loop.
-	// readBlock caps count against len(block)+slack, but a block padded with
-	// ignored garbage (or one that decompressed large) inflates that bound;
-	// this caps consecutive zero-consumption datums per block absolutely,
-	// matching the maxZeroByteItems philosophy applied per-block. Non-zero-byte
-	// records consume bytes and are bounded by len(block) directly.
+	// Bound zero-byte records: a datum that consumes 0 wire bytes lets a
+	// block's declared count drive the decode loop without exhausting the
+	// block. readBlock caps count against len(block) plus slack, but padding
+	// inflates that bound, so this caps consecutive zero-consumption datums
+	// per block absolutely.
 	if len(rest) == len(rd.block) {
 		rd.zeroRun++
 		if rd.zeroRun > maxOCFZeroByteSlack {
@@ -1180,17 +1122,11 @@ func (rd *Reader) readBlock() error {
 		if size > math.MaxInt {
 			return fmt.Errorf("ocf: block size %d exceeds platform max int", size)
 		}
-		// size is the attacker-declared block length, bounded only by the
-		// WithMaxBlockBytes you configured. Eagerly allocating it would let a
-		// tiny hostile file (a huge declared size with few bytes behind it)
-		// force an allocation up to that cap: at a raised cap a multi-GiB
-		// transient spike, and near the cap's MaxInt64 ceiling an unrecoverable
-		// out-of-memory recover() cannot catch. We allocate the full size up
-		// front only within a bounded window, the common path, where it never
-		// exceeds the default cap. Beyond that we read incrementally, so the
-		// buffer grows only to the bytes actually present and a
-		// declared-but-absent size fails after consuming what is there. Same
-		// bounded-allocation discipline the decompressed side applies.
+		// size is the attacker-declared block length, bounded only by
+		// WithMaxBlockBytes. We allocate it up front only within the default
+		// cap, and read incrementally beyond, so a declared-but-absent size
+		// fails after consuming what is there rather than forcing an
+		// allocation up to a raised cap.
 		var compressed []byte
 		if size <= ocfEagerBlockAllocLimit {
 			compressed = make([]byte, int(size))
@@ -1214,31 +1150,17 @@ func (rd *Reader) readBlock() error {
 		if sync != rd.sync {
 			return errors.New("ocf: sync marker mismatch")
 		}
-		// A count=0 block still requires reading size + data + 16-byte sync
-		// first, per spec: bailing on count alone accepts a tail-truncated
-		// file whose count byte reads 0 as a clean end. Once the sync
-		// validates we skip the empty block and keep reading: a block's object
-		// count is unconstrained, unlike an Avro array's terminating zero, so
-		// io.EOF comes only from the count read at the top of this loop.
-		// fastavro does the same; Java never writes one and its for-each
-		// reader stops, so treating the shape as end-of-stream would silently
-		// truncate files only foreign writers produce.
-		//
-		// We consume the skipped payload off the wire, bounded like any block,
-		// but never hand it to the codec. fastavro and Java decompress count-0
-		// payloads eagerly and error on an undecompressable one we skip;
-		// deliberate leniency, and no records are lost either way.
+		// A count=0 block still requires reading size, data and sync, per
+		// spec; bailing on count alone would accept a tail-truncated file as
+		// a clean end. We then skip the block, as fastavro does; Java never
+		// writes one. The skipped payload is consumed off the wire, bounded
+		// like any block, but never handed to the codec.
 		if count == 0 {
 			continue
 		}
-		// Prefer the codec's bounded path: it refuses an over-cap block *before*
-		// allocating it, the only effective defense, since a post-decompression
-		// size check is false comfort once the allocation has happened. Every
-		// built-in implements BoundedDecompressor. A custom codec that does not
-		// is honestly unbounded; for untrusted data supply a codec that bounds
-		// itself. For a BoundedDecompressor, len(block) <= maxDecompressed,
-		// which also caps the per-block decode loop below (count is bounded
-		// relative to len(block)).
+		// The codec's bounded path refuses an over-cap block before
+		// allocating it; every built-in implements BoundedDecompressor, and a
+		// custom codec that does not is unbounded.
 		var block []byte
 		if b, ok := rd.codec.(BoundedDecompressor); ok {
 			block, err = b.DecompressBounded(compressed, rd.maxDecompressed)
@@ -1246,22 +1168,15 @@ func (rd *Reader) readBlock() error {
 			block, err = rd.codec.Decompress(compressed)
 		}
 		if err != nil {
-			// noEOF: a codec error matching io.EOF must not surface as Decode's
+			// noEOF: a codec error matching io.EOF must not come back as Decode's
 			// clean-end sentinel (the user's failing Decompress would read as a
 			// silently shorter file).
 			return fmt.Errorf("ocf: decompressing block: %w", noEOF(err))
 		}
 		// Bound count against the decompressed length plus slack for
-		// zero-byte-record schemas. For non-zero-byte schemas count >
-		// len(block) is corruption; for zero-byte ones count is unbounded
-		// relative to len(block), and a 5-byte varint claiming 10^9 makes your
-		// `for rd.Decode(&v) == nil` loop iterate that many times at 0 bytes
-		// each, ~10^9 CPU amplification from a tiny input.
-		//
-		// Same rule as deser.go's maxZeroByteItems: more than a few thousand
-		// zero-byte records per block is a schema-design problem, and a
-		// producer that wants more can split blocks. Java and fastavro leave
-		// this uncapped.
+		// zero-byte schemas, where count is otherwise unbounded relative to
+		// len(block) and a 5-byte varint claiming 10^9 would iterate your
+		// Decode loop that many times. Java and fastavro leave this uncapped.
 		if count > int64(len(block))+maxOCFZeroByteSlack {
 			return fmt.Errorf("ocf: block claims %d records but decompressed block is %d bytes (zero-byte slack: %d)",
 				count, len(block), maxOCFZeroByteSlack)
@@ -1282,37 +1197,13 @@ const maxOCFZeroByteSlack = 4 << 10
 
 // ---------- codecs ----------
 
-// Memory bounds (security note).
-//
-// Two independent limits guard a block. WithMaxBlockBytes bounds the
-// *compressed* size read off the wire (default 64 MiB), and
-// WithMaxDecompressedBlockBytes bounds what that block inflates to.
-//
-// Each built-in codec implements [BoundedDecompressor]. We pass our cap to
-// DecompressBounded, which refuses an over-cap block *before* allocating it.
-// Otherwise a decompression bomb inflates a tiny block into a huge
-// allocation. Decompress is the unbounded (max == 0) form, kept for the Codec
-// interface and the trusted writer path:
-//
-//   - snappy: snappy.Decode pre-allocates from a varint header that can declare
-//     up to ~4 GiB inside a 5-byte frame; DecompressBounded rejects via a
-//     snappy.DecodedLen pre-check before Decode allocates.
-//   - deflate: flate.NewReader streams without a header bound (io.ReadAll would
-//     grow until the stream ends); DecompressBounded reads via an
-//     io.LimitReader(max+1) and rejects past the cap.
-//   - zstd: the library default permits multi-GiB output; DecompressBounded
-//     builds the decoder with zstd.WithDecoderMaxMemory(max), which bounds the
-//     decode window an output limiter cannot.
-//   - null: the "decompressed" size *is* the input size; DecompressBounded
-//     rejects an over-cap raw block, which also caps the per-block decode loop
-//     (a block's record count cannot exceed its decompressed length plus the
-//     zero-byte slack).
-//
-// Java's SnappyCodec (ByteBuffer.allocate(Snappy.uncompressedLength(...))) and
-// fastavro's snappy decompress (cramjam decompress_raw; python-snappy is its
-// deprecated fallback) leave the decompressed side unbounded. The cap is our
-// own defense-in-depth, in the same family as WithMaxBlockBytes and
-// maxZeroByteItems.
+// Memory bounds. WithMaxBlockBytes bounds the compressed size read off the
+// wire and WithMaxDecompressedBlockBytes bounds what that block inflates to.
+// Each built-in codec implements BoundedDecompressor and refuses an over-cap
+// block before allocating it: snappy through a DecodedLen pre-check, deflate
+// through an io.LimitReader, zstd through WithDecoderMaxMemory, and null by
+// rejecting an over-cap raw block. Java and fastavro leave the decompressed
+// side unbounded.
 
 type nullCodec struct{}
 
@@ -1481,28 +1372,15 @@ func (c *zstdCodec) Close() error {
 
 // resolveCodec returns the codec named in the file header, along with the
 // index into custom that supplied it, or -1 when the name resolved to a
-// built-in. We return a name-matched custom codec as-is.
-//
-// We do *not* inject the per-block decompression bound
-// (WithMaxDecompressedBlockBytes) here. The reader passes it to the codec at
-// decode time via [BoundedDecompressor.DecompressBounded], which every
-// built-in implements, so the bound governs name-resolved and
-// WithCodec-supplied codecs uniformly, including an instance built before
-// NewReader. A codec without BoundedDecompressor decompresses unbounded.
-//
-// The index is what lets one caller answer "which supplied codecs went
-// unused" (releaseUnadopted); every constructor that offers codecs here gets
-// that answer from this one return rather than working it out again.
+// built-in. The decompression bound is not injected here; the reader passes
+// it at decode time through BoundedDecompressor, so it governs name-resolved
+// and WithCodec-supplied codecs alike. The index lets releaseUnadopted tell
+// which supplied codecs went unused.
 func resolveCodec(name string, custom []Codec) (Codec, int, error) {
 	for i, c := range custom {
-		// We skip a nil offer rather than ask it. This scan is what *decides*
-		// adoption, so it runs over offers that are about to be declined, and
-		// Name() on a nil codec is a nil-method call: without this, an offer
-		// that could not possibly be taken still crashes the constructor.
-		// [NewWriter] chooses by position instead of by name and so never asked,
-		// which is how one spelling of one option came to work on one
-		// constructor and SIGSEGV on the other two. Both sides now ask
-		// isNilCodec, so "what is a nil offer" has one answer.
+		// We skip a nil offer rather than ask its Name, since this scan runs
+		// over offers about to be declined. Both choosers ask isNilCodec, so
+		// a nil offer has one answer.
 		if isNilCodec(c) {
 			continue
 		}
@@ -1525,42 +1403,16 @@ func resolveCodec(name string, custom []Codec) (Codec, int, error) {
 }
 
 // releaseUnadopted closes every codec you supplied that the constructor did
-// not adopt. [WithCodec] *offers* a codec, and we take at most one: the first
-// whose Name matches the header's avro.codec for the two reader-side
-// constructors, the last one written for [NewWriter]. Every other offer is
-// dropped.
-//
-// A dropped codec has no owner. The constructor succeeds, so nothing tells you
-// it went unused, and the documented inline form
-// WithCodec(MustZstdCodec(nil, nil)) leaves no handle to close it with.
-//
-// adopted is the index of the taken offer, or -1 when none was, in which case
-// we release every supplied codec. Position is what the choosers decide, but it
-// is not enough to decide whether to close, since one codec can occupy several
-// positions. We release each distinct supplied codec but the adopted one,
-// exactly once:
-//
-//   - We skip the adopted codec by identity, not index, or WithCodec(c),
-//     WithCodec(c) closes c and then returns a Writer that compresses with it.
-//   - We skip an earlier identical offer, or the codec is closed twice.
-//     [Codec.Close] is not documented to be idempotent.
-//
-// We never close a nil codec. Ask [isNilCodec], not c != nil: an interface
-// holding a nil *T passes that and panics inside Close. Nils also stay out of
-// the repeat bookkeeping, because recording a nil of an uncomparable type puts
-// that *type* in the seen list and makes a later real codec of the type read as
-// a repeat, leaking it.
-//
-// We drop Close errors; every path here already has an outcome to report.
-//
-// Repeats are a set-membership question, so a comparable codec goes in a map.
-// A codec whose dynamic type is uncomparable cannot be a key, and == panics on
-// two of them, so we match those by type instead: two values of one
-// uncomparable type are indistinguishable anyway. That answer is conservative
-// in the safe direction, since "same" means we skip a Close, and a skipped
-// Close leaks where a wrong Close hands back a Writer built on a released
-// codec. The split is on reflect.Type.Comparable, so the ordinary case stays
-// linear.
+// not adopt, since a dropped codec has no owner and the inline
+// WithCodec(MustZstdCodec(nil, nil)) form leaves no handle. adopted is the
+// index of the taken offer, or -1. We skip the adopted codec by identity
+// rather than index, or WithCodec(c), WithCodec(c) would close c and return
+// a Writer using it, and we close each distinct codec once, since
+// Codec.Close is not documented to be idempotent. Nils are never closed and
+// stay out of the repeat bookkeeping. A comparable codec goes in a map; an
+// uncomparable one is matched by type, which is conservative in the safe
+// direction, since a skipped Close leaks where a wrong Close hands back a
+// Writer built on a released codec.
 func releaseUnadopted(supplied []Codec, adopted int) {
 	var decided map[Codec]bool      // comparable codecs already accounted for
 	var uncomparable []reflect.Type // the rest, tracked by type
@@ -1585,17 +1437,10 @@ func releaseUnadopted(supplied []Codec, adopted int) {
 		return false
 	}
 
-	// The adopted codec is accounted for first and never closed, so any later
-	// offer of that same codec is recognized as a repeat and left open too.
-	//
-	// The nil test here is currently unreachable and kept deliberately: both
-	// choosers already refuse to adopt a nil (resolveCodec skips them in its
-	// scan, NewWriter takes the last non-nil), so nothing can hand this a nil
-	// adopted index today, and dropping it alone is byte-identical (measured,
-	// not assumed). It becomes operative the moment a chooser stops filtering:
-	// with a nil adoptable, recording that nil would put its *type* in the seen
-	// list, and a real codec of that same uncomparable type would then read as
-	// a repeat and be silently never closed.
+	// The adopted codec is accounted for first and never closed, so a later
+	// offer of it reads as a repeat. The nil test is unreachable today, since
+	// both choosers refuse to adopt a nil, but recording a nil would put its
+	// type in the seen list and leak a later real codec of that type.
 	if adopted >= 0 && !isNilCodec(supplied[adopted]) {
 		seen(supplied[adopted])
 	}
@@ -1609,20 +1454,10 @@ func releaseUnadopted(supplied []Codec, adopted int) {
 	}
 }
 
-// isNilCodec reports whether c holds nothing to call a method on. A Codec can
-// be a non-nil interface wrapping a nil pointer, which passes c != nil and
-// panics at the first method call, so == is not the question worth asking.
-//
-// The kinds listed are exactly those reflect.Value.IsNil accepts. Interface is
-// not among them: reflect.ValueOf resolves the interface to its dynamic value,
-// so that kind cannot occur here.
-//
-// Every site that reaches into your offers asks this one function: both
-// choosers, resolveCodec before it reads a name and NewWriter before it takes
-// the last one, and releaseUnadopted before it closes. A predicate answered in
-// one place cannot drift between them, and that drift is what made
-// WithCodec(nil) a supported no-op on one constructor and a crash on the other
-// two.
+// isNilCodec reports whether c holds nothing to call a method on: a non-nil
+// interface wrapping a nil pointer passes c != nil and panics at the first
+// method call. The kinds listed are those reflect.Value.IsNil accepts. Every
+// site that reaches into your offers asks this one function.
 func isNilCodec(c Codec) bool {
 	if c == nil {
 		return true
@@ -1635,13 +1470,9 @@ func isNilCodec(c Codec) bool {
 	return false
 }
 
-// truncForError caps a wire-derived string at 80 chars for inclusion in
-// error messages. The OCF metadata-map value cap is 1 MiB per entry
-// (ocfMetadataSafetyLimit), so without this an unknown-codec name from
-// a hostile producer would echo up to 1 MiB into the parse error and
-// 1:1-amplify through logging / RPC error trailers. Mirrors the
-// truncForError helper in the root avro package (which is unexported
-// and not reachable from this subpackage).
+// truncForError caps a wire-derived string at 80 chars for error messages,
+// since a metadata value can be 1 MiB. It mirrors the root package's
+// unexported helper.
 func truncForError(s string) string {
 	const max = 80
 	if len(s) <= max {
@@ -1678,14 +1509,10 @@ func encodeMap(dst []byte, entries []kv) []byte {
 // otherwise drive an unbounded make).
 const ocfMetadataSafetyLimit = 1 << 20
 
-// ocfSchemaSafetyLimit is the larger dedicated bound for the self-describing
-// avro.schema metadata value. A wide record's JSON legitimately exceeds 1 MiB
-// (Java/fastavro read such files), so capping it at ocfMetadataSafetyLimit
-// makes the writer's own large-schema files unreadable. The schema's parse
-// cost is independently bounded by the schema parser's own guards, so a
-// generous-but-finite ceiling (still bounding the make([]byte, valLen) alloc)
-// is the right shape. The OCF writer enforces the same bound (producer-side
-// compliance), so a twmb-written file is always twmb-readable.
+// ocfSchemaSafetyLimit is the larger bound for the avro.schema metadata
+// value, since a wide record's JSON legitimately exceeds 1 MiB. The schema
+// parser's own guards bound the parse cost. The writer enforces the same
+// bound, so a file we write is a file we can read.
 const ocfSchemaSafetyLimit = 1 << 26 // 64 MiB
 
 func metadataValueLimit(key string) int64 {

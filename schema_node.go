@@ -88,8 +88,8 @@ type SchemaNode struct {
 	// for int64, or a fractional literal over 1024 bytes, whose digits are
 	// kept verbatim rather than rounded. Whole-valued exponents collapse to
 	// int64 (1e3 reads as int64(1000)); exponents overflowing float64 give
-	// ±Inf. math.NaN() re-reads as the string "NaN" after Schema()/Root(),
-	// because JSON has no NaN literal; ±Inf round-trips as float64(±Inf).
+	// +/-Inf. math.NaN() re-reads as the string "NaN" after Schema()/Root(),
+	// because JSON has no NaN literal; +/-Inf round-trips as float64(+/-Inf).
 	//
 	// When you build a node by hand, a map key with a MarshalText method
 	// renders as that text whatever the key's kind, a float-kind key is an
@@ -100,33 +100,21 @@ type SchemaNode struct {
 	Props map[string]any
 
 	// refTarget is set only by [Schema.Root], on name-reference nodes, and
-	// points at the referenced definition inside the same tree.
-	// [SchemaNode.Schema] emits that definition when the tree being converted
-	// does not define the name itself, which is what lets a node extracted at
-	// any depth convert to a working schema. It is invisible otherwise:
-	// hand-built nodes leave it nil (a dangling reference stays a loud parse
-	// error), copies and slice extractions carry it, and a node rebuilt
-	// field-by-field drops it and thereafter behaves hand-built.
+	// points at the referenced definition inside the same tree. Schema emits
+	// that definition when the converted tree does not define the name
+	// itself, which is what lets a node extracted at any depth convert.
+	// Hand-built nodes leave it nil, copies carry it, and a node rebuilt
+	// field-by-field drops it.
 	refTarget *SchemaNode
 
-	// present records which attributes were written, which the fields
-	// themselves cannot. An attribute whose body is the field's zero ("", [],
-	// 0) is indistinguishable from one nobody wrote. `Doc != ""` /
-	// `len(Aliases) > 0` / `Size != 0` each mean two things, and each drops
-	// exactly the value written as the zero. It is unexported because a
-	// hand-composed node has no empty-doc to express (the distinction exists
-	// only for parsed text) and an exported companion would be new API.
-	//
-	// We record presence only where the attribute is consumed, and consult it
-	// per attribute rather than as one rule, because the authority differs by
-	// placement. Where Apache Avro has the placement, its emission condition
-	// governs, and those conditions differ. doc emits when non-null
-	// (Schema.java:1039/:1154/:1367/:1062), so an empty doc survives. aliases
-	// emits when non-empty (:886, :1070), so an empty list is dropped even on a
-	// binding kind. Where neither reference has the placement, i.e. a
-	// structural key on a kind that does not bind it, our own stray-routing
-	// posture governs: as-written is the key's only surface, so it must survive
-	// the rebuild rather than reaching neither surface.
+	// present records which attributes were written, which the fields alone
+	// cannot: a doc written as "" or an aliases written as [] is
+	// indistinguishable from one nobody wrote. It is unexported because a
+	// hand-built node has no empty doc to express. We consult it per
+	// attribute, since the authority differs: Apache Avro emits doc when
+	// non-null, so an empty doc survives, and aliases when non-empty, so an
+	// empty list is dropped. A structural key on a kind that does not bind it
+	// survives as written, since nothing else carries it.
 	present presenceSet
 
 	// refNS is the namespace scope refTarget was resolved in. We record it
@@ -149,7 +137,7 @@ type SchemaField struct {
 	//   - int schemas give int32, long schemas give int64. We reject
 	//     out-of-range defaults at parse.
 	//   - float schemas give float32, double float64. Overflows narrow to
-	//     ±Inf; NaN, ±Inf, and a float-syntax "-0.0" round-trip. An
+	//     +/-Inf; NaN, +/-Inf, and a float-syntax "-0.0" round-trip. An
 	//     integer-syntax "-0" is the sign-less integer 0 and reads as +0.0
 	//     (matching Java and fastavro), though the wire encoder writes -0.0
 	//     for it.
@@ -171,10 +159,9 @@ type SchemaField struct {
 	Order      string   // sort order: "ascending" (default), "descending", or "ignore"
 	Doc        string   // documentation string
 
-	// docSet is the field-level twin of [SchemaNode]'s: a field's "doc"
-	// key written as the empty string is a written doc, and Apache Avro
-	// emits it (Schema.java:1062 asks f.doc() != null). See the SchemaNode
-	// field for why the state is hidden.
+	// docSet is the field-level twin of SchemaNode's present: a field's
+	// "doc" written as the empty string is a written doc, and Apache Avro
+	// emits it.
 	docSet bool
 
 	// Props holds custom (non-reserved) field properties; numbers decode as
@@ -271,14 +258,11 @@ func (n *SchemaNode) ExpandReferences() *SchemaNode {
 // hundreds.
 const maxExpandedNodes = 1 << 18
 
-// expander carries one ExpandReferences run: the name graph's verdicts, then
-// the copy that acts on them.
-//
-// The three passes are separate because each needs the previous one's answer
-// for the whole tree. Cycles decide which references may be followed; that set
-// decides what a name's expanded size is; that total decides whether anything
-// expands at all. Each pass walks every definition once (memoized per name), so
-// all three are linear in the tree.
+// expander carries one ExpandReferences run. The three passes are separate
+// because each needs the previous one's answer for the whole tree: cycles
+// decide which references may be followed, that set decides a name's
+// expanded size, and that total decides whether anything expands. Each pass
+// is linear in the tree.
 type expander struct {
 	table  map[string]*SchemaNode // fullname -> definition
 	cyclic map[string]bool        // names that reach themselves; never expanded
@@ -291,7 +275,7 @@ type expander struct {
 // resolve returns the definition n names and the fullname to key it by, or nil
 // when n is not a bare reference to anything. n's own tree wins, then the
 // [Schema.Root] stamp, the order [SchemaNode.Schema] splices in, so the two
-// surfaces cannot bind one reference to different definitions. A stamped target
+// paths cannot bind one reference to different definitions. A stamped target
 // from outside the tree joins the table, so every later pass sees it.
 func (x *expander) resolve(n *SchemaNode, ns string) (*SchemaNode, string) {
 	if !nodeCarriesOnlyType(n) {
@@ -314,16 +298,11 @@ func (x *expander) resolve(n *SchemaNode, ns string) (*SchemaNode, string) {
 	return t, fn
 }
 
-// markCycles fills x.cyclic with a name from every reference cycle, by DFS over
-// the name graph: a reference to a name already open on the path is a back
-// edge, and its head goes in the set. Every cycle contains a back edge under any
-// DFS, so cutting the heads cuts every cycle, which is what makes the follow in
-// copy terminate without a per-path guard of its own.
-//
-// The set is a superset of "on a cycle" only in exotic graphs, and being
-// conservative only leaves a reference unexpanded. What matters is that we
-// compute one set, once, so the answer does not depend on where a reference
-// sits.
+// markCycles fills x.cyclic with a name from every reference cycle, by DFS
+// over the name graph: a reference to a name already open on the path is a
+// back edge, and its head goes in the set. Cutting the heads cuts every
+// cycle, so the follow in copy terminates. The set can be a superset of
+// "on a cycle" in exotic graphs, which only leaves a reference unexpanded.
 func (x *expander) markCycles(n *SchemaNode, ns string, depth int) {
 	if n == nil || depth > maxSchemaJSONDepth {
 		return
@@ -503,7 +482,7 @@ func (s *Schema) Root() *SchemaNode {
 	table := fixupNameRefDefaults(&n)
 	// We stamp each name-reference node with its resolved target so an
 	// extracted subtree converts even when the definition lives outside it. It
-	// is the same table the default fixup resolved through, so the two surfaces
+	// is the same table the default fixup resolved through, so the two paths
 	// cannot bind a reference differently.
 	stampNameRefs(&n, table, "")
 	return &n
@@ -573,12 +552,10 @@ func validUTF8(s string) string {
 var jsonMarshalerType = reflect.TypeFor[json.Marshaler]()
 
 // treeValueMarshalOpaque reports whether v defines its own JSON form: a
-// MarshalJSON/MarshalText method, or json.Number, which encoding/json
-// special-cases as a number rather than a string. We leave such values' marshal
-// semantics untouched: the fixups and the canonicalizing render copy skip them,
-// and the composition walkers treat them as opaque leaves. The assertions use
-// the value's own method set, matching what encoding/json consults for an
-// interface-carried (unaddressable) value.
+// MarshalJSON or MarshalText method, or json.Number. The fixups and the
+// canonicalizing copies leave such values alone. The assertions use the
+// value's own method set, as encoding/json does for an interface-carried
+// value.
 func treeValueMarshalOpaque(v any) bool {
 	switch v.(type) {
 	case json.Number, json.Marshaler, encoding.TextMarshaler:
@@ -626,28 +603,17 @@ func canonicalStringKeyMap(t reflect.Type) bool {
 // interface.
 var errBadMapKey = errors.New("avro: SchemaNode default/property value contains a map whose key type has no JSON object-key form (not a string kind, an integer kind, or a usable encoding.TextMarshaler)")
 
-// mapKeyName returns the JSON object name we give map key k. It is the one
-// answer to that question: the budget walk charges it and both canonicalizing
-// copies emit it, so the name cannot depend on which encoding/json
-// implementation the toolchain ships. The v1 implementation (Go 1.26) and the
-// v2 one (Go 1.27) disagree on two of these arms.
-//
-// A key with a MarshalText method is named by that text whatever its kind.
-// That is v2's rule; v1 skipped the method for string kinds only, while
-// honoring it for every other kind. A nil pointer key is named "" without
-// calling the method, as both implementations do, because calling it
-// dereferences nil inside the very walk that exists to make an arbitrary tree
-// safe to marshal. A string kind without the method is its raw string. An
-// integer kind is its decimal.
-//
-// Everything else has no name. A float has no single text form, and NaN has
-// none at all, so we keep v1's refusal where v2 formats one. encoding/json's
-// own resolver panics on a nil interface key; we return an error instead.
-//
-// The name comes back as written. The copies replace invalid UTF-8 in it
-// (validUTF8), and the walk charges the raw form, which is exact for a map we
-// leave opaque and an over-charge for one we canonicalize, the safe direction
-// for a cap.
+// mapKeyName returns the JSON object name we give map key k. The budget walk
+// charges it and both canonicalizing copies emit it, so the name cannot
+// depend on which encoding/json implementation the toolchain ships; v1 (Go
+// 1.26) and v2 (Go 1.27) disagree on two arms. A key with a MarshalText
+// method is named by that text whatever its kind (v2's rule; v1 skipped the
+// method for string kinds). A nil pointer key is named "" without calling
+// the method. A string kind is its raw string and an integer kind its
+// decimal. Everything else has no name: a float has no single text form, so
+// we keep v1's refusal where v2 formats one, and a nil interface key errors
+// where encoding/json panics. The name comes back as written; the copies
+// replace invalid UTF-8 in it.
 func mapKeyName(k reflect.Value) (string, error) {
 	if k.CanInterface() {
 		if tm, ok := k.Interface().(encoding.TextMarshaler); ok {
@@ -672,13 +638,12 @@ func mapKeyName(k reflect.Value) (string, error) {
 	return "", errBadMapKey
 }
 
-// needsJSONFixupKind extends fixup detection to caller-typed values by reflect
-// kind, so a named `type B []byte` or named float behaves like the canonical
-// twin its marshal is indistinguishable from. We exempt marshal-opaque values,
-// since their marshal wins. One deliberate asymmetry: the value-preserving
-// fixups (±Inf, -0.0) apply to named float kinds, but the type-changing NaN to
-// "NaN" stays canonical-only, so a named float NaN keeps json.Marshal's loud
-// unsupported-value error instead of being silently stringified.
+// needsJSONFixupKind extends fixup detection to caller-typed values by
+// reflect kind, so a named []byte or named float behaves like its canonical
+// twin. Marshal-opaque values are exempt. The value-preserving fixups
+// (+/-Inf, -0.0) apply to named float kinds, but the type-changing NaN to
+// "NaN" stays canonical-only, so a named float NaN keeps json.Marshal's
+// unsupported-value error.
 func needsJSONFixupKind(v any) bool {
 	if treeValueMarshalOpaque(v) {
 		return false
@@ -729,22 +694,17 @@ func needsJSONFixupKind(v any) bool {
 }
 
 // applyJSONFixup converts the four values encoding/json cannot round-trip
-// through an Avro schema. In each case the naive marshal is silently wrong:
+// through an Avro schema:
 //
-//   - ±Inf becomes json.Number("±1e1000"). Go's encoder rejects ±Inf outright,
-//     so a Root() whose Default overflowed could not re-marshal at all; the
-//     literal re-parses to ±Inf via parseFloatAcceptOverflow.
-//   - NaN becomes the string "NaN". RFC 8259 has no NaN literal and no numeric
-//     trick recovers one. Re-parse restores NaN only for a float/double
-//     Default, where the schema type drives the coercion; in Props the string
-//     stays a string, since coercing it would reinterpret a user's intentional
-//     "NaN" (Parse never puts NaN there).
+//   - +/-Inf becomes json.Number("1e1000") or "-1e1000", which re-parses to
+//     Inf through parseFloatAcceptOverflow; Go's encoder rejects Inf outright.
+//   - NaN becomes the string "NaN", since JSON has no NaN literal. Re-parse
+//     restores NaN only for a float/double Default; in Props the string stays
+//     a string.
 //   - -0.0 becomes json.Number("-0.0"). Marshal renders "-0", integer syntax
 //     that re-parses as +0 and flips the rebuilt default's sign.
-//   - []byte becomes a codepoint-per-byte string. Marshal base64s it and the
-//     Avro parser reads that base64 text back as raw bytes, so {1,2,3} returns
-//     as the four bytes of "AQID". Props []byte follow the same Avro
-//     convention; pre-encode to a string if you want base64.
+//   - []byte becomes a codepoint-per-byte string. Marshal would base64 it and
+//     the Avro parser would read the base64 text back as raw bytes.
 func applyJSONFixup(v any) any {
 	switch tv := v.(type) {
 	case float64:
@@ -798,7 +758,7 @@ func applyJSONFixup(v any) any {
 // applyJSONFixupKind is needsJSONFixupKind's conversion twin: it rebuilds the
 // caller-typed value in canonical shape with the same fixups the exact-type
 // arms apply, and leaves marshal-opaque values and the no-canonical-twin
-// residuals untouched. A named float NaN deliberately falls through un-fixed
+// residuals untouched. A named float NaN falls through un-fixed
 // (needsJSONFixupKind never selects it) so the marshal error stays loud.
 func applyJSONFixupKind(v any) any {
 	if v == nil || treeValueMarshalOpaque(v) {
@@ -870,28 +830,14 @@ const maxSchemaJSONNodes = 1 << 20
 // see walkBudget. Far above any real schema's serialized size.
 const maxSchemaJSONBytes = 1 << 26
 
-// walkBudget is the per-walk resource budget we thread through toJSONWalk and
-// valueWalkLimit. Both axes decrement across the whole walk: structural nodes,
-// every Props value and SchemaField.Default, and the dedup conflict-comparison
-// marshals, so no single channel can blow either. maxSchemaJSONDepth guards a
-// third axis, and neither of these is redundant with it:
-//
-//   - nodes counts emitted JSON nodes (objects plus array elements, enum
-//     symbols and aliases included). Depth caps the longest container path but
-//     cannot see a shared-reference DAG. One *SchemaNode reached through both
-//     Items and Values, or one sub-value under two map keys, is tiny in memory
-//     yet fans out into an exponential tree when serialized, because neither
-//     toJSONWalk nor json.Marshal memoizes shared references. A ~40-node DAG
-//     demands 2^40 emitted nodes and OOMs before Schema's eventual Parse,
-//     whose depth pre-scan would have rejected the JSON, ever runs.
-//   - bytes counts emitted scalar payload. The node count cannot see a leaf's
-//     size: the tree holds strings and []string by reference, so assigning a
-//     multi-megabyte Doc charges exactly one node while json.Marshal re-expands
-//     it. K nodes sharing one L-byte string are O(K+L) in memory, K*L in the
-//     output.
-//
-// An over-budget walk stops with a clean error (dedup path) or a truncated
-// payload (bare path) rather than hanging, matching what the depth bound does.
+// walkBudget is the per-walk resource budget threaded through toJSONWalk and
+// valueWalkLimit. Both axes decrement across the whole walk, structural
+// nodes and Props values and Defaults alike. Neither is redundant with the
+// depth bound: nodes counts emitted JSON nodes, since a shared-reference
+// DAG is tiny in memory yet fans out exponentially when serialized; bytes
+// counts emitted scalar payload, since K nodes sharing one L-byte string are
+// O(K+L) in memory and K*L in the output. An over-budget walk stops with a
+// clean error rather than hanging.
 type walkBudget struct {
 	nodes int
 	bytes int
@@ -952,13 +898,10 @@ func (b *walkBudget) emitString(d *deduper, s string) string {
 	return ""
 }
 
-// emitStrings charges a structural []string payload, element count against
-// the node budget and content bytes against the byte budget, returning it, or
-// an empty slice (recording the over-budget error) when either is exhausted.
-// The truncation is deterministic so the dedup conflict comparison stays
-// meaningful: asymmetric truncation would make identical bodies compare
-// unequal, the hazard toJSONShared also addresses. Exhaustion is reported by
-// the post-comparison check, not as a spurious body conflict.
+// emitStrings charges a structural []string payload against both budgets and
+// returns it, or an empty slice, recording the over-budget error, when
+// either is exhausted. The truncation is deterministic so the dedup conflict
+// comparison stays meaningful.
 func (b *walkBudget) emitStrings(d *deduper, ss []string) []string {
 	if !b.takeNodes(len(ss)) {
 		d.fail(errSchemaTreeNodes())
@@ -1018,18 +961,11 @@ const (
 )
 
 // marshalEmitLen reports how many bytes json.Marshal will emit for a value
-// that defines its own JSON form, and whether it is such a value at all.
-// json.Marshal consults json.Marshaler first, then encoding.TextMarshaler,
-// so this checks them in that order. json.Number is deliberately *not* here:
-// it is a string-kind value the String arm already charges by content.
-//
-// Measuring costs one call to the caller's own method, charged and dropped.
-// The walk stops at the first value that busts the budget, so a tree of N
-// over-budget marshalers materializes one image, not N, and retains none.
-//
-// A method returning an error is left uncharged and unhandled: json.Marshal
-// will surface that same error, and inventing a budget verdict for a value
-// that will never be emitted would reject the tree for the wrong reason.
+// that defines its own JSON form, checking json.Marshaler then
+// encoding.TextMarshaler in json.Marshal's order. json.Number is not here:
+// the String arm charges it by content. Measuring costs one call to the
+// caller's method, charged and dropped. A method returning an error is left
+// uncharged, since json.Marshal will return that same error.
 func marshalEmitLen(rv reflect.Value, limit int) (int, bool) {
 	if !rv.IsValid() || !rv.CanInterface() {
 		return 0, false
@@ -1060,13 +996,9 @@ func marshalEmitLen(rv reflect.Value, limit int) (int, bool) {
 
 // jsonInvalidUTF8EmitLen is what marshalSchemaTree writes for one invalid
 // UTF-8 byte in a string it receives uncanonicalized: a struct field, or text
-// a marshaler returned. The v1 encoding/json (Go 1.26) writes a six-byte
-// backslash-u escape; the v2 implementation, the default from Go 1.27, writes
-// the three raw bytes of U+FFFD. We measure it once rather than restate it,
-// so a toolchain that changes the spelling again moves the charge with it. A
-// string we canonicalize never carries an invalid byte (validUTF8), so for
-// those the charge is exact under v2 and over by three per byte under v1,
-// the safe direction for a cap.
+// a marshaler returned. v1 encoding/json writes a six-byte escape; v2, the
+// default from Go 1.27, writes the three raw bytes of U+FFFD. We measure it
+// once so a toolchain that changes the spelling moves the charge with it.
 var jsonInvalidUTF8EmitLen = func() int {
 	out, err := marshalSchemaTree(string([]byte{0x80}))
 	if err != nil || len(out) < 2 {
@@ -1101,18 +1033,10 @@ func asciiEscapedLen(b byte) int {
 }
 
 // jsonEscapedLen reports how many bytes the emitter writes for s's content
-// (what lands between the quotes), and stops once the running total passes
-// limit, returning a value greater than it.
-//
-// We count; we never build, because measuring by emitting would allocate the
-// image the budget exists to prevent. That is the one reason we restate the
-// escape rules here instead of delegating to marshalSchemaTree. An executed
-// differential over the emitter's complete single-byte domain plus every
-// multi-byte case holds the restatement to it (census Q9).
-//
-// The early exit bounds the scan by the budget rather than the input: escaping
-// never shrinks a string, so the total passes limit within limit+1 input
-// bytes. A hostile 1 GiB string is abandoned after ~64 MiB.
+// between the quotes, stopping once the running total passes limit. We
+// count rather than emit, since emitting would allocate the image the budget
+// exists to prevent, which is why the escape rules are restated here. The
+// early exit bounds the scan by the budget rather than the input.
 func jsonEscapedLen(s string, limit int) int {
 	n := 0
 	for i := 0; i < len(s); {
@@ -1207,32 +1131,16 @@ func compactedEmitLen(out []byte, limit int) int {
 	return n
 }
 
-// valueWalkLimit walks an arbitrary user-supplied Props value or
-// SchemaField.Default the way json.Marshal will, returning a non-OK code when
-// it is unsafe to serialize. Neither jsonSerializableValue nor json.Marshal
-// bounds anything, so we enforce three orthogonal limits here:
-//
-//   - Depth (depthLeft): the longest container path. Nested far enough, the
-//     fixup walk or json.Marshal overflows the stack uncatchably (recover
-//     cannot catch that) before Schema's eventual Parse can reject it.
-//     depthLeft charges the structural nesting already accrued, so the total
-//     marshaled nesting stays within toJSONWalk's one ceiling.
-//   - Expansion (b.nodes, shared with toJSONWalk): the nodes json.Marshal will
-//     emit. A value sharing a sub-value across sibling paths is shallow yet
-//     fans out into a 2^depth tree (see walkBudget), invisible to the depth
-//     bound. Decrementing on every node also terminates the walk itself, so it
-//     can neither overflow its own stack nor hang on a shared-reference DAG or
-//     a cyclic Go type (type P *P).
-//   - Payload size (b.bytes, shared likewise): every emitted scalar, meaning
-//     string and json.Number content, []byte content, map keys, and struct
-//     field names. Huge or widely-shared leaves are small in memory yet expand
-//     past it in the output, invisible to the node count.
-//
-// We mirror what json.Marshal recurses into (maps, slices, arrays, structs,
-// pointer/interface indirection), not just the map[string]any / []any shapes
-// [Schema.Root] produces, since a hand-built node or a SchemaFor
-// CustomType.Schema can store any Go value. []byte/[N]byte is a scalar, charged
-// by length rather than walked as a nested array.
+// valueWalkLimit walks an arbitrary Props value or SchemaField.Default the
+// way json.Marshal will, returning a non-OK code when it is unsafe to
+// serialize. Three limits apply: depth, since nested far enough the fixup
+// walk or json.Marshal overflows the stack uncatchably; expansion (b.nodes),
+// since a value sharing a sub-value across sibling paths fans out into a
+// 2^depth tree, and decrementing per node also terminates the walk on a
+// cyclic Go type; and payload size (b.bytes), since huge or widely shared
+// leaves are small in memory yet expand in the output. We mirror what
+// json.Marshal recurses into, not only the shapes Root produces, since a
+// hand-built node can store any Go value.
 func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 	if depthLeft < 0 {
 		return valueWalkTooDeep
@@ -1262,17 +1170,13 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 		}
 		return valueWalkLimit(rv.Elem(), depthLeft-1, b)
 	case reflect.Map:
-		// We name every key ourselves (mapKeyName), so the charge is for the
-		// name we emit, a key we cannot name is refused here rather than
-		// forwarded to encoding/json, and two keys that would share one
-		// object name are refused rather than silently collapsed, since a
-		// JSON object with a repeated name reads back as whichever member
-		// came last. Distinct Go keys can share a name only through
-		// MarshalText, through an interface key's dynamic types, or once
-		// invalid UTF-8 becomes U+FFFD. A string or integer key without a
-		// method names itself, so those maps, nearly all of them, pay no
-		// bookkeeping: we track names for the first two shapes only, and
-		// check the third in a second pass only when a key was invalid.
+		// We name every key ourselves (mapKeyName), so a key we cannot name
+		// is refused here rather than forwarded to encoding/json, and two
+		// keys that would share one object name are refused rather than
+		// collapsed. Distinct Go keys can share a name only through
+		// MarshalText, an interface key's dynamic types, or invalid UTF-8
+		// becoming U+FFFD, so we track names for the first two shapes only
+		// and check the third in a second pass only when a key was invalid.
 		keyT := rv.Type().Key()
 		track := rv.Len() > 1 && (keyT.Kind() == reflect.Interface || keyT.Implements(textMarshalerType))
 		var seen map[string]struct{}
@@ -1392,45 +1296,26 @@ func boundedSerializableValue(d *deduper, depth int, b *walkBudget, v any) any {
 	return jsonSerializableValue(v)
 }
 
-// toJSONShared snapshots n's full JSON body (no dedup) for toJSONWalk's
-// conflict comparison, charging the shared budget rather than a fresh one. A
-// named type re-occurring as a distinct pointer with an identical body costs a
-// 2x re-marshal of its subtree: O(k*w) for k copies of a w-node body. The dedup
-// walk charges only 1 node per re-occurrence, since it emits a reference, not
-// the body. The outer budget alone would leave k*w unbounded even though the
-// emitted schema is tiny, so sharing caps the comparison work too. On
-// exhaustion the walk returns truncated output and the caller reports
-// over-budget rather than a spurious conflict, since asymmetric truncation of n
-// vs prev could make identical bodies compare unequal.
+// toJSONShared snapshots n's full JSON body, no dedup, for toJSONWalk's
+// conflict comparison, charging the shared budget. The dedup walk charges
+// one node per re-occurrence, so the outer budget alone would leave k copies
+// of a w-node body costing k*w in comparison work. On exhaustion the caller
+// reports over-budget rather than a spurious conflict, since asymmetric
+// truncation could make identical bodies compare unequal.
 func (n *SchemaNode) toJSONShared(b *walkBudget) any {
 	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0, b, false)
 }
 
-// toJSONWalk is the cycle-aware walker behind both the dedup walk and the bare
-// one. visited threads through every recursive call so Items/Values pointer
-// cycles terminate. A non-nil d tracks named-type definitions and reports
-// conflicting redefinitions; nil just emits the tree. enclosingNS is the scope
-// at this node's position. Named types emit their namespace relative to it
-// (omitted when inherited, "namespace":"" for a null-namespace type inside a
-// namespaced scope). Name references emit the fullname, so they re-bind
-// position-independently.
-//
-// depth is the structural nesting level. visited terminates only *pointer*
-// cycles, and a distinct-node-per-level chain (a hand-built array<array<...>> a
-// million deep) repeats none, so without this bound the walk overflows the
-// stack uncatchably before Parse's own bracket-nesting bound ever runs. The
-// same maxSchemaJSONDepth ceiling applies here; any tree shallow enough to
-// encode or decode sits far below it, since the codec's maxDepth is 4x smaller.
-//
-// stray is true when we reached n through a structural key its parent's kind
-// does not bind (a stray "items" on an "int", surfaced as-written by the
-// metadata walker), and transitively for everything below it. The wire parser
-// binds no names at those positions, so we render them verbatim while the dedup
-// consult skips them entirely: no registration, no
-// second-definition-to-reference rewrite, no conflict comparison. Otherwise a
-// definition-shaped stray body would stand in for, or spuriously conflict with,
-// the real definition of that fullname, and the rebuilt text would either fail
-// to re-parse or silently rewrite the as-written stray content.
+// toJSONWalk is the cycle-aware walker behind both the dedup walk and the
+// bare one. visited terminates Items/Values pointer cycles. A non-nil d
+// tracks named-type definitions and reports conflicting redefinitions.
+// enclosingNS is the scope at this node's position; named types emit their
+// namespace relative to it and name references emit the fullname. depth
+// bounds a distinct-node-per-level chain, which visited cannot see, at the
+// same ceiling as maxSchemaJSONDepth. stray is true when we reached n
+// through a structural key its parent's kind does not bind; the wire parser
+// binds no names there, so we render verbatim and the dedup skips it, or a
+// definition-shaped stray body would stand in for the real definition.
 func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, enclosingNS string, depth int, b *walkBudget, stray bool) any {
 	if depth > maxSchemaJSONDepth {
 		d.fail(fmt.Errorf("avro: SchemaNode tree nests deeper than the supported limit (%d)", maxSchemaJSONDepth))
@@ -1457,14 +1342,11 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		return nil
 	}
 	if _, cycle := visited[n]; cycle {
-		// Cycle through Items/Values back to n. Named types emit the fullname
-		// as a reference, the canonical Avro recursive shape. Unnamed cycles
-		// are an error in the dedup walker and nil-stable JSON in the bare
-		// one, so two equal cyclic subtrees still compare equal. Keyed on the
-		// fullname being expressible, not the short name: fullname "ns." (an
-		// empty short name with a namespace) is a valid reference target, while
-		// fullname "" has no spelling and stays the cycle error. A
-		// stray-reached name registers nothing, so it takes the error path too.
+		// A cycle through Items/Values back to n. Named types emit the
+		// fullname as a reference; unnamed cycles are an error in the dedup
+		// walker and nil-stable JSON in the bare one. Keyed on the fullname
+		// being expressible: "ns." is a valid reference target while "" has
+		// no spelling.
 		if isNamedKind(n.Type) && nodeFullname(n) != "" && !stray {
 			return nodeFullname(n)
 		}
@@ -1476,16 +1358,11 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	visited[n] = struct{}{}
 	defer delete(visited, n)
 
-	// Dedup: an already-emitted named type becomes a name ref; a redefinition
-	// with a different body is a conflict. We key by fullname, since the spec
-	// defines name equality on the fullname ("Names"), so two types sharing a
-	// short name across namespaces are not redefinitions. The reference is the
-	// fullname too: dotted re-binds exactly anywhere, and a null-namespace
-	// type's bare fullname re-binds via the parser's null-namespace fallback.
-	// A bare reference from inside a namespaced scope that also collides with
-	// an in-scope short name re-binds in-scope, the same ambiguity Java's
-	// getQualified/Names.get pair has, since references have no "namespace":""
-	// escape.
+	// Dedup: an already-emitted named type becomes a name reference, and a
+	// redefinition with a different body is a conflict. We key by fullname,
+	// as the spec defines name equality. A bare reference from inside a
+	// namespaced scope that collides with an in-scope short name re-binds
+	// in-scope, the same ambiguity Java has.
 	if d != nil && !stray && isNamedKind(n.Type) && nodeFullname(n) != "" {
 		if prev, exists := d.defined[nodeFullname(n)]; exists {
 			// We marshal-compare bodies only for *distinct* nodes: a named
@@ -1517,28 +1394,20 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// The namespace scope inside this node: a named type opens its own.
 	childNS := nsForChildren(n, enclosingNS)
 
-	// Name-reference resolution (the hidden Root stamp): a reference to a name
-	// this tree does not define emits the stamped definition at its first
-	// occurrence, through this same budgeted, cycle-checked, deduped recursion.
-	// It emits the fullname thereafter, so an extracted subtree is
-	// self-contained. Gated on d != nil, so conflict snapshots stay splice-free
-	// on both sides, and on !stray, since the wire parser binds no names at
-	// stray positions. A reference the tree *does* define locally, before or
-	// after this position, stays as-written and re-binds locally.
+	// A reference to a name this tree does not define emits the stamped
+	// definition at its first occurrence through this same recursion, so an
+	// extracted subtree is self-contained. Gated on d != nil so conflict
+	// snapshots stay splice-free, and on !stray. A reference the tree defines
+	// locally stays as written.
 	refType := n.Type
 	if d != nil && !stray && nodeRefTargetAgrees(n) && nodeIsNameRefShape(n) {
 		if fn := nodeFullname(n.refTarget); fn != "" && !d.localNames[fn] {
 			if _, emitted := d.defined[fn]; !emitted {
-				// A fresh visited map: a recursive definition reaches
-				// back through the extraction point (splicing Node
-				// re-enters the union the outer walk is still inside),
-				// which the shared map's cycle arm would misread as an
-				// unnamed cycle. The revisit is finite: the target
-				// registers in d.defined before walking its children, so
-				// each name splices once and interior revisits end at the
-				// fullname arm. True cycles inside the target are still
-				// caught by the fresh map, and the shared depth and
-				// node/byte budgets bound the emission either way.
+				// A fresh visited map: a recursive definition reaches back
+				// through the extraction point, which the shared map would
+				// misread as an unnamed cycle. The revisit is finite because
+				// the target registers in d.defined before walking its
+				// children, and the shared budgets bound the emission.
 				spliced := n.refTarget.toJSONWalk(make(map[*SchemaNode]struct{}), d, enclosingNS, depth, b, false)
 				// A wrapped reference's custom properties ride onto the
 				// spliced definition, definition-wins and reserved keys
@@ -1565,7 +1434,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			}
 			// Already emitted (an earlier splice, or the walk passed the
 			// definition): reference it by fullname, the spelling that
-			// re-binds exactly regardless of the standalone parse's
+			// re-binds regardless of the standalone parse's
 			// namespace scope at this position.
 			refType = fn
 		}
@@ -1637,16 +1506,14 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		// explicit-empty form, which the value alone cannot show.
 		m["namespace"] = n.Namespace
 	}
-	// Where a kind binds aliases, Apache Avro's condition is non-empty
-	// (Schema.java:886) and an empty list is deliberately dropped. Where it
-	// does not bind, there is no such condition and the stray-routing posture
-	// applies: as-written is the key's only surface, so presence decides.
+	// Where a kind binds aliases, Apache Avro emits only a non-empty list.
+	// Where it does not bind, presence decides, since the
+	// key is carried nowhere else.
 	if len(n.Aliases) > 0 || (n.present.has(presAliases) && !strayKeyBinds(n.Type, "aliases")) {
 		m["aliases"] = b.emitStrings(d, n.Aliases)
 	}
-	// doc emits when *written*, not when non-empty: an empty doc is a doc, and
-	// Apache Avro emits it (Schema.java:1039/:1154/:1367 ask getDoc() != nil).
-	// That per-attribute difference from aliases is why presence is asked here.
+	// doc emits when written, not when non-empty: an empty doc is a doc, and
+	// Apache Avro emits it.
 	if n.Doc != "" || n.present.has(presDoc) {
 		m["doc"] = b.emitString(d, n.Doc)
 	}
@@ -1701,7 +1568,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			}
 			if f.HasDefault || f.Default != nil {
 				// Inverse of the metadata-API normalization: a Root() of
-				// "default":1e1000 holds ±Inf, which json.Marshal rejects,
+				// "default":1e1000 holds +/-Inf, which json.Marshal rejects,
 				// so applyJSONFixup puts the literal back.
 				fd["default"] = boundedSerializableValue(d, depth, b, f.Default)
 			}
@@ -1800,14 +1667,9 @@ func jsonNumericInt(v any) (int, bool) {
 }
 
 // getString reads m[key] into dst when the body is a JSON string, and
-// reports whether it did. The bool is the attribute's presence as distinct
-// from its value: an empty string sets dst to the field's own zero, so the
-// field alone can no longer say whether the key was written.
-//
-// We look up by exact name. Reserved attribute names match only their exact
-// lowercase spelling, and a case-variant key is an ordinary custom property.
-// (Java's reserved sets are exact-lowercase HashSets, Schema.java:175-176;
-// fastavro and goavro read exact names too.)
+// reports whether it did, which is the attribute's presence as distinct from
+// its value. Reserved names match only their exact lowercase spelling, as in
+// Java and fastavro; a case variant is an ordinary custom property.
 func getString(m map[string]any, key string, dst *string) bool {
 	s, ok := m[key].(string)
 	if ok {
@@ -1842,27 +1704,14 @@ func isNamedKind(typ string) bool {
 	return typ == "record" || typ == "error" || typ == "enum" || typ == "fixed"
 }
 
-// coerceMetadataDefault is the metadata-API parallel of [coerceDefault]
-// (schema.go): it puts a parsed-JSON default into the Go form the wire-encode
-// pipeline materializes, so SchemaField.Default's type matches the wire bytes
-// rather than the raw JSON shape.
-//
-//   - int/long/float/double become the schema-width Go type (int32/int64/
-//     float32/float64), matching Java's JacksonUtils.toObject. Parse rejects
-//     out-of-range integer defaults so the integer narrowing is lossless;
-//     float32 narrowing of a finite overflow surfaces ±Inf, as the wire does.
-//   - a string default on bytes/fixed becomes []byte via Avro's
-//     codepoint-per-byte mapping, mirroring [convertDefaultBytes]. Without it,
-//     the natural consumer pattern `defs[f.Name] = f.Default; s.Encode(defs)`
-//     works for every bytes/fixed default except fixed+uuid, whose encoder arm
-//     hard-fails parseUUID on the 16-codepoint wire-form string.
-//
-// We walk unions (Avro 1.12 lets a default match any branch) and nested
-// record/array/map types. A string-form numeric default coerces to float only
-// on an outer float/double field, Java parity with parseField's text-to-Double
-// coercion. Never on a union branch, matching Java, avro-rs, and goavro: we
-// reject union+numeric-string defaults at parse, so they never arrive here.
-// Everything else passes through unchanged.
+// coerceMetadataDefault is the metadata parallel of coerceDefault: it puts a
+// parsed-JSON default into the Go form the wire pipeline materializes, so
+// SchemaField.Default's type matches the wire bytes. Numbers become the
+// schema-width Go type, as in Java. A string default on bytes/fixed becomes
+// []byte through the codepoint mapping, so encoding f.Default back works for
+// fixed+uuid too. We walk unions and nested containers. A string-form
+// numeric default coerces to float only on an outer float/double field,
+// never a union branch, as in Java.
 func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode, ns string) any {
 	if t == nil {
 		return val
@@ -1898,19 +1747,11 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode,
 		return val
 	}
 	if t.Type == "int" {
-		// int defaults surface as int32 so Default's Go type matches both the
-		// wire width and the user's natural field type.
-		//
 		// Every numeric form routes through the range-checked defaultAsInt32.
-		// We reject a top-level out-of-int32 default at parse. During
-		// union-branch selection a wider sibling makes the schema parse-valid,
-		// so this can run on a value parse never rejected. A blind int64-to-
-		// int32 cast would wrap it (3000000000 becomes -1294967296).
-		// branchAcceptsDefault would then take the int branch the wire
-		// rejects, picking a different branch than the wire auto-fill and
-		// corrupting Root().Default and the rebuild with it. Leaving the
-		// out-of-range value alone lets defaultAsInt32 reject it so selection
-		// falls to the wider sibling, as the wire does.
+		// During union-branch selection a wider sibling makes the schema
+		// parse-valid, so this can run on an out-of-int32 value; a blind cast
+		// would wrap it and select the int branch the wire rejects. Leaving it
+		// alone lets defaultAsInt32 reject so selection falls to the sibling.
 		switch val := val.(type) {
 		case int32:
 			return val
@@ -1940,18 +1781,11 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode,
 		return val
 	}
 	if t.Type == "float" || t.Type == "double" {
-		// Width-faithful narrowing per Java's JacksonUtils.toObject: a float
-		// schema gives float32, a double gives float64. Default is then exactly
-		// what the wire encoder emits, finite overflows included
-		// ({"default":1e100, "type":"float"} gives float32(+Inf), matching the
-		// wire bits) as well as integer forms past the mantissa, which
-		// IEEE-round silently.
-		//
-		// Strings go through parseFloatAcceptOverflow inline rather than
-		// [defaultAsFloat], which is strict (no string arm) so it stays
-		// reusable at union-branch matching and encode. This arm is
-		// [coerceDefault]'s parseField-style text-to-float coercion, outer
-		// float/double only.
+		// Width-faithful narrowing, as in Java: a float schema gives float32,
+		// finite overflows and mantissa rounding included, so Default is what
+		// the wire encoder emits. Strings parse inline rather than through
+		// defaultAsFloat, which stays strict for union matching and encode;
+		// this is the outer-field text-to-float coercion.
 		var f float64
 		switch val := val.(type) {
 		case float64:
@@ -2101,7 +1935,7 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *Sche
 // the table. Name-referenced defaults, and defaults whose union contains a
 // name-ref branch, then materialize the way inline-typed siblings already do
 // via the synchronous coerce. We return the table for Root's reference
-// stamping, so both surfaces resolve through the identical name set.
+// stamping, so both paths resolve through the identical name set.
 func fixupNameRefDefaults(root *SchemaNode) map[string]*SchemaNode {
 	table := map[string]*SchemaNode{}
 	collectNamedTypes(root, table)
@@ -2113,14 +1947,10 @@ func fixupNameRefDefaults(root *SchemaNode) map[string]*SchemaNode {
 }
 
 // stampNameRefs records, on every node whose Type is a name reference that
-// resolves in table, the referenced definition (SchemaNode.refTarget).
-// Resolution is lookupNameRef, the same scopedRefKeys precedence every other
-// resolver derives from, at the reference's enclosing namespace scope, so the
-// stamp cannot bind differently than the wire or the default coercion did.
-// Descent is kind-bound like collectNamedTypes: a stray-surfaced body (an
-// "items" on an "int") neither defines nor references, so we stamp nothing
-// inside one. Root trees are JSON-derived and acyclic, and the parse's own
-// nesting cap bounds their depth, so the plain recursion terminates.
+// resolves in table, the referenced definition. Resolution is lookupNameRef
+// at the reference's enclosing scope, so the stamp cannot bind differently
+// than the wire did. Descent is kind-bound, so nothing inside a stray body
+// is stamped. Root trees are acyclic and depth-bounded by the parse.
 func stampNameRefs(n *SchemaNode, table map[string]*SchemaNode, ns string) {
 	if n == nil || len(table) == 0 {
 		return
@@ -2148,12 +1978,8 @@ func stampNameRefs(n *SchemaNode, table map[string]*SchemaNode, ns string) {
 
 // collectLocalNames gathers the fullnames of every named type defined in n's
 // tree, descending the same kind-bound structure the emission walk treats as
-// non-stray. Unlike collectNamedTypes it must survive arbitrary hand-built
-// input, because it runs at the start of [SchemaNode.Schema], before the
-// emission walk's own cycle and depth guards. So it carries its own: visited
-// terminates Items/Values pointer cycles, and depth stops chains past the
-// emission walk's own ceiling (names below it sit in a region the walk rejects
-// before any splice could consult them).
+// non-stray. It runs before the emission walk's own guards on arbitrary
+// hand-built input, so it carries its own cycle and depth guards.
 func collectLocalNames(n *SchemaNode, names map[string]bool, visited map[*SchemaNode]struct{}, depth int) {
 	if n == nil || depth > maxSchemaJSONDepth {
 		return
@@ -2184,18 +2010,10 @@ func collectLocalNames(n *SchemaNode, names map[string]bool, visited map[*Schema
 }
 
 // nodeCarriesNothingBut walks n's exported fields and reports whether every
-// one of them other than Type is zero, skipping the fields exempt reports as
-// carrying no loss.
-//
-// We derive the walk from the struct's field set rather than writing a
-// remembered list, which is the whole point for both callers. A hand-written
-// subset can always be missing a member, and a value in a forgotten field then
-// vanishes. Asking the field set cannot be. One walk rather than two, so a
-// later field cannot be seen by one question and overlooked by the other.
-//
-// We skip unexported state deliberately: it is derived bookkeeping, the
-// name-reference stamp and its scope, not as-written content, so it must not
-// force a different emission.
+// one other than Type is zero, skipping the fields exempt reports as carrying
+// no loss. We derive the walk from the struct's field set rather than a
+// written list, so a field added later cannot be overlooked. Unexported
+// state is derived bookkeeping, not as-written content, so it is skipped.
 func nodeCarriesNothingBut(n *SchemaNode, exempt func(*SchemaNode, string) bool) bool {
 	rv := reflect.ValueOf(n).Elem()
 	t := rv.Type()
@@ -2262,18 +2080,11 @@ func presenceBitFor(field string) (presenceSet, bool) {
 
 // nodePresenceSet reports whether the named exported field carries content
 // its value cannot show: an attribute written as the field's own zero.
-//
-// Without it the emptiness walk above and the emitter disagree by
-// construction. The walk asks IsZero, so a doc written as "" reads as an empty
-// node and the shortcut collapses it to a bare type name, discarding the very
-// attribute we taught the emitter to write. The two questions ("does this node
-// carry anything" and "does this node emit anything") must read the same state,
-// or the answer depends on which one runs first.
-//
-// We key it by field name so it composes with the exemption sets rather than
-// overriding them. At a name-reference splice Doc and LogicalType are exempt
-// usage-site attributes (NOT_BUGS #25), so we ignore their presence there
-// exactly as we ignore their value.
+// Without it the emptiness walk and the emitter disagree, since a doc
+// written as "" reads as an empty node and collapses to a bare type name.
+// It is keyed by field name so it composes with the exemption sets: at a
+// name-reference splice Doc and LogicalType are exempt usage-site
+// attributes, so we ignore their presence as we ignore their value.
 func nodePresenceSet(n *SchemaNode, field string) bool {
 	b, ok := presenceBitFor(field)
 	return ok && n.present.has(b)
@@ -2302,22 +2113,14 @@ func bareEmissionExempt(n *SchemaNode, field string) bool {
 }
 
 // nameRefUsageSiteExempt classifies the fields a node may carry and still be
-// emitted as a pure name reference. Their loss at a reference's usage site is
-// already adjudicated, so blocking on them would convert a documented silent
-// drop into a hard parse error.
-//
-//   - Doc, Aliases, Namespace and LogicalType are reserved usage-site
-//     attributes on a wrapped reference ({"type":"Inner","doc":"x"}). A
-//     definition cannot carry a second name, namespace or doc per usage site,
-//     so the splice drops them by design.
-//   - Props is the wrapper's custom properties, which the splice merges onto
-//     the definition (definition-wins, reserved keys dropped).
-//
-// Every other field blocks, so the node renders as-written instead of splicing
-// and the re-parse judges the hybrid loudly. Precision and Scale are *not*
-// exempt despite also being usage-site attributes. The parse routes an
-// unconsumed precision/scale to Props, so a non-zero value here can only come
-// from you writing the field directly, and that write must not vanish.
+// emitted as a pure name reference. Doc, Aliases, Namespace and LogicalType
+// are usage-site attributes on a wrapped reference that the splice drops,
+// since a definition cannot carry a second doc per usage site, and Props are
+// the wrapper's custom properties, which the splice merges onto the
+// definition. Every other field blocks, so the node renders as written and
+// the re-parse judges the hybrid. Precision and Scale are not exempt: the
+// parse routes an unconsumed pair to Props, so a value here can only come
+// from you writing the field directly.
 func nameRefUsageSiteExempt(_ *SchemaNode, field string) bool {
 	switch field {
 	case "Doc", "Aliases", "Namespace", "LogicalType", "Props":
@@ -2334,36 +2137,20 @@ func nodeCarriesOnlyType(n *SchemaNode) bool {
 }
 
 // nodeIsNameRefShape reports whether n can be emitted as a pure name
-// reference, bare or wrapped with custom properties. It must carry no
-// structural, naming, or kind-specific keys of its own beyond the usage-site
-// attributes a splice is already documented to drop or merge. A stamped node
-// that fails this (you grafted content onto an extracted reference) renders
-// as-written instead of splicing, so nothing it carries is silently discarded;
-// the re-parse then judges the hybrid loudly.
+// reference, bare or wrapped with custom properties. A stamped node that
+// fails this renders as written instead of splicing, so nothing it carries
+// is discarded.
 func nodeIsNameRefShape(n *SchemaNode) bool {
 	return nodeCarriesNothingBut(n, nameRefUsageSiteExempt)
 }
 
 // nodeRefTargetAgrees reports whether n's stamped refTarget is still the type
-// n's exported Type names. The stamp is hidden state that survives a struct
-// copy, which is exactly how you extract a sub-node. If you then edit Type, you
-// would otherwise get the original spelling's definition spliced in, hidden
-// state silently beating the exported field you just set.
-//
-// We decide agreement by asking the resolver, lookupNameRef against a one-entry
-// table holding the stamped target, never by restating which spellings it
-// binds. That inherits every form scopedRefKeys admits and any later change to
-// it; a hand-written list under-accepts the day the resolver grows a form.
-//
-// The scope asked at is the stamp's own (refNS), not the walk's current one.
-// An extracted node is re-rooted at the null namespace, so asking at the walk's
-// scope would call a short-name reference stale purely for having been lifted
-// out of its namespace.
-//
-// Anything else, a primitive or a different name, means the node was edited
-// after Root() stamped it. The stamp is stale and we ignore it, and the node
-// behaves like a hand-built reference: binding to a definition the converted
-// tree provides, or dangling loudly.
+// n's exported Type names. The stamp survives a struct copy, which is how
+// you extract a sub-node, so if you then edit Type the stamp is stale and we
+// ignore it; the node then behaves like a hand-built reference. We ask the
+// resolver against a one-entry table rather than restate which spellings it
+// binds, at the stamp's own scope rather than the walk's, since an extracted
+// node is re-rooted at the null namespace.
 func nodeRefTargetAgrees(n *SchemaNode) bool {
 	t := n.refTarget
 	if t == nil {
@@ -2384,25 +2171,17 @@ func collectNamedTypes(n *SchemaNode, table map[string]*SchemaNode) {
 	// expressible (fullname "ns."), matching the wire builder's
 	// registration; fullname "" has no reference spelling to serve.
 	if n.Name != "" || (isNamedKind(n.Type) && nodeFullname(n) != "") { // record / enum / fixed
-		// Namespace is resolved at construction (see [SchemaNode]), so the
-		// fullname is direct: no inheritance walk needed here. We register
-		// exactly what the wire builder registers, every type under its
-		// fullname *only*. A null-namespace type's fullname is its bare name,
-		// so it owns the bare key. Also registering namespaced types under
-		// their short name would make the bare key last-walked-wins, binding a
-		// bare reference at null-namespace scope to a different type than the
-		// wire bound whenever short names collide.
+		// Namespace is resolved at construction, so the fullname is direct.
+		// We register exactly what the wire builder registers, every type
+		// under its fullname only; also registering short names would make
+		// the bare key last-walked-wins whenever short names collide.
 		table[nodeFullname(n)] = n
 	}
-	// We descend only the structural fields the node's kind binds. The
-	// metadata walker surfaces stray container keys as-written (a stray
-	// "items" on an "int" populates Items), so an unconditional descent would
-	// register a definition-shaped stray body under its fullname. The map is
-	// last-write-wins, so a stray walked after the real definition would
-	// silently become the table's answer for that name, coercing
-	// name-referenced defaults through a body the wire never bound. Branches
-	// stay unconditional: only genuine union parsing populates them (no JSON
-	// key routes a stray there).
+	// We descend only the structural fields the node's kind binds: the
+	// metadata walker carries stray container keys as written, so an
+	// unconditional descent would register a definition-shaped stray body
+	// under its fullname and, being last-write-wins, could replace the real
+	// definition. Branches stay unconditional, since no stray routes there.
 	if n.Type == "array" && n.Items != nil {
 		collectNamedTypes(n.Items, table)
 	}
@@ -2442,14 +2221,10 @@ func coerceTreeDefaults(n *SchemaNode, table map[string]*SchemaNode, ns string) 
 	}
 }
 
-// defaultMatchesBytesOrFixedKind mirrors the wire-encode pipeline's
-// validateLeaf for "bytes" / "fixed" branches: codepoint range
-// (validateAvroByteString) and, for "fixed", the exact-rune-count size match.
-// The metadata-side branch selection must enforce the same codepoint range and
-// fixed-size constraint as the wire path. Otherwise [fixed:8,"string"] with a
-// 4-char default would metadata-match fixed (string-kind only) while the wire
-// matches string, since the size check rejects fixed. Same shape as the
-// convertDefaultBytes/validateDefault delegation.
+// defaultMatchesBytesOrFixedKind mirrors the wire pipeline's validateLeaf for
+// bytes and fixed: the codepoint range and, for fixed, the exact size.
+// Without the size check, [fixed:8,"string"] with a 4-char default would
+// metadata-match fixed while the wire matches string.
 func defaultMatchesBytesOrFixedKind(t *SchemaNode, val any) bool {
 	switch v := val.(type) {
 	case string:
@@ -2469,24 +2244,14 @@ func defaultMatchesBytesOrFixedKind(t *SchemaNode, val any) bool {
 	return false
 }
 
-// branchAcceptsDefault reports whether the Avro type t natively accepts val as
-// a default, using the same Go-to-Avro compatibility validateDefault enforces
-// on the wire side. coerceMetadataDefault's union selection walks branches in
-// order and takes the first that accepts, as Java's parseField does.
-//
-// The numeric arms delegate to defaultAsInt32 / defaultAsInt64 /
-// defaultAsFloat, so both selectors apply identical predicates. float/double
-// accept any numeric input per the lossy-destination policy, so ["float","int"]
-// default 42 picks float on both surfaces, and they reject strings, since
-// Java's text-to-Double coercion fires only for an outer field type.
-// bytes/fixed accept a codepoint-mapped string or []byte.
-//
-// The structural arms recurse so per-element validity mirrors walkDefault:
-// record enforces required-field presence, array/map require every element to
-// accept. Without that, [{record needing X}, {record needing nothing}] with
-// default {} metadata-matches the first branch on type alone while the wire
-// picks the second, and type-switching on Default hands you a Go type
-// contradicting the decoded auto-fill.
+// branchAcceptsDefault reports whether the Avro type t accepts val as a
+// default, with the same compatibility validateDefault enforces on the wire
+// side, so union selection picks the same branch on both sides. The
+// numeric arms delegate to the defaultAs helpers: float/double accept any
+// numeric input and reject strings. The structural arms recurse, so a record
+// enforces required-field presence and containers require every element to
+// accept; otherwise [{record needing X}, {record needing nothing}] with
+// default {} would metadata-match the first while the wire picks the second.
 func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, ns string) bool {
 	// Resolve a bare name-reference if the caller supplied a name-table.
 	if resolved := lookupNameRef(t, table, ns); resolved != nil {
@@ -2515,13 +2280,8 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, 
 		if !ok {
 			return false
 		}
-		// The wire's validateLeaf rejects non-member symbols, so enum needs
-		// its own arm. The string arm would accept any string, and a union
-		// [enum:{A,B}, bytes] with default "Z" would metadata-match enum
-		// while the wire rejects it and picks bytes. Membership is
-		// unconditional, so an empty enum accepts nothing and the walk falls
-		// through exactly as the wire does. A name-referenced enum arrives
-		// here only after lookupNameRef, with its symbols final.
+		// The wire rejects non-member symbols, so enum needs its own arm; the
+		// string arm would accept any string. An empty enum accepts nothing.
 		return slices.Contains(t.Symbols, sym)
 	case "bytes", "fixed":
 		return defaultMatchesBytesOrFixedKind(t, val)
@@ -2540,17 +2300,12 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, 
 				}
 				continue
 			}
-			// We coerce the child before the accept-check, as the wire selector
-			// does. validateLeaf's container arms rewrite each child via
-			// coerceDefault, so a string in a nested float/double field becomes
-			// a float and the wire selects the container branch. Without the
-			// twin coercion here, this selector would reject that field and
-			// pick a later branch. coerceMetadataDefault returns fresh
-			// containers, so a rejected sibling's value is never mutated, and
-			// the coerced value is what Default surfaces, so selection and
-			// surfacing agree. Deliberately *not* applied to the scalar
-			// float/double arm, so a direct scalar branch (["double","string"]
-			// default "5") still rejects the numeric one (NOT_BUGS #10).
+			// We coerce the child before the accept check, as the wire
+			// selector does, so a string in a nested float/double field
+			// selects the container branch on both sides. Fresh containers
+			// keep a rejected sibling's value unmutated. The scalar
+			// float/double arm is not coerced, so ["double","string"] default
+			// "5" still picks string.
 			fv = coerceMetadataDefault(fv, &f.Type, table, childNS)
 			if !branchAcceptsDefault(&f.Type, fv, table, childNS) {
 				return false
@@ -2597,13 +2352,9 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, 
 	return false
 }
 
-// firstMetadataBranchAcceptingDefault returns the first branch of union t whose
-// [branchAcceptsDefault] accepts val, name-refs resolved, or nil. The
-// *SchemaNode twin of [firstUnionBranchAcceptingDefault]: both implement Avro's
-// "first matching branch wins" rule (1.12 relaxed "first branch" to "any
-// branch", with a deterministic first-match tie-break) on their own side of the
-// dual-namespace boundary. [coerceMetadataDefault] uses the returned branch to
-// recurse; [branchAcceptsDefault]'s union arm only needs nil vs non-nil.
+// firstMetadataBranchAcceptingDefault returns the first branch of union t
+// whose branchAcceptsDefault accepts val, name refs resolved, or nil: the
+// *SchemaNode twin of firstUnionBranchAcceptingDefault.
 func firstMetadataBranchAcceptingDefault(t *SchemaNode, val any, table map[string]*SchemaNode, ns string) *SchemaNode {
 	for i := range t.Branches {
 		branch := &t.Branches[i]
@@ -2622,13 +2373,11 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 
 	getString(m, "type", &n.Type)
 	n.present.setIf(getString(m, "name", &n.Name), presName)
-	// Namespace resolves at build. An explicit attribute wins, the
-	// explicit-empty "namespace":"" null-namespace form included, which is a
-	// *different* type than one inheriting the enclosing namespace per the
-	// spec's fullname rules. An undotted named type without the attribute
-	// inherits the enclosing scope. A dotted name carries its own namespace; we
-	// preserve any attribute alongside it as-written for fidelity but ignore
-	// it, exactly as the parser does.
+	// Namespace resolves at build. An explicit attribute wins, the explicit
+	// "namespace":"" form included, which is a different type than one
+	// inheriting the enclosing namespace. A dotted name carries its own
+	// namespace; we preserve any attribute beside it but ignore it, as the
+	// parser does.
 	explicitNS, hasExplicitNS := "", false
 	if s, ok := m["namespace"].(string); ok {
 		explicitNS, hasExplicitNS = s, true
@@ -2648,18 +2397,10 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 		n.Namespace = explicitNS
 	}
 	childNS := nsForChildren(&n, parentNS)
-	// getString consumes only a string body, so recording presence off the same
-	// read keeps the two in step: a non-string doc/logicalType routes elsewhere
-	// (dropped, and Props respectively) and must not count as written.
-	//
-	// We record doc on every kind, not only the ones Apache Avro reads it on.
-	// The authority for a placement is whichever reference *has* that
-	// placement, and it governs empty and non-empty bodies alike. Apache Avro
-	// has no doc slot on a primitive or container so it cannot rule there, and
-	// we already side with fastavro by preserving {"type":"int","doc":"d"}.
-	// Taking the empty twin from Apache Avro's absence while the non-empty twin
-	// follows fastavro's presence would split one placement between two
-	// authorities.
+	// getString consumes only a string body, so recording presence off the
+	// same read keeps the two in step. We record doc on every kind: Apache
+	// Avro has no doc slot on a primitive or container, and we already side
+	// with fastavro by preserving {"type":"int","doc":"d"}.
 	n.present.setIf(getString(m, "doc", &n.Doc), presDoc)
 	n.present.setIf(getString(m, "logicalType", &n.LogicalType), presLogicalType)
 	// Precision/Scale hold validated decimal parameters only: consumption
@@ -2672,11 +2413,8 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	}
 	// We capture size/aliases/symbols through the same decodes the parser's
 	// arms run, so a structural field is set exactly when the parse consumes
-	// the key out of props. A malformed stray body (a mixed-type array, a
-	// non-integral number) rides to Props verbatim as its only surface;
-	// capturing a coerced image here would fabricate metadata appearing nowhere
-	// in the input. At bound positions the parse already validated the value,
-	// so these gates never decline there.
+	// the key. A malformed stray body rides to Props verbatim as its only
+	// surface.
 	sizeOK := false
 	if v, ok := m["size"]; ok {
 		if l, err := decodeLaxInt("size", v); err == nil {
@@ -2702,19 +2440,12 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	}
 
 	// Child schemas come from walkNodeChildren, so the child set, the lift
-	// decision and key routing, and each child's namespace scope cannot drift
-	// from the wire parser or the SchemaCache walkers. At a bound position a
-	// field with no type key never parses, but inside a stray "fields" the
-	// record build never runs, so a typeless element is parseable and fires
-	// fieldNoType. Every element fires exactly one callback, leaving no
-	// pre-sized zero SchemaField behind.
-	//
-	// strayKeys: this walker alone also enumerates container keys the node's
-	// kind does not bind (a stray "items" on an "int"), because SchemaNode
-	// promises to surface them as-written on the matching structural field.
-	// Surfacing is read-only: nothing here registers a name or mutates the
-	// tree, which is why the stray positions are safe here and gated off for
-	// every other walker (see nodeChildVisitor.strayKeys).
+	// decision and each child's namespace scope cannot drift from the wire
+	// parser. Inside a stray "fields" the record build never runs, so a
+	// typeless element is parseable and fires fieldNoType. This walker alone
+	// also enumerates container keys the kind does not bind, since SchemaNode
+	// promises to carry them as written; that is read-only, which is why the
+	// stray positions are gated off for every other walker.
 	walkNodeChildren(m, parentNS, childNS, nodeChildVisitor{
 		strayKeys:      true,
 		strayShapeMemo: memo,
@@ -2723,21 +2454,17 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope, memo), nil)
 		},
 		fieldNoType: func(i int, fm map[string]any) {
-			// Typeless element inside a stray "fields": we surface the
+			// Typeless element inside a stray "fields": we carry the
 			// written attributes (name / doc / aliases / order / default
 			// / props) on the field with a zero Type, as-written, never
 			// a fabricated zero element.
 			n.Fields[i] = metadataField(fm, SchemaNode{}, nil)
 		},
 		flatField: func(i int, fm map[string]any, kind, scope string) {
-			// Flat (goavro-style) field format: the wire parser lifts the
-			// field's defining keys into a nested type definition, named
-			// after the field. The metadata tree must describe that same
-			// post-lift schema. Otherwise the type node is an empty shell.
-			// Root().Schema() cannot rebuild it, since the rebuild emits a
-			// nested type object and the lift's bare-string gate ignores
-			// that, and the lifted named type stays invisible to
-			// name-reference default coercion, which keys on Name.
+			// Flat goavro-style field format: the wire parser lifts the
+			// field's defining keys into a nested type named after the field,
+			// and the metadata tree must describe that same post-lift schema
+			// or the rebuild emits an empty shell.
 			flatType := flatLiftTypeMap(fm, kind)
 			n.Fields[i] = metadataField(fm, nodeFromJSONObject(flatType, scope, memo), flatType)
 		},
@@ -2753,11 +2480,8 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 
 	// Collect custom properties: anything not reserved, with precision/scale
 	// reserved only on a recognized decimal carrier. The structural keys
-	// already recorded their verdicts above: the gate that fired each
-	// walkNodeChildren callback is the shape check, and the size/aliases/
-	// symbols captures ran the parser's own decodes. So we route on those
-	// rather than decoding a second time. name/namespace are single string
-	// asserts with no compounding cost, so a fresh check is fine.
+	// already recorded their shape verdicts above, so we route on those
+	// rather than decode a second time.
 	shapeOK := func(key string, v any) bool {
 		switch key {
 		case "items":
@@ -2791,21 +2515,16 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 // metadataField builds one SchemaField from its raw field object and
 // already-built type node. flatType, non-nil for a flat-form field, is the
 // lifted key set. We keep the keys the lift routed into the type out of Props,
-// and the routed doc belongs to the lifted type rather than the field, exactly
-// as the wire lift routes it.
+// and the routed doc belongs to the lifted type rather than the field, as
+// the wire lift routes it.
 func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) SchemaField {
 	sf := SchemaField{Type: typ}
 	getString(fm, "name", &sf.Name)
 	if d, ok := fm["default"]; ok {
-		// We coerce string defaults to typed float64 for float/double fields,
-		// recursing through nested record/array/map/union types. That matches
-		// Java's Schema.parseField text-to-DoubleNode coercion and the
-		// wire-encode pipeline's coerceDefault, so SchemaField.Default reflects
-		// the materialized wire form instead of the raw JSON string. The nil
-		// name-table makes this best-effort inline coercion only;
-		// fixupNameRefDefaults (called at the end of Root) re-coerces with a
-		// populated table to resolve name-references that aren't visible during
-		// this per-field construction.
+		// String defaults coerce to float64 for float/double fields, as
+		// Java and the wire pipeline do. The nil name table makes this
+		// best-effort; fixupNameRefDefaults re-coerces at the end of Root
+		// with a populated table.
 		sf.Default = coerceMetadataDefault(d, &sf.Type, nil, "")
 		sf.HasDefault = true
 	}
@@ -2815,7 +2534,7 @@ func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) S
 	// Field aliases read through the parser's own decode (stringSliceFrom):
 	// bound fields are parse-validated and stray-fields elements are
 	// shape-checked before this runs, so the gate never declines here. It
-	// exists so this surface structurally cannot coerce a malformed body.
+	// exists so this path cannot coerce a malformed body.
 	if ss, ok, err := stringSliceFrom(fm, "aliases"); err == nil && ok {
 		sf.Aliases = ss
 	}
@@ -2841,27 +2560,18 @@ func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) S
 }
 
 // decimalConsumesPrecisionScale reports whether a type object with the given
-// type and logicalType (values as-written, matched exactly, like the parser's
-// own logical dispatch) is a recognized decimal carrier. That is the one
-// placement where we consume "precision"/"scale" as decimal parameters and
-// validate them (validateLogical's decimal arm). On every other placement the
-// two keys are inert metadata surfaced as custom properties, matching the field
-// level: the spec permits attributes it does not define as metadata, and no
-// wire codec reads an unconsumed precision/scale.
+// type and logicalType, matched exactly as written, is a recognized decimal
+// carrier, the one placement where "precision"/"scale" are consumed and
+// validated. Everywhere else they are inert metadata in Props.
 func decimalConsumesPrecisionScale(typ, logical string) bool {
 	return logical == "decimal" && (typ == "bytes" || typ == "fixed")
 }
 
-// schemaKeyBinds reports whether a type object of the given kind/logical binds
-// reserved key k (raw value v). It is the whole grammar in one place:
-// [strayKeyBinds] for the keys the kind alone decides, plus the two that also
-// depend on the value or the logical type.
-//
-// It exists so [schemaReservedKeyForObject] asks the binding question once
-// rather than enumerating consumed keys. Such an enumeration is a hand-written
-// subset, and a subset can always be missing a member. Type-level "default" and
-// "order" fell through a previous list and were dropped, reaching neither a
-// structural field nor Props.
+// schemaKeyBinds reports whether a type object of the given kind/logical
+// binds reserved key k with raw value v: strayKeyBinds for the keys the kind
+// alone decides, plus the two that also depend on the value or the logical.
+// schemaReservedKeyForObject asks this once rather than enumerating consumed
+// keys; a hand-written list once dropped type-level "default" and "order".
 func schemaKeyBinds(k string, v any, typ, logical string) bool {
 	switch k {
 	case "precision", "scale":
@@ -2880,30 +2590,18 @@ func schemaKeyBinds(k string, v any, typ, logical string) bool {
 	return strayKeyBinds(typ, k)
 }
 
-// schemaReservedKeyForObject reports whether key k (value v) on a type object
-// of the given kind/logical is consumed or structurally surfaced, and so kept
-// out of Props. Props is all raw keys minus these.
-//
-// Reserved names match only their exact lowercase spelling; every other key,
-// case variants of reserved names included, is an ordinary custom property
-// that rides to Props verbatim whatever its body.
-//
-// Exactly two ways a reserved key stays out of Props: the kind binds it, or the
-// kind does not bind it but surfaces it as-written on a structural field. The
-// second needs both a field to land on and a body parsing as that key's shape.
-// A key that is neither has Props as its only surface. That is where type-level
-// "default" and "order" land, since only enum binds "default", no kind binds
-// "order", and neither has a SchemaNode field on a non-binding kind. Java keeps
-// both as schema properties (SCHEMA_RESERVED omits both, Schema.java:175-176;
-// ENUM_RESERVED adds "default" alone), as does fastavro 1.12.2 (executed).
-//
+// schemaReservedKeyForObject reports whether key k with value v on a type
+// object of the given kind/logical is consumed or structurally carried, and
+// so kept out of Props. Reserved names match only their exact lowercase
+// spelling. A reserved key stays out of Props in two ways: the kind binds
+// it, or the kind does not bind it but carries it as written on a structural
+// field, which needs both a field and a body of that key's shape. A key that
+// is neither goes only to Props, which is where type-level
+// "default" and "order" go; Java and fastavro keep both as properties too.
 // shapeOK answers the stray-body shape question from a verdict the caller
-// already computed, so it always describes the queried body. That is what keeps
-// this routing from re-decoding a subtree the caller walked. A fresh
-// strayBodyShapeOK would re-enter aschemaFromAny, which itself routes stray
-// keys, so two decodes per level compound to O(2^depth) on a nested-stray
-// schema. A nil shapeOK takes a fresh decode, for the one caller (the cache
-// splice merge) with no recorded verdict and no nested strays.
+// already computed, since a fresh decode would re-enter aschemaFromAny and
+// compound to O(2^depth) on nested strays. A nil shapeOK takes a fresh
+// decode, for the cache splice merge, which has no nested strays.
 func schemaReservedKeyForObject(k string, v any, typ, logical string, shapeOK strayShapeVerdict) bool {
 	if !schemaReservedKeys[k] {
 		return false

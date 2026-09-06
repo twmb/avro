@@ -278,27 +278,13 @@ func setCustomResult(v reflect.Value, result any, avroType string) error {
 	return nil
 }
 
-// wrapDeserWithCustomDecoders wraps a deserfn with custom decode functions,
-// at parse time and again during schema resolution to re-apply custom
-// decoders to promoted/resolved nodes.
-//
+// wrapDeserWithCustomDecoders wraps a deserfn with custom decode functions.
 // When every decoder returns ErrSkipCustomType, we re-decode the wire into
-// the real target through inner, byte-for-byte the decode a no-custom
-// schema performs. Placing the probe-decoded any instead would lose what
-// only a real decode reproduces: a reused map keeping its existing keys, a
-// logical node landing in a base typed target, an overlapping union
-// recovering its exact wire branch.
-//
-// Cost: a naive re-decode re-runs nested wrappers, which re-probe, giving
-// O(depth^2). The probe counts customMatches over the subtree; if none
-// matched, bypassCustom makes the re-decode one O(subtree) pass. Only when
-// a nested custom did match does the re-decode run with customs active, at
-// O(depth^2) bounded by maxDepth.
-//
-// A fresh interface target needs no probe: inner already produces the
-// canonical no-custom value, so it decodes straight into v, which doubles
-// as the chain input. That keeps a parent's probe, whose element targets
-// are all `any`, single-pass.
+// the real target through inner, the same decode a no-custom schema
+// performs. A naive re-decode re-runs nested wrappers, O(depth^2), so if no
+// nested custom matched during the probe, bypassCustom makes the re-decode
+// one pass. A fresh interface target needs no probe: inner's output is the
+// canonical value and doubles as the chain input.
 func wrapDeserWithCustomDecoders(inner deserfn, decoders []func(any, *SchemaNode) (any, error), sn *SchemaNode) deserfn {
 	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		// A no-match ancestor set this so the whole subtree decodes through inner
@@ -307,13 +293,9 @@ func wrapDeserWithCustomDecoders(inner deserfn, decoders []func(any, *SchemaNode
 		if sl.bypassCustom {
 			return inner(src, v, sl)
 		}
-		// Fresh interface target: inner's interface output *is* the canonical
-		// value a no-custom decode yields (tagged per the caller's option), so
-		// decode straight into v and read it back for the chain, keeping a
-		// parent's probe (whose element targets are all fresh `any`) to a single
-		// pass. A non-nil interface is excluded: inner would reuse the held value
-		// in place (e.g. decode into a reused *T the custom is about to replace),
-		// so it takes the probe + re-decode path below, like a typed target.
+		// A nil interface target decodes straight into v and reads it back
+		// for the chain. A non-nil interface would reuse the held value in
+		// place, so it takes the probe and re-decode path.
 		if v.Kind() == reflect.Interface && v.IsNil() {
 			rest, err := inner(src, v, sl)
 			if err != nil {
