@@ -920,8 +920,8 @@ func BenchmarkDeserializeGeneric(b *testing.B) {
 // Unsafe fast-path coverage: all Go type widths through struct fields
 // -----------------------------------------------------------------------
 
-// Here we drive every branch in usInt/udInt, usLong/udLong, usFloat/udFloat,
-// and usDouble/udDouble. The Go struct field types vary across record schemas.
+// Here we drive every branch in usInteger/udInteger for both wire widths,
+// usFloat/udFloat, and usDouble/udDouble. The Go struct field types vary across record schemas.
 // The unsafe fast path compiles per-Kind closures, so we need a struct field
 // of each Kind.
 
@@ -1114,8 +1114,8 @@ func TestUnsafeDecodeTruncatedBuffer(t *testing.T) {
 }
 
 // numericKindTestType returns a reflect.Type whose Kind is k. We feed it to
-// the unsafe per-kind ser/deser constructors (usInt/usLong/udInt/udLong/
-// udDouble), which take the field's reflect.Type so SemanticError.GoType
+// the unsafe per-kind ser/deser constructors (usInteger/udInteger/
+// udFloating), which take the field's reflect.Type so SemanticError.GoType
 // matches the reflect path. Test-only helper.
 func numericKindTestType(k reflect.Kind) reflect.Type {
 	switch k {
@@ -1149,13 +1149,13 @@ func numericKindTestType(k reflect.Kind) reflect.Type {
 	return nil
 }
 
-// TestUnsafeSerializeDefaults covers usInt/usLong/usFloat/usDouble returning
+// TestUnsafeSerializeDefaults covers usInteger/usFloat/usDouble returning
 // nil for unsupported Go kinds (the default: branches).
 func TestUnsafeSerializeDefaults(t *testing.T) {
-	if usInt(numericKindTestType(reflect.Bool)) != nil {
+	if usInteger[int32](numericKindTestType(reflect.Bool)) != nil {
 		t.Fatal("usInt(Bool) should be nil")
 	}
-	if usLong(numericKindTestType(reflect.Bool)) != nil {
+	if usInteger[int64](numericKindTestType(reflect.Bool)) != nil {
 		t.Fatal("usLong(Bool) should be nil")
 	}
 	if usFloat(reflect.Bool) != nil {
@@ -1166,13 +1166,13 @@ func TestUnsafeSerializeDefaults(t *testing.T) {
 	}
 }
 
-// TestUnsafeDeserializeDefaults covers udInt/udLong/udFloat/udDouble returning
+// TestUnsafeDeserializeDefaults covers udInteger/udFloat/udDouble returning
 // nil for unsupported Go kinds (the default: branches).
 func TestUnsafeDeserializeDefaults(t *testing.T) {
-	if udInt(numericKindTestType(reflect.Bool)) != nil {
+	if udInteger[int32](numericKindTestType(reflect.Bool)) != nil {
 		t.Fatal("udInt(Bool) should be nil")
 	}
-	if udLong(numericKindTestType(reflect.Bool)) != nil {
+	if udInteger[int64](numericKindTestType(reflect.Bool)) != nil {
 		t.Fatal("udLong(Bool) should be nil")
 	}
 	if udFloat(reflect.Bool) != nil {
@@ -1184,16 +1184,16 @@ func TestUnsafeDeserializeDefaults(t *testing.T) {
 }
 
 // TestUnsafeDeserializeLongErrors covers the error branches inside each
-// per-Kind closure returned by udLong when given truncated input.
+// per-Kind closure returned by udInteger[int64] when given truncated input.
 func TestUnsafeDeserializeLongErrors(t *testing.T) {
 	kinds := []reflect.Kind{
 		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
 	}
 	for _, k := range kinds {
-		fn := udLong(numericKindTestType(k))
+		fn := udInteger[int64](numericKindTestType(k))
 		if fn == nil {
-			t.Fatalf("udLong(%v) returned nil", k)
+			t.Fatalf("udInteger[int64](%v) returned nil", k)
 		}
 		var buf [8]byte
 		_, err := fn([]byte{}, unsafe.Pointer(&buf[0]), &slab{})
