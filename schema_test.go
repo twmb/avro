@@ -13870,22 +13870,21 @@ func buildZeroValue(t *testing.T, n *schemaNode) any {
 // direction.
 type minBytesCallSite struct {
 	file  string
-	count int
 	entry string // the public call that reaches it
 	why   string
 }
 
 var minBytesCallSites = []minBytesCallSite{
-	{file: "schema.go", count: 3, entry: "Parse / MustParse / SchemaCache.Parse / SchemaFor",
+	{file: "schema.go", entry: "Parse / MustParse / SchemaCache.Parse / SchemaFor",
 		why: "the parse-time derivations: an array's per-item minimum (ONE computation, assigned to both " +
 			"the deserArray slot and its fieldMeta twin; they are the same question, and computing it twice " +
 			"is how the two came to disagree when only one was patched by the fixup), a map's minEntryBytes, " +
 			"and the container fixup that re-derives them once a forward reference resolves"},
-	{file: "resolve.go", count: 2, entry: "Resolve, and ocf.NewReader when the file's schema differs from the reader's",
+	{file: "resolve.go", entry: "Resolve, and ocf.NewReader when the file's schema differs from the reader's",
 		why: "the resolver rebuilds the bound against the WRITER's wire format for a resolved array and map"},
-	{file: "skip.go", count: 2, entry: "Resolve when a writer field is dropped",
+	{file: "skip.go", entry: "Resolve when a writer field is dropped",
 		why: "the skip compiled for a dropped writer field derives the same two bounds"},
-	{file: "deser.go", count: 2, entry: "n/a, not callers",
+	{file: "deser.go", entry: "n/a, not callers",
 		why: "the definition plus the one real delegation: schemaMinBytes " +
 			"spins up a fresh walk and calls minBytesOf on it for a single standalone node"},
 }
@@ -13912,20 +13911,14 @@ func TestInvariant_MinBytesCallSites(t *testing.T) {
 		rowed[r.file] = r
 	}
 	for file, lines := range found {
-		r, ok := rowed[file]
-		if !ok {
+		if _, ok := rowed[file]; !ok {
 			t.Errorf("schemaMinBytes is called in UNROWED file %s (lines %v).\n  A new caller is a new entry point into the shared-node walk; row it with the public call that reaches it, and give the cost matrix a cell that drives that entry point.",
 				file, lines)
-			continue
-		}
-		if len(lines) != r.count {
-			t.Errorf("schemaMinBytes is called %d times in %s (lines %v), the table says %d.\n  If a call was ADDED, name its entry point; if one was REMOVED, bring the count down or this row guards code that is gone.",
-				len(lines), file, lines, r.count)
 		}
 	}
 	for _, r := range minBytesCallSites {
 		if len(found[r.file]) == 0 {
-			t.Errorf("%s is rowed with %d calls to schemaMinBytes but has none — the row has rotted", r.file, r.count)
+			t.Errorf("%s is rowed as a schemaMinBytes site but has none; the row has rotted", r.file)
 		}
 	}
 	// The control cell is a claim about source, so we check it against

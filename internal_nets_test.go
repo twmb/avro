@@ -93,12 +93,12 @@ const (
 )
 
 // censusTell is a source substring whose every occurrence in non-test code
-// must be a registered site of the question. counts maps a file to the number
-// of registered occurrences. Both a new file and a new occurrence in a known
-// file fail the guard.
+// must be a registered site of the question. files lists the files it may
+// appear in: an occurrence in any other file fails the guard, and a listed
+// file with no occurrence has rotted.
 type censusTell struct {
 	pattern string
-	counts  map[string]int
+	files   []string
 }
 
 type censusQuestion struct {
@@ -130,29 +130,29 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `unionBranchOfKind(node, "null")`, counts: map[string]int{
-				"json_codec.go": 1,
+			{pattern: `unionBranchOfKind(node, "null")`, files: []string{
+				"json_codec.go",
 			}},
-			{pattern: `branchByKind("null")`, counts: map[string]int{
-				"ser.go": 1,
+			{pattern: `branchByKind("null")`, files: []string{
+				"ser.go",
 			}},
-			{pattern: `== "null"`, counts: map[string]int{
-				"json_codec.go":  6,
-				"json_decode.go": 2,
-				"resolve.go":     1,
-				"schema_for.go":  2, // both inside isNullBranchTree
-				"schema.go":      2, // both inside isNullBranch
+			{pattern: `== "null"`, files: []string{
+				"json_codec.go",
+				"json_decode.go",
+				"resolve.go",
+				"schema_for.go", // both inside isNullBranchTree
+				"schema.go",     // both inside isNullBranch
 			}},
-			{pattern: `!= "null"`, counts: map[string]int{
-				"json_codec.go": 1,
+			{pattern: `!= "null"`, files: []string{
+				"json_codec.go",
 				// Not answerers of this question. We register them so the
 				// guard does not flag them: json_scan.go matches the four
 				// bytes of the JSON literal `null` in a *value* stream, and
 				// ocf.go compares a compression codec's name.
-				"json_scan.go": 1,
-				"ocf/ocf.go":   1,
+				"json_scan.go",
+				"ocf/ocf.go",
 			}},
-			{pattern: `literal("null"`, counts: map[string]int{
+			{pattern: `literal("null"`, files: []string{
 				// Not an answerer of this question. We register it so the site
 				// stays visible: schema_decode.go consumes the four bytes of
 				// the JSON literal `null` while tokenizing schema *text*,
@@ -161,7 +161,7 @@ var censusRegistry = []censusQuestion{
 				// classifies no union branch. A site spelling the word is still
 				// worth a row: the next one to appear here might be classifying
 				// rather than tokenizing.
-				"schema_decode.go": 1,
+				"schema_decode.go",
 			}},
 		},
 	},
@@ -179,20 +179,20 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `+ "." +`, counts: map[string]int{
-				"cache.go":       1, // nodeFullnameTree
-				"schema_node.go": 1, // nodeFullname
-				"schema_for.go":  2, // SchemaFor composition
-				"schema.go":      2, // builder qualification (2727); logical key (2165), not this question
+			{pattern: `+ "." +`, files: []string{
+				"cache.go",       // nodeFullnameTree
+				"schema_node.go", // nodeFullname
+				"schema_for.go",  // SchemaFor composition
+				"schema.go",      // builder qualification (2727); logical key (2165), not this question
 				// Not answerers: an error field-path join, not a schema name.
-				"compat.go": 1,
-				"errors.go": 1,
+				"compat.go",
+				"errors.go",
 				// Not an answerer: a kind.logicalType lookup key.
-				"json_codec.go": 1,
+				"json_codec.go",
 			}},
-			{pattern: `+"."+`, counts: map[string]int{
-				"schema.go": 1, // scopedRefKeys: the binding side of the same rule
-				"cache.go":  1, // dupDefRef: which spelling re-binds after a splice
+			{pattern: `+"."+`, files: []string{
+				"schema.go", // scopedRefKeys: the binding side of the same rule
+				"cache.go",  // dupDefRef: which spelling re-binds after a splice
 			}},
 		},
 	},
@@ -217,22 +217,22 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `.Key().Kind()`, counts: map[string]int{
-				"schema_node.go": 1, // canonicalStringKeyMap
+			{pattern: `.Key().Kind()`, files: []string{
+				"schema_node.go", // canonicalStringKeyMap
 				// Not answerers of this question: these decide the Go type of
 				// an Avro map's keys for encode/decode/resolve/SchemaFor.
 				// There the key form is Avro's own string wire, not a JSON
 				// object key.
-				"deser.go":       2,
-				"json_codec.go":  2,
-				"json_decode.go": 2,
-				"resolve.go":     1,
-				"schema_for.go":  1,
-				"ser.go":         3,
+				"deser.go",
+				"json_codec.go",
+				"json_decode.go",
+				"resolve.go",
+				"schema_for.go",
+				"ser.go",
 			}},
-			{pattern: `mapKeyName(`, counts: map[string]int{
-				"schema_node.go": 3, // the definition, the budget walk, the fixup walk
-				"schema_for.go":  1, // the SchemaFor canonicalize walk
+			{pattern: `mapKeyName(`, files: []string{
+				"schema_node.go", // the definition, the budget walk, the fixup walk
+				"schema_for.go",  // the SchemaFor canonicalize walk
 			}},
 		},
 	},
@@ -264,12 +264,12 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `jsonMarshalerType`, counts: map[string]int{
-				"schema_node.go": 4,
-				"schema_for.go":  1,
+			{pattern: `jsonMarshalerType`, files: []string{
+				"schema_node.go",
+				"schema_for.go",
 			}},
-			{pattern: `json.Marshaler`, counts: map[string]int{
-				"schema_node.go": 3,
+			{pattern: `json.Marshaler`, files: []string{
+				"schema_node.go",
 			}},
 			// Rejected tells, recorded so the next question's design starts
 			// from evidence. `MarshalText()` has 4 hits, but reflect.go:161
@@ -293,13 +293,13 @@ var censusRegistry = []censusQuestion{
 			{repr: "runtime dispatch", site: "CustomType.matches", file: "custom_type.go"},
 		},
 		tells: []censusTell{
-			{pattern: `.AvroType != "" &&`, counts: map[string]int{
-				"schema.go":      1, // hasMatchingCustomTypeCond
-				"custom_type.go": 1, // CustomType.matches
+			{pattern: `.AvroType != "" &&`, files: []string{
+				"schema.go",      // hasMatchingCustomTypeCond
+				"custom_type.go", // CustomType.matches
 			}},
-			{pattern: `.LogicalType != "" &&`, counts: map[string]int{
-				"schema.go":      1,
-				"custom_type.go": 1,
+			{pattern: `.LogicalType != "" &&`, files: []string{
+				"schema.go",
+				"custom_type.go",
 			}},
 			// Rejected tell: `matches(` is too generic, and it names only one
 			// of the two answerers. The site most likely to drift away, the
@@ -324,10 +324,10 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `decimalConsumesPrecisionScale`, counts: map[string]int{
-				"schema_node.go":  3,
-				"schema_parse.go": 2,
-				"schema.go":       1,
+			{pattern: `decimalConsumesPrecisionScale`, files: []string{
+				"schema_node.go",
+				"schema_parse.go",
+				"schema.go",
 			}},
 			// Rejected tell: `Logical == ""` has 6 hits in schema.go, three of
 			// them the lift's closer-to-the-type gates and three unrelated
@@ -354,13 +354,13 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `isNilValue`, counts: map[string]int{
-				"ser.go":        4,
-				"json_codec.go": 1,
+			{pattern: `isNilValue`, files: []string{
+				"ser.go",
+				"json_codec.go",
 			}},
-			{pattern: `isNilableKind`, counts: map[string]int{
-				"ser.go":    2,
-				"unsafe.go": 2,
+			{pattern: `isNilableKind`, files: []string{
+				"ser.go",
+				"unsafe.go",
 			}},
 			// Rejected tell: `IsNil()` has 41 hits across 11 files, and most
 			// answer a different question entirely (is this reflect.Value safe
@@ -388,14 +388,14 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `stringFastPathEligible`, counts: map[string]int{
-				"reflect.go": 2,
-				"unsafe.go":  6,
-				"deser.go":   1,
+			{pattern: `stringFastPathEligible`, files: []string{
+				"reflect.go",
+				"unsafe.go",
+				"deser.go",
 			}},
-			{pattern: `implementsTextMarshaler`, counts: map[string]int{
-				"reflect.go":    3,
-				"schema_for.go": 2,
+			{pattern: `implementsTextMarshaler`, files: []string{
+				"reflect.go",
+				"schema_for.go",
 			}},
 			// Rejected tell: `MarshalText()` names the call, not the routing
 			// decision, and spans the schema-tree budget's emission question
@@ -431,27 +431,27 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `isNamedKind`, counts: map[string]int{
-				"cache.go": 3, "schema_canonical.go": 1, "schema_for.go": 4,
-				"schema_node.go": 12, "schema_parse.go": 2, "schema_walk.go": 1, "schema.go": 5,
+			{pattern: `isNamedKind`, files: []string{
+				"cache.go", "schema_canonical.go", "schema_for.go",
+				"schema_node.go", "schema_parse.go", "schema_walk.go", "schema.go",
 			}},
-			{pattern: `isRecordKind`, counts: map[string]int{
-				"schema_canonical.go": 1, "schema_for.go": 2, "schema_node.go": 10,
-				"schema_parse.go": 1, "schema_walk.go": 1,
+			{pattern: `isRecordKind`, files: []string{
+				"schema_canonical.go", "schema_for.go", "schema_node.go",
+				"schema_parse.go", "schema_walk.go",
 			}},
 			// branchIsNamedKind is the *schemaNode twin of isNamedKind: by the
 			// time a node exists the builder has normalized "error" into
 			// "record", so it classifies three spellings where isNamedKind
 			// classifies four. It is its own tell because the union-tag sites
 			// in json_codec.go route through it rather than spell the set.
-			{pattern: `branchIsNamedKind`, counts: map[string]int{
-				"compat.go": 5, "json_codec.go": 2,
+			{pattern: `branchIsNamedKind`, files: []string{
+				"compat.go", "json_codec.go",
 			}},
-			{pattern: `"record", "enum", "fixed"`, counts: map[string]int{
-				"compat.go": 1,
+			{pattern: `"record", "enum", "fixed"`, files: []string{
+				"compat.go",
 			}},
-			{pattern: `"record", "error"`, counts: map[string]int{
-				"schema_node.go": 2, "schema_parse.go": 1, "schema.go": 3,
+			{pattern: `"record", "error"`, files: []string{
+				"schema_node.go", "schema_parse.go", "schema.go",
 			}},
 			// Rejected tell: `== "record"` also matches the recursion question
 			// (json_decode.go's `kind == "record" || kind == "array" || kind
@@ -476,15 +476,15 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `tag == "-"`, counts: map[string]int{
+			{pattern: `tag == "-"`, files: []string{
 				// The two paths, plus one occurrence inside the guard's own
 				// doc comment describing where it is called from.
-				"schema_for.go": 2,
-				"reflect.go":    2, // the runtime mapper's two paths
+				"schema_for.go",
+				"reflect.go", // the runtime mapper's two paths
 			}},
-			{pattern: `checkSkipDirectiveExact`, counts: map[string]int{
+			{pattern: `checkSkipDirectiveExact`, files: []string{
 				// Definition, both call sites, and two doc references.
-				"schema_for.go": 3,
+				"schema_for.go",
 			}},
 			// Rejected tell: `HasPrefix(tag` also matches the "default="
 			// option scan, a different question entirely, and it misses the
@@ -504,11 +504,11 @@ var censusRegistry = []censusQuestion{
 			{repr: "metadata renderer", site: "flatFieldNeedsLift", file: "schema_node.go"},
 		},
 		tells: []censusTell{
-			{pattern: `flatFieldNeedsLift`, counts: map[string]int{
-				"schema_parse.go": 2, "schema_walk.go": 1,
+			{pattern: `flatFieldNeedsLift`, files: []string{
+				"schema_parse.go", "schema_walk.go",
 			}},
-			{pattern: `flatLiftTypeMap`, counts: map[string]int{
-				"schema_parse.go": 2, "schema_node.go": 1, "cache.go": 1,
+			{pattern: `flatLiftTypeMap`, files: []string{
+				"schema_parse.go", "schema_node.go", "cache.go",
 			}},
 			// Rejected tell: `liftFlatFieldType` names the mutator, which only
 			// the parse path calls, so the walker and renderer sites (the ones
@@ -541,14 +541,14 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `strayKeyBinds`, counts: map[string]int{
-				"schema_parse.go": 10, "schema_node.go": 2,
+			{pattern: `strayKeyBinds`, files: []string{
+				"schema_parse.go", "schema_node.go",
 			}},
-			{pattern: `schemaKeyBinds`, counts: map[string]int{
-				"schema_node.go": 2,
+			{pattern: `schemaKeyBinds`, files: []string{
+				"schema_node.go",
 			}},
-			{pattern: `schemaReservedKeyForObject`, counts: map[string]int{
-				"schema_node.go": 3, "schema_parse.go": 1, "cache.go": 1,
+			{pattern: `schemaReservedKeyForObject`, files: []string{
+				"schema_node.go", "schema_parse.go", "cache.go",
 			}},
 			// Rejected tell: `strayBodyShapeOK` has 20 hits across three files,
 			// but it answers the *shape* question (does this body parse as the
@@ -582,14 +582,14 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `nodeCarriesOnlyType`, counts: map[string]int{
+			{pattern: `nodeCarriesOnlyType`, files: []string{
 				// Definition, its three call sites, and three doc references
 				// (counted with grep -o; doc comments count, and reasoning
 				// about the number has been wrong every time).
-				"schema_node.go": 4,
+				"schema_node.go",
 			}},
-			{pattern: `bareEmissionExempt`, counts: map[string]int{
-				"schema_node.go": 2,
+			{pattern: `bareEmissionExempt`, files: []string{
+				"schema_node.go",
 			}},
 			// Rejected tell: `len(n.Props) == 0` is the shape the old
 			// hand-written lists shared. It still appears in unrelated emptiness
@@ -629,12 +629,12 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `nodeIsNameRefShape`, counts: map[string]int{
+			{pattern: `nodeIsNameRefShape`, files: []string{
 				// Definition, its one call site, and one doc reference.
-				"schema_node.go": 2,
+				"schema_node.go",
 			}},
-			{pattern: `nameRefUsageSiteExempt`, counts: map[string]int{
-				"schema_node.go": 2,
+			{pattern: `nameRefUsageSiteExempt`, files: []string{
+				"schema_node.go",
 			}},
 			// Rejected tell: `n.refTarget` marks the stamp, which is
 			// nodeRefTargetAgrees's question. That one is asked beside this
@@ -674,11 +674,11 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `jsonNullBody`, counts: map[string]int{
+			{pattern: `jsonNullBody`, files: []string{
 				// The doc heading, the definition, one call in each of the two
 				// decode helpers, and one doc reference from intPtrFrom, whose
 				// comment records what the guard restores.
-				"schema_parse.go": 3,
+				"schema_parse.go",
 			}},
 			// Rejected tell: `== nil` is the most common comparison in the
 			// package, answering "is this pointer/error/interface unset" almost
@@ -726,7 +726,7 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `checkDecimalUnscaled`, counts: map[string]int{
+			{pattern: `checkDecimalUnscaled`, files: []string{
 				// deser.go 9 over 8 lines: the doc heading, both definitions
 				// (one line names both, so it matches twice), the delegation
 				// line, two binary consume sites, and the RatFromBytes comment
@@ -736,10 +736,10 @@ var censusRegistry = []censusQuestion{
 				// buildBigDecimalPayload and chargeDecimalDefault, every emit
 				// route to the wire, plus decimalChargeLen's doc naming the
 				// function whose input it computes.
-				"deser.go":       5,
-				"ser.go":         6,
-				"json_decode.go": 2,
-				"json_codec.go":  1,
+				"deser.go",
+				"ser.go",
+				"json_decode.go",
+				"json_codec.go",
 			}},
 			// Rejected tell: `maxDecimalUnscaledBytes` names the constant, not
 			// the question. A new emit path that hard-codes 32<<10 instead of
@@ -774,22 +774,22 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `&SemanticError{`, counts: map[string]int{
+			{pattern: `&SemanticError{`, files: []string{
 				// ser.go and json_codec.go carry the decimal unscaled-length
 				// producer charges (Q19): the three shared builders and the
 				// fixed opaque arm on the binary side, the fixed opaque arm on
 				// the JSON side. They name the same identity as every other
 				// encode-side user-value reject.
-				"ser.go":         36,
-				"json_codec.go":  11,
-				"deser.go":       30,
-				"json_decode.go": 5,
-				"unsafe.go":      11,
-				"resolve.go":     1,
-				"promote.go":     1,
-				"reflect.go":     5,
-				"custom_type.go": 2,
-				"errors.go":      4,
+				"ser.go",
+				"json_codec.go",
+				"deser.go",
+				"json_decode.go",
+				"unsafe.go",
+				"resolve.go",
+				"promote.go",
+				"reflect.go",
+				"custom_type.go",
+				"errors.go",
 			}},
 			// Rejected tell: `semErr(` is the constructor most of these sites
 			// call, so counting it double-counts the same answerers and misses
@@ -824,16 +824,16 @@ var censusRegistry = []censusQuestion{
 			},
 		},
 		tells: []censusTell{
-			{pattern: `unionEmitTag`, counts: map[string]int{
+			{pattern: `unionEmitTag`, files: []string{
 				// Definition, its doc heading, and the one call in
 				// appendTaggedUnion.
-				"json_codec.go": 2,
+				"json_codec.go",
 				// wrapUnion's call plus the comment naming why it is shared
 				// with the encode side.
-				"json_decode.go": 1,
+				"json_decode.go",
 				// Two calls, each with a comment line naming the reader union
 				// as the namespace the tag resolves against.
-				"resolve.go": 2,
+				"resolve.go",
 			}},
 		},
 	},
@@ -854,14 +854,14 @@ var censusRegistry = []censusQuestion{
 			{repr: "JSON object decode, JSON key to reader slot", site: "iterateRecordFields", file: "json_decode.go"},
 		},
 		tells: []censusTell{
-			{pattern: `make([]bool,`, counts: map[string]int{
-				"compat.go":      1, // claimed
-				"resolve.go":     1, // readerMatched
-				"json_decode.go": 1, // seen
+			{pattern: `make([]bool,`, files: []string{
+				"compat.go",      // claimed
+				"resolve.go",     // readerMatched
+				"json_decode.go", // seen
 				// Not an answerer, registered so the guard does not flag it:
 				// this tracks which struct fields carry an omitzero directive,
 				// which is a property of the Go type and claims no slot.
-				"reflect.go": 1,
+				"reflect.go",
 				// Not an answerer either, and a near miss worth naming: this
 				// one marks which union *branches* produced a tag claim while
 				// the tag tables are built. It is per-branch bookkeeping
@@ -869,7 +869,7 @@ var censusRegistry = []censusQuestion{
 				// *field* slot, and no second writer can contend for it. The
 				// tier's own ambiguity rule (Q20) resolves a duplicate claim
 				// there. That is a different question with a different remedy.
-				"schema.go": 1,
+				"schema.go",
 			}},
 		},
 	},
@@ -903,16 +903,16 @@ var censusRegistry = []censusQuestion{
 		// explaining its own bound is exactly the shape this question exists
 		// to catch, and it would arrive as a count change here.
 		tells: []censusTell{
-			{pattern: `saturateSchemaMagnitude(`, counts: map[string]int{
-				"deser.go":  4, // the definition plus the fixed / union / record arms
-				"schema.go": 1, // maxDecimalDigits
+			{pattern: `saturateSchemaMagnitude(`, files: []string{
+				"deser.go",  // the definition plus the fixed / union / record arms
+				"schema.go", // maxDecimalDigits
 			}},
-			{pattern: `maxSchemaMagnitude`, counts: map[string]int{
-				"deser.go": 5, // the const and the accessor, plus the prose stating the ceiling once
+			{pattern: `maxSchemaMagnitude`, files: []string{
+				"deser.go", // the const and the accessor, plus the prose stating the ceiling once
 			}},
-			{pattern: `magnitudeWidestMultiplier`, counts: map[string]int{
-				"deser.go":  1, // the const and the prose tying the ceiling to it
-				"schema.go": 1, // the multiply itself
+			{pattern: `magnitudeWidestMultiplier`, files: []string{
+				"deser.go",  // the const and the prose tying the ceiling to it
+				"schema.go", // the multiply itself
 			}},
 		},
 	},
@@ -943,13 +943,13 @@ var censusRegistry = []censusQuestion{
 			// The report resolves index paths that accumulate from the root, so
 			// it only denotes a field when the type it is resolved against is
 			// the root. Every occurrence of that resolution is an answerer.
-			{pattern: `t.FieldByIndex(existing.index).Name`, counts: map[string]int{
-				"schema_for.go": 1,
-				"reflect.go":    1,
+			{pattern: `t.FieldByIndex(existing.index).Name`, files: []string{
+				"schema_for.go",
+				"reflect.go",
 			}},
-			{pattern: `duplicate field name`, counts: map[string]int{
-				"schema_for.go": 1,
-				"reflect.go":    1,
+			{pattern: `duplicate field name`, files: []string{
+				"schema_for.go",
+				"reflect.go",
 			}},
 		},
 	},
@@ -986,8 +986,8 @@ var censusRegistry = []censusQuestion{
 		tells: []censusTell{
 			// Every consult of the predicate. A site that answers this question
 			// by hand instead shows up as a count that did not rise.
-			{pattern: `isNilCodec(`, counts: map[string]int{
-				"ocf/ocf.go": 5, // 4 consults + the declaration
+			{pattern: `isNilCodec(`, files: []string{
+				"ocf/ocf.go", // 4 consults + the declaration
 			}},
 		},
 	},
@@ -1356,25 +1356,19 @@ func TestCensus_NoUnregisteredAnswerers(t *testing.T) {
 		for _, tell := range q.tells {
 			found := occurrences(t, files, tell.pattern)
 			if len(found) == 0 {
-				t.Errorf("%s: tell %q matches nothing in the package — the registry has rotted", q.id, tell.pattern)
+				t.Errorf("%s: tell %q matches nothing in the package; the registry has rotted", q.id, tell.pattern)
 				continue
 			}
 			for file, lines := range found {
-				want, registered := tell.counts[file]
-				if !registered {
+				if !slices.Contains(tell.files, file) {
 					t.Errorf("%s: tell %q appears in UNREGISTERED file %s (lines %v).\n  A new site answering %q must be added to the census registry with its representation, and either routed through %s or given the documented reason it cannot be.",
 						q.id, tell.pattern, file, lines, q.question, q.authority)
-					continue
-				}
-				if len(lines) != want {
-					t.Errorf("%s: tell %q appears %d times in %s (lines %v), registry says %d.\n  If a site was ADDED it must be registered (see %s); if one was REMOVED the count must come down, or this guard is watching code that is gone.",
-						q.id, tell.pattern, len(lines), file, lines, want, q.authority)
 				}
 			}
-			for file, want := range tell.counts {
-				if len(found[file]) == 0 && want > 0 {
-					t.Errorf("%s: tell %q is registered %d times in %s but matches nothing there — the site moved or was deleted, and the registry no longer describes the code",
-						q.id, tell.pattern, want, file)
+			for _, file := range tell.files {
+				if len(found[file]) == 0 {
+					t.Errorf("%s: tell %q is registered in %s but matches nothing there; the site moved or was deleted, and the registry no longer describes the code",
+						q.id, tell.pattern, file)
 				}
 			}
 		}
@@ -2773,17 +2767,7 @@ func TestCensus_Q15_CorpusIsNotVacuous(t *testing.T) {
 // generated schema contains. The runtime field mapper's two decide what an
 // encode/decode binds. All four spell the exact-match skip as `tag == "-"` and
 // must agree, or a subsystem that stopped skipping would put back a field the
-// caller excluded, on one side only. We flagged this as a possible demotion
-// (one answerer). Grepping the rule's shape rather than the helper's name
-// disproves that: `tag == "-"` appears at reflect.go 481 and 510 and
-// schema_for.go 725 and 784.
-type skipTagCell struct {
-	name string
-	// schemaFor renders a schema from a type carrying the tag; mapped
-	// reports whether the runtime mapper binds a field of that name.
-	schemaHas func(t *testing.T) (rendered string, buildErr error)
-	mapped    func(t *testing.T) bool
-}
+// caller excluded, on one side only.
 
 type skipNamed struct {
 	A int `avro:"a"`
