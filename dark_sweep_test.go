@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/twmb/avro"
+	"github.com/twmb/avro/internal/avrotest"
 )
 
 // ---------- dark_sweep_test.go ----------
@@ -83,7 +84,7 @@ func TestMatrix_TimestampScaledOverflowBoundaries(t *testing.T) {
 	for _, u := range units {
 		t.Run(u.logical, func(t *testing.T) {
 			t.Parallel()
-			s := mustParse(t, fmt.Sprintf(`{"type":"long","logicalType":%q}`, u.logical))
+			s := avrotest.MustParse(t, fmt.Sprintf(`{"type":"long","logicalType":%q}`, u.logical))
 			maxSec := int64(math.MaxInt64) / u.scale
 
 			// Every side of both guards. We choose the nanosecond so the
@@ -471,7 +472,7 @@ func TestMatrix_SchemaTreeNonFiniteFloatImages(t *testing.T) {
 // json.Marshal's own cause. Nothing is silently charged or dropped.
 func TestMatrix_SchemaTreeMapKeyMarshalFailureSurfacesJSONCause(t *testing.T) {
 	t.Parallel()
-	s := mustParse(t, `{"type":"record","name":"R","fields":[]}`)
+	s := avrotest.MustParse(t, `{"type":"record","name":"R","fields":[]}`)
 	n := s.Root()
 	if n.Props == nil {
 		n.Props = map[string]any{}
@@ -928,7 +929,7 @@ func TestMatrix_StrictJSONSkipperRejectsMalformedSkippedValues(t *testing.T) {
 		{"well-formed-object", `{"a":{"b":[1,2]}}`},
 	}
 
-	s := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
+	s := avrotest.MustParse(t, `{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
 	// Closing axis: a malformed value followed by the record's own '}' is a
 	// different scanner state than the same value truncated at EOF. The first
 	// has a byte to reject, the second has none.
@@ -974,7 +975,7 @@ func (e darkTextEnum) MarshalText() ([]byte, error) { return []byte(e.S), nil }
 func TestMatrix_EnumCarrierAcceptanceAgreesAcrossWires(t *testing.T) {
 	t.Parallel()
 
-	s := mustParse(t, `{"type":"enum","name":"E","symbols":["RED","BLUE"]}`)
+	s := avrotest.MustParse(t, `{"type":"enum","name":"E","symbols":["RED","BLUE"]}`)
 	cells := []struct {
 		name    string
 		v       any
@@ -1006,7 +1007,7 @@ func TestMatrix_EnumCarrierAcceptanceAgreesAcrossWires(t *testing.T) {
 				return
 			}
 			var sym string
-			mustDecode(t, s, bin, &sym)
+			avrotest.MustDecode(t, s, bin, &sym)
 			if sym != c.wantSym {
 				t.Fatalf("binary decoded %q, want %q", sym, c.wantSym)
 			}

@@ -14,24 +14,6 @@ import (
 // more than that (which cell, which input, which axis), we leave its error
 // handling alone and do not fold it in.
 
-func mustParse(t testing.TB, schema string, opts ...avro.SchemaOpt) *avro.Schema {
-	t.Helper()
-	s, err := avro.Parse(schema, opts...)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	return s
-}
-
-func mustAppendEncode(t testing.TB, s *avro.Schema, dst []byte, v any, opts ...avro.Opt) []byte {
-	t.Helper()
-	b, err := s.AppendEncode(dst, v, opts...)
-	if err != nil {
-		t.Fatalf("AppendEncode: %v", err)
-	}
-	return b
-}
-
 func mustNewWriter(t testing.TB, w io.Writer, s *avro.Schema, opts ...WriterOpt) *Writer {
 	t.Helper()
 	ow, err := NewWriter(w, s, opts...)

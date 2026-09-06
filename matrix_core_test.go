@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/twmb/avro"
+	"github.com/twmb/avro/internal/avrotest"
+	"github.com/twmb/avro/internal/ocftest"
 	"github.com/twmb/avro/ocf"
 )
 
@@ -1766,7 +1768,7 @@ func udInvariant(t *testing.T, schema, fillJSON string, fillVal map[string]any, 
 		t.Fatalf("binary auto-fill encode: %v", err)
 	}
 	var a1 map[string]any
-	mustDecode(t, s, w1, &a1)
+	avrotest.MustDecode(t, s, w1, &a1)
 	j1, err := s.AppendEncodeJSON(nil, fillVal)
 	if err != nil {
 		t.Fatalf("json auto-fill encode: %v", err)
@@ -1845,7 +1847,7 @@ func TestMatrix_GenerativeProps(t *testing.T) {
 		t.Fatalf("props perturb the canonical fingerprint:\n propful=%s\n bare   =%s", s.Canonical(), bare.Canonical())
 	}
 	// The rebuild preserves the props (observation survives a round-trip).
-	rebuilt := mustNodeSchema(t, root)
+	rebuilt := avrotest.MustNodeSchema(t, root)
 	rr := rebuilt.Root()
 	if rr.Props["myrec"] != "v1" || rr.Fields[0].Props["myfield"] == nil {
 		t.Fatalf("rebuild dropped props: root=%#v field=%#v", rr.Props, rr.Fields[0].Props)
@@ -4615,8 +4617,8 @@ func TestMatrix_ConcurrentFirstUse(t *testing.T) {
 			{"name":"keep","type":"int"}]}`)
 		r := avro.MustParse(`{"type":"record","name":"FU","fields":[
 			{"name":"keep","type":"int"}]}`)
-		res := mustResolve(t, w, r)
-		wire := mustAppendEncode(t, w, nil, map[string]any{
+		res := avrotest.MustResolve(t, w, r)
+		wire := avrotest.MustAppendEncode(t, w, nil, map[string]any{
 			"drop": map[string]any{"x": "s", "y": []any{int64(1), int64(2)}},
 			"keep": int32(9),
 		})
@@ -4720,25 +4722,25 @@ func TestMatrix_SingleObjectHeaderLazy(t *testing.T) {
 			// first touch is Decode/Canonical/String must still produce it.
 			for _, warm := range []string{"cold", "canonical-first", "encode-first", "root-first"} {
 				t.Run("parse/"+warm, func(t *testing.T) {
-					s := mustParse(t, sh.schema)
+					s := avrotest.MustParse(t, sh.schema)
 					switch warm {
 					case "canonical-first":
 						_ = s.Canonical()
 						_ = s.Fingerprint(avro.NewRabin())
 					case "encode-first":
-						mustAppendEncode(t, s, nil, sh.val)
+						avrotest.MustAppendEncode(t, s, nil, sh.val)
 					case "root-first":
 						_ = s.Root()
 						_ = s.String()
 					}
 					want := soeOracle(s)
-					got := mustAppendSingleObject(t, s, nil, sh.val)
+					got := avrotest.MustAppendSingleObject(t, s, nil, sh.val)
 					if [10]byte(got[:10]) != want {
 						t.Fatalf("header %x, want %x", got[:10], want)
 					}
 					// Entry point 2: DecodeSingleObject must accept it.
 					var back any
-					if rest := mustDecodeSingleObject(t, s, got, &back); len(rest) != 0 {
+					if rest := avrotest.MustDecodeSingleObject(t, s, got, &back); len(rest) != 0 {
 						t.Fatalf("DecodeSingleObject left %d bytes", len(rest))
 					}
 					// Entry point 3: the exported extractor must read the
@@ -4752,11 +4754,11 @@ func TestMatrix_SingleObjectHeaderLazy(t *testing.T) {
 					}
 					// A schema that reached the header first through
 					// DecodeSingleObject must produce the same bytes.
-					fresh := mustParse(t, sh.schema)
+					fresh := avrotest.MustParse(t, sh.schema)
 					if _, err := fresh.DecodeSingleObject(got, &back); err != nil {
 						t.Fatalf("decode-first DecodeSingleObject: %v", err)
 					}
-					if got2 := mustAppendSingleObject(t, fresh, nil, sh.val); [10]byte(got2[:10]) != want {
+					if got2 := avrotest.MustAppendSingleObject(t, fresh, nil, sh.val); [10]byte(got2[:10]) != want {
 						t.Fatalf("decode-first header %x, want %x", got2[:10], want)
 					}
 				})
@@ -4767,8 +4769,8 @@ func TestMatrix_SingleObjectHeaderLazy(t *testing.T) {
 			// header must follow the canonical form it adopted, and it must also
 			// accept the writer's.
 			t.Run("resolve", func(t *testing.T) {
-				reader := mustParse(t, sh.schema)
-				if id := mustResolve(t, mustParse(t, sh.schema), reader); id != reader {
+				reader := avrotest.MustParse(t, sh.schema)
+				if id := avrotest.MustResolve(t, avrotest.MustParse(t, sh.schema), reader); id != reader {
 					t.Fatalf("identity Resolve did not return the reader")
 				}
 				widened := `{"type":"record","name":"W","fields":[
@@ -4776,15 +4778,15 @@ func TestMatrix_SingleObjectHeaderLazy(t *testing.T) {
 					{"name":"extra","type":"string"}]}`
 				narrowed := `{"type":"record","name":"W","fields":[
 					{"name":"only","type":` + sh.schema + `}]}`
-				w := mustParse(t, widened)
-				r := mustParse(t, narrowed)
-				res := mustResolve(t, w, r)
+				w := avrotest.MustParse(t, widened)
+				r := avrotest.MustParse(t, narrowed)
+				res := avrotest.MustResolve(t, w, r)
 				if got, want := soeOracle(res), soeOracle(r); got != want {
 					t.Fatalf("resolved oracle %x, want reader oracle %x", got, want)
 				}
 				// Writer-shaped SOE wire must decode through the resolved
 				// schema, which forces both lazy headers.
-				wire := mustAppendSingleObject(t, w, nil, map[string]any{"only": sh.val, "extra": "e"})
+				wire := avrotest.MustAppendSingleObject(t, w, nil, map[string]any{"only": sh.val, "extra": "e"})
 				var out map[string]any
 				if _, err := res.DecodeSingleObject(wire, &out); err != nil {
 					t.Fatalf("resolved DecodeSingleObject(writer wire): %v", err)
@@ -4798,7 +4800,7 @@ func TestMatrix_SingleObjectHeaderLazy(t *testing.T) {
 				}
 				// A third schema's header must still be rejected: laziness
 				// must not turn the writer slot into "accept anything".
-				alien := soeOracle(mustParse(t, `{"type":"record","name":"Z","fields":[{"name":"z","type":"int"}]}`))
+				alien := soeOracle(avrotest.MustParse(t, `{"type":"record","name":"Z","fields":[{"name":"z","type":"int"}]}`))
 				alienWire := append(append([]byte{}, alien[:]...), wire[10:]...)
 				if _, err := res.DecodeSingleObject(alienWire, &out); err == nil {
 					t.Fatalf("resolved DecodeSingleObject accepted an alien fingerprint")
@@ -4822,15 +4824,15 @@ func TestMatrix_SingleObjectHeaderLazy(t *testing.T) {
 					t.Fatalf("cache parse parent: %v", err)
 				}
 				val := map[string]any{"p": map[string]any{"l": sh.val}}
-				got := mustAppendSingleObject(t, parent, nil, val)
+				got := avrotest.MustAppendSingleObject(t, parent, nil, val)
 				if want := soeOracle(parent); [10]byte(got[:10]) != want {
 					t.Fatalf("cache header %x, want %x", got[:10], want)
 				}
 				// Cross-product oracle: a cacheless parse of the spliced text
 				// is a different Schema built by a different path, and it must
 				// land on the same header.
-				standalone := mustParse(t, parent.String())
-				alone := mustAppendSingleObject(t, standalone, nil, val)
+				standalone := avrotest.MustParse(t, parent.String())
+				alone := avrotest.MustAppendSingleObject(t, standalone, nil, val)
 				if !bytes.Equal(got[:10], alone[:10]) {
 					t.Fatalf("cache header %x != standalone header %x", got[:10], alone[:10])
 				}
@@ -4856,8 +4858,8 @@ func TestMatrix_ConcurrentFirstUseSOE(t *testing.T) {
 	for round := 0; round < 25; round++ {
 		// Every goroutine reaches the header of a schema none of them has
 		// touched, through a different mix of entry points.
-		s := mustParse(t, schema)
-		want := soeOracle(mustParse(t, schema)) // oracle from a separate schema
+		s := avrotest.MustParse(t, schema)
+		want := soeOracle(avrotest.MustParse(t, schema)) // oracle from a separate schema
 		var wg sync.WaitGroup
 		errs := make(chan error, goroutines*2)
 		start := make(chan struct{})
@@ -4877,7 +4879,7 @@ func TestMatrix_ConcurrentFirstUseSOE(t *testing.T) {
 						errs <- fmt.Errorf("racing header %x, want %x", b[:10], want)
 					}
 				case 1:
-					wire := append(append([]byte{}, want[:]...), mustAppendEncode(t, mustParse(t, schema), nil, val)...)
+					wire := append(append([]byte{}, want[:]...), avrotest.MustAppendEncode(t, avrotest.MustParse(t, schema), nil, val)...)
 					var out map[string]any
 					if _, err := s.DecodeSingleObject(wire, &out); err != nil {
 						errs <- fmt.Errorf("DecodeSingleObject: %v", err)
@@ -4886,7 +4888,7 @@ func TestMatrix_ConcurrentFirstUseSOE(t *testing.T) {
 					// Canonical() is what the header hashes. Racing it against
 					// the hash pins that the hash does not mutate the tree it
 					// reads.
-					if !bytes.Equal(s.Canonical(), mustParse(t, schema).Canonical()) {
+					if !bytes.Equal(s.Canonical(), avrotest.MustParse(t, schema).Canonical()) {
 						errs <- errors.New("racing Canonical differs")
 					}
 				default:
@@ -4911,13 +4913,13 @@ func TestMatrix_ConcurrentFirstUseSOE(t *testing.T) {
 	// One writer, two resolved readers: both resolutions consult the same
 	// writer schema's lazy header, so its Once is raced across owners.
 	for round := 0; round < 25; round++ {
-		w := mustParse(t, `{"type":"record","name":"SW","fields":[
+		w := avrotest.MustParse(t, `{"type":"record","name":"SW","fields":[
 			{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":"long"}]}`)
-		r1 := mustParse(t, `{"type":"record","name":"SW","fields":[{"name":"a","type":"int"}]}`)
-		r2 := mustParse(t, `{"type":"record","name":"SW","fields":[{"name":"b","type":"string"}]}`)
-		res1 := mustResolve(t, w, r1)
-		res2 := mustResolve(t, w, r2)
-		wire := mustAppendSingleObject(t, mustParse(t, w.String()), nil,
+		r1 := avrotest.MustParse(t, `{"type":"record","name":"SW","fields":[{"name":"a","type":"int"}]}`)
+		r2 := avrotest.MustParse(t, `{"type":"record","name":"SW","fields":[{"name":"b","type":"string"}]}`)
+		res1 := avrotest.MustResolve(t, w, r1)
+		res2 := avrotest.MustResolve(t, w, r2)
+		wire := avrotest.MustAppendSingleObject(t, avrotest.MustParse(t, w.String()), nil,
 			map[string]any{"a": int32(1), "b": "s", "c": int64(2)})
 		var wg sync.WaitGroup
 		errs := make(chan error, goroutines)
@@ -5194,7 +5196,7 @@ func TestMatrix_CustomTypes(t *testing.T) {
 						return nil, avro.ErrSkipCustomType
 					},
 				}
-				cs := mustParse(t, posSchema, ct)
+				cs := avrotest.MustParse(t, posSchema, ct)
 				// A matching custom with Encode suppresses the built-in
 				// logical encoder on fixed/decimal builds (documented
 				// per-build suppression), so enriched inputs reject there
@@ -5409,17 +5411,17 @@ func TestMatrix_CustomTimesOCF(t *testing.T) {
 			ct := crossBoxCT(fr.logical)
 			raw := crossRaw(t, fr)
 			schemaJSON := fmt.Sprintf(`{"type":"record","name":"OC","fields":[{"name":"f","type":%s}]}`, fr.schema)
-			ws := mustParse(t, schemaJSON, ct)
+			ws := avrotest.MustParse(t, schemaJSON, ct)
 			var buf bytes.Buffer
-			w := mustNewWriter(t, &buf, ws)
+			w := ocftest.MustNewWriter(t, &buf, ws)
 			for i := 0; i < 3; i++ {
 				if err := w.Encode(map[string]any{"f": cbox{Raw: raw}}); err != nil {
 					t.Fatalf("Encode #%d: %v", i, err)
 				}
 			}
-			mustClose(t, w)
+			avrotest.MustClose(t, w)
 
-			r := mustNewReader(t, bytes.NewReader(buf.Bytes()), ocf.WithSchemaOpts(ct))
+			r := ocftest.MustNewReader(t, bytes.NewReader(buf.Bytes()), ocf.WithSchemaOpts(ct))
 			defer r.Close()
 			var n int
 			for {
@@ -6535,7 +6537,7 @@ func TestMatrix_FieldReorder(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	var got map[string]any
-	mustDecode(t, res, wire, &got)
+	avrotest.MustDecode(t, res, wire, &got)
 	if got["a"] != int32(1) || got["b"] != "two" || !bytes.Equal(got["c"].([]byte), []byte{3}) || got["d"] != int64(4) {
 		t.Fatalf("reordered fields mismatched: %#v", got)
 	}
@@ -6595,7 +6597,7 @@ func TestMatrix_UnionEvolution(t *testing.T) {
 		}
 		wire, _ := w.AppendEncode(nil, int32(3))
 		var got any
-		mustDecode(t, res, wire, &got)
+		avrotest.MustDecode(t, res, wire, &got)
 		if _, ok := got.(int32); !ok {
 			t.Fatalf("exact int branch must win over double promotion, got %T", got)
 		}
@@ -6609,7 +6611,7 @@ func TestMatrix_UnionEvolution(t *testing.T) {
 		}
 		wire, _ := w.AppendEncode(nil, int64(12))
 		var got any
-		mustDecode(t, res, wire, &got)
+		avrotest.MustDecode(t, res, wire, &got)
 		if _, ok := got.(float64); !ok {
 			t.Fatalf("long should promote into the double branch, got %T", got)
 		}
@@ -7288,11 +7290,11 @@ func TestMatrix_NilShapesAcrossUnions(t *testing.T) {
 		}
 		for _, sh := range shapes {
 			t.Run(un.label+"/"+sh.label, func(t *testing.T) {
-				got := mustAppendEncode(t, s, nil, sh.value)
+				got := avrotest.MustAppendEncode(t, s, nil, sh.value)
 				if !bytes.Equal(got, wantWire) {
 					t.Fatalf("binary nil-shape diverges: got=%x want=%x", got, wantWire)
 				}
-				gotJ := mustAppendEncodeJSON(t, s, nil, sh.value)
+				gotJ := avrotest.MustAppendEncodeJSON(t, s, nil, sh.value)
 				if !bytes.Equal(gotJ, wantJSON) {
 					t.Fatalf("JSON nil-shape diverges: got=%s want=%s", gotJ, wantJSON)
 				}
@@ -7303,7 +7305,7 @@ func TestMatrix_NilShapesAcrossUnions(t *testing.T) {
 		fWant, _ := fs.AppendEncode(nil, map[string]any{"u": nil})
 		for _, sh := range shapes {
 			t.Run(un.label+"/field/"+sh.label, func(t *testing.T) {
-				got := mustAppendEncode(t, fs, nil, map[string]any{"u": sh.value})
+				got := avrotest.MustAppendEncode(t, fs, nil, map[string]any{"u": sh.value})
 				if !bytes.Equal(got, fWant) {
 					t.Fatalf("field nil-shape diverges: got=%x want=%x", got, fWant)
 				}
@@ -8789,7 +8791,7 @@ func TestMatrix_ForeignFramingThroughSkip(t *testing.T) {
 		{"name":"keep","type":"int"}]}`
 	w := avro.MustParse(wSchema)
 	r := avro.MustParse(rSchema)
-	res := mustResolve(t, w, r)
+	res := avrotest.MustResolve(t, w, r)
 	strSchema := avro.MustParse(`"string"`)
 	var items [][]byte
 	for _, s := range []string{"x", "yy", "zzz"} {
@@ -8905,7 +8907,7 @@ func FuzzMatrixCore(f *testing.F) {
 			t.Fatalf("encode: %v", err)
 		}
 		var a1 any
-		mustDecode(t, s, w1, &a1)
+		avrotest.MustDecode(t, s, w1, &a1)
 		w2, err := s.AppendEncode(nil, a1)
 		if err != nil || string(w2) != string(w1) {
 			t.Fatalf("re-encode unstable: err=%v\n w1=%x\n w2=%x\nschema: %s", err, w1, w2, schemaJSON)
@@ -8974,10 +8976,10 @@ func TestMatrix_HostileTruncationAndCorruption(t *testing.T) {
 			t.Run(fr.label+"/"+cx.label, func(t *testing.T) {
 				u := &uniq{}
 				schemaJSON := cx.schema(fr.schema(u), fr.kind, u)
-				s := mustParse(t, schemaJSON)
+				s := avrotest.MustParse(t, schemaJSON)
 				vin := cx.wrap(fr.values[0])
-				w1 := mustAppendEncode(t, s, nil, vin)
-				j1 := mustAppendEncodeJSON(t, s, nil, vin)
+				w1 := avrotest.MustAppendEncode(t, s, nil, vin)
+				j1 := avrotest.MustAppendEncodeJSON(t, s, nil, vin)
 
 				// Every strict prefix of the valid binary wire.
 				for i := 0; i < len(w1); i++ {
@@ -9028,7 +9030,7 @@ func TestMatrix_HostileThroughResolution(t *testing.T) {
 		{"name":"tail","type":"string"}]}`
 	w := avro.MustParse(wSchema)
 	r := avro.MustParse(rSchema)
-	res := mustResolve(t, w, r)
+	res := avrotest.MustResolve(t, w, r)
 	vin := map[string]any{
 		"keep": int32(7),
 		"drop": []any{
@@ -9037,7 +9039,7 @@ func TestMatrix_HostileThroughResolution(t *testing.T) {
 		},
 		"tail": "end",
 	}
-	w1 := mustAppendEncode(t, w, nil, vin)
+	w1 := avrotest.MustAppendEncode(t, w, nil, vin)
 	for i := 0; i < len(w1); i++ {
 		hostileDecode(t, res, "resolved(R)", w1[:i], fmt.Sprintf("prefix[:%d]", i))
 	}
@@ -9119,7 +9121,7 @@ func TestMatrix_HostileSizeRejects(t *testing.T) {
 func TestMatrix_HostileSizeDecodeMessages(t *testing.T) {
 	s := avro.MustParse(`"string"`)
 	big := strings.Repeat("y", 1<<20)
-	wire := mustAppendEncode(t, s, nil, big)
+	wire := avrotest.MustAppendEncode(t, s, nil, big)
 	// Decoding a 1 MiB string wire into an int target: the rejection must
 	// not echo the megabyte of wire content.
 	var i int32
@@ -11040,8 +11042,8 @@ func TestMatrix_DecodeTargetRejectionParity(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.label, func(t *testing.T) {
 			s := avro.MustParse(c.schema)
-			wire := mustAppendEncode(t, s, nil, c.value)
-			j := mustAppendEncodeJSON(t, s, nil, c.value)
+			wire := avrotest.MustAppendEncode(t, s, nil, c.value)
+			j := avrotest.MustAppendEncodeJSON(t, s, nil, c.value)
 			for name, target := range mkTargets() {
 				_, binErr := s.Decode(wire, target)
 				jsonTargets := mkTargets() // fresh, undamaged by the binary pass
@@ -11304,7 +11306,7 @@ func TestMatrix_ResolvedJSONUnionInputForms(t *testing.T) {
 func TestMatrix_ResolvedJSONUnionEnvelopeShapedMapValue(t *testing.T) {
 	writer := avro.MustParse(`{"type":"record","name":"Top","fields":[{"name":"u","type":["int",{"type":"map","values":"int"}]}]}`)
 	reader := avro.MustParse(`{"type":"record","name":"Top","fields":[{"name":"u","type":["int",{"type":"map","values":"int"}]},{"name":"pad","type":"int","default":0}]}`)
-	resolved := mustResolve(t, writer, reader)
+	resolved := avrotest.MustResolve(t, writer, reader)
 	cells := []struct {
 		name        string
 		oracleValue any
@@ -11457,7 +11459,7 @@ func TestDifferentialFastavroResolvedJSONUnion(t *testing.T) {
 			}
 			w := avro.MustParse(c.writer)
 			r := avro.MustParse(c.reader)
-			resolved := mustResolve(t, w, r)
+			resolved := avrotest.MustResolve(t, w, r)
 			var got any
 			if err := resolved.DecodeJSON([]byte(c.json), &got); err != nil {
 				t.Fatalf("resolved.DecodeJSON: %v", err)
@@ -12426,7 +12428,7 @@ func TestMatrix_UUIDByteArrayTrustsRawBytes(t *testing.T) {
 					t.Fatalf("binary encode for round trip: %v", err)
 				}
 				var out markerUUID
-				mustDecode(t, s, bin, &out)
+				avrotest.MustDecode(t, s, bin, &out)
 				if [16]byte(out) != raw {
 					t.Fatalf("uuid bytes not preserved: %x vs %x", out, raw)
 				}
@@ -12990,7 +12992,7 @@ var magnitudeEntryPoints = []struct {
 	{
 		name: "Parse+Decode",
 		decode: func(t *testing.T, cs string, body []byte) error {
-			s := mustParse(t, cs)
+			s := avrotest.MustParse(t, cs)
 			return magDecode(func() error {
 				var v any
 				_, err := s.Decode(body, &v)
@@ -13114,7 +13116,7 @@ func magFramed(entryPoint string, body []byte) []byte {
 // because it names the exact arithmetic, and a matrix cell that stopped
 // driving this shape would otherwise take the pin with it.
 func TestRegression_MapBlockBoundSurvivesWrappedMinimum(t *testing.T) {
-	s := mustParse(t, `{"type":"map","values":`+sumWrapsToZero+`}`)
+	s := avrotest.MustParse(t, `{"type":"map","values":`+sumWrapsToZero+`}`)
 	err := magDecode(func() error {
 		var v any
 		_, err := s.Decode(nonEmptyBlock, &v)
@@ -13150,8 +13152,8 @@ func TestInvariant_LegitimateBlockBoundsStillAccept(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			s := mustParse(t, c.schema)
-			b := mustEncode(t, s, c.value)
+			s := avrotest.MustParse(t, c.schema)
+			b := avrotest.MustEncode(t, s, c.value)
 			var got any
 			if _, err := s.Decode(b, &got); err != nil {
 				t.Fatalf("the bound refused a block this schema's own encoder produced: %v", err)

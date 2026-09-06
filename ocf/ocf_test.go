@@ -29,6 +29,7 @@ import (
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
 	"github.com/twmb/avro"
+	"github.com/twmb/avro/internal/avrotest"
 )
 
 // ---------- ocf_test.go ----------
@@ -41,7 +42,7 @@ type person struct {
 }
 
 func TestRoundTrip(t *testing.T) {
-	s := mustParse(t, recordSchema)
+	s := avrotest.MustParse(t, recordSchema)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
@@ -64,7 +65,7 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestDeflate(t *testing.T) {
-	s := mustParse(t, recordSchema)
+	s := avrotest.MustParse(t, recordSchema)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithCodec(DeflateCodec(flate.DefaultCompression)))
@@ -88,7 +89,7 @@ func TestDeflate(t *testing.T) {
 }
 
 func TestMultipleBlocks(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	const n = 250
 	var buf bytes.Buffer
@@ -113,7 +114,7 @@ func TestMultipleBlocks(t *testing.T) {
 }
 
 func TestCustomBlockCount(t *testing.T) {
-	s := mustParse(t, `"string"`)
+	s := avrotest.MustParse(t, `"string"`)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(2))
@@ -133,7 +134,7 @@ func TestCustomBlockCount(t *testing.T) {
 }
 
 func TestMetadata(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithMetadata(map[string][]byte{
@@ -153,7 +154,7 @@ func TestMetadata(t *testing.T) {
 }
 
 func TestReaderSchema(t *testing.T) {
-	s := mustParse(t, recordSchema)
+	s := avrotest.MustParse(t, recordSchema)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
@@ -179,7 +180,7 @@ func TestReaderSchema(t *testing.T) {
 }
 
 func TestEmpty(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
@@ -209,7 +210,7 @@ func (x xorCodec) Decompress(src []byte) ([]byte, error) {
 }
 
 func TestCustomCodec(t *testing.T) {
-	s := mustParse(t, `"long"`)
+	s := avrotest.MustParse(t, `"long"`)
 	codec := xorCodec{0xAB}
 
 	var buf bytes.Buffer
@@ -237,7 +238,7 @@ func TestBadMagic(t *testing.T) {
 }
 
 func TestUnknownCodec(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	codec := xorCodec{0x42}
 
 	var buf bytes.Buffer
@@ -256,7 +257,7 @@ func TestUnknownCodec(t *testing.T) {
 }
 
 func TestBadSync(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(1))
@@ -293,7 +294,7 @@ func TestBadSync(t *testing.T) {
 }
 
 func TestPrimitiveSchema(t *testing.T) {
-	s := mustParse(t, `"string"`)
+	s := avrotest.MustParse(t, `"string"`)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
@@ -313,7 +314,7 @@ func TestPrimitiveSchema(t *testing.T) {
 }
 
 func TestBlockCountZeroOrNegative(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	// Block count 0 with no block bytes defaults to 100.
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(0))
@@ -333,7 +334,7 @@ func TestBlockCountZeroOrNegative(t *testing.T) {
 }
 
 func TestCloseIdempotent(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	// Close with no items.
@@ -343,7 +344,7 @@ func TestCloseIdempotent(t *testing.T) {
 }
 
 func TestCloseFlushError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	ew := &errAfterN{max: 4096}
 	w := mustNewWriter(t, ew, s, WithBlockCount(1000)) // large block, no auto-flush
 	v := int32(1)
@@ -358,7 +359,7 @@ func TestCloseFlushError(t *testing.T) {
 }
 
 func TestStickyWriteError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	// Use a writer that accepts the header but fails on block writes.
 	ew := &errAfterN{max: 4096}
 	w := mustNewWriter(t, ew, s, WithBlockCount(1))
@@ -419,7 +420,7 @@ func TestShortHeader(t *testing.T) {
 }
 
 func TestDeflateRoundTripLarge(t *testing.T) {
-	s := mustParse(t, `"string"`)
+	s := avrotest.MustParse(t, `"string"`)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithCodec(DeflateCodec(flate.BestSpeed)), WithBlockCount(10))
@@ -441,7 +442,7 @@ func TestDeflateRoundTripLarge(t *testing.T) {
 }
 
 func TestEncodeError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(100))
 	// Encoding a string into an int schema must fail.
@@ -471,7 +472,7 @@ func (failCompressCodec) Compress([]byte) ([]byte, error) {
 func (failCompressCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
 
 func TestCompressError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithCodec(failCompressCodec{}), WithBlockCount(1))
 	v := int32(1)
@@ -512,7 +513,7 @@ func TestMissingSchemaInFile(t *testing.T) {
 }
 
 func TestTruncatedBlockCount(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
@@ -529,7 +530,7 @@ func TestTruncatedBlockCount(t *testing.T) {
 }
 
 func TestTruncatedBlockSize(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
@@ -551,7 +552,7 @@ func TestTruncatedBlockSize(t *testing.T) {
 }
 
 func TestTruncatedBlockData(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
@@ -571,7 +572,7 @@ func TestTruncatedBlockData(t *testing.T) {
 }
 
 func TestTruncatedBlockSyncMarker(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
@@ -592,7 +593,7 @@ func TestTruncatedBlockSyncMarker(t *testing.T) {
 }
 
 func TestNegativeBlockSize(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
@@ -620,7 +621,7 @@ func (failDecompressCodec) Decompress([]byte) ([]byte, error) {
 }
 
 func TestDecompressError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	codec := failDecompressCodec{}
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithCodec(codec), WithBlockCount(1))
@@ -642,7 +643,7 @@ func TestDecompressError(t *testing.T) {
 
 func TestDecodeError(t *testing.T) {
 	// Write a string value, then try to decode as int.
-	s := mustParse(t, `"string"`)
+	s := avrotest.MustParse(t, `"string"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(1))
 	v := "hello"
@@ -661,7 +662,7 @@ func TestDecodeError(t *testing.T) {
 
 func TestTrailingBytesInBlock(t *testing.T) {
 	// Construct a block where item count is 1 but the data has extra bytes.
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
@@ -807,7 +808,7 @@ func TestOptMarkerMethods(t *testing.T) {
 }
 
 func TestHeaderWriteError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	_, err := NewWriter(&errAfterN{max: 0}, s)
 	if err == nil {
 		t.Fatal("expected error writing header")
@@ -882,7 +883,7 @@ func TestRandReadError(t *testing.T) {
 	randRead = func(b []byte) (int, error) { return 0, errors.New("rand failed") }
 	defer func() { randRead = orig }()
 
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	_, err := NewWriter(&bytes.Buffer{}, s)
 	if err == nil {
 		t.Fatal("expected error from failing rand")
@@ -893,7 +894,7 @@ func TestRandReadError(t *testing.T) {
 }
 
 func TestBlockCountNegative(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(-5))
 	// Negative count defaults to 100; single item flushed on Close.
@@ -961,7 +962,7 @@ func (s *seekBuf) Seek(offset int64, whence int) (int64, error) {
 // ---------- New feature tests ----------
 
 func TestFlush(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(1000)) // large block, won't auto-flush
@@ -994,7 +995,7 @@ func TestFlush(t *testing.T) {
 }
 
 func TestFlushEmpty(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
@@ -1010,7 +1011,7 @@ func TestFlushEmpty(t *testing.T) {
 }
 
 func TestFlushAfterError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	ew := &errAfterN{max: 4096}
 	w := mustNewWriter(t, ew, s, WithBlockCount(1))
@@ -1026,7 +1027,7 @@ func TestFlushAfterError(t *testing.T) {
 }
 
 func TestWithSyncMarker(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	var marker [16]byte
 	for i := range marker {
@@ -1059,7 +1060,7 @@ func TestWithSyncMarker(t *testing.T) {
 }
 
 func TestWithBlockBytes(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	// Each int encodes as 1 byte (zigzag for small values). Set maxBytes=3,
 	// so the block flushes after 3 items.
@@ -1077,7 +1078,7 @@ func TestWithBlockBytes(t *testing.T) {
 }
 
 func TestWithBlockBytesAndBlockCount(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	// Block count 2, block bytes very large: count triggers first.
 	var buf bytes.Buffer
@@ -1094,7 +1095,7 @@ func TestWithBlockBytesAndBlockCount(t *testing.T) {
 }
 
 func TestWithBlockCountZero(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	// Block count 0 + block bytes 2: only bytes triggers flush.
 	var buf bytes.Buffer
@@ -1111,7 +1112,7 @@ func TestWithBlockCountZero(t *testing.T) {
 }
 
 func TestReset(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	var buf1 bytes.Buffer
 	w := mustNewWriter(t, &buf1, s)
@@ -1151,7 +1152,7 @@ func TestReset(t *testing.T) {
 }
 
 func TestResetClearsError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	ew := &errAfterN{max: 4096}
 	w := mustNewWriter(t, ew, s, WithBlockCount(1))
@@ -1184,7 +1185,7 @@ func TestResetClearsError(t *testing.T) {
 }
 
 func TestResetFlushError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	ew := &errAfterN{max: 4096}
 	w := mustNewWriter(t, ew, s, WithBlockCount(1000))
@@ -1202,7 +1203,7 @@ func TestResetFlushError(t *testing.T) {
 }
 
 func TestResetRandError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	v := int32(9)
 
 	// Live writer: NewWriter generates the initial sync before the override is
@@ -1247,7 +1248,7 @@ func TestResetRandError(t *testing.T) {
 }
 
 func TestAppendWriter(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	// Write the initial items.
 	sb := &seekBuf{}
@@ -1285,7 +1286,7 @@ func TestAppendWriterBadHeader(t *testing.T) {
 }
 
 func TestAppendWriterCustomCodec(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	codec := xorCodec{0xAB}
 
@@ -1317,7 +1318,7 @@ func TestAppendWriterCustomCodec(t *testing.T) {
 }
 
 func TestAppendWriterSeekError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	// Write a valid OCF file first.
 	sb := &seekBuf{}
@@ -1362,7 +1363,7 @@ func (f *failSeekRWS) Seek(int64, int) (int64, error) {
 }
 
 func TestAppendWriterUnknownCodec(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	// Write with a custom codec.
 	codec := xorCodec{0x42}
@@ -1383,7 +1384,7 @@ func TestAppendWriterUnknownCodec(t *testing.T) {
 }
 
 func TestWithBlockBytesNegative(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	// Negative block bytes is clamped to 0; with both zero we default to 100.
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockBytes(-1))
@@ -1403,7 +1404,7 @@ func TestWithBlockBytesNegative(t *testing.T) {
 }
 
 func TestAppendWriterBlockOpts(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	// Write the initial items.
 	sb := &seekBuf{}
@@ -1435,7 +1436,7 @@ func TestAppendWriterBlockOpts(t *testing.T) {
 }
 
 func TestResetHeaderWriteError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	v := int32(7)
 
 	// A failed Reset header write must poison a *live* writer. The sink was
@@ -1565,7 +1566,7 @@ func TestWrite(t *testing.T) {
 }
 
 func TestWriteAfterError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	ew := &errAfterN{max: 4096}
 	w := mustNewWriter(t, ew, s, WithBlockCount(1))
@@ -1582,7 +1583,7 @@ func TestWriteAfterError(t *testing.T) {
 }
 
 func TestWriteAutoFlush(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(2))
@@ -1591,7 +1592,7 @@ func TestWriteAutoFlush(t *testing.T) {
 	for i := range 5 {
 		var encoded []byte
 		v := int32(i)
-		encoded = mustAppendEncode(t, s, encoded, &v)
+		encoded = avrotest.MustAppendEncode(t, s, encoded, &v)
 		if _, err := w.Write(encoded); err != nil {
 			t.Fatal(err)
 		}
@@ -1607,7 +1608,7 @@ func TestWriteAutoFlush(t *testing.T) {
 }
 
 func TestWriteFlushError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	ew := &errAfterN{max: 4096}
 	w := mustNewWriter(t, ew, s, WithBlockCount(1))
 	ew.max = 0
@@ -1621,7 +1622,7 @@ func TestWriteFlushError(t *testing.T) {
 // ---------- Snappy codec ----------
 
 func TestSnappy(t *testing.T) {
-	s := mustParse(t, recordSchema)
+	s := avrotest.MustParse(t, recordSchema)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithCodec(SnappyCodec()))
@@ -1725,7 +1726,7 @@ func TestZstd(t *testing.T) {
 // ---------- Codec close ----------
 
 func TestWriterClosesCodec(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	codec := &trackCloseCodec{}
 	var buf bytes.Buffer
@@ -1751,7 +1752,7 @@ func (c *trackCloseCodec) Close() error {
 }
 
 func TestWriterCloseCodecError(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithCodec(&failCloseCodec{}))
 	if err := w.Close(); err == nil {
@@ -1764,7 +1765,7 @@ type failCloseCodec struct{ nullCodec }
 func (failCloseCodec) Close() error { return errors.New("close failed") }
 
 func TestReaderClose(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 
 	// Null codec: Close is a no-op.
 	var buf bytes.Buffer
@@ -1938,7 +1939,7 @@ func TestZstdCodecShared(t *testing.T) {
 
 func TestWithSchema(t *testing.T) {
 	fullSchema := `{"type":"record","name":"person","fields":[{"name":"name","type":"string","doc":"The name"},{"name":"age","type":"int"}]}`
-	s := mustParse(t, fullSchema)
+	s := avrotest.MustParse(t, fullSchema)
 
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithSchema(fullSchema))
@@ -2275,7 +2276,7 @@ func TestWithReaderSchemaIncompatible(t *testing.T) {
 }
 
 func TestReservedMetadataKey(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	_, err := NewWriter(&buf, s, WithMetadata(map[string][]byte{
 		"avro.custom": []byte("value"),
@@ -2424,7 +2425,7 @@ func TestReaderSchemaOptionsAreExclusive(t *testing.T) {
 }
 
 func TestNegativeBlockCountRead(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
@@ -2585,7 +2586,7 @@ func TestRegression_AppendWriterSchemaOpts(t *testing.T) {
 func TestRegression_TrailingEmptyBlockIsCleanEOF(t *testing.T) {
 	sync := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	var buf bytes.Buffer
-	s := mustParse(t, recordSchema)
+	s := avrotest.MustParse(t, recordSchema)
 	w := mustNewWriter(t, &buf, s, WithSyncMarker(sync))
 	if err := w.Encode(&person{Name: "alice", Age: 30}); err != nil {
 		t.Fatal(err)
@@ -2618,7 +2619,7 @@ func TestRegression_TrailingEmptyBlockIsCleanEOF(t *testing.T) {
 func TestRegression_BlockCountZeroValidatesSync(t *testing.T) {
 	sync := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	var buf bytes.Buffer
-	s := mustParse(t, recordSchema)
+	s := avrotest.MustParse(t, recordSchema)
 	w := mustNewWriter(t, &buf, s, WithSyncMarker(sync))
 	if err := w.Encode(&person{Name: "alice", Age: 30}); err != nil {
 		t.Fatal(err)
@@ -2669,7 +2670,7 @@ func TestRegression_EmptyBlockMidStreamSkipped(t *testing.T) {
 	buf.Write(sync[:])
 
 	// Block 3: count=1, one "second" datum, valid sync.
-	datum := mustAppendEncode(t, s, nil, "second")
+	datum := avrotest.MustAppendEncode(t, s, nil, "second")
 	buf.Write(binary.AppendVarint(nil, 1))
 	buf.Write(binary.AppendVarint(nil, int64(len(datum))))
 	buf.Write(datum)
@@ -2813,7 +2814,7 @@ func TestRegression_OCFBlockEnvelopeInvariant(t *testing.T) {
 	makeOCFWithBadBlock := func(t *testing.T, suffix []byte) []byte {
 		t.Helper()
 		var buf bytes.Buffer
-		s := mustParse(t, `"long"`)
+		s := avrotest.MustParse(t, `"long"`)
 		w := mustNewWriter(t, &buf, s, WithSyncMarker(sync))
 		if err := w.Encode(int64(1)); err != nil {
 			t.Fatal(err)
@@ -2891,7 +2892,7 @@ func TestRegression_OCFBlockCountCap(t *testing.T) {
 	// We build a header-only OCF for a schema and extract the sync marker.
 	headerAndSync := func(t *testing.T, schemaJSON string) ([]byte, []byte) {
 		t.Helper()
-		s := mustParse(t, schemaJSON)
+		s := avrotest.MustParse(t, schemaJSON)
 		var buf bytes.Buffer
 		w := mustNewWriter(t, &buf, s)
 		mustClose(t, w)
@@ -2984,7 +2985,7 @@ func TestRegression_OCFBlockCountCap(t *testing.T) {
 		// We write a legitimate OCF with 5000 long records. Count runs well
 		// past the 4096 zero-byte slack, but len(block) >= count, so the
 		// check accepts.
-		s := mustParse(t, `"long"`)
+		s := avrotest.MustParse(t, `"long"`)
 		var buf bytes.Buffer
 		w := mustNewWriter(t, &buf, s, WithBlockCount(10_000))
 		const n = 5000
@@ -3277,7 +3278,7 @@ func assertOneInt(t *testing.T, buf *bytes.Buffer, want int32) {
 // klauspost's zstd encoder silently re-initializes after Close. So the Writer
 // tracks its own closed state, mirroring Java DataFileWriter.assertOpen.
 func TestRegression_WriterRejectsMutatorsAfterClose(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	build := func() (*Writer, *bytes.Buffer) {
 		var buf bytes.Buffer
 		w := mustNewWriter(t, &buf, s)
@@ -3323,7 +3324,7 @@ func TestRegression_WriterRejectsMutatorsAfterClose(t *testing.T) {
 // Writer.Close is idempotent toward the codec: repeated Close calls close the
 // underlying codec exactly once.
 func TestRegression_WriterCloseClosesCodecOnce(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	closes := 0
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithCodec(closeCountCodec{&closes}))
@@ -3344,7 +3345,7 @@ func TestRegression_WriterCloseClosesCodecOnce(t *testing.T) {
 // Reader.Close is idempotent toward the codec, and Decode after Close errors
 // rather than returning data or a clean io.EOF.
 func TestRegression_ReaderRejectsUseAfterCloseAndClosesCodecOnce(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	// Two records in one block, so the second is buffered after the first
@@ -4069,7 +4070,7 @@ func TestRegression_UserErrorEOFNeverCleanEnd(t *testing.T) {
 		ct := avro.CustomType{AvroType: "long", Decode: func(v any, sn *avro.SchemaNode) (any, error) {
 			return nil, io.EOF
 		}}
-		s := mustParse(t, `{"type":"record","name":"CR2","fields":[{"name":"x","type":"long"}]}`, ct)
+		s := avrotest.MustParse(t, `{"type":"record","name":"CR2","fields":[{"name":"x","type":"long"}]}`, ct)
 		var buf bytes.Buffer
 		w := mustNewWriter(t, &buf, s)
 		if err := w.Encode(map[string]any{"x": int64(1)}); err != nil {
@@ -6317,7 +6318,7 @@ func wantBoundedErr(t *testing.T, name string, fn func() error) {
 // append a hostile block by hand.
 func ocfHeaderSync(t *testing.T, schemaJSON string) (hdr, sync []byte) {
 	t.Helper()
-	s := mustParse(t, schemaJSON)
+	s := avrotest.MustParse(t, schemaJSON)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	mustClose(t, w)
@@ -7021,7 +7022,7 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 	t.Run("count-values", func(t *testing.T) {
 		vi := func(v int64) []byte { return binary.AppendVarint(nil, v) }
 		s := avro.MustParse(`"string"`)
-		datum := mustAppendEncode(t, s, nil, "dX")
+		datum := avrotest.MustAppendEncode(t, s, nil, "dX")
 		cells := []struct {
 			name string
 			raw  []byte // hand-framed cell bytes spliced between the two data blocks
@@ -7141,7 +7142,7 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 		bad := foreignSync
 		bad[0] ^= 0xFF
 		appendRawBlock(&buf, 0, nil, bad)
-		datum := mustAppendEncode(t, s, nil, "d1")
+		datum := avrotest.MustAppendEncode(t, s, nil, "d1")
 		var rest bytes.Buffer
 		appendRawBlock(&rest, 1, datum, foreignSync)
 		buf.Write(rest.Bytes())
@@ -7203,7 +7204,7 @@ func TestReaderMetaMapFraming(t *testing.T) {
 
 	schemaJSON := []byte(`"string"`)
 	s := avro.MustParse(string(schemaJSON))
-	datum := mustAppendEncode(t, s, nil, "d0")
+	datum := avrotest.MustAppendEncode(t, s, nil, "d0")
 	deflated := func() []byte {
 		var b bytes.Buffer
 		zw, _ := flate.NewWriter(&b, flate.DefaultCompression)
@@ -8946,7 +8947,7 @@ func TestRegression_OCFMetadataKeyErrorBounded(t *testing.T) {
 // a %w wrap. fastavro errors at every one of these cuts, and the spec makes all
 // four block parts mandatory.
 func TestRegression_TruncatedBlockHeaderNotEOF(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	// One complete block with one record.
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
@@ -9017,7 +9018,7 @@ func TestRegression_TruncatedBlockHeaderNotEOF(t *testing.T) {
 // are pinned. io.ReadFull differs: its partial reads already return
 // io.ErrUnexpectedEOF.
 func TestRegression_TruncatedLargeBlockDataNotEOF(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	if err := w.Encode(int32(7)); err != nil {
@@ -9072,7 +9073,7 @@ func TestRegression_TruncatedLargeBlockDataNotEOF(t *testing.T) {
 // cuts participate. Both codecs share the invariant and differ in the data-read
 // arms traversed.
 func TestMatrix_TruncationTerminalErrorIdentity(t *testing.T) {
-	s := mustParse(t, `"int"`)
+	s := avrotest.MustParse(t, `"int"`)
 	for _, codec := range []struct {
 		name string
 		opts []WriterOpt
@@ -9350,7 +9351,7 @@ const decodeOptsSchema = `{"type":"record","name":"R","fields":[
 
 func writeDecodeOptsFile(t *testing.T) []byte {
 	t.Helper()
-	s := mustParse(t, decodeOptsSchema)
+	s := avrotest.MustParse(t, decodeOptsSchema)
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s)
 	if err := w.Encode(map[string]any{"u": "hello", "t": time.UnixMilli(1).UTC()}); err != nil {
