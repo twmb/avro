@@ -197,23 +197,23 @@ var censusRegistry = []censusQuestion{
 	},
 	{
 		id:       "Q3",
-		question: "What does json.Marshal emit as the object key for this Go map key?",
-		authority: "EXTERNAL: encoding/json's resolveKeyName. It is executed per corpus cell by " +
-			"TestMatrix_WalkBudgetMapKeyMatchesJSONKeyResolver, which compares against json.Marshal's " +
-			"actual output rather than any restatement of its rules — the whole point, since the two bugs " +
-			"in this area were both a restatement that was narrower than the authority",
+		question: "What is the JSON object name for this Go map key?",
+		authority: "INTERNAL: mapKeyName (schema_node.go). encoding/json's key resolver used to answer this, " +
+			"executed per cell by TestMatrix_WalkBudgetMapKeyMatchesJSONKeyResolver, until the v2 " +
+			"implementation (Go 1.27) changed two of its arms: it names a string-kind key by its MarshalText " +
+			"where v1 used the raw string, and it formats a float-kind key where v1 refused it. A name that " +
+			"depends on the toolchain is no answer, so the package names every key itself, once, and both " +
+			"canonicalizing copies emit that name before json.Marshal sees the map. The matrix still executes " +
+			"json.Marshal for every cell where the two implementations agree, and states the package's own " +
+			"rule for the two where they do not",
 		answerers: []censusAnswerer{
-			{repr: "caller `any` tree, budget walk", site: "mapKeyEmitLen", file: "schema_node.go"},
+			{repr: "caller `any` tree, budget walk", site: "valueWalkLimit, through mapKeyName", file: "schema_node.go"},
+			{repr: "caller `any` tree, fixup walk", site: "applyJSONFixupKind, through mapKeyName", file: "schema_node.go"},
+			{repr: "caller `any` tree, SchemaFor canonicalize walk", site: "canonicalizeTreeValue, through mapKeyName", file: "schema_for.go"},
 			{
-				repr: "caller `any` tree, fixup + canonicalize walk", site: "canonicalStringKeyMap", file: "schema_node.go",
-				note: "different-by-design: this arm asks a NARROWER question — 'do these keys canonicalize to their plain string value', which is true only for the string KIND. A non-string key's object-key form comes from its MarshalText, so such maps stay marshal-opaque and are never rewritten. It must not be collapsed into mapKeyEmitLen, whose question is 'how many bytes does this key cost'; the two agree on the string-kind arm and are deliberately different elsewhere.",
+				repr: "caller `any` tree, which maps to rewrite", site: "canonicalStringKeyMap", file: "schema_node.go",
+				note: "different-by-design: this predicate asks a NARROWER question, 'is this a map we rewrite into map[string]any', which is true only for the string KIND. A non-string-kind key's name comes from its MarshalText or integer formatting under both encoding/json implementations, so those maps stay marshal-opaque and are never rewritten; mapKeyName still charges their keys.",
 			},
-			// SchemaFor's tree canonicalizer (canonicalizeTreeValue,
-			// schema_for.go) is NOT a separate answerer: it calls
-			// canonicalStringKeyMap. That is the shape we want, a second
-			// representation consuming the one predicate instead of restating
-			// it. We record it here so a later edit that inlines the check
-			// reads as the regression it would be.
 		},
 		tells: []censusTell{
 			{pattern: `.Key().Kind()`, counts: map[string]int{
@@ -229,8 +229,9 @@ var censusRegistry = []censusQuestion{
 				"schema_for.go":  1,
 				"ser.go":         3,
 			}},
-			{pattern: `k.Kind() == reflect.String`, counts: map[string]int{
-				"schema_node.go": 1, // mapKeyEmitLen's string-kind arm
+			{pattern: `mapKeyName(`, counts: map[string]int{
+				"schema_node.go": 3, // the definition, the budget walk, the fixup walk
+				"schema_for.go":  1, // the SchemaFor canonicalize walk
 			}},
 		},
 	},
@@ -243,7 +244,7 @@ var censusRegistry = []censusQuestion{
 			"answerer set in the package: the schema-tree budget models json.Marshal's recursion, and " +
 			"anything it fails to model is emitted for free",
 		answerers: []censusAnswerer{
-			{repr: "caller `any` tree, budget walk", site: "valueWalkLimit + marshalEmitLen + mapKeyEmitLen", file: "schema_node.go"},
+			{repr: "caller `any` tree, budget walk", site: "valueWalkLimit + marshalEmitLen + mapKeyName", file: "schema_node.go"},
 			{
 				repr: "caller `any` tree, escaped-length scan", site: "jsonEscapedLen / jsonEscapedLenBytes / asciiEscapedLen / avroCodepointEscapedLen / compactedEmitLen", file: "schema_node.go",
 				note: "RESTATES the authority rather than delegating, which this census otherwise treats as the bug. Permitted only because delegation is impossible for MEASUREMENT: asking the emitter how long its output is means producing that output, which is the allocation the budget exists to prevent. The licence is conditional on the executed differential over the authority's COMPLETE domain — every one of the 256 single-byte values, the multi-byte runes, invalid UTF-8, the HTML trio and the two-character escapes — derived from marshalSchemaTree, the package's own emitter, so a future SetEscapeHTML(false) moves the expectation and reds this until the restatement follows. Escaping below utf8.RuneSelf is byte-LOCAL, so per-byte totality is a proof over that part of the domain, not a sample of it.",
@@ -267,7 +268,7 @@ var censusRegistry = []censusQuestion{
 				"schema_for.go":  1,
 			}},
 			{pattern: `json.Marshaler`, counts: map[string]int{
-				"schema_node.go": 6,
+				"schema_node.go": 5,
 				// Not an answerer: a comment recording that aschema is
 				// deliberately NOT a json.Marshaler (so the stdlib decoder does
 				// not re-scan each nested subtree).

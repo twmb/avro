@@ -348,7 +348,7 @@ func deepCopyJSONTree(v any) any {
 		}
 		out := make(map[string]any, len(v))
 		for k, val := range v {
-			out[k] = deepCopyJSONTree(val)
+			out[validUTF8(k)] = deepCopyJSONTree(val)
 		}
 		return out
 	case []any:
@@ -374,9 +374,13 @@ func deepCopyJSONTree(v any) any {
 			return v
 		}
 		out := make([]string, len(v))
-		copy(out, v)
+		for i, s := range v {
+			out[i] = validUTF8(s)
+		}
 		return out
-	case nil, string, bool, float64, float32, int, int32, int64, json.Number:
+	case string:
+		return validUTF8(v)
+	case nil, bool, float64, float32, int, int32, int64, json.Number:
 		return v
 	}
 	return canonicalizeTreeValue(v)
@@ -389,15 +393,16 @@ func deepCopyJSONTree(v any) any {
 // aliases/symbols form), a byte-kinded slice into []byte, named leaves into
 // their predeclared types, with pointers and interfaces unwrapped. A nil
 // named map/slice canonicalizes to nil, its marshal image being null,
-// exactly like its canonical twin's. Values whose marshal is self-defined
-// (own MarshalJSON/MarshalText, json.Number: treeValueMarshalOpaque) and
-// shapes with no stable same-marshal canonical twin (structs; maps with
-// non-string-kind keys, whose MarshalText output is the key on every
-// toolchain; slices whose elements' marshal is position-dependent) stay as
-// they are: opaque leaves the walkers pass through untouched and Parse reads
-// from the marshal, the documented residual posture. Cyclic values cannot
-// reach here: the render's budgeted walk (valueWalkLimit) errors on them
-// before the copy runs.
+// exactly like its canonical twin's. A string-kind map key is named by
+// mapKeyName, so a MarshalText on it is honored. Values whose marshal is
+// self-defined (own MarshalJSON/MarshalText, json.Number:
+// treeValueMarshalOpaque) and shapes with no stable same-marshal canonical
+// twin (structs; maps with non-string-kind keys, whose MarshalText output is
+// the key on every toolchain; slices whose elements' marshal is
+// position-dependent) stay as they are: opaque leaves the walkers pass
+// through untouched and Parse reads from the marshal, the documented residual
+// posture. Cyclic values and unnameable keys cannot reach here: the render's
+// budgeted walk (valueWalkLimit) errors on them before the copy runs.
 func canonicalizeTreeValue(v any) any {
 	if v == nil || treeValueMarshalOpaque(v) {
 		return v
@@ -418,7 +423,11 @@ func canonicalizeTreeValue(v any) any {
 		}
 		out := make(map[string]any, rv.Len())
 		for it := rv.MapRange(); it.Next(); {
-			out[it.Key().String()] = deepCopyJSONTree(it.Value().Interface())
+			name, err := mapKeyName(it.Key())
+			if err != nil {
+				return v
+			}
+			out[validUTF8(name)] = deepCopyJSONTree(it.Value().Interface())
 		}
 		return out
 	case reflect.Slice, reflect.Array:
@@ -440,7 +449,7 @@ func canonicalizeTreeValue(v any) any {
 			!elem.Implements(jsonMarshalerType) && !elem.Implements(textMarshalerType) {
 			out := make([]string, rv.Len())
 			for i := range out {
-				out[i] = rv.Index(i).String()
+				out[i] = validUTF8(rv.Index(i).String())
 			}
 			return out
 		}
@@ -450,7 +459,7 @@ func canonicalizeTreeValue(v any) any {
 		}
 		return out
 	case reflect.String:
-		return rv.String()
+		return validUTF8(rv.String())
 	case reflect.Bool:
 		return rv.Bool()
 	case reflect.Float64:

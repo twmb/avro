@@ -185,9 +185,11 @@ type darkOKKey int
 
 func (k darkOKKey) MarshalText() ([]byte, error) { return []byte(fmt.Sprint(int(k))), nil }
 
-// A string-*kind* key with a MarshalText that would fail. encoding/json
-// resolves string-kind keys by their raw string and never consults
-// MarshalText, so this must marshal fine on both sides.
+// A string-*kind* key with a MarshalText that fails. The package names every
+// key by its MarshalText (mapKeyName), so this is refused on every toolchain.
+// The v1 encoding/json would have marshaled it by the raw string and the v2
+// one refuses it, which is why the cell is pinned rather than read from the
+// oracle.
 type darkFailStringKey string
 
 func (darkFailStringKey) MarshalText() ([]byte, error) {
@@ -209,26 +211,27 @@ func TestMatrix_SchemaTreeValueRenderMatchesEncodingJSON(t *testing.T) {
 	t.Parallel()
 
 	carriers := []struct {
-		name string
-		v    any
+		name   string
+		v      any
+		refuse string // non-empty: the render must refuse, with this text
 	}{
 		// Elements whose marshal is reachable only through the addressable
 		// slot. Boxing them into []any would change the output, so the
 		// container has to stay opaque.
-		{"ptr-receiver-marshaler-slice", []darkPtrMarshaler{{1}, {2}}},
-		{"ptr-receiver-marshaler-array", [2]darkPtrMarshaler{{1}, {2}}},
-		{"named-byte-slice", darkNamedBytes{1, 2, 3}},
-		{"named-map", darkNamedMap{"k": "v"}},
-		{"named-float-slice", darkNamedFloats{1, 2}},
-		{"text-key-map", map[darkOKKey]int{1: 2}},
-		{"string-kind-key-with-failing-text", map[darkFailStringKey]int{"k": 1}},
-		{"unexported-field-struct", darkUnexported{Exported: 1}},
-		{"separator-marshaler", darkSepMarshaler{}},
-		{"pointer-to-slice", &[]any{1.0}},
-		{"nil-pointer", (*int)(nil)},
-		{"int-array", [2]int{1, 2}},
-		{"float32-plain", float32(1.5)},
-		{"float64-plain", 1.5},
+		{name: "ptr-receiver-marshaler-slice", v: []darkPtrMarshaler{{1}, {2}}},
+		{name: "ptr-receiver-marshaler-array", v: [2]darkPtrMarshaler{{1}, {2}}},
+		{name: "named-byte-slice", v: darkNamedBytes{1, 2, 3}},
+		{name: "named-map", v: darkNamedMap{"k": "v"}},
+		{name: "named-float-slice", v: darkNamedFloats{1, 2}},
+		{name: "text-key-map", v: map[darkOKKey]int{1: 2}},
+		{name: "string-kind-key-with-failing-text", v: map[darkFailStringKey]int{"k": 1}, refuse: "darkFailStringKey: no"},
+		{name: "unexported-field-struct", v: darkUnexported{Exported: 1}},
+		{name: "separator-marshaler", v: darkSepMarshaler{}},
+		{name: "pointer-to-slice", v: &[]any{1.0}},
+		{name: "nil-pointer", v: (*int)(nil)},
+		{name: "int-array", v: [2]int{1, 2}},
+		{name: "float32-plain", v: float32(1.5)},
+		{name: "float64-plain", v: 1.5},
 	}
 
 	// Position axis: alone, or as a sibling of a value that forces the walk
@@ -271,6 +274,14 @@ func TestMatrix_SchemaTreeValueRenderMatchesEncodingJSON(t *testing.T) {
 				// design. The one documented substitution is the byte slice,
 				// which Avro renders as its codepoint string rather than
 				// base64.
+				if c.refuse != "" {
+					_, err := n.Schema()
+					if err == nil || !strings.Contains(err.Error(), c.refuse) {
+						t.Fatalf("the render must refuse %T with %q on every toolchain; got err=%v", c.v, c.refuse, err)
+					}
+					return
+				}
+
 				oracleBytes, oracleErr := json.Marshal(c.v)
 
 				out, err := n.Schema()

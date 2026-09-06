@@ -90,6 +90,13 @@ type SchemaNode struct {
 	// int64 (1e3 reads as int64(1000)); exponents overflowing float64 give
 	// ±Inf. math.NaN() re-reads as the string "NaN" after Schema()/Root(),
 	// because JSON has no NaN literal; ±Inf round-trips as float64(±Inf).
+	//
+	// When you build a node by hand, a map key with a MarshalText method
+	// renders as that text whatever the key's kind, a float-kind key is an
+	// error, and invalid UTF-8 in a string or key becomes U+FFFD. None of
+	// this depends on the Go version. encoding/json changed all three
+	// between Go 1.26 and Go 1.27, so we name keys and replace bytes
+	// ourselves before it runs.
 	Props map[string]any
 
 	// refTarget is set only by [Schema.Root], on name-reference nodes, and
@@ -536,19 +543,31 @@ func needsJSONFixup(v any) bool {
 		return math.IsInf(float64(tv), 0) || math.IsNaN(float64(tv)) || isNegativeZero(float64(tv))
 	case []byte:
 		return true
+	case string:
+		return !utf8.ValidString(tv)
 	case map[string]any:
-		for _, val := range tv {
-			if needsJSONFixup(val) {
+		for k, val := range tv {
+			if !utf8.ValidString(k) || needsJSONFixup(val) {
 				return true
 			}
 		}
 	case []any:
 		return slices.ContainsFunc(tv, needsJSONFixup)
-	case nil, string, bool, json.Number, int, int32, int64:
+	case nil, bool, json.Number, int, int32, int64:
 	default:
 		return needsJSONFixupKind(v)
 	}
 	return false
+}
+
+// validUTF8 replaces each invalid byte of s with U+FFFD. Every string and
+// map key we canonicalize goes through it, so the emitter never sees an
+// invalid byte and the two encoding/json implementations, which spell the
+// replacement differently (v1 as a six-byte escape, v2 as the three raw
+// bytes), have nothing left to disagree on. Parse applies the same
+// replacement on the way in, so a Root tree never carries one either.
+func validUTF8(s string) string {
+	return strings.ToValidUTF8(s, string(utf8.RuneError))
 }
 
 var jsonMarshalerType = reflect.TypeFor[json.Marshaler]()
@@ -593,16 +612,64 @@ func sliceElemMarshalPositionDependent(t reflect.Type) bool {
 	return !t.Implements(jsonMarshalerType) && !t.Implements(textMarshalerType)
 }
 
-// canonicalStringKeyMap reports whether t's keys canonicalize to their plain
-// string value: every string-kind key does. encoding/json checks the string
-// kind *before* any marshaler, so a string-kind key marshals raw and its
-// MarshalText is never consulted (executed). jsonv2 flips that precedence, so
-// pinning the raw string keeps the composed schema identical across toolchains.
-// json.Marshaler is never consulted for keys either way. Non-string-kind keys
-// are the opposite, their MarshalText output being the key under both, so those
-// maps stay marshal-opaque image-owners.
+// canonicalStringKeyMap reports whether t's keys canonicalize to plain strings:
+// every string-kind key does, named as mapKeyName names it. A non-string-kind
+// key's JSON name comes from its MarshalText or its integer formatting under
+// both encoding/json implementations, so those maps stay marshal-opaque
+// image-owners and are never rewritten.
 func canonicalStringKeyMap(t reflect.Type) bool {
 	return t.Key().Kind() == reflect.String
+}
+
+// errBadMapKey is mapKeyName's verdict for a key kind with no JSON object
+// name: float, bool, complex, array, a struct with no text method, or a nil
+// interface.
+var errBadMapKey = errors.New("avro: SchemaNode default/property value contains a map whose key type has no JSON object-key form (not a string kind, an integer kind, or a usable encoding.TextMarshaler)")
+
+// mapKeyName returns the JSON object name we give map key k. It is the one
+// answer to that question: the budget walk charges it and both canonicalizing
+// copies emit it, so the name cannot depend on which encoding/json
+// implementation the toolchain ships. The v1 implementation (Go 1.26) and the
+// v2 one (Go 1.27) disagree on two of these arms.
+//
+// A key with a MarshalText method is named by that text whatever its kind.
+// That is v2's rule; v1 skipped the method for string kinds only, while
+// honoring it for every other kind. A nil pointer key is named "" without
+// calling the method, as both implementations do, because calling it
+// dereferences nil inside the very walk that exists to make an arbitrary tree
+// safe to marshal. A string kind without the method is its raw string. An
+// integer kind is its decimal.
+//
+// Everything else has no name. A float has no single text form, and NaN has
+// none at all, so we keep v1's refusal where v2 formats one. encoding/json's
+// own resolver panics on a nil interface key; we return an error instead.
+//
+// The name comes back as written. The copies replace invalid UTF-8 in it
+// (validUTF8), and the walk charges the raw form, which is exact for a map we
+// leave opaque and an over-charge for one we canonicalize, the safe direction
+// for a cap.
+func mapKeyName(k reflect.Value) (string, error) {
+	if k.CanInterface() {
+		if tm, ok := k.Interface().(encoding.TextMarshaler); ok {
+			if k.Kind() == reflect.Pointer && k.IsNil() {
+				return "", nil
+			}
+			out, err := tm.MarshalText()
+			if err != nil {
+				return "", fmt.Errorf("avro: SchemaNode default/property value map key MarshalText: %w", err)
+			}
+			return string(out), nil
+		}
+	}
+	switch k.Kind() {
+	case reflect.String:
+		return k.String(), nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.FormatInt(k.Int(), 10), nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return strconv.FormatUint(k.Uint(), 10), nil
+	}
+	return "", errBadMapKey
 }
 
 // needsJSONFixupKind extends fixup detection to caller-typed values by reflect
@@ -621,6 +688,8 @@ func needsJSONFixupKind(v any) bool {
 	case reflect.Float64, reflect.Float32:
 		f := rv.Float()
 		return math.IsInf(f, 0) || isNegativeZero(f)
+	case reflect.String:
+		return !utf8.ValidString(rv.String())
 	case reflect.Slice:
 		if canonicalByteSliceKind(rv.Type()) {
 			return true
@@ -639,8 +708,14 @@ func needsJSONFixupKind(v any) bool {
 		if !canonicalStringKeyMap(rv.Type()) {
 			return false
 		}
+		// Only the copy honors a MarshalText on the key type, so such a map
+		// always rebuilds. Left to json.Marshal, the name would depend on
+		// the toolchain.
+		if rv.Type().Key().Implements(textMarshalerType) {
+			return true
+		}
 		for it := rv.MapRange(); it.Next(); {
-			if needsJSONFixup(it.Value().Interface()) {
+			if !utf8.ValidString(it.Key().String()) || needsJSONFixup(it.Value().Interface()) {
 				return true
 			}
 		}
@@ -702,10 +777,12 @@ func applyJSONFixup(v any) any {
 		return tv
 	case []byte:
 		return bytesToAvroJSONString(tv)
+	case string:
+		return validUTF8(tv)
 	case map[string]any:
 		out := make(map[string]any, len(tv))
 		for k, val := range tv {
-			out[k] = applyJSONFixup(val)
+			out[validUTF8(k)] = applyJSONFixup(val)
 		}
 		return out
 	case []any:
@@ -740,6 +817,8 @@ func applyJSONFixupKind(v any) any {
 			return json.Number("-0.0")
 		}
 		return v
+	case reflect.String:
+		return validUTF8(rv.String())
 	case reflect.Slice:
 		if canonicalByteSliceKind(rv.Type()) {
 			b := make([]byte, rv.Len())
@@ -764,7 +843,13 @@ func applyJSONFixupKind(v any) any {
 		}
 		out := make(map[string]any, rv.Len())
 		for it := rv.MapRange(); it.Next(); {
-			out[it.Key().String()] = applyJSONFixup(it.Value().Interface())
+			name, err := mapKeyName(it.Key())
+			if err != nil {
+				// valueWalkLimit runs first and refuses every key it
+				// cannot name, so this arm never observes an error.
+				return v
+			}
+			out[validUTF8(name)] = applyJSONFixup(it.Value().Interface())
 		}
 		return out
 	case reflect.Pointer, reflect.Interface:
@@ -810,6 +895,10 @@ const maxSchemaJSONBytes = 1 << 26
 type walkBudget struct {
 	nodes int
 	bytes int
+	// keyErr carries the map-key error behind a valueWalkBadMapKey verdict:
+	// a key kind with no JSON name, a MarshalText that failed, or two keys
+	// of one map that would share a name.
+	keyErr error
 }
 
 func newWalkBudget() walkBudget {
@@ -851,11 +940,12 @@ func (b *walkBudget) takeBytes(n int) bool {
 }
 
 // emitString charges a structural scalar string's bytes, returning it for
-// emission, or "" (recording the over-budget error) when the byte budget is
-// exhausted, so json.Marshal never copies a payload past the bound.
+// emission with any invalid UTF-8 replaced (validUTF8), or "" (recording the
+// over-budget error) when the byte budget is exhausted, so json.Marshal never
+// copies a payload past the bound.
 func (b *walkBudget) emitString(d *deduper, s string) string {
 	if b.takeBytes(len(s)) {
-		return s
+		return validUTF8(s)
 	}
 	d.fail(errSchemaTreeBytes())
 	return ""
@@ -880,6 +970,19 @@ func (b *walkBudget) emitStrings(d *deduper, ss []string) []string {
 	if !b.takeBytes(total) {
 		d.fail(errSchemaTreeBytes())
 		return []string{}
+	}
+	// Your slice comes back as is unless an element carries invalid UTF-8,
+	// in which case we hand back a replaced copy rather than write into it.
+	for i, s := range ss {
+		if utf8.ValidString(s) {
+			continue
+		}
+		out := make([]string, len(ss))
+		copy(out, ss[:i])
+		for j := i; j < len(ss); j++ {
+			out[j] = validUTF8(ss[j])
+		}
+		return out
 	}
 	return ss
 }
@@ -951,6 +1054,23 @@ func marshalEmitLen(rv reflect.Value, limit int) (int, bool) {
 	return 0, false
 }
 
+// jsonInvalidUTF8EmitLen is what marshalSchemaTree writes for one invalid
+// UTF-8 byte in a string it receives uncanonicalized: a struct field, or text
+// a marshaler returned. The v1 encoding/json (Go 1.26) writes a six-byte
+// backslash-u escape; the v2 implementation, the default from Go 1.27, writes
+// the three raw bytes of U+FFFD. We measure it once rather than restate it,
+// so a toolchain that changes the spelling again moves the charge with it. A
+// string we canonicalize never carries an invalid byte (validUTF8), so for
+// those the charge is exact under v2 and over by three per byte under v1,
+// the safe direction for a cap.
+var jsonInvalidUTF8EmitLen = func() int {
+	out, err := marshalSchemaTree(string([]byte{0x80}))
+	if err != nil || len(out) < 2 {
+		return 6 // the larger spelling, should an emitter ever refuse the byte
+	}
+	return len(out) - 2 // minus the quotes
+}()
+
 // marshalSchemaTree is our one call that turns a rendered schema tree into
 // bytes. The walk budget charges against exactly this emitter's escaping, and
 // the census differential derives its expectation from it. A change here (an
@@ -999,7 +1119,7 @@ func jsonEscapedLen(s string, limit int) int {
 			c, size := utf8.DecodeRuneInString(s[i:])
 			switch {
 			case c == utf8.RuneError && size == 1:
-				n += 6 // invalid UTF-8 is emitted as �
+				n += jsonInvalidUTF8EmitLen
 			case c == ' ' || c == ' ':
 				n += 6 // escaped unconditionally, JSONP safety
 			default:
@@ -1026,7 +1146,7 @@ func jsonEscapedLenBytes(s []byte, limit int) int {
 			c, size := utf8.DecodeRune(s[i:])
 			switch {
 			case c == utf8.RuneError && size == 1:
-				n += 6
+				n += jsonInvalidUTF8EmitLen
 			case c == ' ' || c == ' ':
 				n += 6
 			default:
@@ -1081,53 +1201,6 @@ func compactedEmitLen(out []byte, limit int) int {
 		}
 	}
 	return n
-}
-
-// mapKeyEmitLen reports the bytes json.Marshal emits for one map key, and
-// whether its key resolver can name the key at all.
-//
-// The arms mirror encoding/json's resolveKeyName in order, guards included:
-// string kind first (marshals raw; its MarshalText is not consulted), then
-// encoding.TextMarshaler, then integer formatting. Modeling only the
-// convenient arms would leave the rest free of charge.
-//
-// The nil-pointer guard is the one that matters: for a nil pointer key whose
-// type has a pointer-receiver MarshalText, json.Marshal resolves "" *without*
-// calling the method. Calling it dereferences nil, a panic raised inside the
-// very walk that exists to make an arbitrary tree safe to marshal.
-//
-// The final arm is resolveKeyName's `panic("unexpected map key type")`,
-// reachable via a nil interface key in a map[encoding.TextMarshaler]V, which
-// json's encoder-construction check admits (the interface implements itself)
-// and its resolver then cannot name. We return a named error instead, as we do
-// for the key kinds json rejects at construction (float, array, a struct with
-// no text method). Every key is accounted for, so "json cannot emit this key"
-// is a verdict we own rather than a panic to forward.
-func mapKeyEmitLen(k reflect.Value, limit int) (int, bool) {
-	if k.Kind() == reflect.String {
-		return jsonEscapedLen(k.String(), limit), true
-	}
-	if k.CanInterface() {
-		if tm, ok := k.Interface().(encoding.TextMarshaler); ok {
-			if k.Kind() == reflect.Pointer && k.IsNil() {
-				return 0, true // resolved to "" without calling the method
-			}
-			out, err := tm.MarshalText()
-			if err != nil {
-				// Left uncharged, like marshalEmitLen: the eventual
-				// json.Marshal surfaces this same error by its own name.
-				return 0, true
-			}
-			return jsonEscapedLenBytes(out, limit), true
-		}
-	}
-	switch k.Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-		reflect.Uintptr:
-		return 20, true // a signed 64-bit decimal is at most 20 bytes
-	}
-	return 0, false
 }
 
 // valueWalkLimit walks an arbitrary user-supplied Props value or
@@ -1185,16 +1258,33 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 		}
 		return valueWalkLimit(rv.Elem(), depthLeft-1, b)
 	case reflect.Map:
+		// We name every key ourselves (mapKeyName), so the charge is for the
+		// name we emit, a key we cannot name is refused here rather than
+		// forwarded to encoding/json, and two keys that would share one
+		// object name are refused rather than silently collapsed. Distinct
+		// Go keys can share a name once invalid UTF-8 becomes U+FFFD, or
+		// through MarshalText, and a JSON object with a repeated name reads
+		// back as whichever member came last.
+		var seen map[string]struct{}
 		for iter := rv.MapRange(); iter.Next(); {
-			// json emits every map key, whatever its kind: string-kind raw,
-			// anything else via MarshalText or integer formatting. All of
-			// them must be charged. See mapKeyEmitLen.
-			n, ok := mapKeyEmitLen(iter.Key(), b.bytes)
-			if !ok {
+			name, err := mapKeyName(iter.Key())
+			if err != nil {
+				b.keyErr = err
 				return valueWalkBadMapKey
 			}
-			if !b.takeBytes(n) {
+			if !b.takeBytes(jsonEscapedLen(name, b.bytes)) {
 				return valueWalkTooLarge
+			}
+			if rv.Len() > 1 {
+				emitted := validUTF8(name)
+				if _, dup := seen[emitted]; dup {
+					b.keyErr = fmt.Errorf("avro: SchemaNode default/property value contains a map with two keys that share the JSON object name %q", emitted)
+					return valueWalkBadMapKey
+				}
+				if seen == nil {
+					seen = make(map[string]struct{}, rv.Len())
+				}
+				seen[emitted] = struct{}{}
 			}
 			if r := valueWalkLimit(iter.Value(), depthLeft-1, b); r != valueWalkOK {
 				return r
@@ -1261,7 +1351,12 @@ func boundedSerializableValue(d *deduper, depth int, b *walkBudget, v any) any {
 		d.fail(fmt.Errorf("avro: SchemaNode default/property value expands to more than the supported %d bytes", maxSchemaJSONBytes))
 		return nil
 	case valueWalkBadMapKey:
-		d.fail(errors.New("avro: SchemaNode default/property value contains a map whose key type has no JSON object-key form (not a string kind, an integer kind, or a usable encoding.TextMarshaler)"))
+		err := b.keyErr
+		if err == nil {
+			err = errBadMapKey
+		}
+		b.keyErr = nil
+		d.fail(err)
 		return nil
 	}
 	return jsonSerializableValue(v)
