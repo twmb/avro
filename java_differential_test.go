@@ -927,17 +927,29 @@ func TestDifferentialJavaAcceptanceAttributePlacement(t *testing.T) {
 		}
 	})
 
-	// The stray-name-on-container divergence direction, documented: Java
-	// ignores the reserved key where twmb keeps its walker-parity reject.
-	t.Run("stray-name-on-array-java-accepts", func(t *testing.T) {
-		src := `{"type":"array","items":"int","name":"strayName"}`
-		if ok, _, _, errMsg := fpCanon(t, src); !ok {
-			t.Errorf("Java now rejects a stray name on an array (%s) — recalibrate the documented divergence", errMsg)
-		}
-		if _, err := avro.Parse(src); err == nil {
-			t.Errorf("twmb accepted a stray name on an array; the documented keep-strict posture changed")
-		}
-	})
+	// A stray name on a container: Java ignores the reserved key, and so do
+	// we, with the same canonical form. The dotted spelling must not scope
+	// the record nested inside it in either implementation.
+	for _, c := range []struct{ name, src string }{
+		{"array", `{"type":"array","items":"int","name":"strayName"}`},
+		{"map", `{"type":"map","values":"int","name":"strayName"}`},
+		{"dotted-array", `{"type":"record","name":"top.R","fields":[{"name":"f","type":{"type":"array","name":"wrong.Box","items":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}},{"name":"g","type":"top.Inner"}]}`},
+	} {
+		src := c.src
+		t.Run("stray-name-on-container/"+c.name, func(t *testing.T) {
+			ok, _, canon, errMsg := fpCanon(t, src)
+			if !ok {
+				t.Fatalf("Java rejected a stray name on a container (%s): %s", src, errMsg)
+			}
+			s, err := avro.Parse(src)
+			if err != nil {
+				t.Fatalf("twmb Parse(%s): %v", src, err)
+			}
+			if got := string(s.Canonical()); got != canon {
+				t.Errorf("PCF diverges from Java for %s:\n twmb: %s\n java: %s", src, got, canon)
+			}
+		})
+	}
 }
 
 // schemaOraclePipes launches the Java SchemaOracle subprocess and returns its

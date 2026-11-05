@@ -612,13 +612,139 @@ func TestMatrix_AttributePlacementNamespaceInert(t *testing.T) {
 		}
 	})
 	t.Run("stray-name-cannot-define", func(t *testing.T) {
-		// A stray "name" on a container cannot become a definition. The
-		// shape itself keeps rejecting at parse (see
-		// TestRegression_StrayNameOnUnnamedComplexKeepsRejecting), so no
-		// walker ever sees it.
+		// A stray "name" on a container parses as inert metadata and cannot
+		// become a definition, in the same parse or across the cache.
+		const arr = `{"name":"f","type":{"type":"array","items":"int","name":"strayName"}}`
+		if _, err := avro.Parse(`{"type":"record","name":"R","fields":[` + arr + `,{"name":"g","type":"strayName"}]}`); err == nil {
+			t.Fatalf("strayName resolved: a stray name on an array defined a type")
+		}
 		var c avro.SchemaCache
-		if _, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":"int","name":"strayName"}}]}`); err == nil {
-			t.Fatalf("stray name on an array parsed; the walker-parity guard is gone")
+		if _, err := c.Parse(`{"type":"record","name":"R","fields":[` + arr + `]}`); err != nil {
+			t.Fatalf("stray name on an array: %v", err)
+		}
+		if _, err := c.Parse(`{"type":"record","name":"R2","fields":[{"name":"g","type":"strayName"}]}`); err == nil {
+			t.Fatalf("strayName spliced: a cache walker registered a stray name")
+		}
+	})
+}
+
+// A stray "name" on an unnamed kind is inert metadata, as in Java
+// (SCHEMA_RESERVED) and fastavro. It defines nothing and scopes nothing, and
+// the canonical form, the fingerprint and the wire bytes are those of the
+// schema without it. The metadata walkers must agree with the parser, so the
+// scoping and binding cases also read the answer back through Root().
+func TestMatrix_AttributePlacementNameInert(t *testing.T) {
+	const innerCanon = `{"name":"top.Inner","type":"record","fields":[{"name":"i","type":"int"}]}`
+	const dotted = `{"type":"record","name":"top.R","fields":[
+		{"name":"box","type":{"type":"array","name":"wrong.Box","items":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}},
+		{"name":"g","type":"top.Inner"}]}`
+
+	t.Run("same-as-unnamed", func(t *testing.T) {
+		for _, c := range []struct {
+			named, plain string
+			value        any
+		}{
+			{`{"type":"array","name":"item","items":"string"}`, `{"type":"array","items":"string"}`, []any{"a"}},
+			{`{"type":"map","name":"tag","values":"string"}`, `{"type":"map","values":"string"}`, map[string]any{"k": "v"}},
+			{`{"type":"int","name":"n"}`, `"int"`, int32(7)},
+		} {
+			named, err := avro.Parse(c.named)
+			if err != nil {
+				t.Fatalf("%s: %v", c.named, err)
+			}
+			plain := avro.MustParse(c.plain)
+			if got, want := string(named.Canonical()), string(plain.Canonical()); got != want {
+				t.Errorf("%s: canonical %s, want %s", c.named, got, want)
+			}
+			if !bytes.Equal(named.Fingerprint(avro.NewRabin()), plain.Fingerprint(avro.NewRabin())) {
+				t.Errorf("%s: fingerprint differs from %s", c.named, c.plain)
+			}
+			nb, err := named.Encode(c.value)
+			if err != nil {
+				t.Fatalf("%s: encode: %v", c.named, err)
+			}
+			pb, err := plain.Encode(c.value)
+			if err != nil {
+				t.Fatalf("%s: encode: %v", c.plain, err)
+			}
+			if !bytes.Equal(nb, pb) {
+				t.Errorf("%s: wire % x, want % x", c.named, nb, pb)
+			}
+		}
+	})
+
+	t.Run("dotted-name-does-not-scope", func(t *testing.T) {
+		s, err := avro.Parse(dotted)
+		if err != nil {
+			t.Fatalf("enclosing-scope reference must resolve (the stray name is inert): %v", err)
+		}
+		if _, err := avro.Parse(strings.Replace(dotted, `"top.Inner"`, `"wrong.Inner"`, 1)); err == nil {
+			t.Fatalf("wrong.Inner resolved: the stray name scoped the record in its items")
+		}
+		items := s.Root().Fields[0].Type.Items
+		if items.Namespace != "top" {
+			t.Errorf("Root() scoped the nested record under %q, want top", items.Namespace)
+		}
+		sub, err := items.Schema()
+		if err != nil {
+			t.Fatalf("extracting the nested record: %v", err)
+		}
+		if got := string(sub.Canonical()); got != innerCanon {
+			t.Errorf("extracted subtree %s, want %s", got, innerCanon)
+		}
+	})
+
+	t.Run("dotted-name-does-not-scope-across-cache", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(dotted); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Parse(`{"type":"record","name":"top.R2","fields":[{"name":"g","type":"top.Inner"}]}`); err != nil {
+			t.Fatalf("cross-parse reference to the enclosing-scoped fullname must splice: %v", err)
+		}
+		if _, err := c.Parse(`{"type":"record","name":"top.R3","fields":[{"name":"g","type":"wrong.Inner"}]}`); err == nil {
+			t.Fatalf("wrong.Inner spliced: a cache walker scoped a child by the stray name")
+		}
+	})
+
+	t.Run("name-does-not-shadow-a-definition", func(t *testing.T) {
+		for _, stray := range []string{
+			`{"type":"array","name":"top.Inner","items":"int"}`,
+			`{"type":"map","name":"top.Inner","values":"int"}`,
+			`{"type":"int","name":"top.Inner"}`,
+		} {
+			s, err := avro.Parse(`{"type":"record","name":"top.R","fields":[
+				{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}},
+				{"name":"b","type":` + stray + `},
+				{"name":"c","type":"top.Inner"}]}`)
+			if err != nil {
+				t.Fatalf("%s: %v", stray, err)
+			}
+			ref, err := s.Root().Fields[2].Type.Schema()
+			if err != nil {
+				t.Fatalf("%s: extracting the reference: %v", stray, err)
+			}
+			if got := string(ref.Canonical()); got != innerCanon {
+				t.Errorf("%s: Root() resolved top.Inner to %s, want the record", stray, got)
+			}
+		}
+	})
+
+	t.Run("still-rejects", func(t *testing.T) {
+		for _, c := range []struct{ schema, wantErr string }{
+			{`["null",{"type":"map","name":"a","values":"int"},{"type":"map","name":"b","values":"string"}]`, "duplicate union type"},
+			{`["null",{"type":"array","name":"a","items":"int"},{"type":"array","name":"b","items":"string"}]`, "duplicate union type"},
+			{`{"type":"array","name":"a"}`, ""},
+			{`{"type":"map","name":"a"}`, ""},
+		} {
+			_, err := avro.Parse(c.schema)
+			if err == nil {
+				t.Errorf("%s: accepted, want reject", c.schema)
+				continue
+			}
+			if c.wantErr != "" && !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("%s: error %q does not mention %q", c.schema, err, c.wantErr)
+			}
 		}
 	})
 }
@@ -828,8 +954,8 @@ var reservedCellTable = []reservedCellRow{
 	{"name", "type", "record", "RKRRR-"},
 	{"name", "type", "error", "RKRRR-"},
 	{"name", "type", "enum", "RKRRR-"},
-	{"name", "type", "array", "ARKKK-"},
-	{"name", "type", "map", "ARKKK-"},
+	{"name", "type", "array", "AKKKK-"},
+	{"name", "type", "map", "AKKKK-"},
 	{"name", "type", "fixed", "RKRRR-"},
 	{"name", "field", "null", "RKRRR-"},
 	{"name", "field", "boolean", "RKRRR-"},

@@ -2364,22 +2364,13 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			return err
 		}
 	} else {
-		// A stray "namespace" on an unnamed kind is inert metadata that never
-		// scopes children, and the metadata tree carries it as written; Java
-		// ignores it on every schema object and fastavro accepts it. A stray
-		// "name" on a container kind still rejects: the metadata walkers scope
-		// children by any non-empty SchemaNode.Name, so a parsed stray name
-		// would make Root() scope named descendants differently than the
-		// parser does. Primitive objects have no child positions, so they
-		// keep accepting one.
-		if o.Name != "" {
-			return errors.New("only record, enum, and fixed can have a name")
-		}
-		// The inert attribute never reaches the canonical form (PCF has no
-		// namespace key for unnamed kinds; fastavro's
-		// to_parsing_canonical_form strips it, executed); mirror the
-		// primitive type-object collapse, which drops it the same way.
+		// A stray "name" or "namespace" on an unnamed kind is inert metadata,
+		// as in Java (SCHEMA_RESERVED) and fastavro: it defines no type, scopes
+		// nothing (the metadata walkers key naming on the kind too), and stays
+		// out of the canonical form. The metadata tree carries it as written.
+		o.Name = ""
 		o.Namespace = nil
+		canonObj.Name = ""
 		canonObj.Namespace = nil
 	}
 
