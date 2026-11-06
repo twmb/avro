@@ -7931,7 +7931,9 @@ func TestMatrix_MalformedStrayBodyAcceptedAsProps(t *testing.T) {
 // The adjudicated reject boundaries do not loosen with the malformed-body
 // acceptance. A binding kind still shape-validates its own key. A container
 // kind still rejects another kind's schema-shaped defining key. And a
-// schema-shaped structural key on a wrapped reference still rejects.
+// schema-shaped structural key on a wrapped reference still rejects. A stray
+// name makes no two arrays or maps distinct in a union and fills no missing
+// body.
 func TestMatrix_StrayShapeRejectBoundaries(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct{ schema, wantErr string }{
@@ -7941,6 +7943,10 @@ func TestMatrix_StrayShapeRejectBoundaries(t *testing.T) {
 		{`{"type":"enum","name":"N","symbols":3}`, "array"},
 		{`{"type":"fixed","name":"N","size":"x"}`, ""},
 		{`{"type":"array","items":"int","fields":[{"name":"x","type":"int"}]}`, "has schema for other types"},
+		{`["null",{"type":"map","name":"a","values":"int"},{"type":"map","name":"b","values":"string"}]`, "duplicate union type"},
+		{`["null",{"type":"array","name":"a","items":"int"},{"type":"array","name":"b","items":"string"}]`, "duplicate union type"},
+		{`{"type":"array","name":"a"}`, "is missing"},
+		{`{"type":"map","name":"a"}`, "is missing"},
 	} {
 		_, err := Parse(`{"type":"record","name":"Top","fields":[{"name":"a","type":` + c.schema + `}]}`)
 		if err == nil {

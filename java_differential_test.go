@@ -912,41 +912,22 @@ func TestDifferentialJavaAcceptanceAttributePlacement(t *testing.T) {
 	// The stray-namespace scoping composition: Java, like twmb and
 	// fastavro, resolves a named type defined under a namespace-carrying
 	// array in the *enclosing* scope.
-	t.Run("namespace-scoping", func(t *testing.T) {
-		const def = `{"name":"f","type":{"type":"array","namespace":"x","items":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}}`
-		src := `{"type":"record","name":"top.R","fields":[` + def + `,{"name":"g","type":"top.Inner"}]}`
-		ok, _, canon, errMsg := fpCanon(t, src)
-		if !ok {
-			t.Fatalf("Java: enclosing-scope reference should resolve: %s", errMsg)
-		}
-		if got := string(avro.MustParse(src).Canonical()); got != canon {
-			t.Errorf("PCF diverges from Java:\n twmb: %s\n java: %s", got, canon)
-		}
-		if ok, _, _, _ := fpCanon(t, `{"type":"record","name":"top.R","fields":[`+def+`,{"name":"g","type":"x.Inner"}]}`); ok {
-			t.Errorf("Java resolved x.Inner — namespace-on-array scopes there; recalibrate")
-		}
-	})
-
-	// A stray name on a container: Java ignores the reserved key, and so do
-	// we, with the same canonical form. The dotted spelling must not scope
-	// the record nested inside it in either implementation.
-	for _, c := range []struct{ name, src string }{
-		{"array", `{"type":"array","items":"int","name":"strayName"}`},
-		{"map", `{"type":"map","values":"int","name":"strayName"}`},
-		{"dotted-array", `{"type":"record","name":"top.R","fields":[{"name":"f","type":{"type":"array","name":"wrong.Box","items":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}},{"name":"g","type":"top.Inner"}]}`},
-	} {
-		src := c.src
-		t.Run("stray-name-on-container/"+c.name, func(t *testing.T) {
+	// A stray namespace or dotted name on an array: Java ignores the reserved
+	// key, and so do we, with the same canonical form. Neither implementation
+	// scopes the record nested inside it.
+	for _, stray := range strayScopeAttrs {
+		t.Run("namespace-scoping/"+stray.key, func(t *testing.T) {
+			def := `{"name":"f","type":{"type":"array","` + stray.key + `":"` + stray.val + `","items":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}}`
+			src := `{"type":"record","name":"top.R","fields":[` + def + `,{"name":"g","type":"top.Inner"}]}`
 			ok, _, canon, errMsg := fpCanon(t, src)
 			if !ok {
-				t.Fatalf("Java rejected a stray name on a container (%s): %s", src, errMsg)
+				t.Fatalf("Java: enclosing-scope reference should resolve: %s", errMsg)
 			}
-			s, err := avro.Parse(src)
-			if err != nil {
-				t.Fatalf("twmb Parse(%s): %v", src, err)
+			if got := string(avro.MustParse(src).Canonical()); got != canon {
+				t.Errorf("PCF diverges from Java:\n twmb: %s\n java: %s", got, canon)
 			}
-			if got := string(s.Canonical()); got != canon {
-				t.Errorf("PCF diverges from Java for %s:\n twmb: %s\n java: %s", src, got, canon)
+			if ok, _, _, _ := fpCanon(t, `{"type":"record","name":"top.R","fields":[`+def+`,{"name":"g","type":"x.Inner"}]}`); ok {
+				t.Errorf("Java resolved x.Inner: a stray %s on an array scopes there; recalibrate", stray.key)
 			}
 		})
 	}

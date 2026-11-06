@@ -1465,7 +1465,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// A named kind always emits its name, the empty short name a WithLaxNames
 	// fn can accept included, matching appendCanonObject and the parser, for
 	// which a missing and an empty name are the same fullname. The Name != ""
-	// arm keeps emission for hand-built names on non-named kinds.
+	// check keeps a name on a non-named kind, parsed or hand-built, as written.
 	if n.Name != "" || isNamedKind(n.Type) || n.present.has(presName) {
 		m["name"] = n.Name
 	}
@@ -1744,7 +1744,7 @@ func nsForChildren(n *SchemaNode, enclosing string) string {
 	// Named *kinds* open their own scope even with an empty short name (a user
 	// WithLaxNames fn can accept ""; Namespace carries the resolved namespace
 	// either way). A name on any other kind scopes nothing, as in the parser
-	// (nodeChildScope). The scope is resolveScope's, as for nodeFullname.
+	// and nodeChildScope. The scope is resolveScope's, as for nodeFullname.
 	if n != nil && isNamedKind(n.Type) {
 		_, ns := resolveScope(n.Name, n.Namespace, true, "")
 		return ns
