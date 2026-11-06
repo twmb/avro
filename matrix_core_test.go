@@ -7930,6 +7930,42 @@ var featureWalkerStrayNSRows = []featureWalkerRow{
 		defFollow:       `{"type":"record","name":"ns.FN","fields":[{"name":"d","type":"DN"}]}`,
 		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
 	},
+	{
+		// The same shapes with a stray "name". A walker that scoped children
+		// by the attribute would bind decoy.AE, and a walker that registered
+		// the attribute would replace the real ns.AE with the map.
+		name: "stray-name-on-container",
+		feature: `{"type":"record","name":"ns.Top","fields":[
+			{"name":"ar","type":{"type":"array","name":"decoy.Box","items":{"type":"record","name":"AE","fields":[{"name":"x","type":"int"}]}}},
+			{"name":"mp","type":{"type":"map","name":"ns.AE","values":"AE"}}]}`,
+		twin: `{"type":"record","name":"ns.Top","fields":[
+			{"name":"ar","type":{"type":"array","items":{"type":"record","name":"AE","fields":[{"name":"x","type":"int"}]}}},
+			{"name":"mp","type":{"type":"map","values":"AE"}}]}`,
+		sample: map[string]any{
+			"ar": []any{map[string]any{"x": int32(1)}},
+			"mp": map[string]any{"k": map[string]any{"x": int32(2)}},
+		},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[
+			{"name":"ar","type":{"type":"array","items":{"type":"record","name":"AE","fields":[{"name":"x","type":"int"}]}}},
+			{"name":"mp","type":{"type":"map","values":"AE"}},
+			{"name":"pad","type":"int","default":5}]}`,
+		resolveSample: map[string]any{
+			"ar":  []any{map[string]any{"x": int32(1)}},
+			"mp":  map[string]any{"k": map[string]any{"x": int32(2)}},
+			"pad": int32(5),
+		},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"ns.Top","fields":[{"name":"e","type":{"type":"array","name":"decoy.Box","items":"Elem"}}]}`,
+		refTwin:    `{"type":"record","name":"ns.Top","fields":[{"name":"e","type":{"type":"array","items":"Elem"}}]}`,
+		refSample:  map[string]any{"e": []any{map[string]any{"x": int32(1)}}},
+
+		defFeature:      `{"type":"record","name":"ns.HN","fields":[{"name":"d","type":{"type":"array","name":"decoy.Box","items":{"type":"record","name":"DN","fields":[{"name":"x","type":"int"}]}}}]}`,
+		defTwin:         `{"type":"record","name":"ns.HN","fields":[{"name":"d","type":{"type":"array","items":{"type":"record","name":"DN","fields":[{"name":"x","type":"int"}]}}}]}`,
+		defFollow:       `{"type":"record","name":"ns.FN","fields":[{"name":"d","type":"DN"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
 }
 
 // Name-reference forms: the wrapped-object reference spelling

@@ -44,7 +44,7 @@ type SchemaNode struct {
 	Type        string // Avro type or named type reference
 	LogicalType string // e.g. date, timestamp-millis, decimal, uuid; empty if none (or if the value is not a string; see Props)
 
-	Name string // name for record, enum, fixed
+	Name string // name for record, enum, fixed; on any other kind, an inert attribute as written
 
 	// Namespace is the named type's resolved namespace. [Schema.Root] fills it
 	// for every named type, a child that inherits its enclosing namespace

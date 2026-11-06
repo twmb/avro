@@ -34,8 +34,8 @@ import (
 //
 // We take every attribute the Avro spec defines somewhere and place it on
 // every *other* kind. That list is precision, scale, items, values, symbols,
-// size, fields, order, default, aliases, namespace, logicalType, and the
-// enum-level default. Each placement happens at both levels, a type object and
+// size, fields, order, default, aliases, name, namespace, logicalType, and
+// the enum-level default. Each placement happens at both levels, a type object and
 // a record-field object, and only the placements where the attribute is
 // defined are skipped. Per accepted cell we assert the routing, plus the
 // String() reparse and Root().Schema() rebuild round trips. Wire, Canonical(),
@@ -66,9 +66,7 @@ import (
 //   - A container kind carrying another container kind's defining structural
 //     key hard-rejects: structural-key exclusivity, the cache/metadata walkers'
 //     kind-keyed soundness premise. fastavro and Java accept these as props,
-//     the documented divergence. A stray "name" on an unnamed container kind
-//     rejects for the same walker-parity reason; a stray "namespace" there is
-//     inert.
+//     the documented divergence. A stray "name" or "namespace" there is inert.
 //   - At the field level every non-field-reserved key is a field custom
 //     property as written, and the field's type node stays clean. (The flat
 //     goavro-style lift consumes defining keys only when the field's "type" is
@@ -335,6 +333,28 @@ func censusAttrs() []censusAttr {
 				t.Helper()
 				if n.Namespace != "census.ns" {
 					t.Errorf("%s: captured namespace not surfaced as-written (got %q)", when, n.Namespace)
+				}
+			},
+		},
+		{
+			// name is defined on named kinds. Everywhere else it is inert
+			// metadata, as namespace above: accepted, carried as written on
+			// SchemaNode.Name, and it defines and scopes nothing. The parser,
+			// Java (SCHEMA_RESERVED), and fastavro agree, and
+			// TestMatrix_AttributePlacementNameInert pins the scoping. A
+			// field's name is defined, so there is no field-level cell.
+			key: "name", val: constVal(`"census.Stray"`),
+			verdict: func(kind string) censusVerdict {
+				if censusNamedKinds[kind] {
+					return censusSkip
+				}
+				return censusCaptured
+			},
+			fieldLevel: false,
+			surfaced: func(t *testing.T, n *avro.SchemaNode, when string) {
+				t.Helper()
+				if n.Name != "census.Stray" {
+					t.Errorf("%s: captured name not surfaced as-written (got %q)", when, n.Name)
 				}
 			},
 		},
@@ -726,6 +746,19 @@ func TestMatrix_AttributePlacementNameInert(t *testing.T) {
 			}
 			if got := string(ref.Canonical()); got != innerCanon {
 				t.Errorf("%s: Root() resolved top.Inner to %s, want the record", stray, got)
+			}
+		}
+	})
+
+	t.Run("undotted-name-keeps-namespace-as-written", func(t *testing.T) {
+		for _, stray := range []string{
+			`{"type":"array","name":"Box","items":"int"}`,
+			`{"type":"map","name":"Box","values":"int"}`,
+			`{"type":"int","name":"Box"}`,
+		} {
+			s := avro.MustParse(`{"type":"record","name":"top.R","fields":[{"name":"f","type":` + stray + `}]}`)
+			if got := s.Root().Fields[0].Type.Namespace; got != "" {
+				t.Errorf("%s: Root() Namespace %q, want the empty namespace as written", stray, got)
 			}
 		}
 	})
