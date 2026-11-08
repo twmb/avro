@@ -2346,7 +2346,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		canonType = "record"
 	}
 	canonObj := &aobject{
-		Name: o.Name,
 		Type: canonType,
 
 		Fields:  o.Fields,
@@ -2354,33 +2353,17 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		Items:   o.Items,
 		Values:  o.Values,
 		Size:    o.Size,
-
-		Namespace: o.Namespace,
 	}
 	b.canon = aschema{object: canonObj}
 
+	// A stray "name" or "namespace" on an unnamed kind is inert metadata, as
+	// in Java (SCHEMA_RESERVED) and fastavro: it defines no type, scopes
+	// nothing (the metadata walkers key naming on the kind too), and stays
+	// out of the canonical form. The metadata tree carries it as written.
 	if isNamedKind(o.Type) {
 		if err := b.bindDefinitionName(o, parentName, canonObj); err != nil {
 			return err
 		}
-	} else {
-		// A stray "namespace" on an unnamed kind is inert metadata that never
-		// scopes children, and the metadata tree carries it as written; Java
-		// ignores it on every schema object and fastavro accepts it. A stray
-		// "name" on a container kind still rejects: the metadata walkers scope
-		// children by any non-empty SchemaNode.Name, so a parsed stray name
-		// would make Root() scope named descendants differently than the
-		// parser does. Primitive objects have no child positions, so they
-		// keep accepting one.
-		if o.Name != "" {
-			return errors.New("only record, enum, and fixed can have a name")
-		}
-		// The inert attribute never reaches the canonical form (PCF has no
-		// namespace key for unnamed kinds; fastavro's
-		// to_parsing_canonical_form strips it, executed); mirror the
-		// primitive type-object collapse, which drops it the same way.
-		o.Namespace = nil
-		canonObj.Namespace = nil
 	}
 
 	switch o.Type {
@@ -2505,7 +2488,7 @@ func (b *builder) buildPrimitiveObject(o *aobject, ser serfn, origLogical string
 // bindDefinitionName resolves a named definition's fullname against the
 // enclosing scope, validates the name and the namespace attribute, and
 // refuses a primitive name or a duplicate. The resolved fullname replaces
-// o.Name and canonObj.Name, and the namespace attribute is consumed.
+// o.Name and sets canonObj.Name, and the namespace attribute is consumed.
 func (b *builder) bindDefinitionName(o *aobject, parentName string, canonObj *aobject) error {
 	if err := b.validFullnameErr(o.Name); err != nil {
 		return fmt.Errorf("invalid %s name %q: %w", truncForError(o.Type), truncForError(o.Name), err)
@@ -2545,7 +2528,6 @@ func (b *builder) bindDefinitionName(o *aobject, parentName string, canonObj *ao
 	}
 	o.Namespace = nil      // canonical form omits namespace
 	canonObj.Name = o.Name // use fully-qualified name
-	canonObj.Namespace = nil
 	if _, exists := b.named[o.Name]; exists {
 		if !(b.cachedNames[o.Name] && b.allowReRegister) {
 			return fmt.Errorf("duplicate named type %q", truncForError(o.Name))

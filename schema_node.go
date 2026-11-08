@@ -44,7 +44,7 @@ type SchemaNode struct {
 	Type        string // Avro type or named type reference
 	LogicalType string // e.g. date, timestamp-millis, decimal, uuid; empty if none (or if the value is not a string; see Props)
 
-	Name string // name for record, enum, fixed
+	Name string // name for record, enum, fixed; on any other kind, an inert attribute as written
 
 	// Namespace is the named type's resolved namespace. [Schema.Root] fills it
 	// for every named type, a child that inherits its enclosing namespace
@@ -1465,7 +1465,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// A named kind always emits its name, the empty short name a WithLaxNames
 	// fn can accept included, matching appendCanonObject and the parser, for
 	// which a missing and an empty name are the same fullname. The Name != ""
-	// arm keeps emission for hand-built names on non-named kinds.
+	// check keeps a name on a non-named kind, parsed or hand-built, as written.
 	if n.Name != "" || isNamedKind(n.Type) || n.present.has(presName) {
 		m["name"] = n.Name
 	}
@@ -1743,9 +1743,9 @@ func nodeFullname(n *SchemaNode) string {
 func nsForChildren(n *SchemaNode, enclosing string) string {
 	// Named *kinds* open their own scope even with an empty short name (a user
 	// WithLaxNames fn can accept ""; Namespace carries the resolved namespace
-	// either way). The Name != "" arm keeps hand-built names on non-named kinds
-	// scoping as before. The scope is resolveScope's, as for nodeFullname.
-	if n != nil && (n.Name != "" || isNamedKind(n.Type)) {
+	// either way). A name on any other kind scopes nothing, as in the parser
+	// and nodeChildScope. The scope is resolveScope's, as for nodeFullname.
+	if n != nil && isNamedKind(n.Type) {
 		_, ns := resolveScope(n.Name, n.Namespace, true, "")
 		return ns
 	}
@@ -2015,10 +2015,11 @@ func collectNamedTypes(n *SchemaNode, table map[string]*SchemaNode) {
 	if n == nil {
 		return
 	}
-	// Empty-short-name named kinds register too when their fullname is
-	// expressible (fullname "ns."), matching the wire builder's
-	// registration; fullname "" has no reference spelling to serve.
-	if n.Name != "" || (isNamedKind(n.Type) && nodeFullname(n) != "") { // record / enum / fixed
+	// Only named kinds register, as in the wire builder; a name on any other
+	// kind is inert and must not shadow a real definition. Empty-short-name
+	// named kinds register too when their fullname is expressible (fullname
+	// "ns."); fullname "" has no reference spelling to serve.
+	if isNamedKind(n.Type) && nodeFullname(n) != "" { // record / enum / fixed
 		// Namespace is resolved at construction, so the fullname is direct.
 		// We register exactly what the wire builder registers, every type
 		// under its fullname only; also registering short names would make
@@ -2055,9 +2056,10 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo, 
 	// A dotted name carries its own namespace; we preserve any attribute
 	// beside it as written but it scopes nothing. Named kinds with an empty
 	// short name resolve like any undotted name (the parser registers
-	// "name":"" under an enclosing namespace as fullname "ns.").
+	// "name":"" under an enclosing namespace as fullname "ns."). Unnamed kinds
+	// keep their namespace as written, since a stray name there scopes nothing.
 	n.present.setIf(getString(m, "namespace", &n.Namespace), presNamespace)
-	if (n.Name != "" || isNamedKind(n.Type)) && !strings.Contains(n.Name, ".") {
+	if isNamedKind(n.Type) && !strings.Contains(n.Name, ".") {
 		_, n.Namespace = resolveScope(n.Name, n.Namespace, n.present.has(presNamespace), parentNS)
 	}
 	childNS := nsForChildren(&n, parentNS)

@@ -34,13 +34,13 @@ import (
 //
 // We take every attribute the Avro spec defines somewhere and place it on
 // every *other* kind. That list is precision, scale, items, values, symbols,
-// size, fields, order, default, aliases, namespace, logicalType, and the
-// enum-level default. Each placement happens at both levels, a type object and
-// a record-field object, and only the placements where the attribute is
-// defined are skipped. Per accepted cell we assert the routing, plus the
-// String() reparse and Root().Schema() rebuild round trips. Wire, Canonical(),
-// and Rabin identity with the stray-free twin hold too: a stray attribute
-// must be inert. Reject cells assert their documented policy.
+// size, fields, order, default, aliases, name, namespace, logicalType, and
+// the enum-level default. Each placement happens at both levels, a type
+// object and a record-field object, and only the placements where the
+// attribute is defined are skipped. Per accepted cell we assert the routing,
+// plus the String() reparse and Root().Schema() rebuild round trips. Wire,
+// Canonical(), and Rabin identity with the stray-free twin hold too: a stray
+// attribute must be inert. Reject cells assert their documented policy.
 // The fastavro differential arm executes every cell; the cisuite arm drives a
 // representative subset through the Java oracle.
 //
@@ -66,9 +66,7 @@ import (
 //   - A container kind carrying another container kind's defining structural
 //     key hard-rejects: structural-key exclusivity, the cache/metadata walkers'
 //     kind-keyed soundness premise. fastavro and Java accept these as props,
-//     the documented divergence. A stray "name" on an unnamed container kind
-//     rejects for the same walker-parity reason; a stray "namespace" there is
-//     inert.
+//     the documented divergence. A stray "name" or "namespace" there is inert.
 //   - At the field level every non-field-reserved key is a field custom
 //     property as written, and the field's type node stays clean. (The flat
 //     goavro-style lift consumes defining keys only when the field's "type" is
@@ -339,6 +337,28 @@ func censusAttrs() []censusAttr {
 			},
 		},
 		{
+			// name is defined on named kinds. Everywhere else it is inert
+			// metadata, as namespace above: accepted, carried as written on
+			// SchemaNode.Name, and it defines and scopes nothing. The parser,
+			// Java (SCHEMA_RESERVED), and fastavro agree, and
+			// TestMatrix_AttributePlacementNamespaceInert pins the scoping. A
+			// field's name is defined, so there is no field-level cell.
+			key: "name", val: constVal(`"census.Stray"`),
+			verdict: func(kind string) censusVerdict {
+				if censusNamedKinds[kind] {
+					return censusSkip
+				}
+				return censusCaptured
+			},
+			fieldLevel: false,
+			surfaced: func(t *testing.T, n *avro.SchemaNode, when string) {
+				t.Helper()
+				if n.Name != "census.Stray" {
+					t.Errorf("%s: captured name not surfaced as-written (got %q)", when, n.Name)
+				}
+			},
+		},
+		{
 			// A recognized logical on a kind it is not valid for soft-drops
 			// off the wire codec (raw encoding), but the metadata keeps the
 			// as-written spelling. date is defined on int only.
@@ -572,53 +592,114 @@ func TestMatrix_AttributePlacementCensus(t *testing.T) {
 	}
 }
 
-// A stray "namespace" attribute on an array/map does NOT open a namespace
-// scope. Named types defined under it register in the enclosing scope, and
-// references resolve there. That holds in the parser, in the SchemaCache
-// splice walkers, and in fastavro (executed: the same schema resolves
-// top.Inner and rejects x.Inner). The kind-keyed scope rule (nodeChildScope)
-// and the parser agree by construction; these cells prove the agreement holds
-// for the newly inert attribute.
-func TestMatrix_AttributePlacementNamespaceInert(t *testing.T) {
-	const defInner = `{"name":"f","type":{"type":"array","namespace":"x","items":
-		{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}}`
+// strayScopeAttrs are the attributes a walker could mistake for a namespace
+// scope on an unnamed kind. Either one, taken as a scope, puts a child in x.
+var strayScopeAttrs = []struct{ key, val string }{
+	{"namespace", "x"},
+	{"name", "x.Box"},
+}
 
-	t.Run("same-parse-enclosing-scope-resolves", func(t *testing.T) {
-		src := `{"type":"record","name":"top.R","fields":[` + defInner + `,{"name":"g","type":"top.Inner"}]}`
-		if _, err := avro.Parse(src); err != nil {
-			t.Fatalf("enclosing-scope reference must resolve (namespace attr is inert): %v", err)
-		}
-	})
-	t.Run("same-parse-attr-scope-dangles", func(t *testing.T) {
-		src := `{"type":"record","name":"top.R","fields":[` + defInner + `,{"name":"g","type":"x.Inner"}]}`
-		if _, err := avro.Parse(src); err == nil {
-			t.Fatalf("x.Inner resolved: the stray namespace attribute scoped a child")
-		}
-	})
-	t.Run("cross-parse-cache-splice-enclosing-scope", func(t *testing.T) {
-		var c avro.SchemaCache
-		if _, err := c.Parse(`{"type":"record","name":"top.R","fields":[` + defInner + `]}`); err != nil {
-			t.Fatalf("parse-1: %v", err)
-		}
-		s, err := c.Parse(`{"type":"record","name":"top.R2","fields":[{"name":"g","type":"top.Inner"}]}`)
-		if err != nil {
-			t.Fatalf("cross-parse reference to the enclosing-scoped fullname must splice: %v", err)
-		}
-		if _, err := avro.Parse(s.String()); err != nil {
-			t.Fatalf("spliced String() must be self-contained: %v", err)
-		}
-		if _, err := c.Parse(`{"type":"record","name":"top.R3","fields":[{"name":"g","type":"x.Inner"}]}`); err == nil {
-			t.Fatalf("x.Inner spliced: a cache walker scoped a child by the stray namespace attribute")
-		}
-	})
+// A stray "namespace" or dotted "name" attribute on an array/map does NOT open
+// a namespace scope. Named types defined under it register in the enclosing
+// scope, and references resolve there. That holds in the parser, in the Root()
+// and SchemaCache splice walkers, and in fastavro (executed: the same schema
+// resolves top.Inner and rejects x.Inner). The kind-keyed scope rule
+// (nodeChildScope) and the parser agree by construction; these cells prove the
+// agreement holds for the inert attributes.
+func TestMatrix_AttributePlacementNamespaceInert(t *testing.T) {
+	const innerCanon = `{"name":"top.Inner","type":"record","fields":[{"name":"i","type":"int"}]}`
+	for _, stray := range strayScopeAttrs {
+		defInner := `{"name":"f","type":{"type":"array","` + stray.key + `":"` + stray.val + `","items":
+			{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}}`
+
+		t.Run(stray.key+"/same-parse-enclosing-scope-resolves", func(t *testing.T) {
+			src := `{"type":"record","name":"top.R","fields":[` + defInner + `,{"name":"g","type":"top.Inner"}]}`
+			s, err := avro.Parse(src)
+			if err != nil {
+				t.Fatalf("enclosing-scope reference must resolve (the stray attribute is inert): %v", err)
+			}
+			items := s.Root().Fields[0].Type.Items
+			if items.Namespace != "top" {
+				t.Errorf("Root() scoped the nested record under %q, want top", items.Namespace)
+			}
+			sub, err := items.Schema()
+			if err != nil {
+				t.Fatalf("extracting the nested record: %v", err)
+			}
+			if got := string(sub.Canonical()); got != innerCanon {
+				t.Errorf("extracted subtree %s, want %s", got, innerCanon)
+			}
+		})
+		t.Run(stray.key+"/same-parse-attr-scope-dangles", func(t *testing.T) {
+			src := `{"type":"record","name":"top.R","fields":[` + defInner + `,{"name":"g","type":"x.Inner"}]}`
+			if _, err := avro.Parse(src); err == nil {
+				t.Fatalf("x.Inner resolved: the stray attribute scoped a child")
+			}
+		})
+		t.Run(stray.key+"/cross-parse-cache-splice-enclosing-scope", func(t *testing.T) {
+			var c avro.SchemaCache
+			if _, err := c.Parse(`{"type":"record","name":"top.R","fields":[` + defInner + `]}`); err != nil {
+				t.Fatalf("parse-1: %v", err)
+			}
+			s, err := c.Parse(`{"type":"record","name":"top.R2","fields":[{"name":"g","type":"top.Inner"}]}`)
+			if err != nil {
+				t.Fatalf("cross-parse reference to the enclosing-scoped fullname must splice: %v", err)
+			}
+			if _, err := avro.Parse(s.String()); err != nil {
+				t.Fatalf("spliced String() must be self-contained: %v", err)
+			}
+			if _, err := c.Parse(`{"type":"record","name":"top.R3","fields":[{"name":"g","type":"x.Inner"}]}`); err == nil {
+				t.Fatalf("x.Inner spliced: a cache walker scoped a child by the stray attribute")
+			}
+		})
+	}
 	t.Run("stray-name-cannot-define", func(t *testing.T) {
-		// A stray "name" on a container cannot become a definition. The
-		// shape itself keeps rejecting at parse (see
-		// TestRegression_StrayNameOnUnnamedComplexKeepsRejecting), so no
-		// walker ever sees it.
+		// A stray "name" on a container parses as inert metadata and cannot
+		// become a definition, in the same parse or across the cache.
+		const arr = `{"name":"f","type":{"type":"array","items":"int","name":"strayName"}}`
+		if _, err := avro.Parse(`{"type":"record","name":"R","fields":[` + arr + `,{"name":"g","type":"strayName"}]}`); err == nil {
+			t.Fatalf("strayName resolved: a stray name on an array defined a type")
+		}
 		var c avro.SchemaCache
-		if _, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":"int","name":"strayName"}}]}`); err == nil {
-			t.Fatalf("stray name on an array parsed; the walker-parity guard is gone")
+		if _, err := c.Parse(`{"type":"record","name":"R","fields":[` + arr + `]}`); err != nil {
+			t.Fatalf("stray name on an array: %v", err)
+		}
+		if _, err := c.Parse(`{"type":"record","name":"R2","fields":[{"name":"g","type":"strayName"}]}`); err == nil {
+			t.Fatalf("strayName spliced: a cache walker registered a stray name")
+		}
+	})
+	t.Run("name-does-not-shadow-a-definition", func(t *testing.T) {
+		for _, stray := range []string{
+			`{"type":"array","name":"top.Inner","items":"int"}`,
+			`{"type":"map","name":"top.Inner","values":"int"}`,
+			`{"type":"int","name":"top.Inner"}`,
+		} {
+			s, err := avro.Parse(`{"type":"record","name":"top.R","fields":[
+				{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}},
+				{"name":"b","type":` + stray + `},
+				{"name":"c","type":"top.Inner"}]}`)
+			if err != nil {
+				t.Fatalf("%s: %v", stray, err)
+			}
+			ref, err := s.Root().Fields[2].Type.Schema()
+			if err != nil {
+				t.Fatalf("%s: extracting the reference: %v", stray, err)
+			}
+			if got := string(ref.Canonical()); got != innerCanon {
+				t.Errorf("%s: Root() resolved top.Inner to %s, want the record", stray, got)
+			}
+		}
+	})
+	t.Run("undotted-name-keeps-namespace-as-written", func(t *testing.T) {
+		for _, stray := range []string{
+			`{"type":"array","name":"Box","items":"int"}`,
+			`{"type":"map","name":"Box","values":"int"}`,
+			`{"type":"int","name":"Box"}`,
+		} {
+			s := avro.MustParse(`{"type":"record","name":"top.R","fields":[{"name":"f","type":` + stray + `}]}`)
+			if got := s.Root().Fields[0].Type.Namespace; got != "" {
+				t.Errorf("%s: Root() Namespace %q, want the empty namespace as written", stray, got)
+			}
 		}
 	})
 }
@@ -699,20 +780,22 @@ func TestDifferentialFastavroAttributePlacement(t *testing.T) {
 		}
 	}
 
-	// Scoping calibration (executed): a stray namespace on an array does
-	// not scope in fastavro either. The enclosing-scope fullname resolves,
-	// the attribute-scope one does not.
-	t.Run("namespace-scoping", func(t *testing.T) {
-		const def = `{"name":"f","type":{"type":"array","namespace":"x","items":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}}`
-		ok := o.call(oracleJob{Op: "parse", Schema: json.RawMessage(`{"type":"record","name":"top.R","fields":[` + def + `,{"name":"g","type":"top.Inner"}]}`)})
-		if !ok.OK {
-			t.Errorf("fastavro: enclosing-scope reference should resolve: %s", ok.Err)
-		}
-		bad := o.call(oracleJob{Op: "parse", Schema: json.RawMessage(`{"type":"record","name":"top.R","fields":[` + def + `,{"name":"g","type":"x.Inner"}]}`)})
-		if bad.OK {
-			t.Errorf("fastavro: attribute-scope reference resolved — namespace-on-array scopes there now; recalibrate")
-		}
-	})
+	// Scoping calibration (executed): a stray namespace or dotted name on an
+	// array does not scope in fastavro either. The enclosing-scope fullname
+	// resolves, the attribute-scope one does not.
+	for _, stray := range strayScopeAttrs {
+		t.Run("namespace-scoping/"+stray.key, func(t *testing.T) {
+			def := `{"name":"f","type":{"type":"array","` + stray.key + `":"` + stray.val + `","items":{"type":"record","name":"Inner","fields":[{"name":"i","type":"int"}]}}}`
+			ok := o.call(oracleJob{Op: "parse", Schema: json.RawMessage(`{"type":"record","name":"top.R","fields":[` + def + `,{"name":"g","type":"top.Inner"}]}`)})
+			if !ok.OK {
+				t.Errorf("fastavro: enclosing-scope reference should resolve: %s", ok.Err)
+			}
+			bad := o.call(oracleJob{Op: "parse", Schema: json.RawMessage(`{"type":"record","name":"top.R","fields":[` + def + `,{"name":"g","type":"x.Inner"}]}`)})
+			if bad.OK {
+				t.Errorf("fastavro: attribute-scope reference resolved: a stray %s on an array scopes there now; recalibrate", stray.key)
+			}
+		})
+	}
 }
 
 // ---------- reserved_attribute_matrix_test.go ----------
@@ -828,8 +911,8 @@ var reservedCellTable = []reservedCellRow{
 	{"name", "type", "record", "RKRRR-"},
 	{"name", "type", "error", "RKRRR-"},
 	{"name", "type", "enum", "RKRRR-"},
-	{"name", "type", "array", "ARKKK-"},
-	{"name", "type", "map", "ARKKK-"},
+	{"name", "type", "array", "AKKKK-"},
+	{"name", "type", "map", "AKKKK-"},
 	{"name", "type", "fixed", "RKRRR-"},
 	{"name", "field", "null", "RKRRR-"},
 	{"name", "field", "boolean", "RKRRR-"},
@@ -1286,7 +1369,7 @@ var reservedProvenance = []reservedProvRow{
 	{"name", "null", "field", "follows-java"},
 	{"name", "null", "type", "both-references|standing-ruling"},
 	{"name", "valid", "field", "both-references"},
-	{"name", "valid", "type", "both-references|standing-ruling"},
+	{"name", "valid", "type", "both-references"},
 	{"name", "wrong", "field", "follows-java"},
 	{"name", "wrong", "type", "both-references|standing-ruling"},
 	{"name", "zero", "field", "follows-java"},

@@ -7683,6 +7683,19 @@ var laxAcceptAll = []avro.SchemaOpt{avro.WithLaxNames(func(string) error { retur
 var fwTime = time.Date(2021, 3, 4, 5, 6, 7, 891_000_000, time.UTC)
 
 func init() {
+	// The same shapes with a stray "name", for the cache walkers: a walker that
+	// scoped children by the attribute would register decoy.DN instead of
+	// ns.DN. These drivers never read a subtree back through Root(), so
+	// TestMatrix_AttributePlacementNamespaceInert covers the SchemaNode walkers.
+	strayName := featureWalkerStrayNSRows[0]
+	strayName.name = "stray-name-on-container"
+	strayName.feature = `{"type":"record","name":"ns.Top","fields":[
+		{"name":"ar","type":{"type":"array","name":"decoy.Box","items":{"type":"record","name":"AE","fields":[{"name":"x","type":"int"}]}}},
+		{"name":"mp","type":{"type":"map","name":"ns.AE","values":"AE"}}]}`
+	strayName.refFeature = `{"type":"record","name":"ns.Top","fields":[{"name":"e","type":{"type":"array","name":"decoy.Box","items":"Elem"}}]}`
+	strayName.defFeature = `{"type":"record","name":"ns.HN","fields":[{"name":"d","type":{"type":"array","name":"decoy.Box","items":{"type":"record","name":"DN","fields":[{"name":"x","type":"int"}]}}}]}`
+	featureWalkerStrayNSRows = append(featureWalkerStrayNSRows, strayName)
+
 	featureWalkerRows = append(featureWalkerRows, featureWalkerLiftRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerCaseKeyRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerRefFormRows...)
