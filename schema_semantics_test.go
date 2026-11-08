@@ -8198,17 +8198,26 @@ func doubleDefaultWireSignbit(t *testing.T, s *avro.Schema) bool {
 	return wire[7]&0x80 != 0 // little-endian double: sign bit in the top byte
 }
 
-// Positive zero (either syntax) is unsigned everywhere. We keep this as the
-// control that the fix's negative-zero detection does not over-trigger.
-func TestNegativeZeroPositiveControls(t *testing.T) {
-	for _, lit := range []string{"0.0", "0"} {
-		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"d","type":"double","default":` + lit + `}]}`)
-		if doubleDefaultWireSignbit(t, s) {
-			t.Errorf("%s: positive zero wrote a sign bit", lit)
+// A zero default keeps its sign on the wire, in Root, and through the rebuild,
+// in either syntax. An integer-syntax "-0" is -0.0 in all three.
+func TestNegativeZeroDefaultSignbit(t *testing.T) {
+	for _, c := range []struct {
+		lit string
+		neg bool
+	}{{"0.0", false}, {"0", false}, {"-0.0", true}, {"-0", true}} {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"d","type":"double","default":` + c.lit + `}]}`)
+		if got := doubleDefaultWireSignbit(t, s); got != c.neg {
+			t.Errorf("%s: wire sign bit = %v, want %v", c.lit, got, c.neg)
 		}
-		def := s.Root().Fields[0].Default.(float64)
-		if math.Signbit(def) {
-			t.Errorf("%s: positive zero metadata has a sign bit: %v", lit, def)
+		if got := math.Signbit(s.Root().Fields[0].Default.(float64)); got != c.neg {
+			t.Errorf("%s: Root sign bit = %v, want %v", c.lit, got, c.neg)
+		}
+		rebuilt, err := s.Root().Schema()
+		if err != nil {
+			t.Fatalf("%s: rebuild: %v", c.lit, err)
+		}
+		if got := doubleDefaultWireSignbit(t, rebuilt); got != c.neg {
+			t.Errorf("%s: rebuilt wire sign bit = %v, want %v", c.lit, got, c.neg)
 		}
 	}
 }
