@@ -1033,6 +1033,15 @@ func asciiEscapedLen(b byte) int {
 	return 1
 }
 
+// asciiEscapedLens is asciiEscapedLen as a table. It has 256 entries so that
+// indexing by any byte needs no bounds check.
+var asciiEscapedLens = func() (t [256]uint8) {
+	for b := range utf8.RuneSelf {
+		t[b] = uint8(asciiEscapedLen(byte(b)))
+	}
+	return t
+}()
+
 // jsonEscapedLen reports how many bytes the emitter writes for s's content
 // between the quotes, stopping once the running total passes limit. We
 // count rather than emit, since emitting would allocate the image the budget
@@ -1041,9 +1050,14 @@ func asciiEscapedLen(b byte) int {
 func jsonEscapedLen(s string, limit int) int {
 	n := 0
 	for i := 0; i < len(s); {
-		if b := s[i]; b < utf8.RuneSelf {
-			n += asciiEscapedLen(b)
-			i++
+		if s[i] < utf8.RuneSelf {
+			// An ASCII byte costs at most 6, so a run this long passes limit
+			// by at most one byte's cost, and we check limit once per run
+			// rather than once per byte.
+			end := min(len(s), i+max(0, limit-n)/6+1)
+			for ; i < end && s[i] < utf8.RuneSelf; i++ {
+				n += int(asciiEscapedLens[s[i]])
+			}
 		} else {
 			c, size := utf8.DecodeRuneInString(s[i:])
 			switch {
