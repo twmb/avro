@@ -1583,8 +1583,8 @@ func TestMatrix_GenerativeUnionContainerDefaultFill(t *testing.T) {
 	for _, c := range udfCells() {
 		for _, cont := range udfContainers() {
 			t.Run(c.name+"/"+cont.name, func(t *testing.T) {
-				branchA := fmt.Sprintf(`{"type":"record","name":"A","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.leaf))
-				branchB := fmt.Sprintf(`{"type":"record","name":"B","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.sib))
+				branchA := fmt.Sprintf(`{"type":"record","name":"A","fields":[{"name":"x","type":%s},{"name":"n","type":"int"}]}`, cont.wrap(c.leaf))
+				branchB := fmt.Sprintf(`{"type":"record","name":"B","fields":[{"name":"x","type":%s},{"name":"n","type":"int"}]}`, cont.wrap(c.sib))
 				schema := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"f","type":[%s,%s],"default":%s}]}`,
 					branchA, branchB, cont.def(c.defLit))
 				udInvariant(t, schema, `{}`, map[string]any{}, udfIsLogical(c.leaf),
@@ -1613,8 +1613,8 @@ func TestMatrix_GenerativeUnionContainerDefaultFillRecursive(t *testing.T) {
 		for _, cont := range udfContainers() {
 			for _, depth := range []string{"shallow", "deep"} {
 				t.Run(c.name+"/"+cont.name+"/"+depth, func(t *testing.T) {
-					branchN := fmt.Sprintf(`{"type":"record","name":"N","fields":[{"name":"x","type":%s},{"name":"next","type":["null","N"]}]}`, cont.wrap(c.leaf))
-					branchS := fmt.Sprintf(`{"type":"record","name":"S","fields":[{"name":"x","type":%s},{"name":"next","type":["null","S"]}]}`, cont.wrap(c.sib))
+					branchN := fmt.Sprintf(`{"type":"record","name":"N","fields":[{"name":"x","type":%s},{"name":"n","type":"int"},{"name":"next","type":["null","N"]}]}`, cont.wrap(c.leaf))
+					branchS := fmt.Sprintf(`{"type":"record","name":"S","fields":[{"name":"x","type":%s},{"name":"n","type":"int"},{"name":"next","type":["null","S"]}]}`, cont.wrap(c.sib))
 					inner := cont.def(c.defLit) // {"x":<container form>}
 					def := addNext(inner, "null")
 					if depth == "deep" {
@@ -1647,8 +1647,8 @@ func TestMatrix_GenerativeUnionContainerDefaultFillDiamond(t *testing.T) {
 	for _, c := range udfCells() {
 		for _, cont := range udfContainers() {
 			t.Run(c.name+"/"+cont.name, func(t *testing.T) {
-				recA := fmt.Sprintf(`{"type":"record","name":"DiaA","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.leaf))
-				recB := fmt.Sprintf(`{"type":"record","name":"DiaB","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.sib))
+				recA := fmt.Sprintf(`{"type":"record","name":"DiaA","fields":[{"name":"x","type":%s},{"name":"n","type":"int"}]}`, cont.wrap(c.leaf))
+				recB := fmt.Sprintf(`{"type":"record","name":"DiaB","fields":[{"name":"x","type":%s},{"name":"n","type":"int"}]}`, cont.wrap(c.sib))
 				tdef := fmt.Sprintf(`{"type":"record","name":"DiaT","fields":[{"name":"f","type":[%s,%s],"default":%s}]}`,
 					recA, recB, cont.def(c.defLit))
 				schema := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"a","type":%s},{"name":"b","type":"DiaT"}]}`, tdef)
@@ -1728,7 +1728,9 @@ func udfIsLogical(leaf string) bool { return strings.Contains(leaf, "logicalType
 
 // udfContainer holds the leaf as a record field "x"'s value, at one of three
 // container depths. A union of two such records stays legal, where a union
-// cannot hold two arrays or two maps directly.
+// cannot hold two arrays or two maps directly. Each record also has an int
+// field "n", so a Default that skips narrowing carries a json.Number beside
+// the leaf.
 type udfContainer struct {
 	name string
 	wrap func(leaf string) string // the branch field "x"'s type
@@ -1737,9 +1739,9 @@ type udfContainer struct {
 
 func udfContainers() []udfContainer {
 	return []udfContainer{
-		{"record_field", func(l string) string { return l }, func(lit string) string { return `{"x":` + lit + `}` }},
-		{"array_element", func(l string) string { return `{"type":"array","items":` + l + `}` }, func(lit string) string { return `{"x":[` + lit + `]}` }},
-		{"map_value", func(l string) string { return `{"type":"map","values":` + l + `}` }, func(lit string) string { return `{"x":{"k":` + lit + `}}` }},
+		{"record_field", func(l string) string { return l }, func(lit string) string { return `{"x":` + lit + `,"n":1}` }},
+		{"array_element", func(l string) string { return `{"type":"array","items":` + l + `}` }, func(lit string) string { return `{"x":[` + lit + `],"n":1}` }},
+		{"map_value", func(l string) string { return `{"type":"map","values":` + l + `}` }, func(lit string) string { return `{"x":{"k":` + lit + `},"n":1}` }},
 	}
 }
 
@@ -1749,7 +1751,8 @@ func udfContainers() []udfContainer {
 // missing nested defaults materialize, is canonical; fillJSON is its JSON form
 // for the direct DecodeJSON fill. metaPairs returns, per metadata surface under
 // test, the (Root-derived Default, wire-decoded value) pair that must match
-// type-exactly for a non-logical leaf. A logical leaf surfaces the raw
+// type-exactly for a non-logical leaf. We call metaPairs twice, so it must
+// call Root each time. A logical leaf surfaces the raw
 // Avro-native value, so the rebuild + JSON-decode checks cover
 // it instead. We return the parsed schema, the canonical decode, and the
 // metadata rebuild, so a caller can add shape-specific checks: the diamond's
@@ -1818,7 +1821,40 @@ func udInvariant(t *testing.T, schema, fillJSON string, fillVal map[string]any, 
 	if !bytes.Equal(rj, j1) {
 		t.Errorf("Root().Schema() JSON rebuild auto-fill = %s, want %s (original)", rj, j1)
 	}
+
+	// Root hands back a copy, so writing through one Default must not reach
+	// the next Root.
+	if !logical {
+		for _, pr := range metaPairs(s, a1) {
+			udScribble(pr[0])
+		}
+		for _, pr := range metaPairs(s, a1) {
+			if meta, wire := pr[0], pr[1]; !matEqual(wire, meta) {
+				t.Errorf("writing through one Root().Default reached the next Root:\n  wire = %#v\n  meta = %#v", wire, meta)
+			}
+		}
+	}
 	return s, a1, rebuilt
+}
+
+// udScribble overwrites every byte, slice element, and map value in v.
+func udScribble(v any) {
+	switch x := v.(type) {
+	case []byte:
+		for i := range x {
+			x[i] ^= 0xff
+		}
+	case []any:
+		for i := range x {
+			udScribble(x[i])
+			x[i] = "scribbled"
+		}
+	case map[string]any:
+		for k := range x {
+			udScribble(x[k])
+			x[k] = "scribbled"
+		}
+	}
 }
 
 // TestMatrix_GenerativeProps pins Root().Props / Fields[].Props. They observe

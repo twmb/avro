@@ -139,10 +139,8 @@ type SchemaField struct {
 	//   - int schemas give int32, long schemas give int64. We reject
 	//     out-of-range defaults at parse.
 	//   - float schemas give float32, double float64. Overflows narrow to
-	//     +/-Inf; NaN, +/-Inf, and a float-syntax "-0.0" round-trip. An
-	//     integer-syntax "-0" is the sign-less integer 0 and reads as +0.0
-	//     (matching Java and fastavro), though the wire encoder writes -0.0
-	//     for it.
+	//     +/-Inf; NaN, +/-Inf, and -0.0 round-trip. An integer-syntax "-0"
+	//     reads as -0.0, the value the wire encoder writes for it.
 	//   - string and enum schemas give string.
 	//   - bytes and fixed give []byte, already decoded from the JSON spec's
 	//     codepoint-per-byte form.
@@ -2241,14 +2239,18 @@ func metadataDefault(val any, node *schemaNode) any {
 			return bytes.Clone(b)
 		}
 	case "union":
-		if branch := firstUnionBranchAcceptingDefault(val, node); branch != nil {
-			return metadataDefault(val, branch)
+		// val is already coerced, so we ask the encoder rather than
+		// validateDefault, which wants the JSON form of a bytes or fixed.
+		for _, branch := range node.branches {
+			if _, err := encodeDefault(nil, val, branch); err == nil {
+				return metadataDefault(val, branch)
+			}
 		}
 	case "record":
 		if m, ok := val.(map[string]any); ok {
 			out := make(map[string]any, len(m))
 			for k, v := range m {
-				out[k] = deepCopyTree(v)
+				out[k] = normalizeJSONValue(v)
 			}
 			for _, f := range node.fields {
 				if v, ok := m[f.name]; ok {

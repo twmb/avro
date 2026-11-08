@@ -529,6 +529,7 @@ func TestMatrix_UnionDefaultMetadataSelectionMatchesWireFill(t *testing.T) {
 		{"map-miss-nonmap", `{"type":"map","values":"int"}`, `1`, "int32", int32(1)},
 		{"nameref-record-branch", `{"type":"record","name":"Inner","fields":[{"name":"e","type":"E"}]}`, `{"e":"B"}`, "map[string]interface {}", nil},
 		{"nameref-array-branch", `{"type":"array","items":"E"}`, `["B"]`, "[]interface {}", nil},
+		{"record-unknown-key", `{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}`, `{"x":1,"zz":9}`, "map[string]interface {}", map[string]any{"x": int32(1), "zz": int64(9)}},
 	}
 
 	for _, c := range cells {
