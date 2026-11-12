@@ -545,7 +545,7 @@ func appendAvroJSONBytesValue(buf []byte, v reflect.Value, node *schemaNode, cus
 				return nil, semErrW(v, "bytes", err)
 			}
 			if ok {
-				b, err := decimalUnscaledBytes(r, node.scale, node.precision, "bytes", v.Type())
+				b, err := decimalUnscaledBytes(nil, r, node.scale, node.precision, "bytes", v.Type())
 				if err != nil {
 					return nil, err
 				}
@@ -629,7 +629,7 @@ func appendAvroJSONFixed(buf []byte, v reflect.Value, node *schemaNode, custom m
 				return nil, semErrW(v, "fixed", err)
 			}
 			if ok {
-				b, err := decimalUnscaledBytes(r, node.scale, node.precision, "fixed", v.Type())
+				b, err := decimalUnscaledBytes(nil, r, node.scale, node.precision, "fixed", v.Type())
 				if err != nil {
 					return nil, err
 				}

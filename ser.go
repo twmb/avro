@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -2044,6 +2045,11 @@ func coerceDecimalRat(v reflect.Value, avroType string) (reflect.Value, *big.Rat
 // propagate rather than re-encode as raw bytes.
 func decimalRatFor(v reflect.Value) (*big.Rat, bool, error) {
 	if v.Type() == bigRatType {
+		// We only read the Rat, so we use an addressable one in place rather
+		// than copy it. A *big.Rat peels to an addressable Rat.
+		if v.CanAddr() {
+			return (*big.Rat)(unsafe.Pointer(v.UnsafeAddr())), true, nil
+		}
 		tmp := v.Interface().(big.Rat)
 		return &tmp, true, nil
 	}
@@ -2104,13 +2110,18 @@ func tryCoerceToRat(v reflect.Value) (*big.Rat, bool, error) {
 	return nil, false, nil
 }
 
+// decimalStackBytes sizes the buffer the binary decimal encoders hand
+// decimalUnscaledBytes. 64 bytes hold an unscaled value of 153 digits; a wider
+// one allocates.
+const decimalStackBytes = 64
+
 // decimalUnscaledBytes runs the shared pipeline: r to unscaled, validate
-// precision, then big-endian two's-complement bytes. avroType labels the
-// SemanticError ("bytes" or "fixed") and goType names the source type. One
-// pipeline for the four decimal-emit sites (binary serBytesDecimal and
-// serFixedDecimal, JSON appendAvroJSON's bytes+decimal and fixed+decimal arms),
-// so precision and scale handling cannot drift across them.
-func decimalUnscaledBytes(r *big.Rat, scale, precision int, avroType string, goType reflect.Type) ([]byte, error) {
+// precision, then big-endian two's-complement bytes, appended to buf. avroType
+// labels the SemanticError ("bytes" or "fixed") and goType names the source
+// type. One pipeline for the four decimal-emit sites (binary serBytesDecimal
+// and serFixedDecimal, JSON appendAvroJSON's bytes+decimal and fixed+decimal
+// arms), so precision and scale handling cannot drift across them.
+func decimalUnscaledBytes(buf []byte, r *big.Rat, scale, precision int, avroType string, goType reflect.Type) ([]byte, error) {
 	unscaled, err := ratToUnscaled(r, scale)
 	if err != nil {
 		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
@@ -2118,13 +2129,13 @@ func decimalUnscaledBytes(r *big.Rat, scale, precision int, avroType string, goT
 	if err := checkDecimalPrecision(unscaled, precision); err != nil {
 		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
 	}
-	b := bigIntToBytes(unscaled)
+	b := appendBigIntBytes(buf, unscaled)
 	// We charge the emitted payload against the bound the *decoder* applies to
 	// these same bytes. Declared precision already keeps a parse-valid decimal
 	// well inside it, so this arm cannot fire today. It is here because the
 	// bound belongs to the format, not to whichever gate happens to imply it,
 	// and a later precision change must not silently reopen an unreadable emit.
-	if err := checkDecimalUnscaledLen(b); err != nil {
+	if err := checkDecimalUnscaledLen(b[len(buf):]); err != nil {
 		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
 	}
 	return b, nil
@@ -2238,7 +2249,8 @@ type serBytesDecimal struct {
 }
 
 func (s *serBytesDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
-	b, err := decimalUnscaledBytes(r, s.scale, s.precision, "bytes", bigRatType)
+	var scratch [decimalStackBytes]byte
+	b, err := decimalUnscaledBytes(scratch[:0], r, s.scale, s.precision, "bytes", bigRatType)
 	if err != nil {
 		return nil, err
 	}
@@ -2270,7 +2282,8 @@ type serFixedDecimal struct {
 }
 
 func (s *serFixedDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
-	b, err := decimalUnscaledBytes(r, s.scale, s.precision, "fixed", bigRatType)
+	var scratch [decimalStackBytes]byte
+	b, err := decimalUnscaledBytes(scratch[:0], r, s.scale, s.precision, "fixed", bigRatType)
 	if err != nil {
 		return nil, err
 	}
@@ -2344,7 +2357,7 @@ func buildBigDecimalPayload(r *big.Rat) ([]byte, error) {
 	unscaled, _ := new(big.Int).QuoRem(num, r.Denom(), new(big.Int))
 	// The remainder is provably 0: finiteScale chose s to make 10^s / Denom
 	// an integer.
-	uBytes := bigIntToBytes(unscaled)
+	uBytes := appendBigIntBytes(nil, unscaled)
 	// big-decimal carries no precision attribute, so nothing upstream bounds
 	// the magnitude. This is the one numeric-carrier arm where an ordinary
 	// *big.Rat reaches the wire unbounded, so we charge the inner unscaled
@@ -2415,10 +2428,36 @@ func finiteScale(r *big.Rat) (int, bool) {
 	return b, true
 }
 
-// pow10 returns 10^n as a *big.Int. n must be non-negative. Every decimal
+// pow10Cache holds 10^n for n below its length, each computed on first use.
+// The length covers the precisions and scales schemas declare in practice and
+// bounds what the cache can hold: all 1025 entries together are under 300 KiB.
+// decimalScaleLimit is far higher, and caching up to it would let a hostile
+// set of schemas pin close to a gigabyte.
+var pow10Cache [1025]atomic.Pointer[big.Int]
+
+// cachedPow10 returns 10^n from pow10Cache, or false when n is past it. You
+// must not modify the result: every caller shares it.
+func cachedPow10(n int) (*big.Int, bool) {
+	if n >= len(pow10Cache) {
+		return nil, false
+	}
+	p := pow10Cache[n].Load()
+	if p == nil {
+		// Two goroutines may both compute and store; the values are equal.
+		p = new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil)
+		pow10Cache[n].Store(p)
+	}
+	return p, true
+}
+
+// pow10 returns 10^n as a *big.Int. n must be non-negative. You must not
+// modify the result, which is shared when cachedPow10 has it. Every decimal
 // encode and decode site that materializes a power of ten goes through here, so
 // a future DoS tightening tied to decimalScaleLimit lives in one place.
 func pow10(n int) *big.Int {
+	if p, ok := cachedPow10(n); ok {
+		return p
+	}
 	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil)
 }
 
@@ -2440,7 +2479,16 @@ func scaledRat(unscaled *big.Int, scale int) *big.Rat {
 // prepare_bytes_decimal do.
 func ratToUnscaled(r *big.Rat, scale int) (*big.Int, error) {
 	num := new(big.Int).Mul(r.Num(), pow10(scale))
-	unscaled, rem := new(big.Int).QuoRem(num, r.Denom(), new(big.Int))
+	// Dividing by 1 changes nothing. We read the denominator rather than ask
+	// IsInt, which ignores a sign you set through Denom.
+	denom := r.Denom()
+	if denom.IsInt64() && denom.Int64() == 1 {
+		return num, nil
+	}
+	// A Rat you wrote through Num or Denom need not be in lowest terms, so
+	// we divide the product rather than test whether the denominator divides
+	// 10^scale.
+	unscaled, rem := new(big.Int).QuoRem(num, denom, new(big.Int))
 	if rem.Sign() != 0 {
 		return nil, fmt.Errorf("decimal value %s cannot be represented at scale %d without rounding", truncRatForError(r), scale)
 	}
@@ -2453,6 +2501,12 @@ func ratToUnscaled(r *big.Rat, scale int) (*big.Int, error) {
 // fastavro, and hamba/avro all enforce it on encode.
 func checkDecimalPrecision(unscaled *big.Int, precision int) error {
 	if precision <= 0 {
+		return nil
+	}
+	// A value fits precision digits when its magnitude is below 10^precision.
+	// Counting digits formats the whole value, so we do that only for a
+	// precision past the cache and to word the error.
+	if limit, ok := cachedPow10(precision); ok && unscaled.CmpAbs(limit) < 0 {
 		return nil
 	}
 	digits := decimalDigitCount(unscaled)
@@ -2471,39 +2525,33 @@ func decimalDigitCount(i *big.Int) int {
 	return len(abs.String())
 }
 
-// bigIntToBytes encodes i as big-endian two's complement in the fewest bytes
-// that still carry the right sign.
-func bigIntToBytes(i *big.Int) []byte {
-	switch i.Sign() {
-	case 0:
-		return []byte{0}
-	case 1:
-		b := i.Bytes() // big-endian unsigned
-		if b[0]&0x80 != 0 {
-			// A set high bit would read as negative in two's complement,
-			// so we prepend a zero byte to keep it positive.
-			b = append([]byte{0}, b...)
-		}
-		return b
-	default:
-		// Two's complement for a negative: flip the bits of (|i| - 1). That
-		// works because -n in two's complement is ^(n-1).
-		abs := new(big.Int).Neg(i)
-		abs.Sub(abs, big.NewInt(1))
-		b := abs.Bytes()
-		if len(b) == 0 {
-			return []byte{0xff} // -1
-		}
-		for j := range b {
-			b[j] = ^b[j]
-		}
-		if b[0]&0x80 == 0 {
-			// A clear high bit would read as positive, so we prepend 0xff
-			// to keep the negative sign.
-			b = append([]byte{0xff}, b...)
-		}
-		return b
+// appendBigIntBytes appends i to dst as big-endian two's complement in the
+// fewest bytes that still carry the right sign.
+func appendBigIntBytes(dst []byte, i *big.Int) []byte {
+	// The magnitude needs BitLen bits and the sign one more. The exception
+	// is -2^k, whose two's complement is the sign bit over k zeros.
+	bits := i.BitLen()
+	neg := i.Sign() < 0
+	if neg && int(i.TrailingZeroBits()) == bits-1 {
+		bits--
 	}
+	n := bits/8 + 1
+	start := len(dst)
+	dst = append(dst, make([]byte, n)...)
+	b := dst[start:]
+	i.FillBytes(b) // the magnitude, zero-extended
+	if neg {
+		// -m is ^m + 1.
+		carry := true
+		for j := n - 1; j >= 0; j-- {
+			b[j] = ^b[j]
+			if carry {
+				b[j]++
+				carry = b[j] == 0
+			}
+		}
+	}
+	return dst
 }
 
 // serFixedUUIDReflect serializes a fixed(16) UUID. We take a [16]byte (raw), a

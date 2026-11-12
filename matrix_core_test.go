@@ -4547,6 +4547,10 @@ func TestMatrix_ConcurrentSchemaUse(t *testing.T) {
 			map[string]any{"a": int32(1), "b": "x"}},
 		{"decimal", `{"type":"bytes","logicalType":"decimal","precision":6,"scale":2}`,
 			[]byte{0x30, 0x39}},
+		// Every goroutine encodes the one *big.Rat, which the encoder reads
+		// in place, against powers of ten it shares.
+		{"decimal-rat", `{"type":"bytes","logicalType":"decimal","precision":38,"scale":10}`,
+			big.NewRat(-12345, 100)},
 		{"timestamp", `{"type":"long","logicalType":"timestamp-millis"}`, int64(1717243496789)},
 		{"recursive", `{"type":"record","name":"CN","fields":[
 			{"name":"v","type":"int"},{"name":"next","type":["null","CN"],"default":null}]}`,
@@ -4710,6 +4714,29 @@ func TestMatrix_ConcurrentFirstUse(t *testing.T) {
 				}
 				if got["keep"] != int32(9) {
 					errs <- fmt.Errorf("first-use skip corrupted: %#v", got)
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Error(err)
+		}
+
+		// The decimal encoder computes each power of ten on first use and
+		// shares it from then on. Each round encodes at a scale of its own,
+		// so its goroutines race the first use of that power.
+		scale := 990 + round
+		dec := avro.MustParse(fmt.Sprintf(`{"type":"bytes","logicalType":"decimal","precision":1000,"scale":%d}`, scale))
+		val := new(big.Rat).SetFrac(big.NewInt(-7), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
+		wantDec := []byte{0x02, 0xf9} // one byte, -7
+		errs = make(chan error, 8)
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if got, err := dec.AppendEncode(nil, val); err != nil || !bytes.Equal(got, wantDec) {
+					errs <- fmt.Errorf("first-use decimal encode at scale %d: got %x err %v, want %x", scale, got, err, wantDec)
 				}
 			}()
 		}
