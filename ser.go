@@ -943,13 +943,12 @@ func doSerBytes(dst []byte, v reflect.Value, _ int) []byte {
 	if l == 0 {
 		return dst
 	}
-	if v.CanAddr() {
-		return append(dst, v.Slice(0, l).Bytes()...)
+	// Bytes reads a slice whether or not it is addressable, and a slice in
+	// an any is not.
+	if v.Kind() == reflect.Slice {
+		return append(dst, v.Bytes()...)
 	}
-	for i := range l {
-		dst = append(dst, byte(v.Index(i).Uint()))
-	}
-	return dst
+	return appendByteArray(dst, v)
 }
 
 func doSerString(dst []byte, s string) []byte {
@@ -1764,13 +1763,7 @@ func (s *serSize) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
 	// We write fixed as raw bytes, with no length prefix.
-	if v.CanAddr() {
-		return append(dst, v.Slice(0, s.n).Bytes()...), nil
-	}
-	for i := 0; i < s.n; i++ {
-		dst = append(dst, byte(v.Index(i).Uint()))
-	}
-	return dst, nil
+	return appendByteArray(dst, v), nil
 }
 
 /////////////////////////////

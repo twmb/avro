@@ -53,6 +53,27 @@ func byteArrayToSlice(v reflect.Value) []byte {
 	return b
 }
 
+// appendByteArray appends the byte-array v to dst, the append counterpart of
+// [byteArrayToSlice]. An addressable array is one memmove through Bytes. An
+// array in an any is not addressable: an exact-uint8 element gets
+// reflect.Copy's memmove, and a named byte element is read element-wise. You
+// have already established that v is an Array whose element Kind is Uint8.
+func appendByteArray(dst []byte, v reflect.Value) []byte {
+	if v.CanAddr() {
+		return append(dst, v.Bytes()...)
+	}
+	n, l := len(dst), v.Len()
+	if v.Type().Elem() == byteType {
+		dst = append(dst, make([]byte, l)...)
+		reflect.Copy(reflect.ValueOf(dst[n:]), v)
+		return dst
+	}
+	for i := range l {
+		dst = append(dst, byte(v.Index(i).Uint()))
+	}
+	return dst
+}
+
 // reuseOrMakeStringAnyMap reuses v's existing map[string]any when v is an
 // interface wrapping one, the streaming-decode pattern; otherwise we allocate a
 // fresh map sized to hint. deserRecord's interface arm and decodeRecordAny both

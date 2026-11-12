@@ -2115,8 +2115,9 @@ func derefAll(v reflect.Value) reflect.Value {
 }
 
 // ptrValEq compares a peeled base against the expected sample by type+value.
+// DeepEqual rather than ==, so a slice sample compares by content.
 func ptrValEq(got, want reflect.Value) bool {
-	return got.IsValid() && got.Type() == want.Type() && got.Interface() == want.Interface()
+	return got.IsValid() && got.Type() == want.Type() && reflect.DeepEqual(got.Interface(), want.Interface())
 }
 
 // ptrBase is one primitive base type for the pointer-indirection axis.
@@ -2124,19 +2125,43 @@ type ptrBase struct {
 	avro   string        // the Avro schema text for this primitive
 	sample reflect.Value // a representative non-zero value of the Go base type
 	pad    string        // a union padding branch, token-class-distinct from avro
+	wire   []byte        // the sample's binary encoding, written by hand
 }
+
+// name labels a base by Avro kind and Go carrier; several carriers share one
+// Avro type.
+func (b ptrBase) name() string {
+	kind := strings.Trim(b.avro, `"`)
+	if strings.HasPrefix(kind, "{") {
+		kind = "fixed"
+	}
+	return kind + "/" + b.sample.Type().String()
+}
+
+const ptrFixed3 = `{"type":"fixed","name":"PtrFix3","size":3}`
 
 func ptrBases() []ptrBase {
 	// pad is token-class-distinct from the base so a 3+-branch union dispatches
 	// the sample to its own branch, never the pad. Digit-class bases pad with a
-	// string; string/boolean bases pad with a long.
+	// string; string/boolean/bytes/fixed bases pad with a long.
+	//
+	// The byte carriers cross the three copies the byte encoders choose
+	// between: a slice, an exact-uint8 array, and a named-byte-element array.
+	// Depth 0 holds the carrier in an any, where it is not addressable; every
+	// deeper chain makes it addressable.
 	return []ptrBase{
-		{`"int"`, reflect.ValueOf(int32(7)), `"string"`},
-		{`"long"`, reflect.ValueOf(int64(7)), `"string"`},
-		{`"float"`, reflect.ValueOf(float32(1.5)), `"string"`},
-		{`"double"`, reflect.ValueOf(float64(1.5)), `"string"`},
-		{`"string"`, reflect.ValueOf("v"), `"long"`},
-		{`"boolean"`, reflect.ValueOf(true), `"long"`},
+		{`"int"`, reflect.ValueOf(int32(7)), `"string"`, []byte{0x0e}},
+		{`"long"`, reflect.ValueOf(int64(7)), `"string"`, []byte{0x0e}},
+		{`"float"`, reflect.ValueOf(float32(1.5)), `"string"`, []byte{0x00, 0x00, 0xc0, 0x3f}},
+		{`"double"`, reflect.ValueOf(float64(1.5)), `"string"`, []byte{0, 0, 0, 0, 0, 0, 0xf8, 0x3f}},
+		{`"string"`, reflect.ValueOf("v"), `"long"`, []byte{0x02, 'v'}},
+		{`"boolean"`, reflect.ValueOf(true), `"long"`, []byte{0x01}},
+		{`"bytes"`, reflect.ValueOf([]byte{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0x06, 0xa1, 0xb2, 0xc3}},
+		{`"bytes"`, reflect.ValueOf([3]byte{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0x06, 0xa1, 0xb2, 0xc3}},
+		{`"bytes"`, reflect.ValueOf(nbeFix3{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0x06, 0xa1, 0xb2, 0xc3}},
+		{ptrFixed3, reflect.ValueOf([]byte{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0xa1, 0xb2, 0xc3}},
+		{ptrFixed3, reflect.ValueOf([3]byte{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0xa1, 0xb2, 0xc3}},
+		{ptrFixed3, reflect.ValueOf(nbeFix3{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0xa1, 0xb2, 0xc3}},
 	}
 }
 
@@ -2146,6 +2171,7 @@ func ptrBases() []ptrBase {
 type ptrCtx struct {
 	label  string
 	schema func(b ptrBase) string
+	wire   func(b ptrBase) []byte                   // the context's binary encoding, built by hand from b.wire
 	input  func(b ptrBase, depth int) reflect.Value // context-shaped encode input
 	target func(b ptrBase, depth int) reflect.Value // a *context-shaped fresh decode target
 	check  func(t *testing.T, b ptrBase, target reflect.Value)
@@ -2175,16 +2201,19 @@ func ptrCtxs() []ptrCtx {
 		{
 			label:  "top",
 			schema: func(b ptrBase) string { return b.avro },
+			wire:   func(b ptrBase) []byte { return b.wire },
 			input:  chainTop, target: newChain, check: checkTop,
 		},
 		{
 			label:  "union-null2",
 			schema: func(b ptrBase) string { return fmt.Sprintf(`["null",%s]`, b.avro) },
+			wire:   func(b ptrBase) []byte { return append([]byte{0x02}, b.wire...) }, // branch 1
 			input:  chainTop, target: newChain, check: checkTop,
 		},
 		{
 			label:  "union-multi",
 			schema: func(b ptrBase) string { return fmt.Sprintf(`["null",%s,%s]`, b.avro, b.pad) },
+			wire:   func(b ptrBase) []byte { return append([]byte{0x02}, b.wire...) }, // branch 1
 			input:  chainTop, target: newChain, check: checkTop,
 		},
 		{
@@ -2192,6 +2221,7 @@ func ptrCtxs() []ptrCtx {
 			schema: func(b ptrBase) string {
 				return fmt.Sprintf(`{"type":"record","name":"PtrRec","fields":[{"name":"f","type":%s}]}`, b.avro)
 			},
+			wire: func(b ptrBase) []byte { return b.wire },
 			input: func(b ptrBase, depth int) reflect.Value {
 				v := reflect.New(ptrFieldStruct(b, depth)).Elem()
 				v.Field(0).Set(ptrChain(b.sample, depth))
@@ -2208,6 +2238,9 @@ func ptrCtxs() []ptrCtx {
 		{
 			label:  "array",
 			schema: func(b ptrBase) string { return fmt.Sprintf(`{"type":"array","items":%s}`, b.avro) },
+			wire: func(b ptrBase) []byte { // one block of 2 items, then the end marker
+				return append(append(append([]byte{0x04}, b.wire...), b.wire...), 0x00)
+			},
 			input: func(b ptrBase, depth int) reflect.Value {
 				st := reflect.SliceOf(ptrTypeOf(b.sample.Type(), depth))
 				sl := reflect.MakeSlice(st, 2, 2)
@@ -2234,6 +2267,9 @@ func ptrCtxs() []ptrCtx {
 		{
 			label:  "map",
 			schema: func(b ptrBase) string { return fmt.Sprintf(`{"type":"map","values":%s}`, b.avro) },
+			wire: func(b ptrBase) []byte { // one block of 1 entry keyed "k", then the end marker
+				return append(append([]byte{0x02, 0x02, 'k'}, b.wire...), 0x00)
+			},
 			input: func(b ptrBase, depth int) reflect.Value {
 				mt := reflect.MapOf(stringType, ptrTypeOf(b.sample.Type(), depth))
 				m := reflect.MakeMap(mt)
@@ -2270,7 +2306,7 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 	depths := []int{0, 1, ptrIndirectCap, ptrIndirectCap + 1} // {0, 1, at-cap, past-cap}
 	for _, b := range ptrBases() {
 		for _, pc := range ptrCtxs() {
-			t.Run(strings.Trim(b.avro, `"`)+"/"+pc.label, func(t *testing.T) {
+			t.Run(b.name()+"/"+pc.label, func(t *testing.T) {
 				s := avro.MustParse(pc.schema(b))
 				res, err := avro.Resolve(s, s)
 				if err != nil {
@@ -2281,6 +2317,11 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 				cbin, err := s.AppendEncode(nil, pc.input(b, 0).Interface())
 				if err != nil {
 					t.Fatalf("canonical binary encode: %v", err)
+				}
+				// Every deeper wire is compared to cbin below, so cbin itself is
+				// checked against bytes the encoder did not produce.
+				if want := pc.wire(b); !bytes.Equal(cbin, want) {
+					t.Fatalf("canonical binary wire:\n got=%x\nwant=%x", cbin, want)
 				}
 				cjson, err := s.AppendEncodeJSON(nil, pc.input(b, 0).Interface())
 				if err != nil {
