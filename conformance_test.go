@@ -22624,18 +22624,29 @@ func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
 		{"map-int", `{"type":"map","values":"int"}`, map[string]*int32{"k": nil}},
 		{"map-double", `{"type":"map","values":"double"}`, map[string]*float64{"k": nil}},
 		{"field", `"int"`, (*int32)(nil)},
+		// An untyped nil: the map holds a nil any, and the struct's field is
+		// an any.
+		{"untyped/long", `"long"`, nil},
+		{"untyped/array", `{"type":"array","items":"int"}`, nil},
+		{"untyped/record", `{"type":"record","name":"Sub","fields":[]}`, nil},
 	}
 	for _, n := range nils {
 		s := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":%s}]}`, n.schema))
-		held := reflect.New(reflect.StructOf([]reflect.StructField{{Name: "F", Type: reflect.TypeOf(n.val), Tag: `avro:"f"`}}))
-		held.Elem().Field(0).Set(reflect.ValueOf(n.val))
+		fieldType := reflect.TypeFor[any]()
+		if n.val != nil {
+			fieldType = reflect.TypeOf(n.val)
+		}
+		st := reflect.New(reflect.StructOf([]reflect.StructField{{Name: "F", Type: fieldType, Tag: `avro:"f"`}}))
+		if n.val != nil {
+			st.Elem().Field(0).Set(reflect.ValueOf(n.val))
+		}
 		carriers := []struct {
 			name string
 			v    any
 		}{
 			{"map", map[string]any{"f": n.val}},
-			{"struct", held.Elem().Interface()},
-			{"struct-pointer", held.Interface()},
+			{"struct", st.Elem().Interface()},
+			{"struct-pointer", st.Interface()},
 		}
 		for _, c := range carriers {
 			t.Run("nil/"+n.name+"/"+c.name, func(t *testing.T) {

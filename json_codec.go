@@ -1058,7 +1058,15 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 						return nil, recordFieldError(v.Type(), f.name, err)
 					}
 				} else {
-					buf, err = appendAvroJSON(buf, reflect.ValueOf(value), f.node, cfg, custom, depth+1)
+					// A nil is the zero any, as in the binary map arm, so
+					// both wires read it, and refuse it, the same way.
+					var rv reflect.Value
+					if value != nil {
+						rv = reflect.ValueOf(value)
+					} else {
+						rv = reflect.Zero(anyType)
+					}
+					buf, err = appendAvroJSON(buf, rv, f.node, cfg, custom, depth+1)
 					if err != nil {
 						return nil, recordFieldError(v.Type(), f.name, err)
 					}
