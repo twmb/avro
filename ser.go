@@ -1779,6 +1779,23 @@ var (
 	bigRatType       = reflect.TypeFor[big.Rat]()
 )
 
+// timeOf returns the time.Time v holds. v.Interface would copy an addressable
+// value to the heap first, and a value behind a pointer is addressable.
+func timeOf(v reflect.Value) time.Time {
+	if v.CanAddr() {
+		return *(*time.Time)(unsafe.Pointer(v.UnsafeAddr()))
+	}
+	return v.Interface().(time.Time)
+}
+
+// durationOf is timeOf for a Duration.
+func durationOf(v reflect.Value) Duration {
+	if v.CanAddr() {
+		return *(*Duration)(unsafe.Pointer(v.UnsafeAddr()))
+	}
+	return v.Interface().(Duration)
+}
+
 // Duration is the Avro duration logical type: a 12-byte fixed value holding
 // three little-endian uint32s, months and days and milliseconds.
 type Duration struct {
@@ -1875,7 +1892,7 @@ func tryParseTimeString(v reflect.Value) (time.Time, bool) {
 // accepted-input set lives in one place.
 func extractTime(v reflect.Value) (time.Time, bool) {
 	if v.Type() == timeType {
-		return v.Interface().(time.Time), true
+		return timeOf(v), true
 	}
 	return tryParseTimeString(v)
 }
@@ -1952,7 +1969,7 @@ func serDate(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == timeType {
-		d, err := timeToDate(v.Interface().(time.Time))
+		d, err := timeToDate(timeOf(v))
 		if err != nil {
 			return nil, &SemanticError{GoType: timeType, AvroType: "date", Err: err}
 		}
@@ -1984,7 +2001,7 @@ func serTimeMillis(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return appendVarint(dst, ms), nil
 	}
 	if v.Type() == timeType {
-		ms, err := durationToTimeMillis(timeOfDay(v.Interface().(time.Time)))
+		ms, err := durationToTimeMillis(timeOfDay(timeOf(v)))
 		if err != nil {
 			return nil, &SemanticError{GoType: timeType, AvroType: "time-millis", Err: err}
 		}
@@ -2004,7 +2021,7 @@ func serTimeMicros(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return appendVarlong(dst, time.Duration(v.Int()).Microseconds()), nil
 	}
 	if v.Type() == timeType {
-		return appendVarlong(dst, timeOfDay(v.Interface().(time.Time)).Microseconds()), nil
+		return appendVarlong(dst, timeOfDay(timeOf(v)).Microseconds()), nil
 	}
 	return serLong(dst, v, depth)
 }
@@ -2015,7 +2032,7 @@ func serDuration(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == avroDurationType {
-		b := v.Interface().(Duration).Bytes()
+		b := durationOf(v).Bytes()
 		return append(dst, b[:]...), nil
 	}
 	return (&serSize{12}).ser(dst, v, depth)

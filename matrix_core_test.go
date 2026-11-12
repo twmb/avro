@@ -2128,17 +2128,32 @@ type ptrBase struct {
 	wire   []byte        // the sample's binary encoding, written by hand
 }
 
-// name labels a base by Avro kind and Go carrier; several carriers share one
-// Avro type.
+// name labels a base by Avro kind, or logical type when it has one, and Go
+// carrier; several carriers share one Avro type.
 func (b ptrBase) name() string {
 	kind := strings.Trim(b.avro, `"`)
 	if strings.HasPrefix(kind, "{") {
-		kind = "fixed"
+		var obj struct {
+			Type        string `json:"type"`
+			LogicalType string `json:"logicalType"`
+		}
+		if err := json.Unmarshal([]byte(kind), &obj); err != nil {
+			panic(err)
+		}
+		if kind = obj.LogicalType; kind == "" {
+			kind = obj.Type
+		}
 	}
 	return kind + "/" + b.sample.Type().String()
 }
 
-const ptrFixed3 = `{"type":"fixed","name":"PtrFix3","size":3}`
+const (
+	ptrFixed3    = `{"type":"fixed","name":"PtrFix3","size":3}`
+	ptrTimestamp = `{"type":"long","logicalType":"timestamp-micros"}`
+	ptrDate      = `{"type":"int","logicalType":"date"}`
+	ptrTime      = `{"type":"long","logicalType":"time-micros"}`
+	ptrDuration  = `{"type":"fixed","name":"PtrDur","size":12,"logicalType":"duration"}`
+)
 
 func ptrBases() []ptrBase {
 	// pad is token-class-distinct from the base so a 3+-branch union dispatches
@@ -2162,6 +2177,16 @@ func ptrBases() []ptrBase {
 		{ptrFixed3, reflect.ValueOf([]byte{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0xa1, 0xb2, 0xc3}},
 		{ptrFixed3, reflect.ValueOf([3]byte{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0xa1, 0xb2, 0xc3}},
 		{ptrFixed3, reflect.ValueOf(nbeFix3{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0xa1, 0xb2, 0xc3}},
+		// The logical carriers wider than a word. The encoders read one in
+		// place when it is addressable, which every chain past depth 0 makes
+		// it. The wires are 2026-11-11T12:00:00Z in microseconds, 2026-11-11
+		// in days, and 90 minutes in microseconds.
+		{ptrTimestamp, reflect.ValueOf(time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)), `"string"`,
+			[]byte{0x80, 0xc0, 0xbd, 0xf3, 0xdd, 0xff, 0xaf, 0x06}},
+		{ptrDate, reflect.ValueOf(time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)), `"string"`, []byte{0xc0, 0xc4, 0x02}},
+		{ptrTime, reflect.ValueOf(90 * time.Minute), `"string"`, []byte{0x80, 0xd8, 0xeb, 0x9d, 0x28}},
+		{ptrDuration, reflect.ValueOf(avro.Duration{Months: 1, Days: 2, Milliseconds: 3}), `"long"`,
+			[]byte{1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0}},
 	}
 }
 
@@ -2345,6 +2370,16 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 						if accept {
 							if !bytes.Equal(binW, cbin) {
 								t.Fatalf("deep binary wire differs from bare base:\n got=%x\nwant=%x", binW, cbin)
+							}
+							// A value behind one pointer is read in place, so
+							// encoding it into a buffer with room allocates
+							// nothing.
+							if pc.label == "top" && depth == 1 {
+								ptr := pc.input(b, depth).Interface()
+								buf := make([]byte, 0, 64)
+								if n := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncode(buf[:0], ptr) }); n != 0 {
+									t.Errorf("encoding a value behind a pointer allocates %.0f times, want 0", n)
+								}
 							}
 							if !bytes.Equal(jsonW, cjson) {
 								t.Fatalf("deep JSON wire differs from bare base:\n got=%s\nwant=%s", jsonW, cjson)

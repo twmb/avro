@@ -433,7 +433,7 @@ func appendAvroJSONNull(buf []byte, v reflect.Value) ([]byte, error) {
 
 func appendAvroJSONInt(buf []byte, v reflect.Value, node *schemaNode) ([]byte, error) {
 	if v.Type() == timeType {
-		t := v.Interface().(time.Time)
+		t := timeOf(v)
 		switch node.logical {
 		case "date":
 			d, err := timeToDate(t)
@@ -449,7 +449,7 @@ func appendAvroJSONInt(buf []byte, v reflect.Value, node *schemaNode) ([]byte, e
 		}
 	}
 	if v.Type() == durationType {
-		d := v.Interface().(time.Duration)
+		d := time.Duration(v.Int())
 		switch node.logical {
 		case "time-millis":
 			ms, err := durationToTimeMillis(d)
@@ -495,10 +495,10 @@ func appendAvroJSONLong(buf []byte, v reflect.Value, node *schemaNode) ([]byte, 
 	}
 	if node.logical == "time-micros" {
 		if v.Type() == timeType {
-			return strconv.AppendInt(buf, timeOfDay(v.Interface().(time.Time)).Microseconds(), 10), nil
+			return strconv.AppendInt(buf, timeOfDay(timeOf(v)).Microseconds(), 10), nil
 		}
 		if v.Type() == durationType {
-			return strconv.AppendInt(buf, v.Interface().(time.Duration).Microseconds(), 10), nil
+			return strconv.AppendInt(buf, time.Duration(v.Int()).Microseconds(), 10), nil
 		}
 	}
 	n, err := jsonCoerceToInt64(v)
@@ -660,7 +660,7 @@ func appendAvroJSONFixed(buf []byte, v reflect.Value, node *schemaNode, custom m
 			// through to the size-checked raw path below, so JSON encode stays
 			// raw and self-readable.
 			if node.size == 12 && v.Type() == avroDurationType {
-				raw := v.Interface().(Duration).Bytes()
+				raw := durationOf(v).Bytes()
 				return appendAvroJSONBytes(buf, raw[:]), nil
 			}
 		case "uuid":
