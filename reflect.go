@@ -76,8 +76,9 @@ func appendByteArray(dst []byte, v reflect.Value) []byte {
 
 // reuseOrMakeStringAnyMap reuses v's existing map[string]any when v is an
 // interface wrapping one, the streaming-decode pattern; otherwise we allocate a
-// fresh map sized to hint. deserRecord's interface arm and decodeRecordAny both
-// use it, so the two record-into-*any paths agree on reuse.
+// fresh map sized to hint. deserRecord's interface arm, the resolved decoder's
+// deserInterface, and decodeRecordAny all use it, so every record-into-*any
+// path agrees on reuse.
 //
 // Reuse keeps keys the schema does not name. If you want a fresh decode, clear
 // or replace the map before each call.

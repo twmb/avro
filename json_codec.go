@@ -608,7 +608,7 @@ func appendAvroJSONBytesValue(buf []byte, v reflect.Value, node *schemaNode, cus
 		// reflect.Value.Bytes() panics on Array kinds, so we materialize
 		// the bytes via byteArrayToSlice (element-agnostic so a named byte
 		// element [N]B does not panic). This mirrors the "fixed" arm below
-		// and serBytes (ser.go:460), which takes Array alongside Slice.
+		// and serBytes, which takes Array alongside Slice.
 		return appendAvroJSONBytes(buf, byteArrayToSlice(v)), nil
 	}
 	return nil, semErr(v, "bytes")
@@ -1112,7 +1112,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 
 // appendUnionBranch wraps encoded in the tagged form {type_name: value} when
 // cfg.tagged is set and the branch is non-null, holding the "wrap iff
-// non-null" rule in one place for the four dispatcher sites. The spec
+// non-null" rule in one place for every dispatcher site. The spec
 // defines a union null as bare null, as Java's JsonEncoder.writeIndex does.
 func appendUnionBranch(buf []byte, union, branch *schemaNode, encoded []byte, cfg *optConfig) []byte {
 	if cfg.tagged && branch.kind != "null" {

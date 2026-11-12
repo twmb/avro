@@ -96,8 +96,8 @@ func timeToTimestampNanos(t time.Time) (int64, error) {
 }
 
 // timeLogicalToInt64 returns nil if logical is not a long-typed time logical.
-// JSON encode's "long" arm and the binary ser-side timestamp wrappers both go
-// through here, so a new logical is wired in once.
+// JSON encode's "long" arm asks it. The binary serializers name their
+// converter directly.
 func timeLogicalToInt64(logical string) func(time.Time) (int64, error) {
 	switch logical {
 	case "timestamp-millis":

@@ -102,7 +102,7 @@ func (s *serUnion) tryUnwrapTagged(v reflect.Value) (int, reflect.Value, bool) {
 
 // ser encodes a union value. We try a tagged union map first. If that fails, or
 // v is not a tagged map, we dispatch on the value's canonical Avro name
-// (Java/fastavro/hamba parity; see the branchKinds doc). With no name match we
+// (Java/fastavro/hamba parity; see unionTags.byKind). With no name match we
 // try every branch in order, which keeps the documented whole-number-float and
 // json.Number-into-int promotions.
 func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
@@ -165,8 +165,8 @@ func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 }
 
 // unionTypeNameForValue returns the Avro primitive kind name matching v's Go
-// type directly, or "" when v should fall through to try-each. Every union
-// encoder and encodeDefault use it, so first-pass branch selection agrees.
+// type directly, or "" when v should fall through to try-each. Both union
+// encoders use it, so first-pass branch selection agrees.
 // Pointer and interface chains unwrap up to maxIndirectDepth so a cyclic
 // input cannot overflow the stack.
 func unionTypeNameForValue(v reflect.Value) string {
@@ -2120,8 +2120,8 @@ const decimalStackBytes = 64
 // precision, then big-endian two's-complement bytes, appended to buf. avroType
 // labels the SemanticError ("bytes" or "fixed") and goType names the source
 // type. One pipeline for the four decimal-emit sites (binary serBytesDecimal
-// and serFixedDecimal, JSON appendAvroJSON's bytes+decimal and fixed+decimal
-// arms), so precision and scale handling cannot drift across them.
+// and serFixedDecimal, JSON appendAvroJSONBytesValue and appendAvroJSONFixed),
+// so precision and scale handling cannot drift across them.
 func decimalUnscaledBytes(buf []byte, r *big.Rat, scale, precision int, avroType string, goType reflect.Type) ([]byte, error) {
 	if b, ok := appendDecimalWords(buf, r, scale, precision); ok {
 		return b, nil
@@ -2709,9 +2709,9 @@ func isUUIDType(t reflect.Type) bool {
 }
 
 // uuidBytes copies v's [16]byte payload into a stack array when v is a
-// UUID-typed array, returning (u, true), and (zero, false) otherwise. The three
+// UUID-typed array, returning (u, true), and (zero, false) otherwise. The four
 // encode sites that must materialize a [16]byte from a reflect.Value share it:
-// serFixedUUIDReflect, serUUID, and the JSON "string"+uuid arm.
+// serFixedUUIDReflect, serUUID, and the JSON string+uuid and fixed+uuid arms.
 func uuidBytes(v reflect.Value) ([16]byte, bool) {
 	if !isUUIDType(v.Type()) {
 		return [16]byte{}, false
