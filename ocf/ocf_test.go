@@ -2870,6 +2870,56 @@ func TestWriterBlockFramingContract(t *testing.T) {
 		data := framingFile(t, []WriterOpt{WithBlockBytes(0)}, func(w *Writer) { encodeN(t, w, 4) })
 		wantCounts(t, data, 4) // default 64KiB cap, not seal-per-datum
 	})
+	t.Run("block-buffer-sized-from-its-datums", func(t *testing.T) {
+		// A block's buffer gets to its size in a few moves, never has room
+		// for more than four times what the block holds, and ends within an
+		// eighth of the block. append alone moves it about thirty times.
+		datum := append([]byte{0x90, 0x03}, bytes.Repeat([]byte("ab"), 100)...) // a 200-byte "bytes"
+		schema := avro.MustParse(`"bytes"`)
+		adds := map[string]func(w *Writer) error{
+			"Write":  func(w *Writer) error { _, err := w.Write(datum); return err },
+			"Encode": func(w *Writer) error { return w.Encode(datum[2:]) },
+		}
+		for _, c := range []struct {
+			name  string
+			opts  []WriterOpt
+			block int // the bytes a full block holds
+		}{
+			{"by count", []WriterOpt{WithBlockCount(2000), WithBlockBytes(1 << 26)}, 2000 * len(datum)},
+			{"by bytes", []WriterOpt{WithBlockBytes(400_000)}, 400_000},
+		} {
+			for how, add := range adds {
+				w := mustNewWriter(t, io.Discard, schema, c.opts...)
+				moves, last := 0, cap(w.buf)
+				for len(w.buf)+2*len(datum) < c.block { // stop short of a flush
+					if err := add(w); err != nil {
+						t.Fatalf("%s: %v", how, err)
+					}
+					if cap(w.buf) != last {
+						moves, last = moves+1, cap(w.buf)
+					}
+					if len(w.buf) > 4096 && cap(w.buf) > 4*len(w.buf) {
+						t.Fatalf("%s, %s: room for %d bytes with %d written", how, c.name, cap(w.buf), len(w.buf))
+					}
+				}
+				if moves > 12 {
+					t.Errorf("%s, %s: the block buffer moved %d times on the way to %d bytes", how, c.name, moves, len(w.buf))
+				}
+				if most := c.block + c.block/8 + len(datum); cap(w.buf) > most {
+					t.Errorf("%s, %s: room for %d bytes for a block of %d", how, c.name, cap(w.buf), c.block)
+				}
+				mustClose(t, w)
+			}
+		}
+		// A datum larger than a whole block gets no buffer from the
+		// prediction, which would be too small for it; append sizes that one.
+		w := mustNewWriter(t, io.Discard, schema, WithBlockBytes(1000))
+		w.reserve(5000)
+		if c := cap(w.buf); c != 0 && c < 5000 {
+			t.Errorf("a 5000 byte datum got a buffer of %d bytes, which it cannot fit", c)
+		}
+		mustClose(t, w)
+	})
 	t.Run("one-allocation-per-block", func(t *testing.T) {
 		// A block costs one allocation: the slice that holds its header,
 		// data, and sync marker. The null codec copies into it and zstd

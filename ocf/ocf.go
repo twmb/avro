@@ -424,6 +424,7 @@ type Writer struct {
 	maxCount   int
 	maxBytes   int
 	dataHint   int // the last block's data length, to size the next block by
+	lastLen    int // the last encoded datum's length, to make room for the next by
 	err        error
 	userMeta   []kv
 	hasSync    bool
@@ -597,6 +598,8 @@ func (w *Writer) Encode(v any) error {
 	if w.err != nil {
 		return w.err
 	}
+	// The datum before this one is our guess at this one's size.
+	w.reserve(w.lastLen)
 	// AppendEncode is append-only into w.buf: on error the first len(w.buf)
 	// bytes are still exactly the previously accepted datums, and the failed
 	// datum's partial bytes sit past them in the backing array (hidden by the
@@ -606,12 +609,36 @@ func (w *Writer) Encode(v any) error {
 	if err != nil {
 		return err
 	}
+	w.lastLen = len(buf) - len(w.buf)
 	w.buf = buf
 	w.count++
 	if w.shouldFlush() {
 		return w.flush()
 	}
 	return nil
+}
+
+// reserve makes room in the block buffer for a datum of about n bytes. When
+// the buffer is out of room, append would move it to one a quarter larger,
+// and a block that fills that way is copied about thirty times. We move it
+// instead to four times what it is about to hold, or to the size its datums
+// predict for a whole block plus an eighth, whichever is smaller. A datum
+// that size has no room for is left to append. We keep the buffer from block
+// to block and never pass it to the io.Writer, so this is a cost of a
+// Writer's first block.
+func (w *Writer) reserve(n int) {
+	need := len(w.buf) + n
+	if need <= cap(w.buf) {
+		return
+	}
+	block := w.maxBytes
+	if avg := need / (w.count + 1); w.maxCount > 0 && avg < block/w.maxCount {
+		block = avg * w.maxCount
+	}
+	block += min(block/8, math.MaxInt-block)
+	if want := min(4*need, block); want >= need && want > cap(w.buf) {
+		w.buf = append(make([]byte, 0, want), w.buf...)
+	}
 }
 
 // Write appends pre-encoded Avro bytes as a single datum to the current
@@ -624,6 +651,7 @@ func (w *Writer) Write(p []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
 	}
+	w.reserve(len(p))
 	w.buf = append(w.buf, p...)
 	w.count++
 	if w.shouldFlush() {
