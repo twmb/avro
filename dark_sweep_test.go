@@ -627,6 +627,12 @@ func darkSameBranchShape(wire, meta any) bool {
 // reach the other. The assertion is the same on both sides. Deep input is
 // refused with the recursion-limit error and nothing panics. Shallow input of
 // the same shape round-trips.
+//
+// A leaf is not a level: only a node that holds another node is charged. For
+// every shape here, the deepest value Encode accepts is the deepest
+// EncodeJSON accepts, and each wire decodes what it wrote there. Two shapes
+// end in a leaf, one supplied and one filled from a default, since a leaf is
+// what a wire that charged every node would refuse one level early.
 // ---------------------------------------------------------------------------
 
 type darkNullNext struct {
@@ -683,6 +689,8 @@ func TestMatrix_RecursionLimitAcrossShapesAndParity(t *testing.T) {
 		// That compiles a different (unsafe, field-offset) decoder than the
 		// any/map targets.
 		mkTarget func(shift int) any
+		// json builds the JSON text nested d levels, or nil.
+		json func(d int) string
 	}{
 		{
 			name: "null-union-record",
@@ -796,6 +804,43 @@ func TestMatrix_RecursionLimitAcrossShapesAndParity(t *testing.T) {
 			},
 		},
 		{
+			// The deepest node is a leaf under a union: the innermost record
+			// holds the int branch.
+			name: "record-or-int-union",
+			body: `{"name":"next","type":["null","T","int"]}`,
+			mk: func(d int) any {
+				var cur any = int32(7)
+				for range d + 1 {
+					cur = map[string]any{"next": cur}
+				}
+				return cur
+			},
+			// d records pick the T branch, and the innermost picks the int 7.
+			wire: func(d int) []byte {
+				b := make([]byte, 0, d+2)
+				for range d {
+					b = append(b, 2)
+				}
+				return append(b, 4, 14)
+			},
+			json: func(d int) string {
+				return strings.Repeat(`{"next":`, d+1) + "7" + strings.Repeat("}", d+1)
+			},
+		},
+		{
+			// The deepest node is a leaf filled from a default: no level
+			// supplies "u".
+			name: "leaf-default",
+			body: `{"name":"next","type":["null","T"]},{"name":"u","type":["int","null"],"default":7}`,
+			mk: func(d int) any {
+				var cur any
+				for range d + 1 {
+					cur = map[string]any{"next": cur}
+				}
+				return cur
+			},
+		},
+		{
 			name: "null-union-with-primitive-array",
 			body: `{"name":"next","type":["null","T"]},{"name":"xs","type":{"type":"array","items":"int"}}`,
 			mk: func(d int) any {
@@ -846,8 +891,67 @@ func TestMatrix_RecursionLimitAcrossShapesAndParity(t *testing.T) {
 					t.Fatalf("deep JSON encode: want recursion limit, got %v", err)
 				}
 
+				// The boundary: Encode and EncodeJSON accept the same deepest
+				// value, and each wire decodes what it encoded there. lo is
+				// the deepest nesting Encode accepts.
+				lo, hi := shallow, deep
+				for hi-lo > 1 {
+					mid := (lo + hi) / 2
+					if _, err := s.Encode(mk(mid)); err == nil {
+						lo = mid
+					} else {
+						hi = mid
+					}
+				}
+				bin, err := s.Encode(mk(lo))
+				if err != nil {
+					t.Fatalf("encode at the boundary %d: %v", lo, err)
+				}
+				js, err := s.EncodeJSON(mk(lo))
+				if err != nil {
+					t.Fatalf("Encode accepts %d levels and EncodeJSON refuses them: %v", lo, err)
+				}
+				if _, err := s.EncodeJSON(mk(lo + 1)); err == nil {
+					t.Fatalf("EncodeJSON accepts %d levels and Encode refuses them", lo+1)
+				} else if !strings.Contains(err.Error(), "recursion limit exceeded") {
+					t.Fatalf("EncodeJSON past the boundary: want recursion limit, got %v", err)
+				}
+				var fromBin, fromJSON any
+				if _, err := s.Decode(bin, &fromBin); err != nil {
+					t.Fatalf("Decode refuses the %d levels Encode wrote: %v", lo, err)
+				}
+				if err := s.DecodeJSON(js, &fromJSON); err != nil {
+					t.Fatalf("DecodeJSON refuses the %d levels EncodeJSON wrote: %v", lo, err)
+				}
+				if sh.json != nil {
+					// Hand-built text stops where EncodeJSON stops.
+					text := func(d int) []byte {
+						if shift == 1 {
+							return []byte(`{"o":` + sh.json(d) + `}`)
+						}
+						return []byte(sh.json(d))
+					}
+					var atLimit, pastLimit any
+					if err := s.DecodeJSON(text(lo), &atLimit); err != nil {
+						t.Fatalf("DecodeJSON refuses hand-built text of %d levels, which EncodeJSON accepts: %v", lo, err)
+					}
+					if err := s.DecodeJSON(text(lo+1), &pastLimit); err == nil {
+						t.Fatalf("DecodeJSON accepts hand-built text of %d levels, which EncodeJSON refuses", lo+1)
+					} else if !strings.Contains(err.Error(), "recursion limit exceeded") {
+						t.Fatalf("DecodeJSON past the boundary: want recursion limit, got %v", err)
+					}
+				}
+
 				if sh.wire == nil {
 					return
+				}
+				// The hand-built wire stops where Encode stops.
+				var atLimit, pastLimit any
+				if _, err := s.Decode(sh.wire(lo), &atLimit); err != nil {
+					t.Fatalf("Decode refuses a hand-built wire of %d levels, which Encode accepts: %v", lo, err)
+				}
+				if _, err := s.Decode(sh.wire(lo+1), &pastLimit); err == nil {
+					t.Fatalf("Decode accepts a hand-built wire of %d levels, which Encode refuses", lo+1)
 				}
 				wire := sh.wire(deep)
 				targets := []struct {

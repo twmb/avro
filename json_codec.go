@@ -301,11 +301,19 @@ func dropAliasingOpts(opts []Opt) []Opt {
 	return opts
 }
 
+// kindNests reports whether a node of this kind can hold another node. The
+// JSON encoder and decoder charge a level of nesting to these nodes only, as
+// the binary deserializers do. A leaf at the limit ends the nesting and is
+// not refused.
+func kindNests(kind string) bool {
+	return kind == "union" || unionBranchRecurses(kind)
+}
+
 // appendAvroJSON is the single-pass Avro JSON encoder: we walk the Go value and
 // the schema tree together, writing JSON directly with no intermediate binary
 // encoding step.
 func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
-	if depth >= maxDepth {
+	if depth >= maxDepth && kindNests(node.kind) {
 		return nil, errTooDeep
 	}
 	if !v.IsValid() {

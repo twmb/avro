@@ -180,11 +180,13 @@ type jsonDecoder struct {
 // node, and assigns it to v. A node carrying a custom-decoder wrapper
 // dispatches through it.
 func (ctx *jsonDecoder) decodeValue(v reflect.Value, node *schemaNode) error {
-	if ctx.slab.depth >= maxDepth {
-		return errTooDeep
+	if kindNests(node.kind) {
+		if ctx.slab.depth >= maxDepth {
+			return errTooDeep
+		}
+		ctx.slab.depth++
+		defer func() { ctx.slab.depth-- }()
 	}
-	ctx.slab.depth++
-	defer func() { ctx.slab.depth-- }()
 	if node.decodeJSON != nil {
 		return node.decodeJSON(ctx, v, node)
 	}
