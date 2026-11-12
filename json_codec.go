@@ -798,7 +798,7 @@ func appendAvroJSONEnum(buf []byte, v reflect.Value, node *schemaNode) ([]byte, 
 }
 
 func appendAvroJSONArray(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
-	if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
+	if (v.Kind() != reflect.Slice && v.Kind() != reflect.Array) || v.Type() == arrayRecordType {
 		return nil, semErr(v, "array")
 	}
 	// Native concrete fast path: a plain primitive item and an unnamed []V
@@ -1037,6 +1037,31 @@ func appendJSONDefaultUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *
 
 func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
 	buf = append(buf, '{')
+	if v.Type() == arrayRecordType {
+		row := arrayRecordOf(v)
+		if len(row) != len(node.fields) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "record", Err: fmt.Errorf("record has %d fields, value has %d", len(node.fields), len(row))}
+		}
+		for i, f := range node.fields {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = appendJSONString(buf, f.name)
+			buf = append(buf, ':')
+			// A nil value is a zero any, as in the map arm below.
+			var rv reflect.Value
+			if value := row[i]; value != nil {
+				rv = reflect.ValueOf(value)
+			} else {
+				rv = reflect.Zero(anyType)
+			}
+			var err error
+			if buf, err = appendAvroJSON(buf, rv, f.node, cfg, custom, depth+1); err != nil {
+				return nil, recordFieldError(v.Type(), f.name, err)
+			}
+		}
+		return append(buf, '}'), nil
+	}
 	if v.Kind() == reflect.Map {
 		if v.Type().Key().Kind() != reflect.String {
 			return nil, semErr(v, "record")

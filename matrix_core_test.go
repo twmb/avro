@@ -94,6 +94,17 @@ func matEqual(a, b any) bool {
 	case *big.Rat:
 		bv, ok := b.(*big.Rat)
 		return ok && av.Cmp(bv) == 0
+	case avro.ArrayRecord:
+		bv, ok := b.(avro.ArrayRecord)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !matEqual(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
 	default:
 		return reflect.DeepEqual(a, b)
 	}
@@ -411,6 +422,9 @@ func runCore(t *testing.T, schemaJSON string, vin any, opts ...avro.Opt) {
 	// Metadata rebuild: Root().Schema() must fingerprint-match and must produce
 	// byte-identical wires in both formats.
 	root := s.Root()
+	if root.Type == "record" {
+		runCoreArrayRecord(t, s, schemaJSON, w1, j1, len(root.Fields), opts)
+	}
 	s2, err := root.Schema()
 	if err != nil {
 		t.Fatalf("Root().Schema(): %v\nschema: %s", err, schemaJSON)
@@ -502,6 +516,343 @@ func runCore(t *testing.T, schemaJSON string, vin any, opts ...avro.Opt) {
 // agreement that this loop omitted. We keep matFrags/matCtxs/runCore here as
 // the shared generative tables the broader matrix suite (and the generator)
 // consume.
+
+// runCoreArrayRecord is runCore's positional half, for a schema whose root is
+// a record: the canonical wires decode into an ArrayRecord, on both formats
+// to the same value, and that value encodes back to the same wires. So an
+// ArrayRecord is the same record as a map of the same values, for every
+// field type runCore composes.
+func runCoreArrayRecord(t *testing.T, s *avro.Schema, schemaJSON string, w1, j1 []byte, fields int, opts []avro.Opt) {
+	t.Helper()
+	var row avro.ArrayRecord
+	rest, err := s.Decode(w1, &row, opts...)
+	if err != nil || len(rest) != 0 {
+		t.Fatalf("binDec into ArrayRecord: err=%v rest=%d\nschema: %s", err, len(rest), schemaJSON)
+	}
+	if len(row) != fields {
+		t.Fatalf("ArrayRecord has %d values for %d fields\nschema: %s", len(row), fields, schemaJSON)
+	}
+	wr, err := s.AppendEncode(nil, row, opts...)
+	if err != nil || !bytes.Equal(wr, w1) {
+		t.Fatalf("ArrayRecord re-encode differs: err=%v\n w1=%x\n wr=%x\nschema: %s\nrow: %#v", err, w1, wr, schemaJSON, row)
+	}
+	var rowJ avro.ArrayRecord
+	if err := s.DecodeJSON(j1, &rowJ, opts...); err != nil {
+		t.Fatalf("jsonDec into ArrayRecord: %v\nschema: %s\nj1: %s", err, schemaJSON, j1)
+	}
+	if !matEqual(rowJ, row) {
+		t.Fatalf("ArrayRecord cross-wire value disagreement:\n bin=%#v\njson=%#v\nschema: %s", row, rowJ, schemaJSON)
+	}
+	wj, err := s.AppendEncode(nil, rowJ, opts...)
+	if err != nil || !bytes.Equal(wj, w1) {
+		t.Fatalf("ArrayRecord JSON round-trip lands on a different wire: err=%v\n w1=%x\n wj=%x\nschema: %s", err, w1, wj, schemaJSON)
+	}
+	// The row decoded again into itself reuses its backing array and gives
+	// the same value, with no slot left over from the first decode.
+	var first *any
+	if fields > 0 {
+		first = &row[0]
+	}
+	if _, err := s.Decode(w1, &row, opts...); err != nil || !matEqual(row, rowJ) {
+		t.Fatalf("ArrayRecord decode into a used row: err=%v\n got=%#v\nwant=%#v\nschema: %s", err, row, rowJ, schemaJSON)
+	}
+	if fields > 0 && first != &row[0] {
+		t.Fatalf("ArrayRecord decode into a row with room made a new backing array\nschema: %s", schemaJSON)
+	}
+}
+
+// arRuleHolder holds an ArrayRecord in a struct field, and an any after it.
+type arRuleHolder struct {
+	R     avro.ArrayRecord `avro:"r"`
+	After any              `avro:"after"`
+}
+
+// TestMatrix_ArrayRecordRules pins what is ArrayRecord's own: where we refuse
+// it, that a union takes it as it takes a map, that each of its values
+// decodes as any other any, and that nil is null while empty is a record.
+// That an ArrayRecord is the same record as a map of the same values is
+// runCoreArrayRecord's, for every field type the matrices compose, and an
+// ArrayRecord behind pointers and inside other values is
+// TestMatrix_GenerativePointerIndirection's. Neither has a place for a
+// refusal or for a second record branch, which is why these are their own
+// test.
+func TestMatrix_ArrayRecordRules(t *testing.T) {
+	const (
+		r1    = `{"type":"record","name":"R1","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"}]}`
+		r2    = `{"type":"record","name":"R2","fields":[{"name":"x","type":"long"},{"name":"y","type":"string"}]}`
+		longs = `{"type":"array","items":"long"}`
+		// The row {long, string} fits R1 and R2, and not R3 or E.
+		r3 = `{"type":"record","name":"R3","fields":[{"name":"s","type":"string"},{"name":"n","type":"long"}]}`
+		e  = `{"type":"record","name":"E","fields":[]}`
+		// Every position a record can sit at, under one record.
+		nest = `{"type":"record","name":"Out","fields":[{"name":"id","type":"long"},{"name":"in","type":` + r1 + `},` +
+			`{"name":"opt","type":["null","R1"]},{"name":"list","type":{"type":"array","items":"R1"}},` +
+			`{"name":"byk","type":{"type":"map","values":"R1"}},{"name":"nums","type":` + longs + `}]}`
+	)
+	holder := func(typ string) string {
+		return `{"type":"record","name":"H","fields":[{"name":"r","type":` + typ + `},{"name":"after","type":["null",` + r2 + `],"default":null}]}`
+	}
+	row := avro.ArrayRecord{int64(1), "x"}
+	byName := map[string]any{"a": int64(1), "b": "x"}
+	type byStruct struct {
+		A int64  `avro:"a"`
+		B string `avro:"b"`
+	}
+	nestByName := map[string]any{"id": int64(7), "in": byName, "opt": byName,
+		"list": []any{byName}, "byk": map[string]any{"k": byName}, "nums": []any{int64(9)}}
+	nestRow := avro.ArrayRecord{int64(7), row, row, []any{row}, map[string]any{"k": row}, []any{int64(9)}}
+
+	// Encode: same is a value the two wires must match, and errHas, when
+	// set, is what both wires must refuse with.
+	for _, c := range []struct {
+		name, schema string
+		v, same      any
+		errHas       string
+	}{
+		{"record", r1, row, byName, ""},
+		{"record behind a pointer", r1, &row, byName, ""},
+		{"nullable record", `["null",` + r1 + `]`, row, byName, ""},
+		{"nil is null", `["null",` + r1 + `]`, avro.ArrayRecord(nil), nil, ""},
+		{"nil is null, empty is the record with no fields", `["null",` + e + `]`, avro.ArrayRecord(nil), nil, ""},
+		{"empty is the record with no fields", `["null",` + e + `]`, avro.ArrayRecord{}, map[string]any{"E": map[string]any{}}, ""},
+		{"record before an array branch", `[` + r1 + `,` + longs + `]`, row, map[string]any{"R1": byName}, ""},
+		{"record after an array branch", `[` + longs + `,` + r1 + `]`, row, map[string]any{"R1": byName}, ""},
+		{"a []any is still the array branch", `[` + r1 + `,` + longs + `]`, []any{int64(1), int64(2)}, map[string]any{"array": []any{int64(1), int64(2)}}, ""},
+		// In a union an ArrayRecord is the first record branch its values
+		// fit, in declaration order, as a map whose keys fit two is.
+		{"the first of two record branches that fit", `[` + r1 + `,` + r2 + `]`, row, map[string]any{"R1": byName}, ""},
+		{"the first of two, the other way round", `[` + r2 + `,` + r1 + `]`, row, map[string]any{"R2": map[string]any{"x": int64(1), "y": "x"}}, ""},
+		{"the first of two, behind a pointer", `[` + r1 + `,` + r2 + `]`, &row, map[string]any{"R1": byName}, ""},
+		{"a branch its values do not fit is passed over", `[` + r3 + `,` + e + `,` + r1 + `]`, row, map[string]any{"R1": byName}, ""},
+		{"a tag picks among record branches", `[` + r1 + `,` + r2 + `]`, map[string]any{"R2": row}, map[string]any{"R2": map[string]any{"x": int64(1), "y": "x"}}, ""},
+		{"every position, by position", nest, nestRow, nestByName, ""},
+		{"every position, carriers mixed", nest,
+			avro.ArrayRecord{int64(7), byName, &byStruct{1, "x"}, []any{byStruct{1, "x"}}, map[string]any{"k": row}, []any{int64(9)}}, nestByName, ""},
+		{"struct field", holder(r1), &arRuleHolder{R: row}, map[string]any{"r": byName}, ""},
+		{"struct field, struct by value", holder(r1), arRuleHolder{R: row}, map[string]any{"r": byName}, ""},
+
+		{"a []any is not a record", r1, []any{int64(1), "x"}, nil, "with Avro type record"},
+		{"one value short", r1, avro.ArrayRecord{int64(1)}, nil, "record has 2 fields, value has 1"},
+		{"one value long", r1, avro.ArrayRecord{int64(1), "x", "y"}, nil, "record has 2 fields, value has 3"},
+		{"nil against a record with fields", r1, avro.ArrayRecord(nil), nil, "record has 2 fields, value has 0"},
+		{"not an array", longs, avro.ArrayRecord{int64(1), int64(2)}, nil, "with Avro type array"},
+		{"not an array of records", `{"type":"array","items":` + r1 + `}`, avro.ArrayRecord{row}, nil, "with Avro type array"},
+		{"not the array branch", `["null",` + longs + `]`, avro.ArrayRecord{int64(1)}, nil, "with Avro type array"},
+		{"no record branch fits", `[` + r3 + `,` + e + `]`, row, nil, "cannot use avro.ArrayRecord with Avro type union"},
+		{"struct field, not an array", holder(longs), &arRuleHolder{R: avro.ArrayRecord{int64(1)}}, nil, "with Avro type array"},
+		{"struct field, not an array of records", holder(`{"type":"array","items":` + r1 + `}`), &arRuleHolder{R: avro.ArrayRecord{row}}, nil, "with Avro type array"},
+		{"struct field by value, not an array of records", holder(`{"type":"array","items":` + r1 + `}`), arRuleHolder{R: avro.ArrayRecord{row}}, nil, "with Avro type array"},
+	} {
+		t.Run("encode/"+c.name, func(t *testing.T) {
+			s := avro.MustParse(c.schema)
+			bin, binErr := s.Encode(c.v)
+			js, jsErr := s.EncodeJSON(c.v, avro.TaggedUnions())
+			if c.errHas != "" {
+				for wire, err := range map[string]error{"binary": binErr, "JSON": jsErr} {
+					if err == nil || !strings.Contains(err.Error(), c.errHas) {
+						t.Errorf("%s: got %v, want an error with %q", wire, err, c.errHas)
+					}
+				}
+				return
+			}
+			wantBin, err := s.Encode(c.same)
+			if err != nil {
+				t.Fatalf("control encode: %v", err)
+			}
+			wantJS, _ := s.EncodeJSON(c.same, avro.TaggedUnions())
+			if binErr != nil || !bytes.Equal(bin, wantBin) {
+				t.Errorf("binary: got %x err %v, want %x", bin, binErr, wantBin)
+			}
+			if jsErr != nil || !bytes.Equal(js, wantJS) {
+				t.Errorf("JSON: got %s err %v, want %s", js, jsErr, wantJS)
+			}
+		})
+	}
+
+	// Decode, from both wires: the canonical wires of the by-name value.
+	both := func(t *testing.T, s *avro.Schema, v any, opts []avro.Opt, check func(wire string, decode func(target any) error)) {
+		t.Helper()
+		bin, err := s.Encode(v)
+		if err != nil {
+			t.Fatalf("control encode: %v", err)
+		}
+		js, err := s.EncodeJSON(v, avro.TaggedUnions())
+		if err != nil {
+			t.Fatalf("control JSON encode: %v", err)
+		}
+		check("binary", func(target any) error { _, err := s.Decode(bin, target, opts...); return err })
+		check("JSON", func(target any) error { return s.DecodeJSON(js, target, opts...) })
+	}
+	// Each value of an ArrayRecord is an any, and decodes as any other any
+	// does: slot i is what a map target holds under field i's name, with
+	// and without union tags. So a nested record is a map[string]any.
+	for _, o := range []struct {
+		name string
+		opts []avro.Opt
+	}{{"plain", nil}, {"tagged unions", []avro.Opt{avro.TaggedUnions()}}} {
+		t.Run("decode/each value is what an any gets/"+o.name, func(t *testing.T) {
+			both(t, avro.MustParse(nest), nestByName, o.opts, func(wire string, decode func(any) error) {
+				var got avro.ArrayRecord
+				var byKey map[string]any
+				if err := decode(&got); err != nil {
+					t.Fatalf("%s: %v", wire, err)
+				}
+				if err := decode(&byKey); err != nil {
+					t.Fatalf("%s, map target: %v", wire, err)
+				}
+				names := []string{"id", "in", "opt", "list", "byk", "nums"}
+				if len(got) != len(names) {
+					t.Fatalf("%s: %d values for %d fields: %#v", wire, len(got), len(names), got)
+				}
+				for i, name := range names {
+					if !reflect.DeepEqual(got[i], byKey[name]) {
+						t.Errorf("%s: value %d is %#v, and a map target holds %#v under %q", wire, i, got[i], byKey[name], name)
+					}
+				}
+				if _, isMap := got[1].(map[string]any); !isMap {
+					t.Errorf("%s: the nested record is a %T, want a map[string]any", wire, got[1])
+				}
+			})
+		})
+	}
+	t.Run("decode/an any target is still a map", func(t *testing.T) {
+		both(t, avro.MustParse(nest), nestByName, nil, func(wire string, decode func(any) error) {
+			var got any
+			if err := decode(&got); err != nil || !matEqual(got, nestByName) {
+				t.Errorf("%s: err=%v got=%#v", wire, err, got)
+			}
+		})
+	})
+	t.Run("decode/an any beside an ArrayRecord field is still a map", func(t *testing.T) {
+		in := map[string]any{"r": byName, "after": map[string]any{"x": int64(2), "y": "z"}}
+		both(t, avro.MustParse(holder(r1)), in, nil, func(wire string, decode func(any) error) {
+			var got arRuleHolder
+			want := arRuleHolder{R: row, After: map[string]any{"x": int64(2), "y": "z"}}
+			if err := decode(&got); err != nil || !reflect.DeepEqual(got, want) {
+				t.Errorf("%s: err=%v\n got=%#v\nwant=%#v", wire, err, got, want)
+			}
+		})
+	})
+	t.Run("decode/not an array target", func(t *testing.T) {
+		both(t, avro.MustParse(longs), []any{int64(1)}, nil, func(wire string, decode func(any) error) {
+			var got avro.ArrayRecord
+			if err := decode(&got); err == nil || !strings.Contains(err.Error(), "with Avro type array") {
+				t.Errorf("%s: got %v with %#v, want an array refusal", wire, err, got)
+			}
+		})
+		both(t, avro.MustParse(holder(longs)), map[string]any{"r": []any{int64(1)}}, nil, func(wire string, decode func(any) error) {
+			var got arRuleHolder
+			if err := decode(&got); err == nil || !strings.Contains(err.Error(), "with Avro type array") {
+				t.Errorf("%s, struct field: got %v with %#v, want an array refusal", wire, err, got)
+			}
+		})
+	})
+	t.Run("decode/a []any is not a record target", func(t *testing.T) {
+		both(t, avro.MustParse(r1), byName, nil, func(wire string, decode func(any) error) {
+			var got []any
+			if err := decode(&got); err == nil || !strings.Contains(err.Error(), "with Avro type record") {
+				t.Errorf("%s: got %v with %#v, want a record refusal", wire, err, got)
+			}
+		})
+	})
+	t.Run("decode/a used row keeps nothing from before", func(t *testing.T) {
+		// A decode into an any that holds a pointer writes through the
+		// pointer. A slot of a used row must not be decoded that way: the
+		// pointer belongs to whoever kept the last row.
+		s := avro.MustParse(`{"type":"record","name":"U","fields":[{"name":"nums","type":` + longs + `},{"name":"b","type":"string"}]}`)
+		both(t, s, map[string]any{"nums": []any{int64(9)}, "b": "x"}, nil, func(wire string, decode func(any) error) {
+			kept := &[]int64{42}
+			got := avro.ArrayRecord{kept, "old", "extra"}[:2]
+			want := avro.ArrayRecord{[]any{int64(9)}, "x"}
+			if err := decode(&got); err != nil || !reflect.DeepEqual(got, want) {
+				t.Errorf("%s: err=%v got=%#v want=%#v", wire, err, got, want)
+			}
+			if len(*kept) != 1 || (*kept)[0] != 42 {
+				t.Errorf("%s: the decode wrote through a pointer that was in the used row: %v", wire, *kept)
+			}
+			if cap(got) != 3 {
+				t.Errorf("%s: a row with room was not reused: cap %d", wire, cap(got))
+			}
+		})
+	})
+	t.Run("decode/JSON keys in any order", func(t *testing.T) {
+		var got avro.ArrayRecord
+		if err := avro.MustParse(r1).DecodeJSON([]byte(`{"b":"x","a":1}`), &got); err != nil || !reflect.DeepEqual(got, row) {
+			t.Errorf("err=%v got=%#v want=%#v", err, got, row)
+		}
+	})
+	t.Run("decode/positions follow the reader schema", func(t *testing.T) {
+		// The writer has a field the reader drops and lacks one the reader
+		// fills from its default, and the reader orders the shared two the
+		// other way round. The nested record is a map of the reader's fields.
+		writer := avro.MustParse(`{"type":"record","name":"W","fields":[{"name":"a","type":"long"},{"name":"gone","type":"string"},` +
+			`{"name":"b","type":"string"},{"name":"in","type":{"type":"record","name":"In","fields":[{"name":"p","type":"long"},{"name":"q","type":"long"}]}}]}`)
+		reader := avro.MustParse(`{"type":"record","name":"W","fields":[{"name":"b","type":"string"},{"name":"a","type":"long"},` +
+			`{"name":"added","type":"long","default":9},{"name":"in","type":{"type":"record","name":"In","fields":[{"name":"q","type":"long"},{"name":"p","type":"long"}]}}]}`)
+		res := avrotest.MustResolve(t, writer, reader)
+		in := map[string]any{"a": int64(1), "gone": "g", "b": "x", "in": map[string]any{"p": int64(5), "q": int64(6)}}
+		want := avro.ArrayRecord{"x", int64(1), int64(9), map[string]any{"q": int64(6), "p": int64(5)}}
+		bin := avrotest.MustAppendEncode(t, writer, nil, in)
+		var got avro.ArrayRecord
+		if _, err := res.Decode(bin, &got); err != nil || !reflect.DeepEqual(got, want) {
+			t.Errorf("binary: err=%v\n got=%#v\nwant=%#v", err, got, want)
+		}
+		js := avrotest.MustAppendEncodeJSON(t, writer, nil, in)
+		var gotJ avro.ArrayRecord
+		if err := res.DecodeJSON(js, &gotJ); err != nil || !reflect.DeepEqual(gotJ, want) {
+			t.Errorf("JSON: err=%v\n got=%#v\nwant=%#v", err, gotJ, want)
+		}
+	})
+	t.Run("decode/null is nil and a record with no fields is not", func(t *testing.T) {
+		// Whatever was in the target, at the top of a value and in a struct
+		// field. The value then encodes back to the bytes it came from.
+		type holder struct {
+			R avro.ArrayRecord `avro:"r"`
+		}
+		top := avro.MustParse(`["null",` + e + `]`)
+		field := avro.MustParse(`{"type":"record","name":"H","fields":[{"name":"r","type":["null",` + e + `]}]}`)
+		starts := map[string]func() avro.ArrayRecord{
+			"nil":   func() avro.ArrayRecord { return nil },
+			"empty": func() avro.ArrayRecord { return avro.ArrayRecord{} },
+			"used":  func() avro.ArrayRecord { return avro.ArrayRecord{"stale"} },
+		}
+		for _, c := range []struct {
+			name    string
+			v       any // the union's value, by name
+			wantNil bool
+		}{{"null", nil, true}, {"record", map[string]any{"E": map[string]any{}}, false}} {
+			for start, mk := range starts {
+				both(t, top, c.v, nil, func(wire string, decode func(any) error) {
+					got := mk()
+					if err := decode(&got); err != nil || (got == nil) != c.wantNil || len(got) != 0 {
+						t.Errorf("%s, top, %s into %s: err=%v got=%#v, want nil=%v", wire, c.name, start, err, got, c.wantNil)
+					}
+					back, err := top.Encode(got)
+					want, _ := top.Encode(c.v)
+					if err != nil || !bytes.Equal(back, want) {
+						t.Errorf("%s, top, %s into %s: encodes back to %x err=%v, want %x", wire, c.name, start, back, err, want)
+					}
+				})
+				both(t, field, map[string]any{"r": c.v}, nil, func(wire string, decode func(any) error) {
+					got := holder{R: mk()}
+					if err := decode(&got); err != nil || (got.R == nil) != c.wantNil || len(got.R) != 0 {
+						t.Errorf("%s, field, %s into %s: err=%v got=%#v, want nil=%v", wire, c.name, start, err, got.R, c.wantNil)
+					}
+					back, err := field.Encode(&got)
+					want, _ := field.Encode(map[string]any{"r": c.v})
+					if err != nil || !bytes.Equal(back, want) {
+						t.Errorf("%s, field, %s into %s: encodes back to %x err=%v, want %x", wire, c.name, start, back, err, want)
+					}
+				})
+			}
+		}
+	})
+	t.Run("SchemaFor has no schema for it", func(t *testing.T) {
+		if s, err := avro.SchemaFor[avro.ArrayRecord](); err == nil {
+			t.Errorf("SchemaFor[ArrayRecord] = %s, want an error", s)
+		}
+	})
+}
 
 // Two-level composition: a representative outer set around every (fragment ×
 // inner context) pair, exploding the nesting combinations.
@@ -2169,6 +2520,7 @@ type ptrBase struct {
 }
 
 const (
+	ptrRow       = `{"type":"record","name":"PtrRow","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"}]}`
 	ptrFixed3    = `{"type":"fixed","name":"PtrFix3","size":3}`
 	ptrTimestamp = `{"type":"long","logicalType":"timestamp-micros"}`
 	ptrDate      = `{"type":"int","logicalType":"date"}`
@@ -2208,6 +2560,9 @@ func ptrBases() []ptrBase {
 		{"time-micros", ptrTime, reflect.ValueOf(90 * time.Minute), `"string"`, []byte{0x80, 0xd8, 0xeb, 0x9d, 0x28}},
 		{"duration", ptrDuration, reflect.ValueOf(avro.Duration{Months: 1, Days: 2, Milliseconds: 3}), `"long"`,
 			[]byte{1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0}},
+		// An ArrayRecord, in every context and behind every
+		// chain: the long 7, then the string "v".
+		{"record", ptrRow, reflect.ValueOf(avro.ArrayRecord{int64(7), "v"}), `"long"`, []byte{0x0e, 0x02, 'v'}},
 	}
 }
 

@@ -794,7 +794,7 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 		return ctx.scanner.expect(']')
 	}
 	// Typed slice target.
-	if v.Kind() != reflect.Slice {
+	if v.Kind() != reflect.Slice || v.Type() == arrayRecordType {
 		return semErr(v, "array")
 	}
 	// Native fast path for a plain primitive item into an unnamed []V, which
@@ -1047,6 +1047,15 @@ func (ctx *jsonDecoder) decodeRecord(v reflect.Value, node *schemaNode, toAny bo
 	if toAny {
 		return ctx.decodeRecordAny(v, node)
 	}
+	if v.Type() == arrayRecordType && v.CanAddr() {
+		target := (*ArrayRecord)(v.Addr().UnsafePointer())
+		row := reuseOrMakeArrayRecord(*target, len(node.fields))
+		if err := ctx.decodeArrayRecord(row, node); err != nil {
+			return err
+		}
+		*target = row
+		return nil
+	}
 	// Typed target: struct or map[string]T.
 	if v.Kind() == reflect.Map && v.Type().Key().Kind() == reflect.String {
 		return ctx.decodeRecordMap(v, node)
@@ -1121,6 +1130,31 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 		}
 	}
 	return nil
+}
+
+// decodeArrayRecord decodes a JSON object's fields into row by the schema's
+// field positions, whatever order the keys arrive in. row has one nil slot per
+// field.
+func (ctx *jsonDecoder) decodeArrayRecord(row ArrayRecord, node *schemaNode) error {
+	return ctx.iterateRecordFields(node,
+		func(idx int, key string) error {
+			f := &node.fields[idx]
+			// A key that repeats decodes afresh; the last one wins, as it
+			// does for a map.
+			row[idx] = nil
+			if err := ctx.decodeValue(reflect.ValueOf(&row[idx]).Elem(), f.node); err != nil {
+				return recordFieldError(arrayRecordType, f.name, err)
+			}
+			return nil
+		},
+		func(idx int) error {
+			f := &node.fields[idx]
+			if err := ctx.applyFieldDefault(reflect.ValueOf(&row[idx]).Elem(), node, idx); err != nil {
+				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
+			}
+			return nil
+		},
+	)
 }
 
 func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error {

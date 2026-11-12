@@ -17185,6 +17185,43 @@ func ExampleSchema_AppendEncode() {
 	// encoded "world": 6 bytes
 }
 
+// An ArrayRecord holds a record's values by position, with no field names:
+// value i belongs to field i. It saves a map per record and a map lookup per
+// field for a caller that already has its values in schema order.
+func ExampleArrayRecord() {
+	schema := avro.MustParse(`{
+		"type": "record",
+		"name": "Order",
+		"fields": [
+			{"name": "id",     "type": "long"},
+			{"name": "status", "type": "string"},
+			{"name": "note",   "type": ["null", "string"]}
+		]
+	}`)
+
+	// Every field is present, in the schema's order. A nil is null.
+	row := avro.ArrayRecord{int64(7), "paid", nil}
+	wire, err := schema.Encode(row)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// The same bytes decode by position or by name.
+	var byPosition avro.ArrayRecord
+	if _, err := schema.Decode(wire, &byPosition); err != nil {
+		log.Fatal(err)
+	}
+	var byName map[string]any
+	if _, err := schema.Decode(wire, &byName); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(byPosition[0], byPosition[1], byPosition[2])
+	fmt.Println(byName["id"], byName["status"], byName["note"])
+	// Output:
+	// 7 paid <nil>
+	// 7 paid <nil>
+}
+
 func ExampleSchemaCache() {
 	cache := new(avro.SchemaCache)
 
@@ -22610,9 +22647,9 @@ func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
 
 	// A nil pointer where the schema has no null: one error on every path.
 	// The path is the wire, and how the caller passes the record, since a
-	// struct by value, a pointer to a struct, and a map each go through a
-	// different serializer. The error names the record's Go type and the
-	// field.
+	// struct by value, a pointer to a struct, a map, and an ArrayRecord
+	// each go through a different serializer. The error names the record's
+	// Go type and the field.
 	three := int32(3)
 	nils := []struct {
 		name, schema string
@@ -22647,6 +22684,7 @@ func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
 			{"map", map[string]any{"f": n.val}},
 			{"struct", st.Elem().Interface()},
 			{"struct-pointer", st.Interface()},
+			{"ArrayRecord", avro.ArrayRecord{n.val}},
 		}
 		for _, c := range carriers {
 			t.Run("nil/"+n.name+"/"+c.name, func(t *testing.T) {

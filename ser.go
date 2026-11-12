@@ -1082,6 +1082,32 @@ func (s *serRecord) loadOrCompileFast(t reflect.Type) *fastRecordSer {
 	return actual.(*fastRecordSer)
 }
 
+// ArrayRecord holds the values of a record's fields in the order the schema
+// declares them: value i belongs to field i, every field must be present, and
+// a nil value is null. We encode it, and decode into it, wherever the schema
+// has a record.
+//
+// Each value is an any and is treated as any other any: on encode it is
+// whatever its field accepts, and on decode a record inside an ArrayRecord is
+// a map[string]any. In a union it is the first record branch its values fit,
+// as a map is; a tagged union map names a branch.
+//
+// An ArrayRecord is not an array: we refuse it wherever the schema has an
+// array. Where the schema has a null, a nil ArrayRecord is null and an empty
+// one is a record with no fields.
+type ArrayRecord []any
+
+var arrayRecordType = reflect.TypeFor[ArrayRecord]()
+
+// arrayRecordOf returns the ArrayRecord v holds, and reads an addressable one
+// in place rather than through v.Interface, which would copy it to the heap.
+func arrayRecordOf(v reflect.Value) ArrayRecord {
+	if v.CanAddr() {
+		return *(*ArrayRecord)(unsafe.Pointer(v.UnsafeAddr()))
+	}
+	return v.Interface().(ArrayRecord)
+}
+
 func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	if depth >= maxDepth {
 		return nil, errTooDeep
@@ -1092,6 +1118,26 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 	}
 	k := v.Kind()
 	t := v.Type()
+	if t == arrayRecordType {
+		row := arrayRecordOf(v)
+		if len(row) != len(s.fields) {
+			return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf("record has %d fields, value has %d", len(s.fields), len(row))}
+		}
+		for i := range s.fields {
+			f := &s.fields[i]
+			// A nil value is a zero any, as in the map arm below.
+			var rv reflect.Value
+			if value := row[i]; value != nil {
+				rv = reflect.ValueOf(value)
+			} else {
+				rv = reflect.Zero(anyType)
+			}
+			if dst, err = f.fn(dst, rv, depth+1); err != nil {
+				return nil, recordFieldError(t, f.name, err)
+			}
+		}
+		return dst, nil
+	}
 	if k != reflect.Struct && (k != reflect.Map || t.Key().Kind() != reflect.String) {
 		return nil, &SemanticError{GoType: t, AvroType: "record"}
 	}
@@ -1633,7 +1679,7 @@ func serArrayPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, 
 	if err != nil {
 		return nil, v, 0, err
 	}
-	if v.Kind() != reflect.Array && v.Kind() != reflect.Slice {
+	if (v.Kind() != reflect.Array && v.Kind() != reflect.Slice) || v.Type() == arrayRecordType {
 		return nil, v, 0, semErr(v, "array")
 	}
 	l := v.Len()

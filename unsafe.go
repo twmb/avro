@@ -302,6 +302,11 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 	if f.meta != nil && (f.meta.hasCustomType || (f.meta.inner != nil && f.meta.inner.hasCustomType)) {
 		return nil
 	}
+	// An ArrayRecord is a slice by kind and a record by meaning. The reflect
+	// path knows the difference; the slice arms here do not.
+	if goType == arrayRecordType {
+		return nil
+	}
 	k := goType.Kind()
 
 	// Regular unions need the reflect slow path.

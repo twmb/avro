@@ -192,7 +192,8 @@ func (sl *slab) put() {
 //   - array: slice, any
 //   - map: map[string]T, any
 //   - union: any, *T (for ["null", T] unions), or the matched branch type
-//   - record: struct (matched by field name or `avro` tag), map[string]any, any
+//   - record: struct (matched by field name or `avro` tag), map[string]any,
+//     [ArrayRecord] (matched by position), any
 //
 // When decoding into *any, primitive types become nil, bool, int32, int64,
 // float32, float64, string, []byte, []any, or map[string]any (for records).
@@ -618,6 +619,16 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		return src, nil
 	}
 	t := v.Type()
+	if t == arrayRecordType && v.CanAddr() {
+		target := (*ArrayRecord)(v.Addr().UnsafePointer())
+		row := reuseOrMakeArrayRecord(*target, len(s.fields))
+		src, err := s.deserArrayRecord(src, row, sl)
+		if err != nil {
+			return nil, err
+		}
+		*target = row
+		return src, nil
+	}
 	if k != reflect.Struct && (k != reflect.Map || t.Key().Kind() != reflect.String) {
 		return nil, &SemanticError{GoType: t, AvroType: "record"}
 	}
@@ -649,6 +660,40 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	// re-call to report the error.
 	_, err = typeFieldMappingSkip(s.names, &s.cache, t, sl.skipUnknown)
 	return nil, err
+}
+
+// deserArrayRecord decodes the record's fields into row, one per position.
+// row has one nil slot per field.
+func (s *deserRecord) deserArrayRecord(src []byte, row ArrayRecord, sl *slab) ([]byte, error) {
+	var err error
+	for i := range s.fields {
+		f := &s.fields[i]
+		if f.fnIface != nil {
+			if row[i], src, err = f.fnIface(src, sl); err != nil {
+				return nil, recordFieldError(arrayRecordType, f.name, err)
+			}
+			continue
+		}
+		if src, err = f.fn(src, reflect.ValueOf(&row[i]).Elem(), sl); err != nil {
+			return nil, recordFieldError(arrayRecordType, f.name, err)
+		}
+	}
+	return src, nil
+}
+
+// reuseOrMakeArrayRecord returns n nil slots: row's own backing array when it
+// has the room, which is the streaming-decode pattern, and a new one
+// otherwise. Every record-into-ArrayRecord decoder uses it, so they agree on
+// reuse. The n slots are cleared, so no value from a previous decode is
+// reused; a slot past n keeps its old value. The result is never nil, even for
+// a record with no fields: a nil ArrayRecord is null, and a record is not.
+func reuseOrMakeArrayRecord(row ArrayRecord, n int) ArrayRecord {
+	if row == nil || cap(row) < n {
+		return make(ArrayRecord, n)
+	}
+	row = row[:n]
+	clear(row)
+	return row
 }
 
 type deserEnum struct {
@@ -1199,7 +1244,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	v = indirectAlloc(v)
 	iface := v.Kind() == reflect.Interface
 	fixedArray := v.Kind() == reflect.Array
-	if !iface && !fixedArray && v.Kind() != reflect.Slice {
+	if (!iface && !fixedArray && v.Kind() != reflect.Slice) || v.Type() == arrayRecordType {
 		return nil, semErr(v, "array")
 	}
 	// Fixed-size Go arrays: we decode straight into the array elements and
