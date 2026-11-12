@@ -1360,17 +1360,15 @@ func unwrapElemPtr(v reflect.Value) (reflect.Value, error) {
 	return indirect(v)
 }
 
-// peelElem unwraps one Pointer/Interface layer from an array or map element,
-// tagging the unwrap error with avroType. Keep it a direct call.
-func peelElem(v reflect.Value, avroType string) (reflect.Value, error) {
+// peelElem unwraps one Pointer/Interface layer from an array or map element.
+// A nil returns the bare unwrap error, as every other serializer returns it,
+// so the record around the element names itself and the field. Keep it a
+// direct call.
+func peelElem(v reflect.Value) (reflect.Value, error) {
 	if v.Kind() != reflect.Interface && v.Kind() != reflect.Pointer {
 		return v, nil
 	}
-	out, err := unwrapElemPtr(v)
-	if err != nil {
-		return v, &SemanticError{AvroType: avroType, Err: err}
-	}
-	return out, nil
+	return unwrapElemPtr(v)
 }
 
 // appendArrayPrimitive runs the shared sequence for the primitive serArray
@@ -1488,7 +1486,7 @@ func appendArrayPrimitive(
 		return append(dst, 0), nil
 	}
 	for i := range l {
-		elem, err := peelElem(v.Index(i), avroType)
+		elem, err := peelElem(v.Index(i))
 		if err != nil {
 			return nil, err
 		}
@@ -1600,7 +1598,7 @@ func appendMapPrimitive(
 		}
 		dst = doSerString(dst, key)
 		valV.SetIterValue(iter)
-		elem, err := peelElem(valV, avroType)
+		elem, err := peelElem(valV)
 		if err != nil {
 			return nil, err
 		}

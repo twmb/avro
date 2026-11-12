@@ -22587,6 +22587,62 @@ func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
 			}
 		})
 	}
+
+	// A nil pointer where the schema has no null: one error on every path.
+	// The path is the wire, and how the caller passes the record, since a
+	// struct by value, a pointer to a struct, and a map each go through a
+	// different serializer. The error names the record's Go type and the
+	// field.
+	three := int32(3)
+	nils := []struct {
+		name, schema string
+		val          any // field f's value, holding the nil
+	}{
+		{"array-int", `{"type":"array","items":"int"}`, []*int32{&three, nil}},
+		{"array-string", `{"type":"array","items":"string"}`, []*string{nil}},
+		{"array-any", `{"type":"array","items":"long"}`, []any{nil}},
+		{"map-int", `{"type":"map","values":"int"}`, map[string]*int32{"k": nil}},
+		{"map-double", `{"type":"map","values":"double"}`, map[string]*float64{"k": nil}},
+		{"field", `"int"`, (*int32)(nil)},
+	}
+	for _, n := range nils {
+		s := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":%s}]}`, n.schema))
+		held := reflect.New(reflect.StructOf([]reflect.StructField{{Name: "F", Type: reflect.TypeOf(n.val), Tag: `avro:"f"`}}))
+		held.Elem().Field(0).Set(reflect.ValueOf(n.val))
+		carriers := []struct {
+			name string
+			v    any
+		}{
+			{"map", map[string]any{"f": n.val}},
+			{"struct", held.Elem().Interface()},
+			{"struct-pointer", held.Interface()},
+		}
+		for _, c := range carriers {
+			t.Run("nil/"+n.name+"/"+c.name, func(t *testing.T) {
+				_, berr := s.AppendEncode(nil, c.v)
+				_, jerr := s.AppendEncodeJSON(nil, c.v)
+				var bse, jse *avro.SemanticError
+				if !errors.As(berr, &bse) || !errors.As(jerr, &jse) {
+					t.Fatalf("want *SemanticError on both wires, got binary %v, JSON %v", berr, jerr)
+				}
+				wantGo := reflect.TypeOf(c.v)
+				if wantGo.Kind() == reflect.Pointer {
+					wantGo = wantGo.Elem()
+				}
+				for _, e := range []struct {
+					wire string
+					se   *avro.SemanticError
+				}{{"binary", bse}, {"JSON", jse}} {
+					if e.se.GoType != wantGo || e.se.AvroType != "record" || e.se.Field != "f" {
+						t.Errorf("%s: GoType %v, AvroType %q, Field %q; want %v, \"record\", \"f\"", e.wire, e.se.GoType, e.se.AvroType, e.se.Field, wantGo)
+					}
+				}
+				if berr.Error() != jerr.Error() {
+					t.Errorf("the wires word the error differently:\n binary: %v\n JSON:   %v", berr, jerr)
+				}
+			})
+		}
+	}
 }
 
 // A bare (untagged) JSON union value commits to the first token-class-matching
