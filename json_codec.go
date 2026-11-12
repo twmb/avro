@@ -1000,10 +1000,7 @@ func appendJSONFieldDefault(buf []byte, f fieldNode, cfg *optConfig, depth int) 
 // name a different one: a default "A" for [enum, string] is a Go string, and
 // a default for [fixed, bytes] is a []byte.
 func appendJSONDefaultUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, depth int) ([]byte, error) {
-	var val any
-	if v.IsValid() {
-		val = v.Interface()
-	}
+	val := v.Interface()
 	for _, branch := range node.branches {
 		// appendAvroJSON success alone is too lenient: its bytes/fixed arm
 		// writes a default string as raw UTF-8, so it would claim a
