@@ -2087,7 +2087,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		unionLog = append(unionLog, ln)
 	}
 	fillUnionTagTables(tags, deser, branchNodes, unionStd, unionLog)
-	// byKind serves type-name dispatch in the encoders and encodeDefault (see
+	// byKind serves type-name dispatch in the encoders (see
 	// unionTypeNameForValue). Primitive kinds only: named branches go through
 	// tagged dispatch, and the spec guarantees primitive kinds are unique
 	// within a union. finalizeUnionNames need not rebuild it, since a forward
