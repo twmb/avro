@@ -2344,9 +2344,9 @@ type serBytesDecimal struct {
 	scale     int
 }
 
-func (s *serBytesDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
+func (s *serBytesDecimal) serRat(dst []byte, r *big.Rat, goType reflect.Type) ([]byte, error) {
 	var scratch [decimalStackBytes]byte
-	b, err := decimalUnscaledBytes(scratch[:0], r, s.scale, s.precision, "bytes", bigRatType)
+	b, err := decimalUnscaledBytes(scratch[:0], r, s.scale, s.precision, "bytes", goType)
 	if err != nil {
 		return nil, err
 	}
@@ -2360,7 +2360,7 @@ func (s *serBytesDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 		return nil, err
 	}
 	if ok {
-		return s.serRat(dst, r)
+		return s.serRat(dst, r, v.Type())
 	}
 	if err := rejectNonNumericStructuredString(v, "bytes", "decimal"); err != nil {
 		return nil, err
@@ -2377,13 +2377,13 @@ type serFixedDecimal struct {
 	scale     int
 }
 
-func (s *serFixedDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
+func (s *serFixedDecimal) serRat(dst []byte, r *big.Rat, goType reflect.Type) ([]byte, error) {
 	var scratch [decimalStackBytes]byte
-	b, err := decimalUnscaledBytes(scratch[:0], r, s.scale, s.precision, "fixed", bigRatType)
+	b, err := decimalUnscaledBytes(scratch[:0], r, s.scale, s.precision, "fixed", goType)
 	if err != nil {
 		return nil, err
 	}
-	return appendDecimalFixed(dst, b, s.size, bigRatType)
+	return appendDecimalFixed(dst, b, s.size, goType)
 }
 
 func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
@@ -2392,7 +2392,7 @@ func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 		return nil, err
 	}
 	if ok {
-		return s.serRat(dst, r)
+		return s.serRat(dst, r, v.Type())
 	}
 	if err := rejectNonNumericStructuredString(v, "fixed", "decimal"); err != nil {
 		return nil, err

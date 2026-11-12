@@ -19422,6 +19422,26 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 							t.Errorf("EncodeJSON(%s) %d digits past precision %d: got %v, want %q", form.name, past, sc.precision, err, wantErr)
 						}
 					}
+					// The error names the Go type you passed, and both wires
+					// word it the same, whichever carrier holds the number.
+					text := new(big.Rat).SetFrac(u, den).FloatString(sc.scale)
+					for _, in := range []any{new(big.Rat).SetFrac(u, den), text, json.Number(text)} {
+						_, berr := s.Encode(in)
+						_, jerr := s.EncodeJSON(in)
+						var bse, jse *avro.SemanticError
+						if !errors.As(berr, &bse) || !errors.As(jerr, &jse) {
+							t.Errorf("%T %d digits past precision: want *SemanticError on both wires, got binary %v, JSON %v", in, past, berr, jerr)
+							continue
+						}
+						want := reflect.TypeOf(in)
+						if want.Kind() == reflect.Pointer {
+							want = want.Elem()
+						}
+						if bse.GoType != want || jse.GoType != want || berr.Error() != jerr.Error() {
+							t.Errorf("%T %d digits past precision: binary names %v, JSON names %v, want %v on both\n binary: %.120s\n JSON:   %.120s",
+								in, past, bse.GoType, jse.GoType, want, berr.Error(), jerr.Error())
+						}
+					}
 				}
 			}
 			// A value finer than the scale rejects rather than rounds.
