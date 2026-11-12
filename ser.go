@@ -230,18 +230,23 @@ func serNullUnionAt(u *serUnion, valIdx int, nullByte, valByte byte) serfn {
 		if depth >= maxDepth {
 			return nil, errTooDeep
 		}
-		if isNilValue(v) {
-			return append(dst, nullByte), nil
-		}
-		if idx, inner, ok := u.tryUnwrapTagged(v); ok {
-			if idx != valIdx && isNilValue(inner) {
+		// Only a value of a nilable kind can be nil or, behind its pointers
+		// and interfaces, a tagged union map. An int, a string, or a struct
+		// is neither, so it goes to its branch with neither check.
+		if k := v.Kind(); k == reflect.Invalid || isNilableKind(k) {
+			if isNilValue(v) {
 				return append(dst, nullByte), nil
 			}
-			if idx == valIdx {
-				if result, err := u.fns[valIdx](append(dst, valByte), inner, depth+1); err == nil {
-					return result, nil
-				} else if errors.Is(err, errTooDeep) {
-					return nil, err
+			if idx, inner, ok := u.tryUnwrapTagged(v); ok {
+				if idx != valIdx && isNilValue(inner) {
+					return append(dst, nullByte), nil
+				}
+				if idx == valIdx {
+					if result, err := u.fns[valIdx](append(dst, valByte), inner, depth+1); err == nil {
+						return result, nil
+					} else if errors.Is(err, errTooDeep) {
+						return nil, err
+					}
 				}
 			}
 		}
