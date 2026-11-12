@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"math/bits"
 	"reflect"
 	"strconv"
 	"strings"
@@ -2122,6 +2123,9 @@ const decimalStackBytes = 64
 // and serFixedDecimal, JSON appendAvroJSON's bytes+decimal and fixed+decimal
 // arms), so precision and scale handling cannot drift across them.
 func decimalUnscaledBytes(buf []byte, r *big.Rat, scale, precision int, avroType string, goType reflect.Type) ([]byte, error) {
+	if b, ok := appendDecimalWords(buf, r, scale, precision); ok {
+		return b, nil
+	}
 	unscaled, err := ratToUnscaled(r, scale)
 	if err != nil {
 		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
@@ -2241,6 +2245,83 @@ func chargeDecimalLeaf(payload []byte, logical string) error {
 		return nil
 	}
 	return checkDecimalUnscaledSize(n)
+}
+
+// decimalStackWords is how many words appendDecimalWords computes in: 512
+// bits on a 64-bit build.
+const decimalStackWords = 8
+
+// appendDecimalWords is decimalUnscaledBytes for a value small enough to
+// compute in a stack array, which a big.Int cannot do: its words are always on
+// the heap. We take a value when numerator * 10^scale fits decimalStackWords
+// words and the denominator fits one. We report false for every other value,
+// and for every value that does not fit the scale or the precision, so the
+// big.Int path words each error.
+func appendDecimalWords(buf []byte, r *big.Rat, scale, precision int) ([]byte, bool) {
+	if scale < 0 || precision <= 0 {
+		return nil, false
+	}
+	pow, ok := cachedPow10(scale)
+	if !ok {
+		return nil, false
+	}
+	limit, ok := cachedPow10(precision)
+	if !ok {
+		return nil, false
+	}
+	num, denom := r.Num(), r.Denom()
+	x, y, d := num.Bits(), pow.Bits(), denom.Bits()
+	if len(x)+len(y) > decimalStackWords || len(d) != 1 || denom.Sign() < 0 {
+		return nil, false
+	}
+
+	// z = x * y, schoolbook. The sum under each Add fits two words: the
+	// largest product is (2^W-1)^2, which leaves room for two more words.
+	var stack [decimalStackWords]big.Word
+	z := stack[:len(x)+len(y)]
+	for i, xi := range x {
+		var carry uint
+		for j, yj := range y {
+			hi, lo := bits.Mul(uint(xi), uint(yj))
+			lo, c := bits.Add(lo, uint(z[i+j]), 0)
+			hi += c
+			lo, c = bits.Add(lo, carry, 0)
+			hi += c
+			z[i+j], carry = big.Word(lo), hi
+		}
+		z[i+len(y)] = big.Word(carry)
+	}
+	// z /= d, from the top word down. rem stays below d, which Div requires.
+	if d[0] != 1 {
+		var rem uint
+		for i := len(z) - 1; i >= 0; i-- {
+			var q uint
+			q, rem = bits.Div(rem, uint(z[i]), uint(d[0]))
+			z[i] = big.Word(q)
+		}
+		if rem != 0 {
+			return nil, false
+		}
+	}
+	for len(z) > 0 && z[len(z)-1] == 0 {
+		z = z[:len(z)-1]
+	}
+	// The value fits the precision when its magnitude is below 10^precision.
+	// Neither slice has a leading zero word, so a longer one is larger.
+	if l := limit.Bits(); len(z) > len(l) {
+		return nil, false
+	} else if len(z) == len(l) {
+		i := len(z) - 1
+		for i > 0 && z[i] == l[i] {
+			i--
+		}
+		if z[i] >= l[i] {
+			return nil, false
+		}
+	}
+	// At most decimalStackWords words, far inside the decoder's bound on an
+	// unscaled value, which decimalUnscaledBytes charges on the other path.
+	return appendTwosComplement(buf, z, num.Sign() < 0), true
 }
 
 type serBytesDecimal struct {
@@ -2528,18 +2609,39 @@ func decimalDigitCount(i *big.Int) int {
 // appendBigIntBytes appends i to dst as big-endian two's complement in the
 // fewest bytes that still carry the right sign.
 func appendBigIntBytes(dst []byte, i *big.Int) []byte {
-	// The magnitude needs BitLen bits and the sign one more. The exception
-	// is -2^k, whose two's complement is the sign bit over k zeros.
-	bits := i.BitLen()
-	neg := i.Sign() < 0
-	if neg && int(i.TrailingZeroBits()) == bits-1 {
-		bits--
+	return appendTwosComplement(dst, i.Bits(), i.Sign() < 0)
+}
+
+// appendTwosComplement is appendBigIntBytes for a magnitude given as words,
+// least significant first with no leading zero word, as big.Int.Bits returns
+// it.
+func appendTwosComplement(dst []byte, mag []big.Word, neg bool) []byte {
+	// The magnitude needs its bit length and the sign one more bit. The
+	// exception is -2^k, whose two's complement is the sign bit over k zeros.
+	bitLen, pow2 := 0, false
+	if top := len(mag) - 1; top >= 0 {
+		bitLen = top*bits.UintSize + bits.Len(uint(mag[top]))
+		pow2 = mag[top]&(mag[top]-1) == 0
+		for _, w := range mag[:top] {
+			pow2 = pow2 && w == 0
+		}
 	}
-	n := bits/8 + 1
+	if neg && pow2 {
+		bitLen--
+	}
+	n := bitLen/8 + 1
+	// The magnitude, most significant byte first. A byte past the last word
+	// is zero.
+	const wordBytes = bits.UintSize / 8
 	start := len(dst)
-	dst = append(dst, make([]byte, n)...)
+	for k := n - 1; k >= 0; k-- {
+		var c byte
+		if w := k / wordBytes; w < len(mag) {
+			c = byte(mag[w] >> (8 * (k % wordBytes)))
+		}
+		dst = append(dst, c)
+	}
 	b := dst[start:]
-	i.FillBytes(b) // the magnitude, zero-extended
 	if neg {
 		// -m is ^m + 1.
 		carry := true

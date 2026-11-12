@@ -15,6 +15,7 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"math/bits"
 	"math/rand"
 	"net"
 	"os"
@@ -19219,8 +19220,11 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 		{"bytes/p18s4", `{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}`, 18, 4, 0},
 		{"bytes/p4s0", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":0}`, 4, 0, 0},
 		{"bytes/p76s38", `{"type":"bytes","logicalType":"decimal","precision":76,"scale":38}`, 76, 38, 0},
+		{"bytes/p120s19", `{"type":"bytes","logicalType":"decimal","precision":120,"scale":19}`, 120, 19, 0},
+		{"bytes/p160s38", `{"type":"bytes","logicalType":"decimal","precision":160,"scale":38}`, 160, 38, 0},
 		{"fixed/p8s6", `{"type":"fixed","name":"Dec16","size":16,"logicalType":"decimal","precision":8,"scale":6}`, 8, 6, 16},
 		{"fixed/p38s10", `{"type":"fixed","name":"Dec32","size":32,"logicalType":"decimal","precision":38,"scale":10}`, 38, 10, 32},
+		{"fixed/p100s20", `{"type":"fixed","name":"Dec48","size":48,"logicalType":"decimal","precision":100,"scale":20}`, 100, 20, 48},
 		// The encoder shares one 10^n for n up to 1024 and computes a larger
 		// one per call, for the scale and the precision separately.
 		{"bytes/p1024s1024", `{"type":"bytes","logicalType":"decimal","precision":1024,"scale":1024}`, 1024, 1024, 0},
@@ -19242,10 +19246,23 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 			r.Denom().Mul(r.Denom(), six)
 			return r
 		}},
+		// Times 2^64+1, the denominator takes two words, and its low word
+		// alone still divides the numerator times 10^scale.
+		{"unreduced-wide", func(u, den *big.Int) *big.Rat {
+			r := new(big.Rat).SetFrac(u, den)
+			k := new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(1))
+			r.Num().Mul(r.Num(), k)
+			r.Denom().Mul(r.Denom(), k)
+			return r
+		}},
 	}
 
+	// The encoder computes a value in a stack array when numerator * 10^scale
+	// fits 8 words and the denominator fits one, and in big.Ints otherwise.
+	words := func(x *big.Int) int { return (x.BitLen() + bits.UintSize - 1) / bits.UintSize }
+
 	// Liveness floors: the precision filter below must leave each class.
-	var cells, negPow2, integers, wide int
+	var cells, negPow2, integers, wide, onStack, onHeap int
 	for _, sc := range schemas {
 		t.Run(sc.name, func(t *testing.T) {
 			s := avro.MustParse(sc.json)
@@ -19268,6 +19285,27 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 				pow := new(big.Int).Lsh(big.NewInt(1), k)
 				for _, d := range []int64{-1, 0, 1} {
 					u := new(big.Int).Add(pow, big.NewInt(d))
+					unscaled = append(unscaled, u, new(big.Int).Neg(u))
+				}
+			}
+			// A value with few fractional digits has a short denominator at
+			// any scale: one word through 19 digits, two from 20. A numerator
+			// near 2^384 times the two words of 10^38 straddles 8 words.
+			one := big.NewInt(1)
+			pow384 := new(big.Int).Lsh(one, 384)
+			pow64 := new(big.Int).Lsh(one, 64)
+			for _, digits := range []int{4, 19, 20} {
+				if digits > sc.scale {
+					continue
+				}
+				shift := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(sc.scale-digits)), nil)
+				for _, v := range []*big.Int{
+					big.NewInt(1), big.NewInt(127), big.NewInt(128), big.NewInt(12345),
+					new(big.Int).Sub(pow64, one), pow64, new(big.Int).Add(pow64, one),
+					new(big.Int).Sub(new(big.Int).Lsh(one, 128), one), new(big.Int).Sub(new(big.Int).Lsh(one, 256), one),
+					new(big.Int).Sub(pow384, one), new(big.Int).Add(pow384, one),
+				} {
+					u := new(big.Int).Mul(v, shift)
 					unscaled = append(unscaled, u, new(big.Int).Neg(u))
 				}
 			}
@@ -19301,6 +19339,20 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 						}
 						if !bytes.Equal(wire, wantWire) {
 							t.Fatalf("Encode(%s %T) of unscaled %v:\n got=%x\nwant=%x", form.name, carrier, u, wire, wantWire)
+						}
+						// The stack array is what keeps an encode from
+						// allocating, so a *big.Rat that qualifies for it
+						// encodes with no allocation.
+						if words(want.Num())+words(den) <= 8 && words(want.Denom()) == 1 && sc.scale <= 1024 && sc.precision <= 1024 {
+							onStack++
+							if ptr, ok := carrier.(*big.Rat); ok {
+								var buf []byte
+								if n := testing.AllocsPerRun(5, func() { buf, _ = s.AppendEncode(buf[:0], ptr) }); n != 0 {
+									t.Errorf("Encode(%s) of unscaled %v allocates %.0f times, want 0", form.name, u, n)
+								}
+							}
+						} else {
+							onHeap++
 						}
 						if want.Num().Cmp(num) != 0 || want.Denom().Cmp(denom) != 0 {
 							t.Fatalf("Encode(%s %T) changed its input from %v/%v to %v/%v", form.name, carrier, num, denom, want.Num(), want.Denom())
@@ -19336,18 +19388,21 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 				}
 			}
 
-			// One digit past the precision rejects, and the error counts the
-			// digits.
-			over := new(big.Int).Add(maxUnscaled, big.NewInt(1))
-			wantErr := fmt.Sprintf("decimal value has %d digits, exceeds schema precision %d", sc.precision+1, sc.precision)
-			for _, u := range []*big.Int{over, new(big.Int).Neg(over)} {
-				for _, form := range forms {
-					r := form.mk(u, den)
-					if _, err := s.Encode(r); err == nil || !strings.Contains(err.Error(), wantErr) {
-						t.Errorf("Encode(%s) one digit past precision %d: got %v, want %q", form.name, sc.precision, err, wantErr)
-					}
-					if _, err := s.EncodeJSON(r); err == nil || !strings.Contains(err.Error(), wantErr) {
-						t.Errorf("EncodeJSON(%s) one digit past precision %d: got %v, want %q", form.name, sc.precision, err, wantErr)
+			// One digit past the precision rejects, as does a value 21 digits
+			// past it, which is words longer than 10^precision. The error
+			// counts the digits.
+			for _, past := range []int{1, 21} {
+				over := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(sc.precision+past-1)), nil)
+				wantErr := fmt.Sprintf("decimal value has %d digits, exceeds schema precision %d", sc.precision+past, sc.precision)
+				for _, u := range []*big.Int{over, new(big.Int).Neg(over)} {
+					for _, form := range forms {
+						r := form.mk(u, den)
+						if _, err := s.Encode(r); err == nil || !strings.Contains(err.Error(), wantErr) {
+							t.Errorf("Encode(%s) %d digits past precision %d: got %v, want %q", form.name, past, sc.precision, err, wantErr)
+						}
+						if _, err := s.EncodeJSON(r); err == nil || !strings.Contains(err.Error(), wantErr) {
+							t.Errorf("EncodeJSON(%s) %d digits past precision %d: got %v, want %q", form.name, past, sc.precision, err, wantErr)
+						}
 					}
 				}
 			}
@@ -19361,12 +19416,16 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 	for _, floor := range []struct {
 		name      string
 		got, want int
-	}{{"cells", cells, 1000}, {"negative powers of two", negPow2, 100}, {"integer-valued Rats", integers, 50}, {"values wider than 64 bytes", wide, 100}} {
+	}{
+		{"cells", cells, 1000}, {"negative powers of two", negPow2, 100}, {"integer-valued Rats", integers, 50},
+		{"values wider than 64 bytes", wide, 100}, {"values computed on the stack", onStack, 300}, {"values computed in big.Ints", onHeap, 300},
+	} {
 		if floor.got < floor.want {
 			t.Errorf("only %d %s ran, want at least %d", floor.got, floor.name, floor.want)
 		}
 	}
-	t.Logf("%d cells: %d negative powers of two, %d integer-valued Rats, %d wider than 64 bytes", cells, negPow2, integers, wide)
+	t.Logf("%d cells: %d negative powers of two, %d integer-valued Rats, %d wider than 64 bytes, %d on the stack, %d in big.Ints",
+		cells, negPow2, integers, wide, onStack, onHeap)
 }
 
 // TestDecimalFloat32SourcePrecision pins that a float32 decimal input is
