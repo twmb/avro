@@ -1592,6 +1592,22 @@ func TestMatrix_GenerativeUnionContainerDefaultFill(t *testing.T) {
 						return [][2]any{{s.Root().Fields[0].Default, a1["f"]}}
 					})
 			})
+			// The same leaf and sibling as one union inside the default: f is
+			// a record, and its field x holds [leaf, sibling] directly, as an
+			// array's items, or as a map's values. The field after f is a
+			// union we do supply, which both wires must still choose by the
+			// value's Go type: a string is the string branch, not the enum.
+			t.Run(c.name+"/"+cont.name+"/nested", func(t *testing.T) {
+				union := "[" + c.leaf + "," + c.sib + "]"
+				schema := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"f","type":`+
+					`{"type":"record","name":"NU","fields":[{"name":"x","type":%s},{"name":"n","type":"int"}]},"default":%s},`+
+					`{"name":"g","type":[{"type":"enum","name":"AfterEnum","symbols":["A","B"]},"string"]}]}`,
+					cont.wrap(union), cont.def(c.defLit))
+				udInvariant(t, schema, `{"g":"A"}`, map[string]any{"g": "A"}, udfIsLogical(c.leaf),
+					func(s *avro.Schema, a1 map[string]any) [][2]any {
+						return [][2]any{{s.Root().Fields[0].Default, a1["f"]}}
+					})
+			})
 		}
 	}
 }
@@ -1715,6 +1731,11 @@ func udfCells() []udfCell {
 		{"fixed_wrong_size", `{"type":"fixed","name":"FX","size":4}`, `"string"`, `"AB"`},
 		{"enum_member", `{"type":"enum","name":"EN","symbols":["A","B"]}`, `"string"`, `"A"`},
 		{"enum_nonmember", `{"type":"enum","name":"EN","symbols":["A","B"]}`, `"string"`, `"Z"`},
+		// fixed vs a bytes sibling: both hold a []byte once parsed, as enum
+		// and string both hold a string, so the value's Go type alone names
+		// the sibling.
+		{"fixed_right_size_bytes_sibling", `{"type":"fixed","name":"FX","size":2}`, `"bytes"`, `"AB"`},
+		{"fixed_wrong_size_bytes_sibling", `{"type":"fixed","name":"FX","size":4}`, `"bytes"`, `"AB"`},
 		{"string_any", `"string"`, `"bytes"`, `"hello"`},
 		// logical leaf (long-backed): Default surfaces the raw long while the
 		// wire decodes time.Time. The representation-agnostic rebuild and the
@@ -1773,6 +1794,24 @@ func udInvariant(t *testing.T, schema, fillJSON string, fillVal map[string]any, 
 	j1, err := s.AppendEncodeJSON(nil, fillVal)
 	if err != nil {
 		t.Fatalf("json auto-fill encode: %v", err)
+	}
+
+	// Both wires fill the same union branch. The bare JSON form does not
+	// name a branch, so we compare the tagged forms: the JSON encode's own
+	// tags against the tags a decode of the binary wire reports.
+	jt, err := s.AppendEncodeJSON(nil, fillVal, avro.TaggedUnions())
+	if err != nil {
+		t.Fatalf("tagged json auto-fill encode: %v", err)
+	}
+	var fromJSON, fromBinary any
+	if err := s.DecodeJSON(jt, &fromJSON, avro.TaggedUnions()); err != nil {
+		t.Fatalf("decode of the tagged json auto-fill %s: %v", jt, err)
+	}
+	if _, err := s.Decode(w1, &fromBinary, avro.TaggedUnions()); err != nil {
+		t.Fatalf("tagged decode of the binary auto-fill: %v", err)
+	}
+	if !matEqual(fromJSON, fromBinary) {
+		t.Errorf("JSON auto-fill names a different union branch than binary:\n  json   = %s\n  binary = %#v", jt, fromBinary)
 	}
 
 	// Non-logical: Root().Default equals the binary auto-fill decode, type-exactly

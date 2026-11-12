@@ -138,6 +138,10 @@ type optConfig struct {
 	linkedin    bool
 	skipUnknown bool
 	alias       bool
+	// inDefault is above zero while the JSON encoder writes a field's
+	// default; appendAvroJSONUnion reads it. Every encode builds its own
+	// optConfig, so only that encode's goroutine writes it.
+	inDefault int
 }
 
 func parseOpts(opts []Opt) optConfig {
@@ -968,11 +972,9 @@ func appendAvroJSONNativeArray(buf []byte, v reflect.Value, kind string, cfg *op
 // for a nil defaultVal, otherwise recursive appendAvroJSON, so encoder
 // options apply to defaults too. It errors when the field has no default.
 // The recursion passes a nil custom map, bypassing CustomType.Encode as the
-// binary encodeDefault does, since defaults are already Avro-native. A
-// union default dispatches with the same declaration-order try-each as
-// encodeDefault, so the tagged form names the branch the binary
-// defaultBytes encode against; the runtime type-name fast path would name
-// a different one for [enum, string] default "A".
+// binary encodeDefault does, since defaults are already Avro-native. It
+// also marks the encode as inside a default, so a union at any depth of the
+// default picks its branch as appendJSONDefaultUnion does.
 func appendJSONFieldDefault(buf []byte, f fieldNode, cfg *optConfig, depth int) ([]byte, error) {
 	if !f.hasDefault {
 		// The callers wrap through recordFieldError, so this renders with
@@ -985,25 +987,37 @@ func appendJSONFieldDefault(buf []byte, f fieldNode, cfg *optConfig, depth int) 
 	}
 	// Binary's encodeDefault takes no custom parameter for the same reason;
 	// matching that keeps Encode/EncodeJSON parity for default-fill.
-	if f.node != nil && f.node.kind == "union" {
-		v := reflect.ValueOf(f.defaultVal)
-		for _, branch := range f.node.branches {
-			// We select the branch as binary encodeDefault does.
-			// appendAvroJSON success alone is too lenient: its bytes/fixed
-			// arm writes a default string as raw UTF-8, so it would claim a
-			// codepoint>255 default that binary passes to a later branch.
-			if _, err := encodeDefault(nil, f.defaultVal, branch); err != nil {
-				continue
-			}
-			encoded, err := appendAvroJSON(nil, v, branch, cfg, nil, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			return appendUnionBranch(buf, f.node, branch, encoded, cfg), nil
-		}
-		return nil, fmt.Errorf("avro json: union default for field %q does not match any branch", truncForError(f.name))
+	cfg.inDefault++
+	buf, err := appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, nil, depth+1)
+	cfg.inDefault--
+	return buf, err
+}
+
+// appendJSONDefaultUnion encodes a union value that is part of a field's
+// default. It walks the branches in declaration order and takes the first
+// that binary encodeDefault accepts, so the tagged form names the branch the
+// binary defaultBytes encode against. The runtime type-name fast path would
+// name a different one: a default "A" for [enum, string] is a Go string, and
+// a default for [fixed, bytes] is a []byte.
+func appendJSONDefaultUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, depth int) ([]byte, error) {
+	var val any
+	if v.IsValid() {
+		val = v.Interface()
 	}
-	return appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, nil, depth+1)
+	for _, branch := range node.branches {
+		// appendAvroJSON success alone is too lenient: its bytes/fixed arm
+		// writes a default string as raw UTF-8, so it would claim a
+		// codepoint>255 default that binary passes to a later branch.
+		if _, err := encodeDefault(nil, val, branch); err != nil {
+			continue
+		}
+		encoded, err := appendAvroJSON(nil, v, branch, cfg, nil, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		return appendUnionBranch(buf, node, branch, encoded, cfg), nil
+	}
+	return nil, fmt.Errorf("avro json: union default %s does not match any branch", truncValueForError(val))
 }
 
 func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
@@ -1124,6 +1138,9 @@ func appendUnionBranch(buf []byte, union, branch *schemaNode, encoded []byte, cf
 func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
 	if depth >= maxDepth {
 		return nil, errTooDeep
+	}
+	if cfg.inDefault > 0 {
+		return appendJSONDefaultUnion(buf, v, node, cfg, depth)
 	}
 
 	// We peel pointer and interface layers for the tagged-map detection below,
