@@ -2871,28 +2871,64 @@ func TestWriterBlockFramingContract(t *testing.T) {
 		wantCounts(t, data, 4) // default 64KiB cap, not seal-per-datum
 	})
 	t.Run("one-allocation-per-block", func(t *testing.T) {
-		// Once a writer has sized a block, the next costs one allocation: the
-		// slice that holds its header, data, and sync marker. The null codec
-		// copies into it and zstd compresses into it.
+		// A block costs one allocation: the slice that holds its header,
+		// data, and sync marker. The null codec copies into it and zstd
+		// compresses into it, sized by the block before or, for a writer's
+		// first block, by the uncompressed data.
 		datum := append([]byte{0x90, 0x03}, bytes.Repeat([]byte("ab"), 100)...) // a 200-byte "bytes"
-		for _, cm := range ocfCodecMakers() {
-			if cm.name != "null" && cm.name != "zstandard" {
-				continue
+		shared := MustZstdCodec(nil, nil)
+		defer shared.Close()
+		makers := append(ocfCodecMakers(), struct {
+			name string
+			mk   func(t *testing.T) Codec
+		}{"zstandard under NopCloser", func(*testing.T) Codec { return NopCloser(shared) }})
+		for _, cm := range makers {
+			if cm.name == "deflate" || cm.name == "snappy" {
+				continue // their Compress allocates more of its own
 			}
-			w := mustNewWriter(t, io.Discard, avro.MustParse(`"bytes"`), WithCodec(cm.mk(t)), WithBlockCount(100))
-			block := func() {
-				for range 100 {
+			schema := avro.MustParse(`"bytes"`)
+			fill := func(w *Writer, n int) {
+				for range n {
 					if _, err := w.Write(datum); err != nil {
 						t.Fatalf("Write: %v", err)
 					}
 				}
 			}
-			block()
-			block()
-			if n := testing.AllocsPerRun(10, block); n != 1 {
+			// Six writers, each one datum short of its first block, so each
+			// measured run flushes a first block.
+			fresh := make([]*Writer, 6)
+			for i := range fresh {
+				fresh[i] = mustNewWriter(t, io.Discard, schema, WithCodec(cm.mk(t)), WithBlockCount(100))
+				fill(fresh[i], 99)
+			}
+			// A zstd codec of a writer's own builds its encoder state on
+			// first use, so only the shared one shows the first block alone.
+			next := 0
+			first := testing.AllocsPerRun(len(fresh)-1, func() { fill(fresh[next], 1); next++ })
+			if cm.name != "zstandard" && first != 1 {
+				t.Errorf("%s: a writer's first block allocates %.0f times, want 1", cm.name, first)
+			}
+			w := fresh[0]
+			fill(w, 100)
+			if n := testing.AllocsPerRun(10, func() { fill(w, 100) }); n != 1 {
 				t.Errorf("%s: a block allocates %.0f times, want 1", cm.name, n)
 			}
-			mustClose(t, w)
+			for _, w := range fresh {
+				mustClose(t, w)
+			}
+			// After its first block, a zstd writer sizes a block by the data
+			// of the one before, not by the uncompressed block, which for
+			// this datum is over a hundred times larger.
+			if cm.name != "null" {
+				var dst keepWriter
+				w := mustNewWriter(t, &dst, schema, WithCodec(cm.mk(t)), WithBlockCount(100))
+				fill(w, 300)
+				mustClose(t, w)
+				last := dst.parts[len(dst.parts)-1]
+				if uncompressed := 100 * len(datum); cap(last) > uncompressed/2 {
+					t.Errorf("%s: the third block's slice has room for %d bytes, for %d written and %d uncompressed", cm.name, cap(last), len(last), uncompressed)
+				}
+			}
 		}
 	})
 }

@@ -679,11 +679,20 @@ func (w *Writer) Close() error {
 // length, can take.
 const blockHeaderMax = 2 * binary.MaxVarintLen64
 
-// appendCompressor is a codec of ours that can compress onto the end of a
-// buffer, so the Writer can compress a block straight into the slice it
-// writes. The result must begin with dst.
-type appendCompressor interface {
-	appendCompress(dst, src []byte) ([]byte, error)
+// zstdEncoderOf returns c's encoder when c is our zstd codec, as it is or
+// under [NopCloser], and nil for every other codec.
+func zstdEncoderOf(c Codec) *zstd.Encoder {
+	for {
+		nc, ok := c.(nopCloser)
+		if !ok {
+			break
+		}
+		c = nc.Codec
+	}
+	if z, ok := c.(*zstdCodec); ok {
+		return z.enc
+	}
+	return nil
 }
 
 func (w *Writer) flush() error {
@@ -693,21 +702,24 @@ func (w *Writer) flush() error {
 	// right-aligned against the data. The slice is new for every block, so a
 	// destination that keeps what it is handed still holds the right bytes.
 	var block []byte
-	var err error
-	if ac, ok := w.codec.(appendCompressor); ok {
-		// The capacity is a guess from the last block; append grows it when
-		// this block compresses worse.
-		block = make([]byte, blockHeaderMax, blockHeaderMax+w.dataHint+len(w.sync))
-		block, err = ac.appendCompress(block, w.buf)
+	if enc := zstdEncoderOf(w.codec); enc != nil {
+		// zstd appends to the slice it is given, so it compresses straight
+		// after the header's room. The capacity is the last block's data
+		// length, or for the first block its uncompressed length; append
+		// grows it when this block compresses worse.
+		hint := w.dataHint
+		if hint == 0 {
+			hint = len(w.buf)
+		}
+		block = enc.EncodeAll(w.buf, make([]byte, blockHeaderMax, blockHeaderMax+hint+len(w.sync)))
 	} else {
-		var data []byte
-		data, err = w.codec.Compress(w.buf)
+		data, err := w.codec.Compress(w.buf)
+		if err != nil {
+			w.err = err
+			return fmt.Errorf("ocf: compressing block: %w", err)
+		}
 		block = make([]byte, blockHeaderMax, blockHeaderMax+len(data)+len(w.sync))
 		block = append(block, data...)
-	}
-	if err != nil {
-		w.err = err
-		return fmt.Errorf("ocf: compressing block: %w", err)
 	}
 	n := len(block) - blockHeaderMax
 	var hdr [blockHeaderMax]byte
@@ -1358,10 +1370,6 @@ func (*zstdCodec) Name() string { return "zstandard" }
 
 func (c *zstdCodec) Compress(src []byte) ([]byte, error) {
 	return c.enc.EncodeAll(src, nil), nil
-}
-
-func (c *zstdCodec) appendCompress(dst, src []byte) ([]byte, error) {
-	return c.enc.EncodeAll(src, dst), nil
 }
 
 func (c *zstdCodec) Decompress(src []byte) ([]byte, error) {
