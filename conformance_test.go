@@ -8375,6 +8375,13 @@ func TestMatrix_DateEncodeWallClock(t *testing.T) {
 		{"UTC 1970-01-01", time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC), 0},
 		{"+05 1970-01-01 12:00", time.Date(1970, 1, 1, 12, 0, 0, 0, plus5), 0},
 		{"UTC 1969-12-27", time.Date(1969, 12, 27, 0, 0, 0, 0, time.UTC), -5},
+		// Before 1970 and away from midnight, on each side of the epoch
+		// in a zone, and the two ends of int32.
+		{"UTC 1969-12-31 12:00", time.Date(1969, 12, 31, 12, 0, 0, 0, time.UTC), -1},
+		{"-05 1969-12-31 23:00", time.Date(1969, 12, 31, 23, 0, 0, 0, minus5), -1},
+		{"+05 1970-01-01 01:00", time.Date(1970, 1, 1, 1, 0, 0, 0, plus5), 0},
+		{"first int32 day", time.Date(-5877641, 6, 23, 0, 0, 0, 0, time.UTC), math.MinInt32},
+		{"last int32 day", time.Date(5881580, 7, 11, 0, 0, 0, 0, time.UTC), math.MaxInt32},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
