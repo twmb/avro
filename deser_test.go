@@ -3564,7 +3564,7 @@ func TestDurationSchemaValidation(t *testing.T) {
 
 // ---- Duration in record as [12]byte triggers unsafe fallback ----
 
-// ---- Decimal: bigIntToBytes edge cases ----
+// ---- Decimal: appendBigIntBytes edge cases ----
 
 // ---- Decimal: interface deserialization ----
 

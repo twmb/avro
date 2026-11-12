@@ -2536,7 +2536,7 @@ var pow10Cache [1025]atomic.Pointer[big.Int]
 // cachedPow10 returns 10^n from pow10Cache, or false when n is past it. You
 // must not modify the result: every caller shares it.
 func cachedPow10(n int) (*big.Int, bool) {
-	if n >= len(pow10Cache) {
+	if n < 0 || n >= len(pow10Cache) {
 		return nil, false
 	}
 	p := pow10Cache[n].Load()

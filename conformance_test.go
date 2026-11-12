@@ -4178,7 +4178,7 @@ func TestSpecBareTypeNameInObjectAccepted(t *testing.T) {
 
 // TestSpecJSONEncodeBytesAcceptsByteArray locks that EncodeJSON accepts a
 // Go [N]byte for an Avro "bytes" schema, matching the binary path's
-// serBytes (ser.go:460), which accepts both reflect.Array and
+// serBytes, which accepts both reflect.Array and
 // reflect.Slice. Without the Array case, every position the bytes encoder
 // is reached fails for [N]byte. The JSON "fixed" arm already handled
 // Array; "string" rejects [N]byte on both wires consistently, since
@@ -8815,9 +8815,9 @@ func TestMatrix_LenientInputAudit(t *testing.T) {
 // TestMatrix_UnionDispatchAmbiguous locks the encoder's branch-selection
 // rule where multiple branches could accept the same Go input.
 // serUnion.ser tries a tagged-map unwrap, then the Go-type natural Avro
-// kind via unionTypeNameForValue, branchKinds picking that branch
+// kind via unionTypeNameForValue, unionTags.byKind picking that branch
 // regardless of schema order. Try-each in schema order is reached only
-// for Go types whose natural kind is not in branchKinds. We enumerate
+// for Go types whose natural kind is not in unionTags.byKind. We enumerate
 // the natural-kind-first vs schema-order-first distinction. Both
 // encoders share unionTypeNameForValue, so the cells assert the same
 // wantBranch on both wires.
@@ -8877,7 +8877,7 @@ func TestMatrix_UnionDispatchAmbiguous(t *testing.T) {
 		},
 		{
 			// float64 input against [int, float]: natural kind =
-			// "double", not in branchKinds. Falls through to try-each,
+			// "double", not in unionTags.byKind. Falls through to try-each,
 			// which walks schema order; int branch accepts whole-
 			// number floats first.
 			name:       "int vs float: int branch wins for whole-number float64 (fall-through, schema-order)",
@@ -19253,6 +19253,16 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 			r.Denom().Mul(r.Denom(), six)
 			return r
 		}},
+		// Both signs flipped, which you also get by writing through Num and
+		// Denom. We divide by the denominator as it reads, sign included, so
+		// the value is the same. math/big itself ignores a denominator's
+		// sign, so we compare a decode against value below, not against this.
+		{"negated", func(u, den *big.Int) *big.Rat {
+			r := new(big.Rat).SetFrac(u, den)
+			r.Num().Neg(r.Num())
+			r.Denom().Neg(r.Denom())
+			return r
+		}},
 		// Times 2^64+1, the denominator takes two words, and its low word
 		// alone still divides the numerator times 10^scale.
 		{"unreduced-wide", func(u, den *big.Int) *big.Rat {
@@ -19326,7 +19336,8 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 					wantWire = avroLen(ref)
 				}
 				for _, form := range forms {
-					want := form.mk(u, den) // value = u / 10^scale, exact at this scale
+					value := new(big.Rat).SetFrac(u, den) // u / 10^scale, exact at this scale
+					want := form.mk(u, den)               // the same value, in this form
 					num, denom := new(big.Int).Set(want.Num()), new(big.Int).Set(want.Denom())
 					// A *big.Rat is read in place and a big.Rat is copied.
 					for _, carrier := range []any{want, *want} {
@@ -19350,7 +19361,7 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 						// The stack array is what keeps an encode from
 						// allocating, so a *big.Rat that qualifies for it
 						// encodes with no allocation.
-						if words(want.Num())+words(den) <= 8 && words(want.Denom()) == 1 && sc.scale <= 1024 && sc.precision <= 1024 {
+						if words(want.Num())+words(den) <= 8 && words(want.Denom()) == 1 && want.Denom().Sign() > 0 && sc.scale <= 1024 && sc.precision <= 1024 {
 							onStack++
 							if ptr, ok := carrier.(*big.Rat); ok {
 								var buf []byte
@@ -19368,8 +19379,8 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 						if _, err := s.Decode(wire, &got); err != nil {
 							t.Fatalf("Decode(%v wire): %v", want, err)
 						}
-						if got == nil || got.Cmp(want) != 0 {
-							t.Errorf("unscaled %v: round-trip got %v, want %v", u, got, want)
+						if got == nil || got.Cmp(value) != 0 {
+							t.Errorf("unscaled %v: round-trip got %v, want %v", u, got, value)
 						}
 						jwire, err := s.EncodeJSON(carrier)
 						if err != nil {
@@ -19379,8 +19390,8 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 						if err := s.DecodeJSON(jwire, &jgot); err != nil {
 							t.Fatalf("DecodeJSON(%s): %v", jwire, err)
 						}
-						if jgot == nil || jgot.Cmp(want) != 0 {
-							t.Errorf("unscaled %v: JSON round-trip got %v, want %v", u, jgot, want)
+						if jgot == nil || jgot.Cmp(value) != 0 {
+							t.Errorf("unscaled %v: JSON round-trip got %v, want %v", u, jgot, value)
 						}
 						// A decoded Rat is yours to change. Writing through
 						// both must not reach a power of ten a later cell

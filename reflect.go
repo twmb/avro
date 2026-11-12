@@ -42,15 +42,7 @@ func copyBytesToArray(v reflect.Value, b []byte) {
 // where reflect.Copy would panic on the exact-type mismatch. You have already
 // established that v is an Array whose element Kind is Uint8.
 func byteArrayToSlice(v reflect.Value) []byte {
-	b := make([]byte, v.Len())
-	if v.Type().Elem() == byteType {
-		reflect.Copy(reflect.ValueOf(b), v)
-		return b
-	}
-	for i := range b {
-		b[i] = byte(v.Index(i).Uint())
-	}
-	return b
+	return appendByteArray(make([]byte, 0, v.Len()), v)
 }
 
 // appendByteArray appends the byte-array v to dst, the append counterpart of
