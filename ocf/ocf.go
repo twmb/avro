@@ -423,6 +423,7 @@ type Writer struct {
 	count      int
 	maxCount   int
 	maxBytes   int
+	dataHint   int // the last block's data length, to size the next block by
 	err        error
 	userMeta   []kv
 	hasSync    bool
@@ -674,21 +675,52 @@ func (w *Writer) Close() error {
 	}
 }
 
+// blockHeaderMax is the most a block's two varints, its count and its data
+// length, can take.
+const blockHeaderMax = 2 * binary.MaxVarintLen64
+
+// appendCompressor is a codec of ours that can compress onto the end of a
+// buffer, so the Writer can compress a block straight into the slice it
+// writes. The result must begin with dst.
+type appendCompressor interface {
+	appendCompress(dst, src []byte) ([]byte, error)
+}
+
 func (w *Writer) flush() error {
-	compressed, err := w.codec.Compress(w.buf)
+	// We build the block in one fresh slice: room for the header, then the
+	// data, then the sync marker. The header's length is not known until the
+	// data's is, so we leave blockHeaderMax in front and write the header
+	// right-aligned against the data. The slice is new for every block, so a
+	// destination that keeps what it is handed still holds the right bytes.
+	var block []byte
+	var err error
+	if ac, ok := w.codec.(appendCompressor); ok {
+		// The capacity is a guess from the last block; append grows it when
+		// this block compresses worse.
+		block = make([]byte, blockHeaderMax, blockHeaderMax+w.dataHint+len(w.sync))
+		block, err = ac.appendCompress(block, w.buf)
+	} else {
+		var data []byte
+		data, err = w.codec.Compress(w.buf)
+		block = make([]byte, blockHeaderMax, blockHeaderMax+len(data)+len(w.sync))
+		block = append(block, data...)
+	}
 	if err != nil {
 		w.err = err
 		return fmt.Errorf("ocf: compressing block: %w", err)
 	}
-	var block []byte
-	block = binary.AppendVarint(block, int64(w.count))
-	block = binary.AppendVarint(block, int64(len(compressed)))
-	block = append(block, compressed...)
+	n := len(block) - blockHeaderMax
+	var hdr [blockHeaderMax]byte
+	h := binary.AppendVarint(hdr[:0], int64(w.count))
+	h = binary.AppendVarint(h, int64(n))
+	start := blockHeaderMax - len(h)
+	copy(block[start:], h)
 	block = append(block, w.sync[:]...)
-	if err := writeFull(w.w, block); err != nil {
+	if err := writeFull(w.w, block[start:]); err != nil {
 		w.err = err
 		return fmt.Errorf("ocf: writing block: %w", err)
 	}
+	w.dataHint = n
 	w.buf = w.buf[:0]
 	w.count = 0
 	return nil
@@ -1326,6 +1358,10 @@ func (*zstdCodec) Name() string { return "zstandard" }
 
 func (c *zstdCodec) Compress(src []byte) ([]byte, error) {
 	return c.enc.EncodeAll(src, nil), nil
+}
+
+func (c *zstdCodec) appendCompress(dst, src []byte) ([]byte, error) {
+	return c.enc.EncodeAll(src, dst), nil
 }
 
 func (c *zstdCodec) Decompress(src []byte) ([]byte, error) {
