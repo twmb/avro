@@ -991,6 +991,11 @@ func appendJSONFieldDefault(buf []byte, f fieldNode, cfg *optConfig, depth int) 
 		return nil, errors.New("missing key")
 	}
 	if f.defaultVal == nil {
+		// A null for a union is charged the union's level, as a null you
+		// supply is; nothing below walks it.
+		if kindNests(f.node.kind) && fillTooDeep(depth, 1) {
+			return nil, errTooDeep
+		}
 		return append(buf, "null"...), nil
 	}
 	// Binary's encodeDefault takes no custom parameter for the same reason;
@@ -1113,6 +1118,9 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 					}
 					continue
 				case ozNull:
+					if fillTooDeep(depth, 1) {
+						return nil, recordFieldError(v.Type(), f.name, errTooDeep)
+					}
 					buf = append(buf, "null"...)
 					continue
 				}

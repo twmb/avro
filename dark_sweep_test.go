@@ -666,11 +666,48 @@ type darkPrimArr struct {
 	Xs   []int32      `avro:"xs"`
 }
 
+// The fill carriers: a record that is not a map[string]any, whose deepest
+// level leaves a field for the encoder to fill.
+type darkOmitNext struct {
+	Next *darkOmitNext `avro:"next,omitzero"`
+}
+
+type darkOmitDefault struct {
+	Next *darkOmitDefault `avro:"next"`
+	U    any              `avro:"u,omitzero"`
+}
+
 func TestMatrix_RecursionLimitAcrossShapesAndParity(t *testing.T) {
 	t.Parallel()
 
 	const deep = 1200 // > the package's depth limit
 	const shallow = 4
+
+	// links nests innermost under d records that are maps. Each level also
+	// carries every key of extra.
+	links := func(innermost any, extra map[string]any) func(d int) any {
+		return func(d int) any {
+			cur := innermost
+			for range d {
+				m := map[string]any{"next": cur}
+				for k, v := range extra {
+					m[k] = v
+				}
+				cur = m
+			}
+			return cur
+		}
+	}
+	// chainWire is the binary form of links for a record whose only field is
+	// next: d records that take the record branch, and one that takes null.
+	chainWire := func(record, null byte) func(d int) []byte {
+		return func(d int) []byte { return append(bytes.Repeat([]byte{record}, d), null) }
+	}
+	const (
+		nextOnly      = `{"name":"next","type":["null","T"]}`
+		nullSecond    = `{"name":"next","type":["T","null"]}`
+		recordDefault = nextOnly + `,{"name":"u","type":[{"type":"record","name":"X","fields":[]},"null"],"default":{}}`
+	)
 
 	shapes := []struct {
 		name string
@@ -839,6 +876,33 @@ func TestMatrix_RecursionLimitAcrossShapesAndParity(t *testing.T) {
 				}
 				return cur
 			},
+		},
+		// The rest end in a value the encoder fills in or writes through a
+		// loop of its own: a default, a null for an omitted or zero field,
+		// or a container of a primitive type. A decoder charges each one a
+		// level, so an encoder that did not would write what it cannot read.
+		{name: "fill/default-record/map", body: recordDefault, mk: links(map[string]any{"next": nil}, nil)},
+		{name: "fill/default-record/named-map", body: recordDefault, mk: links(darkNamedMap{"next": nil}, nil)},
+		{name: "fill/default-record/omitzero-struct", body: recordDefault, mk: links(darkOmitDefault{}, nil)},
+		{name: "fill/default-record/omitzero-struct-pointer", body: recordDefault, mk: links(&darkOmitDefault{Next: &darkOmitDefault{}}, nil)},
+		{name: "fill/default-empty-array", body: nextOnly + `,{"name":"u","type":[{"type":"array","items":"int"},"null"],"default":[]}`, mk: links(map[string]any{"next": nil}, nil)},
+		{name: "fill/default-map", body: nextOnly + `,{"name":"u","type":[{"type":"map","values":"int"},"null"],"default":{"k":1}}`, mk: links(map[string]any{"next": nil}, nil)},
+		{name: "fill/default-null", body: `{"name":"next","type":["null","T"],"default":null}`, mk: links(map[string]any{}, nil), wire: chainWire(2, 0)},
+		// A zero omitzero field takes its default, which a union with null
+		// first always has, and otherwise the null branch.
+		{name: "fill/omitzero/null-first/struct", body: nextOnly, mk: links(darkOmitNext{}, nil)},
+		{name: "fill/omitzero/null-first/struct-pointer", body: nextOnly, mk: links(&darkOmitNext{Next: &darkOmitNext{}}, nil)},
+		{name: "fill/omitzero/null-second/struct", body: nullSecond, mk: links(darkOmitNext{}, nil), wire: chainWire(0, 2)},
+		{name: "fill/omitzero/null-second/struct-pointer", body: nullSecond, mk: links(&darkOmitNext{Next: &darkOmitNext{}}, nil)},
+		// A container of a primitive type as the deepest node, under a union
+		// so that nothing else sits at its depth.
+		{
+			name: "fill/primitive-array", body: nextOnly + `,{"name":"xs","type":["null",{"type":"array","items":"int"}]}`,
+			mk: links(map[string]any{"next": nil, "xs": []int32{1}}, map[string]any{"xs": nil}),
+		},
+		{
+			name: "fill/primitive-map", body: nextOnly + `,{"name":"xs","type":["null",{"type":"map","values":"int"}]}`,
+			mk: links(map[string]any{"next": nil, "xs": map[string]int32{"k": 1}}, map[string]any{"xs": nil}),
 		},
 		{
 			name: "null-union-with-primitive-array",

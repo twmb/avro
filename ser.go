@@ -975,6 +975,10 @@ type serRecordField struct {
 	// parse records the reason and every consumer of defaultBytes reports
 	// it when the default would reach the wire.
 	defaultErr error
+	// defaultNest is how many levels of nesting a decoder charges to read
+	// defaultBytes back. appendDefault charges the same, so we never write
+	// a default at a depth where our own decoder refuses it.
+	defaultNest int
 }
 
 // avroType names the field's Avro type, or "" when the field has no
@@ -991,12 +995,22 @@ func (f *serRecordField) avroType() string {
 // appendDefault appends the field's pre-encoded default, or returns the verdict
 // we recorded when we built it. One accessor rather than a check beside each
 // append, so a later consumer cannot pick up the bytes without the verdict that
-// governs them.
-func (f *serRecordField) appendDefault(dst []byte) ([]byte, error) {
+// governs them. depth is the record's own.
+func (f *serRecordField) appendDefault(dst []byte, depth int) ([]byte, error) {
 	if f.defaultErr != nil {
 		return nil, f.defaultErr
 	}
+	if fillTooDeep(depth, f.defaultNest) {
+		return nil, errTooDeep
+	}
 	return append(dst, f.defaultBytes...), nil
+}
+
+// fillTooDeep reports whether a value that nests nest levels, written for a
+// field of a record at depth, passes the limit. We ask before we write bytes
+// that no serializer walked: a default, or the null of an omitzero field.
+func fillTooDeep(depth, nest int) bool {
+	return nest > 0 && depth+nest >= maxDepth
 }
 
 // ozAction is what an omitzero-tagged field does when its Go value is zero (or
@@ -1091,7 +1105,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 					if !f.hasDefault {
 						return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: errors.New("missing key")}
 					}
-					if dst, err = f.appendDefault(dst); err != nil {
+					if dst, err = f.appendDefault(dst, depth); err != nil {
 						return nil, recordFieldError(t, f.name, err)
 					}
 					continue
@@ -1121,7 +1135,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 				if !f.hasDefault {
 					return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: errors.New("missing key")}
 				}
-				if dst, err = f.appendDefault(dst); err != nil {
+				if dst, err = f.appendDefault(dst, depth); err != nil {
 					return nil, recordFieldError(t, f.name, err)
 				}
 				continue
@@ -1157,11 +1171,14 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 		if mapping.omitzero[i] && valueIsZero(fv) {
 			switch f.omitzeroAction() {
 			case ozDefault:
-				if dst, err = f.appendDefault(dst); err != nil {
+				if dst, err = f.appendDefault(dst, depth); err != nil {
 					return nil, recordFieldError(t, f.name, err)
 				}
 				continue
 			case ozNull:
+				if fillTooDeep(depth, 1) {
+					return nil, recordFieldError(t, f.name, errTooDeep)
+				}
 				nullByte, _ := nullUnionBytes(f.meta != nil && f.meta.nullSecond)
 				dst = append(dst, nullByte)
 				continue
@@ -1377,9 +1394,12 @@ func peelElem(v reflect.Value) (reflect.Value, error) {
 // compiler emits one indirect call per element, matching the inlined
 // direct-call shape.
 func appendArrayPrimitive(
-	dst []byte, v reflect.Value, avroType string,
+	dst []byte, v reflect.Value, depth int, avroType string,
 	appendFn func([]byte, reflect.Value) ([]byte, error),
 ) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	dst, v, l, err := serArrayPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -1503,9 +1523,12 @@ func appendArrayPrimitive(
 // everything else, reusing two addressable Values through SetIterKey and
 // SetIterValue rather than allocating per entry.
 func appendMapPrimitive(
-	dst []byte, v reflect.Value, avroType string,
+	dst []byte, v reflect.Value, depth int, avroType string,
 	appendFn func([]byte, reflect.Value) ([]byte, error),
 ) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	dst, v, l, err := serMapPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -1631,23 +1654,23 @@ func serArrayPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, 
 // the element to escape (~25% slower), and a generic with an empty-struct
 // GCShape adds a dictionary lookup (+34-62%).
 
-func (s *serArray) serString(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "string", appendAvroString)
+func (s *serArray) serString(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "string", appendAvroString)
 }
-func (s *serArray) serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "boolean", appendAvroBool)
+func (s *serArray) serBoolean(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "boolean", appendAvroBool)
 }
-func (s *serArray) serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "int", appendAvroInt)
+func (s *serArray) serInt(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "int", appendAvroInt)
 }
-func (s *serArray) serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "long", appendAvroLong)
+func (s *serArray) serLong(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "long", appendAvroLong)
 }
-func (s *serArray) serFloat(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "float", appendAvroFloat32)
+func (s *serArray) serFloat(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "float", appendAvroFloat32)
 }
-func (s *serArray) serDouble(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "double", appendAvroFloat64)
+func (s *serArray) serDouble(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "double", appendAvroFloat64)
 }
 
 type serMap struct {
@@ -1706,23 +1729,23 @@ func serMapPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, er
 // pick one at schema-build time from the map's value type. See serArray.serString
 // for the factoring history.
 
-func (s *serMap) serString(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "string", appendAvroString)
+func (s *serMap) serString(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "string", appendAvroString)
 }
-func (s *serMap) serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "boolean", appendAvroBool)
+func (s *serMap) serBoolean(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "boolean", appendAvroBool)
 }
-func (s *serMap) serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "int", appendAvroInt)
+func (s *serMap) serInt(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "int", appendAvroInt)
 }
-func (s *serMap) serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "long", appendAvroLong)
+func (s *serMap) serLong(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "long", appendAvroLong)
 }
-func (s *serMap) serFloat(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "float", appendAvroFloat32)
+func (s *serMap) serFloat(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "float", appendAvroFloat32)
 }
-func (s *serMap) serDouble(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "double", appendAvroFloat64)
+func (s *serMap) serDouble(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "double", appendAvroFloat64)
 }
 
 type serSize struct {

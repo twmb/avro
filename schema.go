@@ -2733,6 +2733,7 @@ func (b *builder) buildRecord(o *aobject) error {
 			drf.hasDefault = true
 			fn.hasDefault = true
 			sr.fields[fieldIdx].defaultBytes = []byte{0} // varint 0 = null branch
+			sr.fields[fieldIdx].defaultNest = 1          // the union
 			sr.fields[fieldIdx].hasDefault = true
 		}
 		dr.fields = append(dr.fields, drf)
@@ -3347,11 +3348,12 @@ func resolveFieldDefaultValue(defaultVal any, node *schemaNode, fieldName string
 // value first (encodeDefault reads sibling/nested f.defaultVal for absent
 // fields).
 func encodeFieldDefaultBytes(defaultVal any, node *schemaNode, fieldName string, srf *serRecordField) error {
-	defaultBytes, deferred, err := encodeDefaultCharged(defaultVal, node)
+	defaultBytes, nest, deferred, err := encodeDefaultCharged(defaultVal, node)
 	if err != nil {
 		return fmt.Errorf("record field %q: encoding default: %v", truncForError(fieldName), err)
 	}
 	srf.defaultBytes = defaultBytes
+	srf.defaultNest = nest
 	srf.hasDefault = true
 	// Recorded, not returned: a default that cannot be *written* must not stop
 	// the schema parsing, because a reader that drops this field never writes

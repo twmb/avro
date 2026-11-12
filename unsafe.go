@@ -38,6 +38,9 @@ type fastFieldSer struct {
 	// omitzeroErr carries serRecordField.defaultErr through the compile, so
 	// this path refuses where the reflect path refuses.
 	omitzeroErr error
+	// omitzeroNest is the nesting of omitzeroBytes: the default's, or one
+	// for the null of a union.
+	omitzeroNest int
 }
 
 type fastRecordDeser struct {
@@ -93,9 +96,11 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 				case ozDefault:
 					ffs.omitzeroBytes = f.defaultBytes
 					ffs.omitzeroErr = f.defaultErr
+					ffs.omitzeroNest = f.defaultNest
 				case ozNull:
 					nb, _ := nullUnionBytes(f.meta != nil && f.meta.nullSecond)
 					ffs.omitzeroBytes = []byte{nb}
+					ffs.omitzeroNest = 1
 				}
 			}
 			fast.fields[i] = ffs
@@ -183,6 +188,9 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 				// ["T","null"]).
 				if f.omitzeroErr != nil {
 					return nil, recordFieldError(fast.typ, f.name, f.omitzeroErr)
+				}
+				if fillTooDeep(depth, f.omitzeroNest) {
+					return nil, recordFieldError(fast.typ, f.name, errTooDeep)
 				}
 				dst = append(dst, f.omitzeroBytes...)
 				continue
