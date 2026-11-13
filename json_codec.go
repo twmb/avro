@@ -950,31 +950,31 @@ func appendJSONNativeSlice[V any](buf []byte, s []V, emit func([]byte, V) []byte
 func appendAvroJSONNativeArray(buf []byte, v reflect.Value, kind string, cfg *optConfig) ([]byte, bool) {
 	switch et := v.Type().Elem(); {
 	case kind == "string" && et == stringType:
-		if s, ok := v.Interface().([]string); ok {
+		if s, ok := sliceOf[string](v); ok {
 			return appendJSONNativeSlice(buf, s, appendJSONString), true
 		}
 	case kind == "int" && et == int32Type:
-		if s, ok := v.Interface().([]int32); ok {
+		if s, ok := sliceOf[int32](v); ok {
 			return appendJSONNativeSlice(buf, s, func(b []byte, x int32) []byte { return strconv.AppendInt(b, int64(x), 10) }), true
 		}
 	case kind == "long" && et == int64Type:
-		if s, ok := v.Interface().([]int64); ok {
+		if s, ok := sliceOf[int64](v); ok {
 			return appendJSONNativeSlice(buf, s, func(b []byte, x int64) []byte { return strconv.AppendInt(b, x, 10) }), true
 		}
 	case kind == "long" && et == intType:
-		if s, ok := v.Interface().([]int); ok {
+		if s, ok := sliceOf[int](v); ok {
 			return appendJSONNativeSlice(buf, s, func(b []byte, x int) []byte { return strconv.AppendInt(b, int64(x), 10) }), true
 		}
 	case kind == "float" && et == float32Type:
-		if s, ok := v.Interface().([]float32); ok {
+		if s, ok := sliceOf[float32](v); ok {
 			return appendJSONNativeSlice(buf, s, func(b []byte, x float32) []byte { return appendJSONFloat(b, float64(x), 32, cfg) }), true
 		}
 	case kind == "double" && et == float64Type:
-		if s, ok := v.Interface().([]float64); ok {
+		if s, ok := sliceOf[float64](v); ok {
 			return appendJSONNativeSlice(buf, s, func(b []byte, x float64) []byte { return appendJSONFloat(b, x, 64, cfg) }), true
 		}
 	case kind == "boolean" && et == boolType:
-		if s, ok := v.Interface().([]bool); ok {
+		if s, ok := sliceOf[bool](v); ok {
 			return appendJSONNativeSlice(buf, s, strconv.AppendBool), true
 		}
 	}

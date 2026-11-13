@@ -2445,6 +2445,33 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 			})
 		}
 	}
+	// A slice of a primitive type behind a pointer, which a slice field of a
+	// struct passed by pointer also is. Both encoders loop over the slice
+	// where it is, so the pointer costs no allocation over the slice by
+	// value.
+	for _, c := range []struct {
+		schema string
+		ptr    any
+	}{
+		{`{"type":"array","items":"string"}`, &[]string{"a", "b"}},
+		{`{"type":"array","items":"boolean"}`, &[]bool{true, false}},
+		{`{"type":"array","items":"int"}`, &[]int32{1, 2}},
+		{`{"type":"array","items":"long"}`, &[]int64{1, 2}},
+		{`{"type":"array","items":"long"}`, &[]int{1, 2}},
+		{`{"type":"array","items":"float"}`, &[]float32{1.5}},
+		{`{"type":"array","items":"double"}`, &[]float64{1.5}},
+	} {
+		s := avro.MustParse(c.schema)
+		byValue := reflect.ValueOf(c.ptr).Elem().Interface()
+		buf := make([]byte, 0, 64)
+		if n := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncode(buf[:0], c.ptr) }); n != 0 {
+			t.Errorf("%T: encoding a slice behind a pointer allocates %.0f times, want 0", c.ptr, n)
+		}
+		want := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncodeJSON(buf[:0], byValue) })
+		if n := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncodeJSON(buf[:0], c.ptr) }); n != want {
+			t.Errorf("%T: JSON encoding a slice behind a pointer allocates %.0f times, and %.0f by value", c.ptr, n, want)
+		}
+	}
 }
 
 // ===========================================================================

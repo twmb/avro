@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 var (
@@ -243,6 +244,21 @@ func indirect(v reflect.Value) (reflect.Value, error) {
 	default:
 		return v, nil
 	}
+}
+
+// sliceOf returns v as a []T when v is the unnamed slice type []T. We read an
+// addressable slice where it is: v.Interface would first copy its header to
+// the heap, an allocation for every slice field of a struct you pass by
+// pointer. A named slice type or a value you cannot interface is not ours to
+// take, and the caller reads it element by element.
+func sliceOf[T any](v reflect.Value) ([]T, bool) {
+	if !v.CanInterface() || v.Type() != reflect.TypeFor[[]T]() {
+		return nil, false
+	}
+	if v.CanAddr() {
+		return *(*[]T)(unsafe.Pointer(v.UnsafeAddr())), true
+	}
+	return v.Interface().([]T), true
 }
 
 func indirectAlloc(v reflect.Value) reflect.Value {

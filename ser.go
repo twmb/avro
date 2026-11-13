@@ -1418,30 +1418,26 @@ func appendArrayPrimitive(
 	// equal float32WireBits for every value.
 	switch et := v.Type().Elem(); {
 	case avroType == "string" && et == stringType:
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]string); ok {
-				for _, x := range s {
-					dst = doSerString(dst, x)
-				}
-				return append(dst, 0), nil
+		if s, ok := sliceOf[string](v); ok {
+			for _, x := range s {
+				dst = doSerString(dst, x)
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			dst = doSerString(dst, v.Index(i).String())
 		}
 		return append(dst, 0), nil
 	case avroType == "boolean" && et == boolType:
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]bool); ok {
-				for _, x := range s {
-					if x {
-						dst = append(dst, 1)
-					} else {
-						dst = append(dst, 0)
-					}
+		if s, ok := sliceOf[bool](v); ok {
+			for _, x := range s {
+				if x {
+					dst = append(dst, 1)
+				} else {
+					dst = append(dst, 0)
 				}
-				return append(dst, 0), nil
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			if v.Index(i).Bool() {
@@ -1452,58 +1448,50 @@ func appendArrayPrimitive(
 		}
 		return append(dst, 0), nil
 	case avroType == "int" && et == int32Type:
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]int32); ok {
-				for _, x := range s {
-					dst = appendVarint(dst, x)
-				}
-				return append(dst, 0), nil
+		if s, ok := sliceOf[int32](v); ok {
+			for _, x := range s {
+				dst = appendVarint(dst, x)
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			dst = appendVarint(dst, int32(v.Index(i).Int()))
 		}
 		return append(dst, 0), nil
 	case avroType == "long" && (et == int64Type || et == intType):
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]int64); ok {
-				for _, x := range s {
-					dst = appendVarlong(dst, x)
-				}
-				return append(dst, 0), nil
+		if s, ok := sliceOf[int64](v); ok {
+			for _, x := range s {
+				dst = appendVarlong(dst, x)
 			}
-			if s, ok := v.Interface().([]int); ok {
-				for _, x := range s {
-					dst = appendVarlong(dst, int64(x))
-				}
-				return append(dst, 0), nil
+			return append(dst, 0), nil
+		}
+		if s, ok := sliceOf[int](v); ok {
+			for _, x := range s {
+				dst = appendVarlong(dst, int64(x))
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			dst = appendVarlong(dst, v.Index(i).Int())
 		}
 		return append(dst, 0), nil
 	case avroType == "float" && et == float32Type:
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]float32); ok {
-				for _, x := range s {
-					dst = appendUint32(dst, math.Float32bits(x))
-				}
-				return append(dst, 0), nil
+		if s, ok := sliceOf[float32](v); ok {
+			for _, x := range s {
+				dst = appendUint32(dst, math.Float32bits(x))
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			dst = appendUint32(dst, float32WireBits(v.Index(i)))
 		}
 		return append(dst, 0), nil
 	case avroType == "double" && et == float64Type:
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]float64); ok {
-				for _, x := range s {
-					dst = appendUint64(dst, math.Float64bits(x))
-				}
-				return append(dst, 0), nil
+		if s, ok := sliceOf[float64](v); ok {
+			for _, x := range s {
+				dst = appendUint64(dst, math.Float64bits(x))
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			dst = appendUint64(dst, math.Float64bits(v.Index(i).Float()))
