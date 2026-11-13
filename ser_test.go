@@ -2181,6 +2181,12 @@ var magnitudeSites = []magnitudeSite{
 		reason: "elemSize is reflect.Type.Size(); see udArrayDirect",
 	},
 	{
+		where: "ocf/ocf.go::checkedReader.left", count: 1, verdict: magNotAMagnitude,
+		reason: "fi.Size() is a file's length from Stat, not a schema's size. The difference only picks how a " +
+			"declared size the caps already bound is read: a wrong or wrapped answer makes that one read " +
+			"allocate once or grow, and changes no verdict",
+	},
+	{
 		where: "ser.go::appendDecimalWords", count: 11, verdict: magBoundedHere,
 		reason: "scale and precision only pick a power of ten here. The arithmetic is on word counts and word " +
 			"indexes of that power and of the numerator, and the gate `len(x)+len(y) > decimalStackWords` runs " +

@@ -572,7 +572,7 @@ func TestEncodeMapEmpty(t *testing.T) {
 		t.Fatalf("expected [0], got %v", data)
 	}
 	r := bufio.NewReader(bytes.NewReader(data))
-	m, err := decodeMap(r)
+	m, err := decodeMap(r, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,7 +637,7 @@ func TestDecodeMapNegativeCount(t *testing.T) {
 	data = append(data, 0) // terminating zero-count block
 
 	r := bufio.NewReader(bytes.NewReader(data))
-	m, err := decodeMap(r)
+	m, err := decodeMap(r, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,7 +680,7 @@ func TestDecodeMapTruncatedNegCountSize(t *testing.T) {
 	data = binary.AppendVarint(data, -2) // negative count
 	// No byte-size follows: truncated.
 	r := bufio.NewReader(bytes.NewReader(data))
-	_, err := decodeMap(r)
+	_, err := decodeMap(r, nil)
 	if err == nil {
 		t.Fatal("expected error for truncated negative count byte-size")
 	}
@@ -692,7 +692,7 @@ func TestDecodeMapTruncatedKeyLen(t *testing.T) {
 	data = binary.AppendVarint(data, 1) // 1 entry
 	// No key length: truncated.
 	r := bufio.NewReader(bytes.NewReader(data))
-	_, err := decodeMap(r)
+	_, err := decodeMap(r, nil)
 	if err == nil {
 		t.Fatal("expected error for truncated key length")
 	}
@@ -704,7 +704,7 @@ func TestDecodeMapTruncatedKeyData(t *testing.T) {
 	data = binary.AppendVarint(data, 10) // key length = 10
 	data = append(data, 'a')             // only 1 byte of key, need 10
 	r := bufio.NewReader(bytes.NewReader(data))
-	_, err := decodeMap(r)
+	_, err := decodeMap(r, nil)
 	if err == nil {
 		t.Fatal("expected error for truncated key data")
 	}
@@ -717,7 +717,7 @@ func TestDecodeMapTruncatedValLen(t *testing.T) {
 	data = append(data, 'k')            // key
 	// No value length: truncated.
 	r := bufio.NewReader(bytes.NewReader(data))
-	_, err := decodeMap(r)
+	_, err := decodeMap(r, nil)
 	if err == nil {
 		t.Fatal("expected error for truncated value length")
 	}
@@ -731,7 +731,7 @@ func TestDecodeMapTruncatedValData(t *testing.T) {
 	data = binary.AppendVarint(data, 10) // val length = 10
 	data = append(data, 'v')             // only 1 byte of val, need 10
 	r := bufio.NewReader(bytes.NewReader(data))
-	_, err := decodeMap(r)
+	_, err := decodeMap(r, nil)
 	if err == nil {
 		t.Fatal("expected error for truncated value data")
 	}
@@ -1803,7 +1803,7 @@ func TestWithMaxBlockBytes(t *testing.T) {
 func TestDecodeMapOversizedCount(t *testing.T) {
 	var data []byte
 	data = binary.AppendVarint(data, 1<<20+1) // count exceeds limit
-	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)))
+	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)), nil)
 	if err == nil || !strings.Contains(err.Error(), "exceeds safety limit") {
 		t.Fatalf("expected safety limit error, got %v", err)
 	}
@@ -1813,7 +1813,7 @@ func TestDecodeMapOversizedKeyLen(t *testing.T) {
 	var data []byte
 	data = binary.AppendVarint(data, 1)       // 1 entry
 	data = binary.AppendVarint(data, 1<<20+1) // key length too large
-	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)))
+	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)), nil)
 	if err == nil || !strings.Contains(err.Error(), "key length") {
 		t.Fatalf("expected key length error, got %v", err)
 	}
@@ -2741,7 +2741,7 @@ func TestAppendWriterIgnoresHeaderOptions(t *testing.T) {
 func parseBlockCounts(t *testing.T, data []byte) []int64 {
 	t.Helper()
 	br := bufio.NewReader(bytes.NewReader(data))
-	_, _, sync, err := readHeader(br, nil)
+	_, _, sync, err := readHeader(br, nil, nil)
 	if err != nil {
 		t.Fatalf("parse header: %v", err)
 	}

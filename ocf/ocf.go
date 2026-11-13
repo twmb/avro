@@ -84,6 +84,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"math"
 	"reflect"
 	"slices"
@@ -843,8 +844,9 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 			customCodecs = append(customCodecs, o.c)
 		}
 	}
-	br := bufio.NewReader(&checkedReader{r: rws})
-	schema, meta, sync, err := readHeader(br, schemaOpts)
+	src := &checkedReader{r: rws}
+	br := bufio.NewReader(src)
+	schema, meta, sync, err := readHeader(br, src, schemaOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -898,6 +900,16 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 type checkedReader struct {
 	r          io.Reader
 	emptyReads int
+
+	// read counts the bytes r has returned. fileLeft is how many bytes a
+	// regular file had left when read was fileAt, so that left asks a file
+	// once and counts down from the answer, not once per block. fileState
+	// is 0 before we ask, 1 when fileLeft is set, and -1 when r is not a
+	// regular file.
+	read      int64
+	fileLeft  int64
+	fileAt    int64
+	fileState int8
 }
 
 // maxConsecutiveEmptyReads mirrors bufio's bound before it reports
@@ -917,7 +929,36 @@ func (c *checkedReader) Read(p []byte) (int, error) {
 	} else {
 		c.emptyReads = 0
 	}
+	c.read += int64(n)
 	return n, err
+}
+
+// left reports how many bytes r still has to return, when r can say without
+// being read: one with a Len method, as bytes.Reader, bytes.Buffer, and
+// strings.Reader have, or a regular file. We ask a file with Stat and its
+// current offset, neither of which moves it. refresh asks the file again,
+// since a file can grow.
+func (c *checkedReader) left(refresh bool) (int64, bool) {
+	switch src := c.r.(type) {
+	case interface{ Len() int }:
+		return int64(src.Len()), true
+	case interface {
+		io.Seeker
+		Stat() (fs.FileInfo, error)
+	}:
+		if c.fileState == 0 || refresh && c.fileState > 0 {
+			c.fileState = -1
+			if fi, err := src.Stat(); err == nil && fi.Mode().IsRegular() {
+				if off, err := src.Seek(0, io.SeekCurrent); err == nil {
+					c.fileLeft, c.fileAt, c.fileState = fi.Size()-off, c.read, 1
+				}
+			}
+		}
+		if c.fileState > 0 {
+			return c.fileLeft - (c.read - c.fileAt), true
+		}
+	}
+	return 0, false
 }
 
 // writeFull converts an io.Writer contract violation (a nil error with
@@ -941,7 +982,10 @@ func writeFull(w io.Writer, p []byte) error {
 
 // Reader decodes Avro values from an OCF.
 type Reader struct {
-	r               *bufio.Reader
+	r *bufio.Reader
+	// src wraps the caller's reader, which allocDeclared asks how many
+	// bytes it has left. We read only through r.
+	src             *checkedReader
 	schema          *avro.Schema
 	codec           Codec
 	sync            [16]byte
@@ -955,6 +999,32 @@ type Reader struct {
 	// decodeOpts are the caller's [WithDecodeOpts], already stripped of
 	// anything that would alias block.
 	decodeOpts []avro.Opt
+}
+
+// allocDeclared reports whether to allocate a declared size of n bytes in one
+// shot. A caller's reader src that can say how many bytes remain decides: one
+// shot when the bytes are there, incremental when they are not, so a
+// declared-but-absent size costs the bytes that are present. A reader that
+// cannot say is read as it always was, in one shot within
+// ocfEagerBlockAllocLimit.
+//
+// The reader's answer only picks how we read. A reader that answers wrong
+// makes that read allocate more or copy more, and never changes what it
+// returns.
+func allocDeclared(n int64, src *checkedReader, br *bufio.Reader) bool {
+	if src == nil {
+		return n <= ocfEagerBlockAllocLimit
+	}
+	// br holds bytes it has read from src and not yet handed to us.
+	buffered := int64(br.Buffered())
+	left, known := src.left(false)
+	if known && n > left+buffered {
+		left, known = src.left(true)
+	}
+	if known {
+		return n <= left+buffered
+	}
+	return n <= ocfEagerBlockAllocLimit
 }
 
 // noEOF converts a bare io.EOF from a mid-structure read into
@@ -972,7 +1042,7 @@ func noEOF(err error) error {
 // readHeader never returns a bare io.EOF: NewReader has no end-of-stream
 // sentinel, since a stream that ends anywhere inside the header is truncated.
 // We normalize every read error through noEOF, for uniformity with readBlock.
-func readHeader(br *bufio.Reader, schemaOpts []avro.SchemaOpt) (schema *avro.Schema, meta map[string][]byte, sync [16]byte, err error) {
+func readHeader(br *bufio.Reader, src *checkedReader, schemaOpts []avro.SchemaOpt) (schema *avro.Schema, meta map[string][]byte, sync [16]byte, err error) {
 	var m [4]byte
 	if _, err = io.ReadFull(br, m[:]); err != nil {
 		return nil, nil, sync, fmt.Errorf("ocf: reading magic: %w", noEOF(err))
@@ -981,7 +1051,7 @@ func readHeader(br *bufio.Reader, schemaOpts []avro.SchemaOpt) (schema *avro.Sch
 		return nil, nil, sync, fmt.Errorf("ocf: invalid magic %x", m)
 	}
 
-	meta, err = decodeMap(br)
+	meta, err = decodeMap(br, src)
 	if err != nil {
 		// Single normalization chokepoint for every stream read inside
 		// decodeMap (map counts, key/value lengths, key/value bytes).
@@ -1050,8 +1120,9 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 		maxDecompressed = defaultMaxDecompressedBytes
 	}
 
-	br := bufio.NewReader(&checkedReader{r: r})
-	schema, meta, sync, err := readHeader(br, schemaOpts)
+	src := &checkedReader{r: r}
+	br := bufio.NewReader(src)
+	schema, meta, sync, err := readHeader(br, src, schemaOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -1076,6 +1147,7 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 
 	rd := &Reader{
 		r:               br,
+		src:             src,
 		schema:          schema,
 		codec:           codec,
 		sync:            sync,
@@ -1201,12 +1273,11 @@ func (rd *Reader) readBlock() error {
 			return fmt.Errorf("ocf: block size %d exceeds platform max int", size)
 		}
 		// size is the attacker-declared block length, bounded only by
-		// WithMaxBlockBytes. We allocate it up front only within the default
-		// cap, and read incrementally beyond, so a declared-but-absent size
-		// fails after consuming what is there rather than forcing an
-		// allocation up to a raised cap.
+		// WithMaxBlockBytes. Where allocDeclared declines, we read
+		// incrementally, so a declared-but-absent size fails after
+		// consuming what is there rather than forcing an allocation.
 		var compressed []byte
-		if size <= ocfEagerBlockAllocLimit {
+		if allocDeclared(size, rd.src, rd.r) {
 			compressed = make([]byte, int(size))
 			if _, err := io.ReadFull(rd.r, compressed); err != nil {
 				return fmt.Errorf("ocf: reading block data: %w", noEOF(err))
@@ -1600,7 +1671,22 @@ func metadataValueLimit(key string) int64 {
 	return ocfMetadataSafetyLimit
 }
 
-func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
+// readDeclared reads the n bytes a header value declares, as readBlock reads
+// a block.
+func readDeclared(r *bufio.Reader, src *checkedReader, n int64) ([]byte, error) {
+	if allocDeclared(n, src, r) {
+		b := make([]byte, int(n))
+		_, err := io.ReadFull(r, b)
+		return b, err
+	}
+	var buf bytes.Buffer
+	if _, err := io.CopyN(&buf, r, n); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeMap(r *bufio.Reader, src *checkedReader) (map[string][]byte, error) {
 	m := make(map[string][]byte)
 	for {
 		count, err := binary.ReadVarint(r)
@@ -1642,8 +1728,8 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 			if valLen < 0 || valLen > metadataValueLimit(string(key)) {
 				return nil, fmt.Errorf("map value length %d out of range", valLen)
 			}
-			val := make([]byte, int(valLen))
-			if _, err := io.ReadFull(r, val); err != nil {
+			val, err := readDeclared(r, src, valLen)
+			if err != nil {
 				return nil, err
 			}
 			m[string(key)] = val
