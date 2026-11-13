@@ -2704,8 +2704,7 @@ func TestCensus_Q15_RecordKindAgreesWithFieldBinding(t *testing.T) {
 			}
 			s, err := Parse(withFields)
 			if err != nil {
-				t.Logf("kind %q rejects a stray fields attribute (%v) — the exclusivity rule, not this question", cell.kind, err)
-				return
+				t.Fatalf("kind %q must parse with a stray fields attribute: %v", cell.kind, err)
 			}
 			if n := len(s.node.fields); n != 0 {
 				t.Errorf("kind %q is not a record kind but the compiled node bound %d fields", cell.kind, n)
@@ -2924,14 +2923,14 @@ func flatFieldCorpus() []flatFieldCell {
 		{"flat-record", `{"name":"f","type":"record","fields":[{"name":"x","type":"int"}]}`, true, "record"},
 		{"nested-enum-not-flat", `{"name":"f","type":{"type":"enum","name":"E","symbols":["A"]}}`, false, "enum"},
 		{"plain-primitive", `{"name":"f","type":"int"}`, false, "int"},
-		// The discriminator. The lift still fires, since "items" is array's
-		// defining key, and it carries the foreign "symbols" into the lifted
-		// array object, where the per-kind exclusivity rule rejects it. So
-		// the verdict is lift and the outcome is a parse error, the
-		// documented path. A predicate that lifted on any
-		// complex key, or one that declined here, would both look fine
-		// without this cell.
-		{"mismatched-defining-key", `{"name":"f","type":"array","items":"int","symbols":["A"]}`, true, ""},
+		// The lift fires on array's own defining key, and carries the
+		// foreign "symbols" into the lifted array object, where it is inert.
+		{"mismatched-defining-key", `{"name":"f","type":"array","items":"int","symbols":["A"]}`, true, "array"},
+		// The discriminator. Only a foreign defining key is present, so the
+		// verdict is no lift, and "array" is then a type name nothing
+		// defines. A predicate that lifted whenever any complex key was
+		// present would lift here.
+		{"mismatched-key-alone", `{"name":"f","type":"array","symbols":["A"]}`, false, ""},
 	}
 }
 
@@ -2956,7 +2955,7 @@ func TestCensus_Q7_FlatLiftVerdictAgreesWithTheParsedShape(t *testing.T) {
 			s, err := Parse(src)
 			if cell.wantKind == "" {
 				if err == nil {
-					t.Fatalf("Parse(%s) accepted; the lift carries the foreign defining key into the lifted type, where the exclusivity rule must reject it", src)
+					t.Fatalf("Parse(%s) accepted; with no lift the field names a type nothing defines", src)
 				}
 				return
 			}

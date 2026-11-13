@@ -2345,14 +2345,24 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	if canonType == "error" {
 		canonType = "record"
 	}
-	canonObj := &aobject{
-		Type: canonType,
-
-		Fields:  o.Fields,
-		Symbols: o.Symbols,
-		Items:   o.Items,
-		Values:  o.Values,
-		Size:    o.Size,
+	// The canonical object takes only the key its kind binds. Another kind's
+	// key on this object ("size" on an array, say) is inert metadata, as in
+	// Java (SCHEMA_RESERVED) and fastavro. Nothing below builds from a stray
+	// key. Leaving the stray key off here keeps the key, and any type defined
+	// inside the key, out of the canonical form and out of every walk of the
+	// canonical tree. The metadata tree carries the key as written.
+	canonObj := &aobject{Type: canonType}
+	switch canonType {
+	case "record":
+		canonObj.Fields = o.Fields
+	case "enum":
+		canonObj.Symbols = o.Symbols
+	case "array":
+		canonObj.Items = o.Items
+	case "map":
+		canonObj.Values = o.Values
+	case "fixed":
+		canonObj.Size = o.Size
 	}
 	b.canon = aschema{object: canonObj}
 
@@ -2554,29 +2564,12 @@ func (b *builder) buildChild(parentName string, s *aschema, ctxLabel string) (ch
 	return child, isFwdRef, fwdName, nil
 }
 
-// rejectOtherKindKeys errors when o carries a structural key of a kind
-// other than kind: a non-empty fields or symbols, or items, values, or
-// size. kind labels the message; "record" covers "error" too.
-func (o *aobject) rejectOtherKindKeys(kind string) error {
-	if len(o.Fields) > 0 && kind != "record" ||
-		len(o.Symbols) > 0 && kind != "enum" ||
-		o.Items != nil && kind != "array" ||
-		o.Values != nil && kind != "map" ||
-		o.Size != nil && kind != "fixed" {
-		return fmt.Errorf("invalid %s has schema for other types", kind)
-	}
-	return nil
-}
-
 func (b *builder) buildRecord(o *aobject) error {
 	// The field aliases ride on the node; the canonical fields built below
 	// strip them.
 	fieldAliases := make([][]string, len(o.Fields))
 	for i, f := range o.Fields {
 		fieldAliases[i] = f.Aliases
-	}
-	if err := o.rejectOtherKindKeys("record"); err != nil {
-		return err
 	}
 	// The fields attribute is required (Java: "Record has no fields"),
 	// while an *empty* array is the legal empty record. Same
@@ -2766,10 +2759,6 @@ func (b *builder) buildRecord(o *aobject) error {
 }
 
 func (b *builder) buildEnum(o *aobject) error {
-	if err := o.rejectOtherKindKeys("enum"); err != nil {
-		return err
-	}
-
 	// The symbols attribute is required (Java: "Enum has no symbols"), but
 	// an *empty* array is legal: the spec asks only for "a JSON array,
 	// listing symbols", and Java, fastavro and avro-rs all accept zero.
@@ -2828,9 +2817,6 @@ func (b *builder) buildEnum(o *aobject) error {
 }
 
 func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) error {
-	if err := o.rejectOtherKindKeys("array"); err != nil {
-		return err
-	}
 	if o.Items == nil {
 		return errors.New("array is missing items schema")
 	}
@@ -2904,9 +2890,6 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 }
 
 func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) error {
-	if err := o.rejectOtherKindKeys("map"); err != nil {
-		return err
-	}
 	if o.Values == nil {
 		return errors.New("map is missing values schema")
 	}
@@ -2965,9 +2948,6 @@ func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) err
 }
 
 func (b *builder) buildFixed(o *aobject) error {
-	if err := o.rejectOtherKindKeys("fixed"); err != nil {
-		return err
-	}
 	if o.Size == nil {
 		return errors.New("fixed is missing size")
 	}

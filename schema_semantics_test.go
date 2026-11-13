@@ -37,10 +37,10 @@ import (
 // size, fields, order, default, aliases, name, namespace, logicalType, and
 // the enum-level default. Each placement happens at both levels, a type
 // object and a record-field object, and only the placements where the
-// attribute is defined are skipped. Per accepted cell we assert the routing,
-// plus the String() reparse and Root().Schema() rebuild round trips. Wire,
+// attribute is defined are skipped. Per cell we assert the routing, plus the
+// String() reparse and Root().Schema() rebuild round trips. Wire,
 // Canonical(), and Rabin identity with the stray-free twin hold too: a stray
-// attribute must be inert. Reject cells assert their documented policy.
+// attribute must be inert.
 // The fastavro differential arm executes every cell; the cisuite arm drives a
 // representative subset through the Java oracle.
 //
@@ -63,10 +63,10 @@ import (
 //     form strips them. The rebuild emits the defined-placement attributes
 //     plus the Props-routed ones, so the rebuild is canonical-identical, not
 //     text-identical.
-//   - A container kind carrying another container kind's defining structural
-//     key hard-rejects: structural-key exclusivity, the cache/metadata walkers'
-//     kind-keyed soundness premise. fastavro and Java accept these as props,
-//     the documented divergence. A stray "name" or "namespace" there is inert.
+//   - That covers a kind that binds a different structural key: another
+//     kind's defining key on a record, enum, array, map, or fixed is captured
+//     like any other, as fastavro and Java accept it. A stray "name" or
+//     "namespace" there is inert.
 //   - At the field level every non-field-reserved key is a field custom
 //     property as written, and the field's type node stays clean. (The flat
 //     goavro-style lift consumes defining keys only when the field's "type" is
@@ -102,7 +102,6 @@ const (
 	censusSkip     censusVerdict = iota // defined placement, not a stray
 	censusProps                         // accepted; key surfaces in Props
 	censusCaptured                      // accepted; key surfaces on the matching SchemaNode field (or nowhere), never Props
-	censusReject63                      // rejected: structural-key exclusivity
 )
 
 type censusAttr struct {
@@ -137,23 +136,19 @@ func (a censusAttr) propsValue(kind string) any {
 	return a.propsVal
 }
 
-// structuralExclusive returns the #63 verdict table for one structural key:
-// defined on definedKind, captured-dropped on primitives, and rejected on
-// every other container kind.
-func structuralExclusive(definedKinds ...string) func(string) censusVerdict {
+// structuralKeyVerdict returns the verdict table for one structural key:
+// defined on definedKinds, and captured-dropped on every other kind, a
+// primitive or a kind that binds a different key.
+func structuralKeyVerdict(definedKinds ...string) func(string) censusVerdict {
 	defined := map[string]bool{}
 	for _, k := range definedKinds {
 		defined[k] = true
 	}
 	return func(kind string) censusVerdict {
-		switch {
-		case defined[kind]:
+		if defined[kind] {
 			return censusSkip
-		case censusPrimitives[kind]:
-			return censusCaptured
-		default:
-			return censusReject63
 		}
+		return censusCaptured
 	}
 }
 
@@ -175,7 +170,7 @@ func censusAttrs() []censusAttr {
 		},
 		{
 			key: "items", val: constVal(`"long"`),
-			verdict: structuralExclusive("array"), fieldLevel: true, propsVal: "long",
+			verdict: structuralKeyVerdict("array"), fieldLevel: true, propsVal: "long",
 			surfaced: func(t *testing.T, n *avro.SchemaNode, when string) {
 				t.Helper()
 				if n.Items == nil || n.Items.Type != "long" {
@@ -185,7 +180,7 @@ func censusAttrs() []censusAttr {
 		},
 		{
 			key: "values", val: constVal(`"long"`),
-			verdict: structuralExclusive("map"), fieldLevel: true, propsVal: "long",
+			verdict: structuralKeyVerdict("map"), fieldLevel: true, propsVal: "long",
 			surfaced: func(t *testing.T, n *avro.SchemaNode, when string) {
 				t.Helper()
 				if n.Values == nil || n.Values.Type != "long" {
@@ -195,7 +190,7 @@ func censusAttrs() []censusAttr {
 		},
 		{
 			key: "symbols", val: constVal(`["CENSUS"]`),
-			verdict: structuralExclusive("enum"), fieldLevel: true, propsVal: []any{"CENSUS"},
+			verdict: structuralKeyVerdict("enum"), fieldLevel: true, propsVal: []any{"CENSUS"},
 			surfaced: func(t *testing.T, n *avro.SchemaNode, when string) {
 				t.Helper()
 				if !reflect.DeepEqual(n.Symbols, []string{"CENSUS"}) {
@@ -205,7 +200,7 @@ func censusAttrs() []censusAttr {
 		},
 		{
 			key: "size", val: constVal(`4`),
-			verdict: structuralExclusive("fixed"), fieldLevel: true, propsVal: int64(4),
+			verdict: structuralKeyVerdict("fixed"), fieldLevel: true, propsVal: int64(4),
 			surfaced: func(t *testing.T, n *avro.SchemaNode, when string) {
 				t.Helper()
 				if n.Size != 4 {
@@ -215,7 +210,7 @@ func censusAttrs() []censusAttr {
 		},
 		{
 			key: "fields", val: constVal(`[{"name":"cf","type":"int"}]`),
-			verdict: structuralExclusive("record", "error"), fieldLevel: true,
+			verdict: structuralKeyVerdict("record", "error"), fieldLevel: true,
 			propsVal: []any{map[string]any{"name": "cf", "type": "int"}},
 			surfaced: func(t *testing.T, n *avro.SchemaNode, when string) {
 				t.Helper()
@@ -528,16 +523,6 @@ func TestMatrix_AttributePlacementCensus(t *testing.T) {
 				val := attr.val(kind)
 				src := censusTypeSchema(kind, attr.key, val, true)
 				s, err := avro.Parse(src)
-
-				if verdict == censusReject63 {
-					if err == nil {
-						t.Fatalf("Parse(%s) accepted; want the #63 structural-key exclusivity reject", src)
-					}
-					if !strings.Contains(err.Error(), "has schema for other types") {
-						t.Errorf("Parse(%s) rejected with %q; want the #63 exclusivity error", src, err)
-					}
-					return
-				}
 				if err != nil {
 					t.Fatalf("Parse(%s): %v", src, err)
 				}
@@ -704,60 +689,113 @@ func TestMatrix_AttributePlacementNamespaceInert(t *testing.T) {
 	})
 }
 
-// The primitive-object capture-drop family (#63). A named type spelled inside
-// a captured-then-dropped structural subtree ({"type":"int","items":
-// {...record D...}}) is invisible to the parser, so a same-parse reference
-// does not resolve. The walkers agree: the metadata tree surfaces the subtree
-// as-written (Root().Items on the int node). The rebuild collapses it, the
-// SchemaCache walkers never collect D for cross-parse splicing, and
-// walker-parity (the tombstoned B7 rule) holds for the dropped shape.
+// The capture-drop family (#63). A named type spelled inside a structural key
+// that its carrier's kind does not bind ({"type":"int","items":{...record
+// D...}}, or the same "items" on a map) is invisible to the parser, so a
+// same-parse reference does not resolve. The walkers agree: the metadata tree
+// surfaces the subtree as-written, the SchemaCache walkers never collect D
+// for cross-parse splicing, and walker-parity (the tombstoned B7 rule) holds
+// for the dropped shape.
+//
+// The carrier axis is every census kind crossed with every structural key it
+// does not bind and whose body is a schema. A carrier that bound the stray
+// key would define D, and the reference below would resolve.
 func TestMatrix_AttributePlacementDroppedSubtreeAgreement(t *testing.T) {
-	const droppedDef = `{"name":"f","type":{"type":"int","items":
-		{"type":"record","name":"D","fields":[{"name":"d","type":"int"}]}}}`
+	binds := map[string]string{"array": "items", "map": "values", "record": "fields", "error": "fields"}
+	const defD = `{"type":"record","name":"D","fields":[{"name":"d","type":"int"}]}`
+	cells := 0
+	for _, kind := range censusKinds {
+		for _, key := range []string{"items", "values", "fields"} {
+			if binds[kind] == key {
+				continue
+			}
+			body := defD
+			if key == "fields" {
+				body = `[{"name":"x","type":` + defD + `}]`
+			}
+			dropped := `{"name":"f","type":` + censusTypeSchema(kind, key, body, true) + `}`
+			clean := `{"name":"f","type":` + censusTypeSchema(kind, key, body, false) + `}`
+			cells++
+			t.Run(kind+"/"+key, func(t *testing.T) {
+				// The carrier parses, and the stray definition is on no
+				// surface that binds a name.
+				alone := `{"type":"record","name":"Outer","fields":[` + dropped + `]}`
+				s, err := avro.Parse(alone)
+				if err != nil {
+					t.Fatalf("the carrier must parse with the stray key inert: %v", err)
+				}
+				twin := avro.MustParse(`{"type":"record","name":"Outer","fields":[` + clean + `]}`)
+				if !bytes.Equal(s.Canonical(), twin.Canonical()) {
+					t.Errorf("the stray definition reached the canonical form:\n got %s\nwant %s", s.Canonical(), twin.Canonical())
+				}
+				if strings.Contains(string(s.Canonical()), `"D"`) {
+					t.Errorf("the canonical form names the stray definition: %s", s.Canonical())
+				}
+				// The metadata tree is the one surface that carries the
+				// subtree, as written.
+				carrier := s.Root().Fields[0].Type
+				var surfaced *avro.SchemaNode
+				switch key {
+				case "items":
+					surfaced = carrier.Items
+				case "values":
+					surfaced = carrier.Values
+				case "fields":
+					if len(carrier.Fields) == 1 {
+						surfaced = &carrier.Fields[0].Type
+					}
+				}
+				if surfaced == nil || surfaced.Name != "D" {
+					t.Errorf("Root() does not carry the stray %q subtree as written: %+v", key, carrier)
+				}
 
-	t.Run("same-parse-ref-rejects", func(t *testing.T) {
-		src := `{"type":"record","name":"Outer","fields":[` + droppedDef + `,{"name":"g","type":"D"}]}`
-		if _, err := avro.Parse(src); err == nil {
-			t.Fatalf("a definition inside a dropped primitive-object subtree resolved in the parser")
+				// A same-parse reference to D does not resolve.
+				src := `{"type":"record","name":"Outer","fields":[` + dropped + `,{"name":"g","type":"D"}]}`
+				if _, err := avro.Parse(src); err == nil {
+					t.Errorf("a definition inside a dropped subtree resolved in the parser")
+				}
+				// A real D defined after the carrier is the one a
+				// reference binds.
+				real := `{"type":"record","name":"D","fields":[{"name":"real","type":"string"}]}`
+				both, err := avro.Parse(`{"type":"record","name":"Outer","fields":[` + dropped + `,{"name":"g","type":` + real + `},{"name":"h","type":"D"}]}`)
+				if err != nil {
+					t.Fatalf("a real definition after the stray one must parse: %v", err)
+				}
+				bothTwin := avro.MustParse(`{"type":"record","name":"Outer","fields":[` + clean + `,{"name":"g","type":` + real + `},{"name":"h","type":"D"}]}`)
+				if !bytes.Equal(both.Canonical(), bothTwin.Canonical()) {
+					t.Errorf("the stray definition shadowed the real one:\n got %s\nwant %s", both.Canonical(), bothTwin.Canonical())
+				}
+
+				// A cross-parse reference through a SchemaCache does not
+				// resolve either.
+				var cache avro.SchemaCache
+				if _, err := cache.Parse(alone); err != nil {
+					t.Fatalf("cache parse-1: %v", err)
+				}
+				if _, err := cache.Parse(`{"type":"record","name":"O2","fields":[{"name":"g","type":"D"}]}`); err == nil {
+					t.Errorf("a cache walker collected a definition from a dropped subtree")
+				}
+			})
 		}
-	})
-	t.Run("cross-parse-cache-ref-rejects", func(t *testing.T) {
-		var c avro.SchemaCache
-		if _, err := c.Parse(`{"type":"record","name":"Outer","fields":[` + droppedDef + `]}`); err != nil {
-			t.Fatalf("parse-1: %v", err)
-		}
-		if _, err := c.Parse(`{"type":"record","name":"O2","fields":[{"name":"g","type":"D"}]}`); err == nil {
-			t.Fatalf("a cache walker collected a definition from a dropped primitive-object subtree")
-		}
-	})
-	t.Run("fields-arm-agrees", func(t *testing.T) {
-		var c avro.SchemaCache
-		if _, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"f","type":{"type":"boolean","fields":[{"name":"x","type":{"type":"record","name":"D2","fields":[{"name":"d","type":"int"}]}}]}}]}`); err != nil {
-			t.Fatalf("parse-1: %v", err)
-		}
-		if _, err := c.Parse(`{"type":"record","name":"O3","fields":[{"name":"g","type":"D2"}]}`); err == nil {
-			t.Fatalf("a cache walker collected a definition from a dropped fields subtree")
-		}
-	})
+	}
+	// 14 kinds x 3 schema-bodied keys, less the 4 a kind binds.
+	if cells != 38 {
+		t.Fatalf("drove %d cells, want 38: the carrier axis lost a member", cells)
+	}
 }
 
 // TestDifferentialFastavroAttributePlacement executes every census cell
-// against fastavro's parser, which accepts every placement, including the
-// structural-key cells we reject and the name/namespace-on-unnamed cells.
-// That is the #63 documented divergence, asserted here so a fastavro release
-// that starts rejecting flips this calibration loudly. Runs with
-// AVRO_FASTAVRO_PYTHON, like every differential.
+// against fastavro's parser, which accepts every placement, as we do,
+// including another kind's structural key on a container and the
+// name/namespace-on-unnamed cells. Runs with AVRO_FASTAVRO_PYTHON, like every
+// differential.
 func TestDifferentialFastavroAttributePlacement(t *testing.T) {
 	o := startOracle(t)
-	check := func(t *testing.T, src string, twmbRejects bool) {
+	check := func(t *testing.T, src string) {
 		t.Helper()
 		resp := o.call(oracleJob{Op: "parse", Schema: json.RawMessage(src)})
 		if !resp.OK {
-			if twmbRejects {
-				t.Errorf("fastavro now REJECTS a #63 cell it accepted at calibration (%s): %s", src, resp.Err)
-			} else {
-				t.Errorf("fastavro rejected a schema twmb accepts: %s\n%s", resp.Err, src)
-			}
+			t.Errorf("fastavro rejected a schema twmb accepts: %s\n%s", resp.Err, src)
 		}
 	}
 	for _, attr := range censusAttrs() {
@@ -767,7 +805,25 @@ func TestDifferentialFastavroAttributePlacement(t *testing.T) {
 				continue
 			}
 			t.Run("type/"+attr.key+"/"+kind, func(t *testing.T) {
-				check(t, censusTypeSchema(kind, attr.key, attr.val(kind), true), verdict == censusReject63)
+				src := censusTypeSchema(kind, attr.key, attr.val(kind), true)
+				check(t, src)
+				// A structural key on a kind that does not bind it must
+				// be absent from the canonical form, ours and the one
+				// fastavro computes.
+				switch attr.key {
+				case "fields", "items", "values", "symbols", "size":
+					s, err := avro.Parse(src)
+					if err != nil {
+						t.Fatalf("Parse(%s): %v", src, err)
+					}
+					resp := o.call(oracleJob{Op: "canonical", Schema: json.RawMessage(src)})
+					if !resp.OK {
+						t.Fatalf("fastavro canonical failed for %s: %s", src, resp.Err)
+					}
+					if got := string(s.Canonical()); got != resp.Canonical {
+						t.Errorf("canonical form differs from fastavro for %s:\n twmb     %s\n fastavro %s", src, got, resp.Canonical)
+					}
+				}
 			})
 		}
 		if !attr.fieldLevel {
@@ -775,7 +831,7 @@ func TestDifferentialFastavroAttributePlacement(t *testing.T) {
 		}
 		for _, kind := range append(append([]string{}, censusKinds...), "union") {
 			t.Run("field/"+attr.key+"/"+kind, func(t *testing.T) {
-				check(t, censusFieldSchema(kind, attr.key, attr.val(kind), true), false)
+				check(t, censusFieldSchema(kind, attr.key, attr.val(kind), true))
 			})
 		}
 	}
@@ -1022,10 +1078,10 @@ var reservedCellTable = []reservedCellRow{
 	{"fields", "type", "string", "AKKKK-"},
 	{"fields", "type", "record", "RKKRR-"},
 	{"fields", "type", "error", "RKKRR-"},
-	{"fields", "type", "enum", "ARKKK-"},
-	{"fields", "type", "array", "ARKKK-"},
-	{"fields", "type", "map", "ARKKK-"},
-	{"fields", "type", "fixed", "ARKKK-"},
+	{"fields", "type", "enum", "AKKKK-"},
+	{"fields", "type", "array", "AKKKK-"},
+	{"fields", "type", "map", "AKKKK-"},
+	{"fields", "type", "fixed", "AKKKK-"},
 	{"fields", "field", "null", "AKKKK-"},
 	{"fields", "field", "boolean", "AKKKK-"},
 	{"fields", "field", "int", "AKKKK-"},
@@ -1048,12 +1104,12 @@ var reservedCellTable = []reservedCellRow{
 	{"items", "type", "double", "AKKKK-"},
 	{"items", "type", "bytes", "AKKKK-"},
 	{"items", "type", "string", "AKKKK-"},
-	{"items", "type", "record", "ARRKK-"},
-	{"items", "type", "error", "ARRKK-"},
-	{"items", "type", "enum", "ARRKK-"},
+	{"items", "type", "record", "AKKKK-"},
+	{"items", "type", "error", "AKKKK-"},
+	{"items", "type", "enum", "AKKKK-"},
 	{"items", "type", "array", "RKRRR-"},
-	{"items", "type", "map", "ARRKK-"},
-	{"items", "type", "fixed", "ARRKK-"},
+	{"items", "type", "map", "AKKKK-"},
+	{"items", "type", "fixed", "AKKKK-"},
 	{"items", "field", "null", "AKKKK-"},
 	{"items", "field", "boolean", "AKKKK-"},
 	{"items", "field", "int", "AKKKK-"},
@@ -1076,12 +1132,12 @@ var reservedCellTable = []reservedCellRow{
 	{"values", "type", "double", "AKKKK-"},
 	{"values", "type", "bytes", "AKKKK-"},
 	{"values", "type", "string", "AKKKK-"},
-	{"values", "type", "record", "ARRKK-"},
-	{"values", "type", "error", "ARRKK-"},
-	{"values", "type", "enum", "ARRKK-"},
-	{"values", "type", "array", "ARRKK-"},
+	{"values", "type", "record", "AKKKK-"},
+	{"values", "type", "error", "AKKKK-"},
+	{"values", "type", "enum", "AKKKK-"},
+	{"values", "type", "array", "AKKKK-"},
 	{"values", "type", "map", "RKRRR-"},
-	{"values", "type", "fixed", "ARRKK-"},
+	{"values", "type", "fixed", "AKKKK-"},
 	{"values", "field", "null", "AKKKK-"},
 	{"values", "field", "boolean", "AKKKK-"},
 	{"values", "field", "int", "AKKKK-"},
@@ -1104,12 +1160,12 @@ var reservedCellTable = []reservedCellRow{
 	{"symbols", "type", "double", "AKKKK-"},
 	{"symbols", "type", "bytes", "AKKKK-"},
 	{"symbols", "type", "string", "AKKKK-"},
-	{"symbols", "type", "record", "ARKKK-"},
-	{"symbols", "type", "error", "ARKKK-"},
+	{"symbols", "type", "record", "AKKKK-"},
+	{"symbols", "type", "error", "AKKKK-"},
 	{"symbols", "type", "enum", "RKKRR-"},
-	{"symbols", "type", "array", "ARKKK-"},
-	{"symbols", "type", "map", "ARKKK-"},
-	{"symbols", "type", "fixed", "ARKKK-"},
+	{"symbols", "type", "array", "AKKKK-"},
+	{"symbols", "type", "map", "AKKKK-"},
+	{"symbols", "type", "fixed", "AKKKK-"},
 	{"symbols", "field", "null", "AKKKK-"},
 	{"symbols", "field", "boolean", "AKKKK-"},
 	{"symbols", "field", "int", "AKKKK-"},
@@ -1132,11 +1188,11 @@ var reservedCellTable = []reservedCellRow{
 	{"size", "type", "double", "AKKKKK"},
 	{"size", "type", "bytes", "AKKKKK"},
 	{"size", "type", "string", "AKKKKK"},
-	{"size", "type", "record", "ARRKKR"},
-	{"size", "type", "error", "ARRKKR"},
-	{"size", "type", "enum", "ARRKKR"},
-	{"size", "type", "array", "ARRKKR"},
-	{"size", "type", "map", "ARRKKR"},
+	{"size", "type", "record", "AKKKKK"},
+	{"size", "type", "error", "AKKKKK"},
+	{"size", "type", "enum", "AKKKKK"},
+	{"size", "type", "array", "AKKKKK"},
+	{"size", "type", "map", "AKKKKK"},
 	{"size", "type", "fixed", "RKKRRK"},
 	{"size", "field", "null", "AKKKKK"},
 	{"size", "field", "boolean", "AKKKKK"},
@@ -4001,23 +4057,22 @@ func TestMatrix_PrimitiveDocSurvivesEitherWay(t *testing.T) {
 	}
 }
 
-// TestMatrix_StrayZeroBodySurvivesTheRebuild covers the placements no reference
+// TestMatrix_StrayBodySurvivesTheRebuild covers the placements no reference
 // can adjudicate: a structural key written as its destination's zero on a kind
 // that does not bind it. Apache Avro skips every stray key as reserved and keeps
-// none; fastavro keeps every stray key as a property and drops none. Neither is
-// answering the question our metadata tree poses, so our own stray-routing
-// posture governs. That is the same basis the field-lift and consumed-parameter
-// rulings rest on, and the posture says as-written is the key's only surface.
+// none, and fastavro drops a stray structural key from its parsed schema too.
+// Neither is answering the question our metadata tree poses, so our own
+// stray-routing posture governs. That is the same basis the field-lift and
+// consumed-parameter rulings rest on, and the posture says as-written is the
+// key's only surface.
 //
-// Here is the trap, and why each cell asserts the emitted form's round trip
-// rather than only the field's survival. The exclusivity rule is decided on the
-// value, so `symbols:["A"]` on an array rejects while `symbols:[]` is accepted.
-// Preserving the empty body therefore emits a schema whose own re-parse has to
-// be checked. If exclusivity ever became presence-decided, the rebuild would
-// start emitting schemas we reject.
-func TestMatrix_StrayZeroBodySurvivesTheRebuild(t *testing.T) {
+// Each cell asserts the emitted form's round trip rather than only the field's
+// survival: preserving the body emits a schema whose own re-parse has to be
+// checked. The readable cells are the same placements with a body that reads
+// as a real definition, on a kind that binds a different key.
+func TestMatrix_StrayBodySurvivesTheRebuild(t *testing.T) {
 	// Each cell: a kind that does not bind the key, and the key written as
-	// its destination's zero.
+	// its destination's zero or as a readable body.
 	cells := []struct{ name, src, key string }{
 		{"name/int", `{"type":"int","name":""}`, "name"},
 		{"name/array", `{"type":"array","items":"int","name":""}`, "name"},
@@ -4033,6 +4088,33 @@ func TestMatrix_StrayZeroBodySurvivesTheRebuild(t *testing.T) {
 		{"fields/int", `{"type":"int","fields":[]}`, "fields"},
 		{"fields/enum", `{"type":"enum","name":"E","symbols":["A"],"fields":[]}`, "fields"},
 		{"fields/map", `{"type":"map","values":"int","fields":[]}`, "fields"},
+		{"symbols/array/readable", `{"type":"array","items":"int","symbols":["A"]}`, "symbols"},
+		{"symbols/record/readable", `{"type":"record","name":"R","fields":[],"symbols":["A"]}`, "symbols"},
+		{"fields/enum/readable", `{"type":"enum","name":"E","symbols":["A"],"fields":[{"name":"f","type":"int"}]}`, "fields"},
+		{"fields/map/readable", `{"type":"map","values":"int","fields":[{"name":"f","type":"int"}]}`, "fields"},
+		{"size/record/readable", `{"type":"record","name":"R","fields":[],"size":2}`, "size"},
+		{"size/array/readable", `{"type":"array","items":"double","size":3}`, "size"},
+		{"items/fixed/readable", `{"type":"fixed","name":"F","size":4,"items":"long"}`, "items"},
+		{"values/array/readable", `{"type":"array","items":"int","values":"long"}`, "values"},
+	}
+	// The zero and quoted bodies on every kind that binds a different key.
+	strayBinds := map[string]string{"array": "items", "map": "values", "fixed": "size"}
+	for _, kind := range []string{"record", "error", "enum", "array", "map", "fixed"} {
+		for _, stray := range []struct{ key, class, body string }{
+			{"items", "zero", `{}`},
+			{"values", "zero", `{}`},
+			{"size", "zero", `0`},
+			{"size", "quoted", `"2"`},
+		} {
+			if strayBinds[kind] == stray.key {
+				continue
+			}
+			cells = append(cells, struct{ name, src, key string }{
+				stray.key + "/" + kind + "/" + stray.class,
+				censusTypeSchema(kind, stray.key, stray.body, true),
+				stray.key,
+			})
+		}
 	}
 	for _, c := range cells {
 		t.Run(c.name, func(t *testing.T) {
@@ -4076,25 +4158,6 @@ func TestMatrix_StrayZeroBodySurvivesTheRebuild(t *testing.T) {
 					s.Canonical(), twin.Canonical())
 			}
 		})
-	}
-}
-
-// TestMatrix_StrayReadableBodyStillRejectsOnExclusivity is the boundary
-// the preservation above must not cross. A stray defining key that parsed as
-// a real definition still hard-rejects on a kind that binds another one. The
-// exclusivity rule is about a key that defines something, and an empty body
-// defines nothing. That is exactly why the two verdicts differ.
-func TestMatrix_StrayReadableBodyStillRejectsOnExclusivity(t *testing.T) {
-	for _, src := range []string{
-		`{"type":"array","items":"int","symbols":["A"]}`,
-		`{"type":"record","name":"R","fields":[],"symbols":["A"]}`,
-		`{"type":"enum","name":"E","symbols":["A"],"fields":[{"name":"f","type":"int"}]}`,
-		`{"type":"map","values":"int","fields":[{"name":"f","type":"int"}]}`,
-		`{"type":"record","name":"R","fields":[],"size":2}`,
-	} {
-		if _, err := avro.Parse(src); err == nil {
-			t.Errorf("a readable defining key on a kind that binds another one stopped rejecting: %s", src)
-		}
 	}
 }
 
@@ -5396,10 +5459,9 @@ func TestMatrix_NullDecimalParamsRejectedWhereConsumed(t *testing.T) {
 // only surface is Props, as-written. So a null must land there like every
 // other malformed body instead of vanishing from both surfaces.
 //
-// The container and named hosts also exercise the exclusivity rule. That rule
-// rejects a kind carrying another kind's defining key only when that key
-// parsed as a real definition. A body that names no value defines nothing, so
-// it must route like the other malformed bodies rather than trip exclusivity.
+// The container and named hosts take the same routes as the primitive ones:
+// a kind that binds a different key surfaces a readable size as written, and
+// routes an unreadable one to Props.
 func TestMatrix_NullStrayBodyRidesToProps(t *testing.T) {
 	hosts := []struct{ name, src string }{
 		{"int", `{"type":"int","size":null}`},
@@ -5445,26 +5507,15 @@ func TestMatrix_NullStrayBodyRidesToProps(t *testing.T) {
 				t.Errorf("the malformed sibling did not ride to Props: %#v", sib.Root().Props)
 			}
 
-			// The boundary on the other side: a readable size is a real
-			// width. A container or named kind still hard-rejects when it
-			// carries another kind's defining key as a real definition.
-			// Routing the unreadable bodies to Props must not soften that.
+			// The boundary on the other side: a readable size surfaces
+			// as written on the structural field, on every host.
 			readable := strings.Replace(h.src, `"size":null`, `"size":2`, 1)
-			switch h.name {
-			case "int", "string":
-				// A primitive object surfaces a readable stray as-written.
-				ps, err := avro.Parse(readable)
-				if err != nil {
-					t.Fatalf("a readable stray size on a primitive must surface as-written: %v", err)
-				}
-				if ps.Root().Size != 2 {
-					t.Errorf("a readable stray size did not reach the structural field: %d", ps.Root().Size)
-				}
-			default:
-				if _, err := avro.Parse(readable); err == nil {
-					t.Errorf("a readable size on a %s stopped rejecting; the exclusivity rule is "+
-						"about keys that parsed as a real definition", h.name)
-				}
+			ps, err := avro.Parse(readable)
+			if err != nil {
+				t.Fatalf("a readable stray size must surface as-written: %v", err)
+			}
+			if ps.Root().Size != 2 {
+				t.Errorf("a readable stray size did not reach the structural field: %d", ps.Root().Size)
 			}
 		})
 	}
@@ -5582,15 +5633,9 @@ type presenceCell struct {
 	// field. It is false for the two keys a non-binding kind surfaces only
 	// through Props (precision/scale, which have no stray structural route).
 	validStructural bool
-	// validRejects marks the exclusivity cells: a container kind carrying
-	// another kind's defining key rejects when that key parsed as a real
-	// definition. There the readable body is the one that fails, and the
-	// unreadable one rides to Props. Stating it keeps the rule visible
-	// instead of steering the corpus around it.
-	validRejects bool
-	valid        string
-	wrong        string
-	quoted       string // "" when the key's valid body is already a string
+	valid           string
+	wrong           string
+	quoted          string // "" when the key's valid body is already a string
 	// structural reads the destination a readable body lands on, so
 	// "consumed" is measured off the metadata API rather than assumed.
 	structural func(avro.SchemaNode) bool
@@ -5644,7 +5689,7 @@ func presenceCells() []presenceCell {
 		},
 		{
 			key: "size", level: "type", host: pcTypeHost(`{"type":"map","values":"int"%s}`),
-			route: routeProps, validStructural: true, validRejects: true,
+			route: routeProps, validStructural: true,
 			valid: "2", wrong: "[]", quoted: `"2"`,
 			structural: func(n avro.SchemaNode) bool { return pcType(n).Size != 0 },
 			props:      pcFieldTypeProps,
@@ -6016,15 +6061,14 @@ func TestMatrix_ReservedKeyBodyPresence(t *testing.T) {
 			// Non-vacuity: the readable body must reach a different verdict,
 			// or the equality above would hold for an implementation that
 			// treated every body alike.
-			if validOut.rejected != c.validRejects {
-				t.Fatalf("the readable body was %s, want the opposite; this cell tests nothing as written: %s",
-					map[bool]string{true: "rejected", false: "accepted"}[validOut.rejected], validSrc)
+			if validOut.rejected {
+				t.Fatalf("the readable body was rejected; this cell tests nothing as written: %s", validSrc)
 			}
 			if nullOut == validOut {
 				t.Errorf("a null body reached the SAME verdict as the valid body %s; "+
 					"a body that names no value cannot mean the value: %s", c.valid, nullSrc)
 			}
-			if !c.validRejects && validOut.structural != c.validStructural {
+			if validOut.structural != c.validStructural {
 				t.Errorf("a readable body landed structurally = %v, want %v (%s)",
 					validOut.structural, c.validStructural, validSrc)
 			}
