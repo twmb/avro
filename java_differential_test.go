@@ -853,10 +853,10 @@ func TestDifferentialJavaWireLeniencies(t *testing.T) {
 // TestDifferentialJavaAcceptanceAttributePlacement drives a representative
 // subset of the attribute x placement census through the Java oracle. Java
 // accepts every cell. Stray attributes are either reserved-and-ignored via
-// SCHEMA_RESERVED or kept as props, including the structural-key cells twmb
-// rejects as structural-key exclusivity. For every cell twmb also accepts, Java's Parsing
-// Canonical Form must equal twmb's. That proves both strip the stray
-// identically, so the Rabin fingerprints agree. The "error" kind is excluded:
+// SCHEMA_RESERVED or kept as props, including another kind's structural key
+// on a container. For every cell, Java's Parsing Canonical Form must equal
+// twmb's. That proves both strip the stray identically, so the Rabin
+// fingerprints agree. The "error" kind is excluded:
 // standalone error schemas are a protocol-context type in Java's parser, and
 // twmb's record-alias handling for it is pinned against the record twin
 // locally.
@@ -875,9 +875,6 @@ func TestDifferentialJavaAcceptanceAttributePlacement(t *testing.T) {
 				ok, _, canon, errMsg := fpCanon(t, src)
 				if !ok {
 					t.Fatalf("Java rejected the placement (%s): %s", src, errMsg)
-				}
-				if verdict == censusReject63 {
-					return // twmb rejects (documented #63 divergence); nothing to compare
 				}
 				s, err := avro.Parse(src)
 				if err != nil {

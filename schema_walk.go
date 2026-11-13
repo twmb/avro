@@ -75,8 +75,8 @@ type nodeChildVisitor struct {
 // Order is fixed: type, fields in declaration order, items, values. Each
 // container key fires only on the kind that binds it (fields on record/error,
 // items on array, values on map) unless vis.strayKeys opts in. Under the
-// default a node fires at most one of the three; a strayKeys walk of a
-// primitive can fire several.
+// default a node fires at most one of the three; a strayKeys walk can fire
+// several on one node, for each key the node's kind does not bind.
 func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor) {
 	typ, _ := v["type"].(string)
 	if vis.typeValue != nil {
