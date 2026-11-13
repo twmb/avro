@@ -1629,7 +1629,7 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 // deserializers. onBlock fills slots [start, start+n) of v's backing array
 // and returns the advanced src. minItemBytes bounds the block count to
 // len(src)/minItemBytes, as deserArray.deser does, so a hostile float-array
-// stream cannot drive a 4x MakeSlice allocation per wire byte.
+// stream cannot drive a 4x slice allocation per wire byte.
 func udArrayBlocks(
 	src []byte, p unsafe.Pointer, sl *slab,
 	sliceType reflect.Type, minItemBytes int,
