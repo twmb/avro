@@ -9329,9 +9329,10 @@ var foreignBufferDecodeSites = map[string]string{
 
 	"applyFieldDefault: node.deserRecord.fields[idx].fn: enc": "the schema's pre-encoded default; DecodeJSON never sets the alias flag, so this path copies out of it regardless",
 
-	"deserInterface: d.deser: d.encodedDefault": "the schema's pre-encoded default, shared by every decode of this resolution; AliasInput's contract forbids writing to anything a decode returns, which is what makes handing it out sound",
-	"deserMap: d.deser: d.encodedDefault":       "same buffer and same rule as deserInterface",
-	"deserStruct: d.deser: d.encodedDefault":    "same buffer and same rule as deserInterface; a struct target is not a different contract",
+	"deserInterface: d.deser: d.encodedDefault":   "the schema's pre-encoded default, shared by every decode of this resolution; AliasInput's contract forbids writing to anything a decode returns, which is what makes handing it out sound",
+	"deserMap: d.deser: d.encodedDefault":         "same buffer and same rule as deserInterface",
+	"deserStruct: d.deser: d.encodedDefault":      "same buffer and same rule as deserInterface; a struct target is not a different contract",
+	"deserArrayRecord: d.deser: d.encodedDefault": "same buffer and same rule as deserInterface; an ArrayRecord target is not a different contract",
 }
 
 // fallbackImporter tries compiled export data first and re-asks a source

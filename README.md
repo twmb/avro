@@ -91,7 +91,7 @@ All types can decode into `any`.
 | array     | slice or `[N]array` | slice or `[N]array` |
 | map       | `map[string]T` | `map[string]T` |
 | union     | `*T`, tagged-union map, or the matched branch | `*T` or the matched branch |
-| record    | struct or `map[string]any` | struct or `map[string]any` |
+| record    | struct, `map[string]any`, or `ArrayRecord` | struct, `map[string]any`, or `ArrayRecord` |
 
 Shorthands used above:
 `numeric` = `int int8-int64 uint uint8-uint64 float32 float64 json.Number`.
@@ -105,6 +105,12 @@ integers require a whole number in range, and floats round silently. See
 must match: decoding bytes into `[N]byte`, or encoding or decoding any value
 as fixed, requires the byte length to equal N, and `[N]array` requires
 exactly N elements.
+
+An `ArrayRecord` holds a record's values by position, with no names: value
+i belongs to field i, and every field must be present. It is never an array,
+and a plain `[]any` is never a record. Each value in one is an `any`, so a
+record nested inside one decodes as a `map[string]any`, as into any other
+`any`.
 
 Decoding into `any` yields the natural Go type: `int32` and `int64` for int
 and long, `float32` and `float64` for float and double, `[]any` for arrays,

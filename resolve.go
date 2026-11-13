@@ -428,6 +428,16 @@ func (rr *resolvedRecord) buildDeser() deserfn {
 			return rr.deserInterface(src, v, sl)
 		}
 		t := v.Type()
+		if t == arrayRecordType && v.CanAddr() {
+			target := (*ArrayRecord)(v.Addr().UnsafePointer())
+			row := reuseOrMakeArrayRecord(*target, len(rr.readerNames))
+			src, err := rr.deserArrayRecord(src, row, sl)
+			if err != nil {
+				return nil, err
+			}
+			*target = row
+			return src, nil
+		}
 		if k == reflect.Map && t.Key().Kind() == reflect.String {
 			return rr.deserMap(src, v, t, sl)
 		}
@@ -436,6 +446,30 @@ func (rr *resolvedRecord) buildDeser() deserfn {
 		}
 		return nil, &SemanticError{GoType: t, AvroType: "record"}
 	}
+}
+
+// deserArrayRecord decodes into row by the reader schema's field positions:
+// the writer's fields in wire order, then the reader's defaults for the fields
+// the writer lacks. row has one nil slot per reader field.
+func (rr *resolvedRecord) deserArrayRecord(src []byte, row ArrayRecord, sl *slab) ([]byte, error) {
+	var err error
+	for _, op := range rr.wireOps {
+		if op.readerIdx < 0 {
+			if src, err = op.skip(src, sl); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if src, err = op.read(src, reflect.ValueOf(&row[op.readerIdx]).Elem(), sl); err != nil {
+			return nil, recordFieldError(arrayRecordType, rr.readerNames[op.readerIdx], err)
+		}
+	}
+	for _, d := range rr.defaults {
+		if _, err = d.deser(d.encodedDefault, reflect.ValueOf(&row[d.readerIdx]).Elem(), sl); err != nil {
+			return nil, recordFieldError(arrayRecordType, rr.readerNames[d.readerIdx], err)
+		}
+	}
+	return src, nil
 }
 
 func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) ([]byte, error) {

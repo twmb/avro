@@ -146,6 +146,10 @@
 // need it when a writer schema uses a different name for the same type: a
 // legacy schema naming a record "r508" instead of "FieldSummary".
 //
+// An [ArrayRecord] is a record's values with no names: value i belongs to
+// field i. It takes no default fill, since it cannot leave a field out, and
+// it saves a map lookup per field on encode and the map itself on decode.
+//
 // When you encode a map[string]any as a record, we fill missing keys from
 // the schema's defaults. A ["null", T] field with no default has an implicit
 // null default, so a missing key there fills null rather than erroring. The

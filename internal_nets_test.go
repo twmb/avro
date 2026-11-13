@@ -5713,6 +5713,21 @@ func FuzzDecodeEncodeRoundTrip(f *testing.F) {
 		if !fuzzEqual(v1, v2) {
 			t.Fatalf("round-trip mismatch:\n  v1: %#v\n  v2: %#v", v1, v2)
 		}
+
+		// An ArrayRecord is the same record as the map: whatever decodes
+		// into a map decodes into an ArrayRecord, and encodes back to the
+		// bytes the map does. The bytes compare equal because no record in
+		// fuzzSchemas has a map field, whose entries encode in any order.
+		if s.node.kind == "record" {
+			var row ArrayRecord
+			if rem, err := s.Decode(data, &row); err != nil || len(rem) != 0 {
+				t.Fatalf("decode into an ArrayRecord: err=%v, %d trailing bytes", err, len(rem))
+			}
+			byPosition, err := s.Encode(row)
+			if err != nil || !bytes.Equal(byPosition, encoded) {
+				t.Fatalf("an ArrayRecord encodes differently from the map:\n map: %x\n row: %x (err=%v)\n row: %#v", encoded, byPosition, err, row)
+			}
+		}
 	})
 }
 
