@@ -14,6 +14,7 @@ import (
 	"go/types"
 	"math"
 	"math/big"
+	"math/bits"
 	"os"
 	"reflect"
 	"runtime"
@@ -7435,10 +7436,11 @@ func TestMatrix_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
 		// schema-controlled and only validated non-negative, so without the cap
 		// make([]byte, size) here is a parse-time DoS. At 1<<62 a regressed cap
 		// panics immediately with "makeslice: len out of range" (it exceeds the
-		// runtime max alloc).
-		{"fixed", "uuid", 1 << 62, false},
-		{"fixed", "duration", 1 << 62, false},
-		{"fixed", "decimal", 1 << 62, true},
+		// runtime max alloc). The size is written from the int width so the
+		// table compiles where int is 32 bits, and there it is 1<<30.
+		{"fixed", "uuid", 1 << (bits.UintSize - 2), false},
+		{"fixed", "duration", 1 << (bits.UintSize - 2), false},
+		{"fixed", "decimal", 1 << (bits.UintSize - 2), true},
 	}
 	for _, c := range cases {
 		node := &schemaNode{kind: c.kind, logical: c.logical, size: c.size}
