@@ -102,7 +102,8 @@ type Codec interface {
 	// (e.g. "null", "deflate", "snappy", "zstandard").
 	Name() string
 
-	// Compress encodes a raw data block for storage.
+	// Compress encodes a raw data block for storage. You must not retain
+	// src after Compress returns: a Writer reuses it for its next block.
 	Compress(src []byte) ([]byte, error)
 
 	// Decompress decodes a stored data block back to raw bytes.
