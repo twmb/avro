@@ -3688,7 +3688,7 @@ func TestCensus_Q22_MagnitudeConsumersAgreeOnTheCeiling(t *testing.T) {
 	const maxInt = int(^uint(0) >> 1)
 	corpus := []int{0, 1, 2, 12, 16, 8192, decimalScaleLimit, decimalScaleLimit + 1,
 		maxSchemaMagnitude - 1, maxSchemaMagnitude, maxSchemaMagnitude + 1,
-		1 << 40, maxInt - 1, maxInt}
+		min(1<<40, math.MaxInt>>1), maxInt - 1, maxInt}
 
 	prevCapacity := -1
 	for _, size := range corpus {
@@ -4752,7 +4752,7 @@ func TestDoSBattery_C11_SchemaDeclaredMagnitude(t *testing.T) {
 	for _, sh := range shapes {
 		// Parse must accept these: an open upper bound is the documented
 		// posture, so rejecting here would be the other kind of bug.
-		s, err := Parse(sh.schema)
+		s, err := Parse(maxIntSchema(sh.schema))
 		if err != nil {
 			t.Errorf("%s: parse rejected a schema the open-size posture accepts: %v", sh.name, err)
 			continue

@@ -6501,14 +6501,18 @@ var narrowEncodeRows = []struct {
 
 func intOverflowProbe() any {
 	if math.MaxInt > math.MaxInt32 {
-		return int(math.MaxInt32) + 1
+		// The sum is computed at run time: as a constant it overflows a
+		// 32-bit int, and the compiler checks it in this dead branch too.
+		v := int(math.MaxInt32)
+		return v + 1
 	}
 	return nil
 }
 
 func intUnderflowProbe() any {
 	if math.MinInt < math.MinInt32 {
-		return int(math.MinInt32) - 1
+		v := int(math.MinInt32)
+		return v - 1
 	}
 	return nil
 }
@@ -13467,28 +13471,36 @@ func TestMatrix_TypedContainersPerFragment(t *testing.T) {
 // source-derived site registry at the bottom keep the class closed.
 // ---------------------------------------------------------------------------
 
+// maxIntSchema rewrites the largest int64 in a schema's text to the largest
+// int of this build. The shapes below write a fixed size at the top of the
+// integer range, and that size has to parse where int is 32 bits and still be
+// the top of the range there. On a 64-bit build the text is unchanged.
+func maxIntSchema(schema string) string {
+	return strings.ReplaceAll(schema, "9223372036854775807", strconv.Itoa(math.MaxInt))
+}
+
 // The three shapes a derived per-item minimum can take when the arithmetic
 // carrying it has no ceiling. Named for what the arithmetic does, not for the
 // schema, because the schema is only the vehicle.
-const (
+var (
 	// sumWrapsToZero: 1 (the long) + MaxInt64 wraps to MinInt64, and
 	// MinInt64 + MaxInt64 lands on exactly -1. A map's per-entry minimum is
 	// 1 + that, i.e. zero, and the block bound divides by it.
-	sumWrapsToZero = `{"type":"record","name":"WZ","fields":[
+	sumWrapsToZero = maxIntSchema(`{"type":"record","name":"WZ","fields":[
 		{"name":"lead","type":"long"},
 		{"name":"a","type":` + `{"type":"fixed","name":"WZA","size":9223372036854775807}` + `},
-		{"name":"b","type":` + `{"type":"fixed","name":"WZB","size":9223372036854775807}` + `}]}`
+		{"name":"b","type":` + `{"type":"fixed","name":"WZB","size":9223372036854775807}` + `}]}`)
 
 	// sumWrapsNegative: the union contributes 1, then one MaxInt64 field
 	// carries the sum to MinInt64, and it stays there.
-	sumWrapsNegative = `{"type":"record","name":"WN","fields":[
+	sumWrapsNegative = maxIntSchema(`{"type":"record","name":"WN","fields":[
 		{"name":"u","type":[` + `{"type":"fixed","name":"WNU","size":9223372036854775807}` + `]},
-		{"name":"a","type":` + `{"type":"fixed","name":"WNA","size":9223372036854775807}` + `}]}`
+		{"name":"a","type":` + `{"type":"fixed","name":"WNA","size":9223372036854775807}` + `}]}`)
 
 	// magnitudeAlone: no sum at all. The caller's own `1 + minimum` is what
 	// wraps, which is why a ceiling inside the producer is the fix and a
 	// guard at one consumer is not.
-	magnitudeAlone = `{"type":"fixed","name":"MA","size":9223372036854775807}`
+	magnitudeAlone = maxIntSchema(`{"type":"fixed","name":"MA","size":9223372036854775807}`)
 )
 
 // wrapShapes are the value schemas whose derived minimum the arithmetic must

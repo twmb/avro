@@ -7222,6 +7222,9 @@ func TestSchemaCacheDiamondFixed(t *testing.T) {
 func TestSchemaCacheDedupPreservesLargeNumbers(t *testing.T) {
 	// Verify that JSON normalization preserves large integers exactly,
 	// so two schemas with the same large "size" value dedup correctly.
+	if strconv.IntSize < 64 {
+		t.Skip("a fixed size above 2^53 does not fit a 32-bit int")
+	}
 	cache := &SchemaCache{}
 
 	schema1 := `{"type":"fixed","name":"Big","size":9007199254740993}`
