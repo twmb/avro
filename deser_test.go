@@ -3556,26 +3556,6 @@ func TestDurationSchemaValidation(t *testing.T) {
 	}
 }
 
-// ---- Decimal logical type (bytes) ----
-
-// ---- Decimal logical type (fixed) ----
-
-// ---- Duration/Decimal: fallback to raw byte types ----
-
-// ---- Duration in record as [12]byte triggers unsafe fallback ----
-
-// ---- Decimal: appendBigIntBytes edge cases ----
-
-// ---- Decimal: interface deserialization ----
-
-// ---- Decimal: type mismatch error ----
-
-// ---- Bytes decimal: truncated varint ----
-
-// ---- Decimal: empty bytes (zero length), bytesToBigInt empty ----
-
-// ---- Fixed decimal: negative sign extension padding (ser) ----
-
 // ---- Nil pointer errors for duration/decimal ser ----
 
 func TestDurationSerNilPointer(t *testing.T) {

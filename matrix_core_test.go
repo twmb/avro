@@ -2386,6 +2386,18 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 						if (jsonErr == nil) != accept {
 							t.Fatalf("JSON encode accept=%v, want %v (err=%v)", jsonErr == nil, accept, jsonErr)
 						}
+						// A chain past the cap is refused for the same reason on
+						// both wires, and errors.As gives one verdict for both.
+						if !accept {
+							var bse, jse *avro.SemanticError
+							if errors.As(binErr, &bse) != errors.As(jsonErr, &jse) {
+								t.Errorf("past the cap, the wires disagree on *SemanticError:\n binary: %v\n JSON:   %v", binErr, jsonErr)
+							}
+							const deep = "nests deeper than supported"
+							if !strings.Contains(binErr.Error(), deep) || !strings.Contains(jsonErr.Error(), deep) {
+								t.Errorf("past the cap, want both wires to say %q:\n binary: %v\n JSON:   %v", deep, binErr, jsonErr)
+							}
+						}
 						// An accepted deep input encodes to the same bytes as the
 						// bare base: pointer wrapping is transparent on the wire.
 						if accept {
@@ -2767,6 +2779,24 @@ func TestMatrix_NullUnionNilEquivalenceParity(t *testing.T) {
 		name string
 		run  func(t *testing.T)
 	}{
+		// ----- the null schema: a nil pointer at the last layer we follow -----
+		{"null-schema/nil-at-the-cap", func(t *testing.T) {
+			v := reflect.Zero(reflect.TypeFor[*int32]())
+			for range ptrIndirectCap {
+				p := reflect.New(v.Type())
+				p.Elem().Set(v)
+				v = p
+			}
+			s := avro.MustParse(`"null"`)
+			bin, berr := s.Encode(v.Interface())
+			js, jerr := s.EncodeJSON(v.Interface())
+			if berr != nil || len(bin) != 0 {
+				t.Errorf("binary: wire %x, err %v, want null", bin, berr)
+			}
+			if jerr != nil || string(js) != "null" {
+				t.Errorf("JSON: %s, err %v, want null", js, jerr)
+			}
+		}},
 		// ----- field context: *Inner, slice base, both positions -----
 		{"field/slice/null-first/nil", func(t *testing.T) {
 			var x []string

@@ -356,9 +356,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		}
 	}
 	// We dereference pointers and interfaces, capped at maxIndirectDepth
-	// so a self-referential interface (var p any; p = &p) terminates. The
-	// deeply-wrapped value falls through to the type switch, which returns
-	// a SemanticError for the unmatched kind.
+	// so a self-referential interface (var p any; p = &p) terminates.
 	for range maxIndirectDepth {
 		if v.Kind() != reflect.Pointer && v.Kind() != reflect.Interface {
 			break
@@ -374,6 +372,13 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			return nil, errIndirectNil
 		}
 		v = v.Elem()
+	}
+	// A value still behind a pointer or interface is past the depth we
+	// follow, and gets the plain sentinel indirect returns for it on the
+	// binary wire. The "null" schema decides for itself below, as serNull
+	// does: a nil pointer at this layer is still null.
+	if k := v.Kind(); node.kind != "null" && (k == reflect.Pointer || k == reflect.Interface) {
+		return nil, errIndirectDeep
 	}
 
 	switch node.kind {
