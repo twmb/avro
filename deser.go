@@ -1278,6 +1278,17 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	// For interface targets with primitive avro items, use the iface
 	// fast loop that operates directly on []any.
 	useFastIface := iface && s.fastIfaceLoop != nil
+	// For a slice of any, stale is how many slots at the front of v's backing
+	// array a previous decode into v may have filled. We set each such slot
+	// to nil before we decode into it. Otherwise we would decode into the
+	// map or the pointer the slot has, and a value you took out of the slice
+	// after the previous decode would change. A slot past stale is new
+	// capacity from Grow, and Grow zeros new capacity. An element of any
+	// other type is decoded in place.
+	var stale int
+	if !iface && sliceType.Elem() == anyType {
+		stale = v.Cap()
+	}
 	// Avro arrays are encoded as a series of blocks. Each block starts
 	// with a count. Positive means N elements follow, zero means end of
 	// array. Negative means |N| elements follow, and the next varint is
@@ -1330,6 +1341,9 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 				sliceVal.Grow(n)
 			}
 			sliceVal.SetLen(newLen)
+			if start < stale {
+				zeroStale(sliceVal, start, min(newLen, stale))
+			}
 		}
 		if useFastNative {
 			handled, rest, nerr := s.nativeLoop(sliceVal, src, start, n, sl)
@@ -1372,8 +1386,8 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			// non-nil retained pointer, so an element aliased from a prior
 			// decode is updated in place. That matches the unsafe struct-field
 			// path (udArrayPtrRecord) and the documented pointer-reuse
-			// contract. On a freshly grown slice the new slots are nil, so
-			// they all get fresh backing.
+			// contract. A slice that grows keeps the pointers it had, since
+			// Grow copies them, so only the new slots get fresh backing.
 			var need int
 			for i := range n {
 				if sliceVal.Index(start + i).IsNil() {
@@ -1398,6 +1412,22 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 				return nil, err
 			}
 		}
+	}
+}
+
+// zeroStale zeros slots [start, end) of the slice v, whose length is at least
+// end.
+func zeroStale(v reflect.Value, start, end int) {
+	if start == 0 {
+		// Clear zeros a slice through its length, in one pass.
+		n := v.Len()
+		v.SetLen(end)
+		v.Clear()
+		v.SetLen(n)
+		return
+	}
+	for i := start; i < end; i++ {
+		v.Index(i).SetZero()
 	}
 }
 

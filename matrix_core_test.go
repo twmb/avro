@@ -252,7 +252,7 @@ func matFrags() []frag {
 			schema: func(u *uniq) string {
 				return fmt.Sprintf(`{"type":"record","name":%q,"fields":[{"name":"x","type":"int"},{"name":"y","type":"string"}]}`, u.name("Rec"))
 			},
-			values: []any{map[string]any{"x": int32(7), "y": "v"}}},
+			values: []any{map[string]any{"x": int32(7), "y": "v"}, map[string]any{"x": int32(-3), "y": ""}}},
 		{label: "rec0", kind: "record",
 			schema: func(u *uniq) string {
 				return fmt.Sprintf(`{"type":"record","name":%q,"fields":[]}`, u.name("Empty"))
@@ -12143,7 +12143,9 @@ func TestDifferentialFastavroResolvedJSONUnion(t *testing.T) {
 // matrix core always decodes into fresh targets. The reuse semantics have
 // their own documented contracts, and historically their own bugs. Map targets
 // retain non-schema keys while schema fields overwrite (encoding/json parity),
-// slices are rewritten to exactly the new length, and pointers are reused.
+// slices are rewritten to exactly the new length, and pointers are reused. An
+// any element of a slice is the exception: the element starts from nil, so a
+// value you took out of the slice survives the next decode.
 // Every fragment kind drives a decode-twice cycle on the same target, on both
 // wire formats.
 // ---------------------------------------------------------------------------
@@ -12217,6 +12219,57 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 			if !matEqual(jm["f"], want2.(map[string]any)["f"]) {
 				t.Fatalf("JSON reuse field stale: %#v", jm["f"])
 			}
+
+			// A value you take out of a []any survives the next decode into
+			// the same slice, whether the next array fits the slice or
+			// outgrows it. A record with one array field has the array's
+			// own wire.
+			arr := avro.MustParse(fmt.Sprintf(`{"type":"array","items":%s}`, fr.schema(&uniq{})))
+			holder := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"ReuseHolder","fields":[{"name":"f","type":%s}]}`, arr.String()))
+			first, err := arr.AppendEncode(nil, []any{fr.values[0], fr.values[0]})
+			if err != nil {
+				t.Fatalf("encode first array: %v", err)
+			}
+			var wantKept []any
+			if _, err := arr.Decode(first, &wantKept); err != nil {
+				t.Fatalf("fresh decode of the first array: %v", err)
+			}
+			for _, n := range []int{1, 3} {
+				second, err := arr.AppendEncode(nil, slices.Repeat([]any{fr.values[1]}, n))
+				if err != nil {
+					t.Fatalf("encode second array: %v", err)
+				}
+				var want []any
+				if _, err := arr.Decode(second, &want); err != nil {
+					t.Fatalf("fresh decode of the second array: %v", err)
+				}
+				var top []any
+				var field struct {
+					F []any `avro:"f"`
+				}
+				for name, target := range map[string]struct {
+					schema *avro.Schema
+					ptr    any
+					elems  *[]any
+				}{
+					"slice":        {arr, &top, &top},
+					"struct field": {holder, &field, &field.F},
+				} {
+					if _, err := target.schema.Decode(first, target.ptr); err != nil {
+						t.Fatalf("%s: first decode: %v", name, err)
+					}
+					kept := slices.Clone(*target.elems)
+					if _, err := target.schema.Decode(second, target.ptr); err != nil {
+						t.Fatalf("%s: second decode of %d: %v", name, n, err)
+					}
+					if !matEqual(kept, wantKept) {
+						t.Errorf("%s: the second decode of %d wrote a value taken from the first:\n got=%#v\nwant=%#v", name, n, kept, wantKept)
+					}
+					if !matEqual(*target.elems, want) {
+						t.Errorf("%s: second decode of %d into the used slice:\n got=%#v\nwant=%#v", name, n, *target.elems, want)
+					}
+				}
+			}
 		})
 	}
 }
@@ -12259,6 +12312,16 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 		}
 		if target[0] != nil || target[1] == nil || *target[1] != 7 || target[2] != nil {
 			t.Fatalf("pointer-slice reuse wrong: %v", target)
+		}
+		// A slice that grows keeps the pointers it had, as a slice that
+		// fits does.
+		kept := target[1]
+		w3, _ := s.AppendEncode(nil, []any{nil, int32(8), nil, nil, int32(9)})
+		if _, err := s.Decode(w3, &target); err != nil {
+			t.Fatalf("decode #3 into a []*int32 that must grow: %v", err)
+		}
+		if target[1] != kept || *kept != 8 || *target[4] != 9 {
+			t.Fatalf("pointer-slice regrow: kept pointer reused=%v, reads %d; target[4]=%d", target[1] == kept, *kept, *target[4])
 		}
 	})
 	t.Run("typed-map-accumulates", func(t *testing.T) {
