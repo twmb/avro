@@ -106,11 +106,11 @@ must match: decoding bytes into `[N]byte`, or encoding or decoding any value
 as fixed, requires the byte length to equal N, and `[N]array` requires
 exactly N elements.
 
-An `ArrayRecord` holds a record's values by position, with no names: value
-i belongs to field i, and every field must be present. It is never an array,
-and a plain `[]any` is never a record. Each value in one is an `any`, so a
-record nested inside one decodes as a `map[string]any`, as into any other
-`any`.
+An `ArrayRecord` is a record's field values as a `[]any`: the slice index
+corresponds to the field index in the schema. `Encode` does not support schema
+defaults for an `ArrayRecord`, and instead returns an error if a value is nil
+(unless the field is a union with null). `Encode` also returns an error if the
+slice length is not the number of fields.
 
 Decoding into `any` yields the natural Go type: `int32` and `int64` for int
 and long, `float32` and `float64` for float and double, `[]any` for arrays,

@@ -1082,25 +1082,28 @@ func (s *serRecord) loadOrCompileFast(t reflect.Type) *fastRecordSer {
 	return actual.(*fastRecordSer)
 }
 
-// ArrayRecord holds the values of a record's fields in the order the schema
-// declares them: value i belongs to field i, every field must be present, and
-// a nil value is null. We encode it, and decode into it, wherever the schema
-// has a record.
+// ArrayRecord is a record's field values as a []any. The slice index
+// corresponds to the field index in the schema. You can pass an ArrayRecord
+// to [Schema.Encode] and [Schema.EncodeJSON], and you can decode into an
+// ArrayRecord with [Schema.Decode] and [Schema.DecodeJSON]. The value for a
+// nested record can be an ArrayRecord as well.
 //
-// Each value is an any and is treated as any other any: on encode it is
-// whatever its field accepts, and on decode a record inside an ArrayRecord is
-// a map[string]any. In a union it is the first record branch its values fit,
-// as a map is; a tagged union map names a branch.
+// Encode does not support schema defaults for an ArrayRecord, and instead
+// returns an error if a value is nil (unless the field is a union with
+// null). Encode also returns an error if the slice length is not the number
+// of fields.
 //
-// An ArrayRecord is not an array: we refuse it wherever the schema has an
-// array. Where the schema has a null, a nil ArrayRecord is null and an empty
-// one is a record with no fields.
+// For a union of null and a record, a nil ArrayRecord is the null and a
+// non-nil ArrayRecord is the record, on encode and on decode.
+//
+// Encode and Decode return an error for an ArrayRecord where the schema has
+// an array.
 type ArrayRecord []any
 
 var arrayRecordType = reflect.TypeFor[ArrayRecord]()
 
-// arrayRecordOf returns the ArrayRecord v holds, and reads an addressable one
-// in place rather than through v.Interface, which would copy it to the heap.
+// arrayRecordOf returns v as an ArrayRecord. We read an addressable v in
+// place, because v.Interface would copy the slice header to the heap.
 func arrayRecordOf(v reflect.Value) ArrayRecord {
 	if v.CanAddr() {
 		return *(*ArrayRecord)(unsafe.Pointer(v.UnsafeAddr()))

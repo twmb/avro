@@ -193,7 +193,7 @@ func (sl *slab) put() {
 //   - map: map[string]T, any
 //   - union: any, *T (for ["null", T] unions), or the matched branch type
 //   - record: struct (matched by field name or `avro` tag), map[string]any,
-//     [ArrayRecord] (matched by position), any
+//     [ArrayRecord] (matched by slice index), any
 //
 // When decoding into *any, primitive types become nil, bool, int32, int64,
 // float32, float64, string, []byte, []any, or map[string]any (for records).

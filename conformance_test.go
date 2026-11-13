@@ -17185,9 +17185,10 @@ func ExampleSchema_AppendEncode() {
 	// encoded "world": 6 bytes
 }
 
-// An ArrayRecord holds a record's values by position, with no field names:
-// value i belongs to field i. It saves a map per record and a map lookup per
-// field for a caller that already has its values in schema order.
+// An ArrayRecord is a record's field values as a []any: the slice index
+// corresponds to the field index in the schema. Use an ArrayRecord when you
+// have a record's values in field order and do not want to build a
+// map[string]any for every record.
 func ExampleArrayRecord() {
 	schema := avro.MustParse(`{
 		"type": "record",
@@ -17199,24 +17200,26 @@ func ExampleArrayRecord() {
 		]
 	}`)
 
-	// Every field is present, in the schema's order. A nil is null.
+	// One value per field, in the schema's field order. The nil encodes as
+	// null, because the note field is a union with null.
 	row := avro.ArrayRecord{int64(7), "paid", nil}
 	wire, err := schema.Encode(row)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// The same bytes decode by position or by name.
-	var byPosition avro.ArrayRecord
-	if _, err := schema.Decode(wire, &byPosition); err != nil {
+	// You can decode the same bytes into an ArrayRecord or into a
+	// map[string]any.
+	var gotRow avro.ArrayRecord
+	if _, err := schema.Decode(wire, &gotRow); err != nil {
 		log.Fatal(err)
 	}
-	var byName map[string]any
-	if _, err := schema.Decode(wire, &byName); err != nil {
+	var gotMap map[string]any
+	if _, err := schema.Decode(wire, &gotMap); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(byPosition[0], byPosition[1], byPosition[2])
-	fmt.Println(byName["id"], byName["status"], byName["note"])
+	fmt.Println(gotRow[0], gotRow[1], gotRow[2])
+	fmt.Println(gotMap["id"], gotMap["status"], gotMap["note"])
 	// Output:
 	// 7 paid <nil>
 	// 7 paid <nil>
