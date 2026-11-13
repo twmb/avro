@@ -2870,6 +2870,117 @@ func TestWriterBlockFramingContract(t *testing.T) {
 		data := framingFile(t, []WriterOpt{WithBlockBytes(0)}, func(w *Writer) { encodeN(t, w, 4) })
 		wantCounts(t, data, 4) // default 64KiB cap, not seal-per-datum
 	})
+	t.Run("block-buffer-sized-from-its-datums", func(t *testing.T) {
+		// A block's buffer gets to its size in a few moves, never has room
+		// for more than four times what the block holds, and ends within an
+		// eighth of the block. append alone moves it about thirty times.
+		datum := append([]byte{0x90, 0x03}, bytes.Repeat([]byte("ab"), 100)...) // a 200-byte "bytes"
+		schema := avro.MustParse(`"bytes"`)
+		adds := map[string]func(w *Writer) error{
+			"Write":  func(w *Writer) error { _, err := w.Write(datum); return err },
+			"Encode": func(w *Writer) error { return w.Encode(datum[2:]) },
+		}
+		for _, c := range []struct {
+			name  string
+			opts  []WriterOpt
+			block int // the bytes a full block holds
+		}{
+			{"by count", []WriterOpt{WithBlockCount(2000), WithBlockBytes(1 << 26)}, 2000 * len(datum)},
+			{"by bytes", []WriterOpt{WithBlockBytes(400_000)}, 400_000},
+		} {
+			for how, add := range adds {
+				w := mustNewWriter(t, io.Discard, schema, c.opts...)
+				moves, last := 0, cap(w.buf)
+				for len(w.buf)+2*len(datum) < c.block { // stop short of a flush
+					if err := add(w); err != nil {
+						t.Fatalf("%s: %v", how, err)
+					}
+					if cap(w.buf) != last {
+						moves, last = moves+1, cap(w.buf)
+					}
+					if len(w.buf) > 4096 && cap(w.buf) > 4*len(w.buf) {
+						t.Fatalf("%s, %s: room for %d bytes with %d written", how, c.name, cap(w.buf), len(w.buf))
+					}
+				}
+				if moves > 12 {
+					t.Errorf("%s, %s: the block buffer moved %d times on the way to %d bytes", how, c.name, moves, len(w.buf))
+				}
+				if most := c.block + c.block/8 + len(datum); cap(w.buf) > most {
+					t.Errorf("%s, %s: room for %d bytes for a block of %d", how, c.name, cap(w.buf), c.block)
+				}
+				mustClose(t, w)
+			}
+		}
+		// A datum larger than a whole block gets no buffer from the
+		// prediction, which would be too small for it; append sizes that one.
+		w := mustNewWriter(t, io.Discard, schema, WithBlockBytes(1000))
+		w.reserve(5000)
+		if c := cap(w.buf); c != 0 && c < 5000 {
+			t.Errorf("a 5000 byte datum got a buffer of %d bytes, which it cannot fit", c)
+		}
+		mustClose(t, w)
+	})
+	t.Run("one-allocation-per-block", func(t *testing.T) {
+		// A block costs one allocation: the slice that holds its header,
+		// data, and sync marker. The null codec copies into it and zstd
+		// compresses into it, sized by the block before or, for a writer's
+		// first block, by the uncompressed data.
+		datum := append([]byte{0x90, 0x03}, bytes.Repeat([]byte("ab"), 100)...) // a 200-byte "bytes"
+		shared := MustZstdCodec(nil, nil)
+		defer shared.Close()
+		makers := append(ocfCodecMakers(), struct {
+			name string
+			mk   func(t *testing.T) Codec
+		}{"zstandard under NopCloser", func(*testing.T) Codec { return NopCloser(shared) }})
+		for _, cm := range makers {
+			if cm.name == "deflate" || cm.name == "snappy" {
+				continue // their Compress allocates more of its own
+			}
+			schema := avro.MustParse(`"bytes"`)
+			fill := func(w *Writer, n int) {
+				for range n {
+					if _, err := w.Write(datum); err != nil {
+						t.Fatalf("Write: %v", err)
+					}
+				}
+			}
+			// Six writers, each one datum short of its first block, so each
+			// measured run flushes a first block.
+			fresh := make([]*Writer, 6)
+			for i := range fresh {
+				fresh[i] = mustNewWriter(t, io.Discard, schema, WithCodec(cm.mk(t)), WithBlockCount(100))
+				fill(fresh[i], 99)
+			}
+			// A zstd codec of a writer's own builds its encoder state on
+			// first use, so only the shared one shows the first block alone.
+			next := 0
+			first := testing.AllocsPerRun(len(fresh)-1, func() { fill(fresh[next], 1); next++ })
+			if cm.name != "zstandard" && first != 1 {
+				t.Errorf("%s: a writer's first block allocates %.0f times, want 1", cm.name, first)
+			}
+			w := fresh[0]
+			fill(w, 100)
+			if n := testing.AllocsPerRun(10, func() { fill(w, 100) }); n != 1 {
+				t.Errorf("%s: a block allocates %.0f times, want 1", cm.name, n)
+			}
+			for _, w := range fresh {
+				mustClose(t, w)
+			}
+			// After its first block, a zstd writer sizes a block by the data
+			// of the one before, not by the uncompressed block, which for
+			// this datum is over a hundred times larger.
+			if cm.name != "null" {
+				var dst keepWriter
+				w := mustNewWriter(t, &dst, schema, WithCodec(cm.mk(t)), WithBlockCount(100))
+				fill(w, 300)
+				mustClose(t, w)
+				last := dst.parts[len(dst.parts)-1]
+				if uncompressed := 100 * len(datum); cap(last) > uncompressed/2 {
+					t.Errorf("%s: the third block's slice has room for %d bytes, for %d written and %d uncompressed", cm.name, cap(last), len(last), uncompressed)
+				}
+			}
+		}
+	})
 }
 
 // The append writer honors the same sizing options and normalizations for
@@ -6639,6 +6750,8 @@ func ocfCodecMakers() []struct {
 		name string
 		mk   func(t *testing.T) Codec
 	}{
+		// A nil offer is no codec, which leaves the null codec in place.
+		{"null", func(*testing.T) Codec { return nil }},
 		{"deflate", func(*testing.T) Codec { return DeflateCodec(5) }},
 		{"snappy", func(*testing.T) Codec { return SnappyCodec() }},
 		{"zstandard", func(t *testing.T) Codec {
@@ -6649,6 +6762,17 @@ func ocfCodecMakers() []struct {
 			return z
 		}},
 	}
+}
+
+// keepWriter keeps each slice it is handed without copying it, which io.Writer
+// forbids. The Writer builds every block in a slice of its own, so the kept
+// slices still hold the file; a Writer that reused one buffer across blocks
+// would leave every kept block holding the last.
+type keepWriter struct{ parts [][]byte }
+
+func (k *keepWriter) Write(p []byte) (int, error) {
+	k.parts = append(k.parts, p)
+	return len(p), nil
 }
 
 func TestMatrixOCF_CodecsAndBlocks(t *testing.T) {
@@ -6672,9 +6796,9 @@ func TestMatrixOCF_CodecsAndBlocks(t *testing.T) {
 		}
 		for _, cm := range ocfCodecMakers() {
 			t.Run(fr.label+"/"+cm.name, func(t *testing.T) {
-				var buf bytes.Buffer
+				var dst keepWriter
 				// Tiny block count forces multiple blocks per file.
-				w := mustNewWriter(t, &buf, schema, WithCodec(cm.mk(t)), WithBlockCount(2))
+				w := mustNewWriter(t, &dst, schema, WithCodec(cm.mk(t)), WithBlockCount(2))
 				for r := 0; r < rounds; r++ {
 					for _, v := range fr.values {
 						if err := w.Encode(v); err != nil {
@@ -6683,8 +6807,11 @@ func TestMatrixOCF_CodecsAndBlocks(t *testing.T) {
 					}
 				}
 				mustClose(t, w)
+				if len(dst.parts) < 3 { // the header and at least two blocks
+					t.Fatalf("file arrived in %d writes, want the header and several blocks", len(dst.parts))
+				}
 
-				r := mustNewReader(t, bytes.NewReader(buf.Bytes()), WithCodec(cm.mk(t)))
+				r := mustNewReader(t, bytes.NewReader(bytes.Join(dst.parts, nil)), WithCodec(cm.mk(t)))
 				defer r.Close()
 				var got []any
 				for {

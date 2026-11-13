@@ -2181,6 +2181,13 @@ var magnitudeSites = []magnitudeSite{
 		reason: "elemSize is reflect.Type.Size(); see udArrayDirect",
 	},
 	{
+		where: "ser.go::appendDecimalWords", count: 11, verdict: magBoundedHere,
+		reason: "scale and precision only pick a power of ten here. The arithmetic is on word counts and word " +
+			"indexes of that power and of the numerator, and the gate `len(x)+len(y) > decimalStackWords` runs " +
+			"before any of it, so every index is below 8. A scale or precision past the 1025 shared powers " +
+			"returns before the gate",
+	},
+	{
 		where: "varint.go::appendVarlong", count: 1, verdict: magWrapIsTheContract,
 		reason: "`uint64(i) << 1` is the zigzag transform. It operates on a wire value, not a schema magnitude, and " +
 			"the shift discarding the top bit is what zigzag IS",

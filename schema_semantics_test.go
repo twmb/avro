@@ -10448,6 +10448,11 @@ func TestMatrix_EncodeErrorIdentityCensus(t *testing.T) {
 		v      any
 	}{
 		{"typed nil pointer", `"string"`, (*string)(nil)},
+		{"typed nil pointer, array element", `{"type":"array","items":"int"}`, []*int32{nil}},
+		{"nil any, array element", `{"type":"array","items":"int"}`, []any{nil}},
+		{"typed nil pointer, map value", `{"type":"map","values":"int"}`, map[string]*int32{"k": nil}},
+		{"pointer chain past the cap", `"string"`, ptrChain(reflect.ValueOf("x"), ptrIndirectCap+1).Interface()},
+		{"pointer chain past the cap, array element", `{"type":"array","items":"int"}`, []any{ptrChain(reflect.ValueOf(int32(1)), ptrIndirectCap+1).Interface()}},
 		{"invalid UUID string into fixed-uuid", `{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`, "zz"},
 	}
 	for _, row := range plain {

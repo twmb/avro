@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"math/bits"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -100,7 +102,7 @@ func (s *serUnion) tryUnwrapTagged(v reflect.Value) (int, reflect.Value, bool) {
 
 // ser encodes a union value. We try a tagged union map first. If that fails, or
 // v is not a tagged map, we dispatch on the value's canonical Avro name
-// (Java/fastavro/hamba parity; see the branchKinds doc). With no name match we
+// (Java/fastavro/hamba parity; see unionTags.byKind). With no name match we
 // try every branch in order, which keeps the documented whole-number-float and
 // json.Number-into-int promotions.
 func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
@@ -163,8 +165,8 @@ func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 }
 
 // unionTypeNameForValue returns the Avro primitive kind name matching v's Go
-// type directly, or "" when v should fall through to try-each. Every union
-// encoder and encodeDefault use it, so first-pass branch selection agrees.
+// type directly, or "" when v should fall through to try-each. Both union
+// encoders use it, so first-pass branch selection agrees.
 // Pointer and interface chains unwrap up to maxIndirectDepth so a cyclic
 // input cannot overflow the stack.
 func unionTypeNameForValue(v reflect.Value) string {
@@ -228,18 +230,23 @@ func serNullUnionAt(u *serUnion, valIdx int, nullByte, valByte byte) serfn {
 		if depth >= maxDepth {
 			return nil, errTooDeep
 		}
-		if isNilValue(v) {
-			return append(dst, nullByte), nil
-		}
-		if idx, inner, ok := u.tryUnwrapTagged(v); ok {
-			if idx != valIdx && isNilValue(inner) {
+		// Only a value of a nilable kind can be nil or, behind its pointers
+		// and interfaces, a tagged union map. An int, a string, or a struct
+		// is neither, so it goes to its branch with neither check.
+		if k := v.Kind(); k == reflect.Invalid || isNilableKind(k) {
+			if isNilValue(v) {
 				return append(dst, nullByte), nil
 			}
-			if idx == valIdx {
-				if result, err := u.fns[valIdx](append(dst, valByte), inner, depth+1); err == nil {
-					return result, nil
-				} else if errors.Is(err, errTooDeep) {
-					return nil, err
+			if idx, inner, ok := u.tryUnwrapTagged(v); ok {
+				if idx != valIdx && isNilValue(inner) {
+					return append(dst, nullByte), nil
+				}
+				if idx == valIdx {
+					if result, err := u.fns[valIdx](append(dst, valByte), inner, depth+1); err == nil {
+						return result, nil
+					} else if errors.Is(err, errTooDeep) {
+						return nil, err
+					}
 				}
 			}
 		}
@@ -943,13 +950,12 @@ func doSerBytes(dst []byte, v reflect.Value, _ int) []byte {
 	if l == 0 {
 		return dst
 	}
-	if v.CanAddr() {
-		return append(dst, v.Slice(0, l).Bytes()...)
+	// Bytes reads a slice whether or not it is addressable, and a slice in
+	// an any is not.
+	if v.Kind() == reflect.Slice {
+		return append(dst, v.Bytes()...)
 	}
-	for i := range l {
-		dst = append(dst, byte(v.Index(i).Uint()))
-	}
-	return dst
+	return appendByteArray(dst, v)
 }
 
 func doSerString(dst []byte, s string) []byte {
@@ -974,6 +980,10 @@ type serRecordField struct {
 	// parse records the reason and every consumer of defaultBytes reports
 	// it when the default would reach the wire.
 	defaultErr error
+	// defaultNest is how many levels of nesting a decoder charges to read
+	// defaultBytes back. appendDefault charges the same, so we never write
+	// a default at a depth where our own decoder refuses it.
+	defaultNest int
 }
 
 // avroType names the field's Avro type, or "" when the field has no
@@ -990,12 +1000,22 @@ func (f *serRecordField) avroType() string {
 // appendDefault appends the field's pre-encoded default, or returns the verdict
 // we recorded when we built it. One accessor rather than a check beside each
 // append, so a later consumer cannot pick up the bytes without the verdict that
-// governs them.
-func (f *serRecordField) appendDefault(dst []byte) ([]byte, error) {
+// governs them. depth is the record's own.
+func (f *serRecordField) appendDefault(dst []byte, depth int) ([]byte, error) {
 	if f.defaultErr != nil {
 		return nil, f.defaultErr
 	}
+	if fillTooDeep(depth, f.defaultNest) {
+		return nil, errTooDeep
+	}
 	return append(dst, f.defaultBytes...), nil
+}
+
+// fillTooDeep reports whether a value that nests nest levels, written for a
+// field of a record at depth, passes the limit. We ask before we write bytes
+// that no serializer walked: a default, or the null of an omitzero field.
+func fillTooDeep(depth, nest int) bool {
+	return nest > 0 && depth+nest >= maxDepth
 }
 
 // ozAction is what an omitzero-tagged field does when its Go value is zero (or
@@ -1090,7 +1110,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 					if !f.hasDefault {
 						return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: errors.New("missing key")}
 					}
-					if dst, err = f.appendDefault(dst); err != nil {
+					if dst, err = f.appendDefault(dst, depth); err != nil {
 						return nil, recordFieldError(t, f.name, err)
 					}
 					continue
@@ -1120,7 +1140,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 				if !f.hasDefault {
 					return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: errors.New("missing key")}
 				}
-				if dst, err = f.appendDefault(dst); err != nil {
+				if dst, err = f.appendDefault(dst, depth); err != nil {
 					return nil, recordFieldError(t, f.name, err)
 				}
 				continue
@@ -1156,11 +1176,14 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 		if mapping.omitzero[i] && valueIsZero(fv) {
 			switch f.omitzeroAction() {
 			case ozDefault:
-				if dst, err = f.appendDefault(dst); err != nil {
+				if dst, err = f.appendDefault(dst, depth); err != nil {
 					return nil, recordFieldError(t, f.name, err)
 				}
 				continue
 			case ozNull:
+				if fillTooDeep(depth, 1) {
+					return nil, recordFieldError(t, f.name, errTooDeep)
+				}
 				nullByte, _ := nullUnionBytes(f.meta != nil && f.meta.nullSecond)
 				dst = append(dst, nullByte)
 				continue
@@ -1359,17 +1382,15 @@ func unwrapElemPtr(v reflect.Value) (reflect.Value, error) {
 	return indirect(v)
 }
 
-// peelElem unwraps one Pointer/Interface layer from an array or map element,
-// tagging the unwrap error with avroType. Keep it a direct call.
-func peelElem(v reflect.Value, avroType string) (reflect.Value, error) {
+// peelElem unwraps one Pointer/Interface layer from an array or map element.
+// A nil returns the bare unwrap error, as every other serializer returns it,
+// so the record around the element names itself and the field. Keep it a
+// direct call.
+func peelElem(v reflect.Value) (reflect.Value, error) {
 	if v.Kind() != reflect.Interface && v.Kind() != reflect.Pointer {
 		return v, nil
 	}
-	out, err := unwrapElemPtr(v)
-	if err != nil {
-		return v, &SemanticError{AvroType: avroType, Err: err}
-	}
-	return out, nil
+	return unwrapElemPtr(v)
 }
 
 // appendArrayPrimitive runs the shared sequence for the primitive serArray
@@ -1378,9 +1399,12 @@ func peelElem(v reflect.Value, avroType string) (reflect.Value, error) {
 // compiler emits one indirect call per element, matching the inlined
 // direct-call shape.
 func appendArrayPrimitive(
-	dst []byte, v reflect.Value, avroType string,
+	dst []byte, v reflect.Value, depth int, avroType string,
 	appendFn func([]byte, reflect.Value) ([]byte, error),
 ) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	dst, v, l, err := serArrayPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -1394,30 +1418,26 @@ func appendArrayPrimitive(
 	// equal float32WireBits for every value.
 	switch et := v.Type().Elem(); {
 	case avroType == "string" && et == stringType:
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]string); ok {
-				for _, x := range s {
-					dst = doSerString(dst, x)
-				}
-				return append(dst, 0), nil
+		if s, ok := sliceOf[string](v); ok {
+			for _, x := range s {
+				dst = doSerString(dst, x)
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			dst = doSerString(dst, v.Index(i).String())
 		}
 		return append(dst, 0), nil
 	case avroType == "boolean" && et == boolType:
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]bool); ok {
-				for _, x := range s {
-					if x {
-						dst = append(dst, 1)
-					} else {
-						dst = append(dst, 0)
-					}
+		if s, ok := sliceOf[bool](v); ok {
+			for _, x := range s {
+				if x {
+					dst = append(dst, 1)
+				} else {
+					dst = append(dst, 0)
 				}
-				return append(dst, 0), nil
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			if v.Index(i).Bool() {
@@ -1428,58 +1448,50 @@ func appendArrayPrimitive(
 		}
 		return append(dst, 0), nil
 	case avroType == "int" && et == int32Type:
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]int32); ok {
-				for _, x := range s {
-					dst = appendVarint(dst, x)
-				}
-				return append(dst, 0), nil
+		if s, ok := sliceOf[int32](v); ok {
+			for _, x := range s {
+				dst = appendVarint(dst, x)
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			dst = appendVarint(dst, int32(v.Index(i).Int()))
 		}
 		return append(dst, 0), nil
 	case avroType == "long" && (et == int64Type || et == intType):
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]int64); ok {
-				for _, x := range s {
-					dst = appendVarlong(dst, x)
-				}
-				return append(dst, 0), nil
+		if s, ok := sliceOf[int64](v); ok {
+			for _, x := range s {
+				dst = appendVarlong(dst, x)
 			}
-			if s, ok := v.Interface().([]int); ok {
-				for _, x := range s {
-					dst = appendVarlong(dst, int64(x))
-				}
-				return append(dst, 0), nil
+			return append(dst, 0), nil
+		}
+		if s, ok := sliceOf[int](v); ok {
+			for _, x := range s {
+				dst = appendVarlong(dst, int64(x))
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			dst = appendVarlong(dst, v.Index(i).Int())
 		}
 		return append(dst, 0), nil
 	case avroType == "float" && et == float32Type:
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]float32); ok {
-				for _, x := range s {
-					dst = appendUint32(dst, math.Float32bits(x))
-				}
-				return append(dst, 0), nil
+		if s, ok := sliceOf[float32](v); ok {
+			for _, x := range s {
+				dst = appendUint32(dst, math.Float32bits(x))
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			dst = appendUint32(dst, float32WireBits(v.Index(i)))
 		}
 		return append(dst, 0), nil
 	case avroType == "double" && et == float64Type:
-		if v.CanInterface() {
-			if s, ok := v.Interface().([]float64); ok {
-				for _, x := range s {
-					dst = appendUint64(dst, math.Float64bits(x))
-				}
-				return append(dst, 0), nil
+		if s, ok := sliceOf[float64](v); ok {
+			for _, x := range s {
+				dst = appendUint64(dst, math.Float64bits(x))
 			}
+			return append(dst, 0), nil
 		}
 		for i := range l {
 			dst = appendUint64(dst, math.Float64bits(v.Index(i).Float()))
@@ -1487,7 +1499,7 @@ func appendArrayPrimitive(
 		return append(dst, 0), nil
 	}
 	for i := range l {
-		elem, err := peelElem(v.Index(i), avroType)
+		elem, err := peelElem(v.Index(i))
 		if err != nil {
 			return nil, err
 		}
@@ -1504,9 +1516,12 @@ func appendArrayPrimitive(
 // everything else, reusing two addressable Values through SetIterKey and
 // SetIterValue rather than allocating per entry.
 func appendMapPrimitive(
-	dst []byte, v reflect.Value, avroType string,
+	dst []byte, v reflect.Value, depth int, avroType string,
 	appendFn func([]byte, reflect.Value) ([]byte, error),
 ) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	dst, v, l, err := serMapPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -1599,7 +1614,7 @@ func appendMapPrimitive(
 		}
 		dst = doSerString(dst, key)
 		valV.SetIterValue(iter)
-		elem, err := peelElem(valV, avroType)
+		elem, err := peelElem(valV)
 		if err != nil {
 			return nil, err
 		}
@@ -1632,23 +1647,23 @@ func serArrayPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, 
 // the element to escape (~25% slower), and a generic with an empty-struct
 // GCShape adds a dictionary lookup (+34-62%).
 
-func (s *serArray) serString(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "string", appendAvroString)
+func (s *serArray) serString(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "string", appendAvroString)
 }
-func (s *serArray) serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "boolean", appendAvroBool)
+func (s *serArray) serBoolean(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "boolean", appendAvroBool)
 }
-func (s *serArray) serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "int", appendAvroInt)
+func (s *serArray) serInt(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "int", appendAvroInt)
 }
-func (s *serArray) serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "long", appendAvroLong)
+func (s *serArray) serLong(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "long", appendAvroLong)
 }
-func (s *serArray) serFloat(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "float", appendAvroFloat32)
+func (s *serArray) serFloat(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "float", appendAvroFloat32)
 }
-func (s *serArray) serDouble(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendArrayPrimitive(dst, v, "double", appendAvroFloat64)
+func (s *serArray) serDouble(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendArrayPrimitive(dst, v, depth, "double", appendAvroFloat64)
 }
 
 type serMap struct {
@@ -1707,23 +1722,23 @@ func serMapPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, er
 // pick one at schema-build time from the map's value type. See serArray.serString
 // for the factoring history.
 
-func (s *serMap) serString(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "string", appendAvroString)
+func (s *serMap) serString(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "string", appendAvroString)
 }
-func (s *serMap) serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "boolean", appendAvroBool)
+func (s *serMap) serBoolean(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "boolean", appendAvroBool)
 }
-func (s *serMap) serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "int", appendAvroInt)
+func (s *serMap) serInt(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "int", appendAvroInt)
 }
-func (s *serMap) serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "long", appendAvroLong)
+func (s *serMap) serLong(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "long", appendAvroLong)
 }
-func (s *serMap) serFloat(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "float", appendAvroFloat32)
+func (s *serMap) serFloat(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "float", appendAvroFloat32)
 }
-func (s *serMap) serDouble(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	return appendMapPrimitive(dst, v, "double", appendAvroFloat64)
+func (s *serMap) serDouble(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	return appendMapPrimitive(dst, v, depth, "double", appendAvroFloat64)
 }
 
 type serSize struct {
@@ -1764,13 +1779,7 @@ func (s *serSize) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
 	// We write fixed as raw bytes, with no length prefix.
-	if v.CanAddr() {
-		return append(dst, v.Slice(0, s.n).Bytes()...), nil
-	}
-	for i := 0; i < s.n; i++ {
-		dst = append(dst, byte(v.Index(i).Uint()))
-	}
-	return dst, nil
+	return appendByteArray(dst, v), nil
 }
 
 /////////////////////////////
@@ -1783,6 +1792,23 @@ var (
 	avroDurationType = reflect.TypeFor[Duration]()
 	bigRatType       = reflect.TypeFor[big.Rat]()
 )
+
+// timeOf returns the time.Time v holds. v.Interface would copy an addressable
+// value to the heap first, and a value behind a pointer is addressable.
+func timeOf(v reflect.Value) time.Time {
+	if v.CanAddr() {
+		return *(*time.Time)(unsafe.Pointer(v.UnsafeAddr()))
+	}
+	return v.Interface().(time.Time)
+}
+
+// durationOf is timeOf for a Duration.
+func durationOf(v reflect.Value) Duration {
+	if v.CanAddr() {
+		return *(*Duration)(unsafe.Pointer(v.UnsafeAddr()))
+	}
+	return v.Interface().(Duration)
+}
 
 // Duration is the Avro duration logical type: a 12-byte fixed value holding
 // three little-endian uint32s, months and days and milliseconds.
@@ -1880,7 +1906,7 @@ func tryParseTimeString(v reflect.Value) (time.Time, bool) {
 // accepted-input set lives in one place.
 func extractTime(v reflect.Value) (time.Time, bool) {
 	if v.Type() == timeType {
-		return v.Interface().(time.Time), true
+		return timeOf(v), true
 	}
 	return tryParseTimeString(v)
 }
@@ -1957,7 +1983,7 @@ func serDate(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == timeType {
-		d, err := timeToDate(v.Interface().(time.Time))
+		d, err := timeToDate(timeOf(v))
 		if err != nil {
 			return nil, &SemanticError{GoType: timeType, AvroType: "date", Err: err}
 		}
@@ -1989,7 +2015,7 @@ func serTimeMillis(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return appendVarint(dst, ms), nil
 	}
 	if v.Type() == timeType {
-		ms, err := durationToTimeMillis(timeOfDay(v.Interface().(time.Time)))
+		ms, err := durationToTimeMillis(timeOfDay(timeOf(v)))
 		if err != nil {
 			return nil, &SemanticError{GoType: timeType, AvroType: "time-millis", Err: err}
 		}
@@ -2009,7 +2035,7 @@ func serTimeMicros(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return appendVarlong(dst, time.Duration(v.Int()).Microseconds()), nil
 	}
 	if v.Type() == timeType {
-		return appendVarlong(dst, timeOfDay(v.Interface().(time.Time)).Microseconds()), nil
+		return appendVarlong(dst, timeOfDay(timeOf(v)).Microseconds()), nil
 	}
 	return serLong(dst, v, depth)
 }
@@ -2020,7 +2046,7 @@ func serDuration(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == avroDurationType {
-		b := v.Interface().(Duration).Bytes()
+		b := durationOf(v).Bytes()
 		return append(dst, b[:]...), nil
 	}
 	return (&serSize{12}).ser(dst, v, depth)
@@ -2051,6 +2077,11 @@ func coerceDecimalRat(v reflect.Value, avroType string) (reflect.Value, *big.Rat
 // propagate rather than re-encode as raw bytes.
 func decimalRatFor(v reflect.Value) (*big.Rat, bool, error) {
 	if v.Type() == bigRatType {
+		// We only read the Rat, so we use an addressable one in place rather
+		// than copy it. A *big.Rat peels to an addressable Rat.
+		if v.CanAddr() {
+			return (*big.Rat)(unsafe.Pointer(v.UnsafeAddr())), true, nil
+		}
 		tmp := v.Interface().(big.Rat)
 		return &tmp, true, nil
 	}
@@ -2111,13 +2142,21 @@ func tryCoerceToRat(v reflect.Value) (*big.Rat, bool, error) {
 	return nil, false, nil
 }
 
+// decimalStackBytes sizes the buffer the binary decimal encoders hand
+// decimalUnscaledBytes. 64 bytes hold an unscaled value of 153 digits; a wider
+// one allocates.
+const decimalStackBytes = 64
+
 // decimalUnscaledBytes runs the shared pipeline: r to unscaled, validate
-// precision, then big-endian two's-complement bytes. avroType labels the
-// SemanticError ("bytes" or "fixed") and goType names the source type. One
-// pipeline for the four decimal-emit sites (binary serBytesDecimal and
-// serFixedDecimal, JSON appendAvroJSON's bytes+decimal and fixed+decimal arms),
+// precision, then big-endian two's-complement bytes, appended to buf. avroType
+// labels the SemanticError ("bytes" or "fixed") and goType names the source
+// type. One pipeline for the four decimal-emit sites (binary serBytesDecimal
+// and serFixedDecimal, JSON appendAvroJSONBytesValue and appendAvroJSONFixed),
 // so precision and scale handling cannot drift across them.
-func decimalUnscaledBytes(r *big.Rat, scale, precision int, avroType string, goType reflect.Type) ([]byte, error) {
+func decimalUnscaledBytes(buf []byte, r *big.Rat, scale, precision int, avroType string, goType reflect.Type) ([]byte, error) {
+	if b, ok := appendDecimalWords(buf, r, scale, precision); ok {
+		return b, nil
+	}
 	unscaled, err := ratToUnscaled(r, scale)
 	if err != nil {
 		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
@@ -2125,13 +2164,13 @@ func decimalUnscaledBytes(r *big.Rat, scale, precision int, avroType string, goT
 	if err := checkDecimalPrecision(unscaled, precision); err != nil {
 		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
 	}
-	b := bigIntToBytes(unscaled)
+	b := appendBigIntBytes(buf, unscaled)
 	// We charge the emitted payload against the bound the *decoder* applies to
 	// these same bytes. Declared precision already keeps a parse-valid decimal
 	// well inside it, so this arm cannot fire today. It is here because the
 	// bound belongs to the format, not to whichever gate happens to imply it,
 	// and a later precision change must not silently reopen an unreadable emit.
-	if err := checkDecimalUnscaledLen(b); err != nil {
+	if err := checkDecimalUnscaledLen(b[len(buf):]); err != nil {
 		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
 	}
 	return b, nil
@@ -2239,13 +2278,91 @@ func chargeDecimalLeaf(payload []byte, logical string) error {
 	return checkDecimalUnscaledSize(n)
 }
 
+// decimalStackWords is how many words appendDecimalWords computes in: 512
+// bits on a 64-bit build.
+const decimalStackWords = 8
+
+// appendDecimalWords is decimalUnscaledBytes for a value small enough to
+// compute in a stack array, which a big.Int cannot do: its words are always on
+// the heap. We take a value when numerator * 10^scale fits decimalStackWords
+// words and the denominator fits one. We report false for every other value,
+// and for every value that does not fit the scale or the precision, so the
+// big.Int path words each error.
+func appendDecimalWords(buf []byte, r *big.Rat, scale, precision int) ([]byte, bool) {
+	if scale < 0 || precision <= 0 {
+		return nil, false
+	}
+	pow, ok := cachedPow10(scale)
+	if !ok {
+		return nil, false
+	}
+	limit, ok := cachedPow10(precision)
+	if !ok {
+		return nil, false
+	}
+	num, denom := r.Num(), r.Denom()
+	x, y, d := num.Bits(), pow.Bits(), denom.Bits()
+	if len(x)+len(y) > decimalStackWords || len(d) != 1 || denom.Sign() < 0 {
+		return nil, false
+	}
+
+	// z = x * y, schoolbook. The sum under each Add fits two words: the
+	// largest product is (2^W-1)^2, which leaves room for two more words.
+	var stack [decimalStackWords]big.Word
+	z := stack[:len(x)+len(y)]
+	for i, xi := range x {
+		var carry uint
+		for j, yj := range y {
+			hi, lo := bits.Mul(uint(xi), uint(yj))
+			lo, c := bits.Add(lo, uint(z[i+j]), 0)
+			hi += c
+			lo, c = bits.Add(lo, carry, 0)
+			hi += c
+			z[i+j], carry = big.Word(lo), hi
+		}
+		z[i+len(y)] = big.Word(carry)
+	}
+	// z /= d, from the top word down. rem stays below d, which Div requires.
+	if d[0] != 1 {
+		var rem uint
+		for i := len(z) - 1; i >= 0; i-- {
+			var q uint
+			q, rem = bits.Div(rem, uint(z[i]), uint(d[0]))
+			z[i] = big.Word(q)
+		}
+		if rem != 0 {
+			return nil, false
+		}
+	}
+	for len(z) > 0 && z[len(z)-1] == 0 {
+		z = z[:len(z)-1]
+	}
+	// The value fits the precision when its magnitude is below 10^precision.
+	// Neither slice has a leading zero word, so a longer one is larger.
+	if l := limit.Bits(); len(z) > len(l) {
+		return nil, false
+	} else if len(z) == len(l) {
+		i := len(z) - 1
+		for i > 0 && z[i] == l[i] {
+			i--
+		}
+		if z[i] >= l[i] {
+			return nil, false
+		}
+	}
+	// At most decimalStackWords words, far inside the decoder's bound on an
+	// unscaled value, which decimalUnscaledBytes charges on the other path.
+	return appendTwosComplement(buf, z, num.Sign() < 0), true
+}
+
 type serBytesDecimal struct {
 	precision int
 	scale     int
 }
 
-func (s *serBytesDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
-	b, err := decimalUnscaledBytes(r, s.scale, s.precision, "bytes", bigRatType)
+func (s *serBytesDecimal) serRat(dst []byte, r *big.Rat, goType reflect.Type) ([]byte, error) {
+	var scratch [decimalStackBytes]byte
+	b, err := decimalUnscaledBytes(scratch[:0], r, s.scale, s.precision, "bytes", goType)
 	if err != nil {
 		return nil, err
 	}
@@ -2259,7 +2376,7 @@ func (s *serBytesDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 		return nil, err
 	}
 	if ok {
-		return s.serRat(dst, r)
+		return s.serRat(dst, r, v.Type())
 	}
 	if err := rejectNonNumericStructuredString(v, "bytes", "decimal"); err != nil {
 		return nil, err
@@ -2276,12 +2393,13 @@ type serFixedDecimal struct {
 	scale     int
 }
 
-func (s *serFixedDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
-	b, err := decimalUnscaledBytes(r, s.scale, s.precision, "fixed", bigRatType)
+func (s *serFixedDecimal) serRat(dst []byte, r *big.Rat, goType reflect.Type) ([]byte, error) {
+	var scratch [decimalStackBytes]byte
+	b, err := decimalUnscaledBytes(scratch[:0], r, s.scale, s.precision, "fixed", goType)
 	if err != nil {
 		return nil, err
 	}
-	return appendDecimalFixed(dst, b, s.size, bigRatType)
+	return appendDecimalFixed(dst, b, s.size, goType)
 }
 
 func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
@@ -2290,7 +2408,7 @@ func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 		return nil, err
 	}
 	if ok {
-		return s.serRat(dst, r)
+		return s.serRat(dst, r, v.Type())
 	}
 	if err := rejectNonNumericStructuredString(v, "fixed", "decimal"); err != nil {
 		return nil, err
@@ -2351,7 +2469,7 @@ func buildBigDecimalPayload(r *big.Rat) ([]byte, error) {
 	unscaled, _ := new(big.Int).QuoRem(num, r.Denom(), new(big.Int))
 	// The remainder is provably 0: finiteScale chose s to make 10^s / Denom
 	// an integer.
-	uBytes := bigIntToBytes(unscaled)
+	uBytes := appendBigIntBytes(nil, unscaled)
 	// big-decimal carries no precision attribute, so nothing upstream bounds
 	// the magnitude. This is the one numeric-carrier arm where an ordinary
 	// *big.Rat reaches the wire unbounded, so we charge the inner unscaled
@@ -2422,10 +2540,36 @@ func finiteScale(r *big.Rat) (int, bool) {
 	return b, true
 }
 
-// pow10 returns 10^n as a *big.Int. n must be non-negative. Every decimal
+// pow10Cache holds 10^n for n below its length, each computed on first use.
+// The length covers the precisions and scales schemas declare in practice and
+// bounds what the cache can hold: all 1025 entries together are under 300 KiB.
+// decimalScaleLimit is far higher, and caching up to it would let a hostile
+// set of schemas pin close to a gigabyte.
+var pow10Cache [1025]atomic.Pointer[big.Int]
+
+// cachedPow10 returns 10^n from pow10Cache, or false when n is past it. You
+// must not modify the result: every caller shares it.
+func cachedPow10(n int) (*big.Int, bool) {
+	if n < 0 || n >= len(pow10Cache) {
+		return nil, false
+	}
+	p := pow10Cache[n].Load()
+	if p == nil {
+		// Two goroutines may both compute and store; the values are equal.
+		p = new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil)
+		pow10Cache[n].Store(p)
+	}
+	return p, true
+}
+
+// pow10 returns 10^n as a *big.Int. n must be non-negative. You must not
+// modify the result, which is shared when cachedPow10 has it. Every decimal
 // encode and decode site that materializes a power of ten goes through here, so
 // a future DoS tightening tied to decimalScaleLimit lives in one place.
 func pow10(n int) *big.Int {
+	if p, ok := cachedPow10(n); ok {
+		return p
+	}
 	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil)
 }
 
@@ -2447,7 +2591,16 @@ func scaledRat(unscaled *big.Int, scale int) *big.Rat {
 // prepare_bytes_decimal do.
 func ratToUnscaled(r *big.Rat, scale int) (*big.Int, error) {
 	num := new(big.Int).Mul(r.Num(), pow10(scale))
-	unscaled, rem := new(big.Int).QuoRem(num, r.Denom(), new(big.Int))
+	// Dividing by 1 changes nothing. We read the denominator rather than ask
+	// IsInt, which ignores a sign you set through Denom.
+	denom := r.Denom()
+	if denom.IsInt64() && denom.Int64() == 1 {
+		return num, nil
+	}
+	// A Rat you wrote through Num or Denom need not be in lowest terms, so
+	// we divide the product rather than test whether the denominator divides
+	// 10^scale.
+	unscaled, rem := new(big.Int).QuoRem(num, denom, new(big.Int))
 	if rem.Sign() != 0 {
 		return nil, fmt.Errorf("decimal value %s cannot be represented at scale %d without rounding", truncRatForError(r), scale)
 	}
@@ -2460,6 +2613,12 @@ func ratToUnscaled(r *big.Rat, scale int) (*big.Int, error) {
 // fastavro, and hamba/avro all enforce it on encode.
 func checkDecimalPrecision(unscaled *big.Int, precision int) error {
 	if precision <= 0 {
+		return nil
+	}
+	// A value fits precision digits when its magnitude is below 10^precision.
+	// Counting digits formats the whole value, so we do that only for a
+	// precision past the cache and to word the error.
+	if limit, ok := cachedPow10(precision); ok && unscaled.CmpAbs(limit) < 0 {
 		return nil
 	}
 	digits := decimalDigitCount(unscaled)
@@ -2478,39 +2637,54 @@ func decimalDigitCount(i *big.Int) int {
 	return len(abs.String())
 }
 
-// bigIntToBytes encodes i as big-endian two's complement in the fewest bytes
-// that still carry the right sign.
-func bigIntToBytes(i *big.Int) []byte {
-	switch i.Sign() {
-	case 0:
-		return []byte{0}
-	case 1:
-		b := i.Bytes() // big-endian unsigned
-		if b[0]&0x80 != 0 {
-			// A set high bit would read as negative in two's complement,
-			// so we prepend a zero byte to keep it positive.
-			b = append([]byte{0}, b...)
+// appendBigIntBytes appends i to dst as big-endian two's complement in the
+// fewest bytes that still carry the right sign.
+func appendBigIntBytes(dst []byte, i *big.Int) []byte {
+	return appendTwosComplement(dst, i.Bits(), i.Sign() < 0)
+}
+
+// appendTwosComplement is appendBigIntBytes for a magnitude given as words,
+// least significant first with no leading zero word, as big.Int.Bits returns
+// it.
+func appendTwosComplement(dst []byte, mag []big.Word, neg bool) []byte {
+	// The magnitude needs its bit length and the sign one more bit. The
+	// exception is -2^k, whose two's complement is the sign bit over k zeros.
+	bitLen, pow2 := 0, false
+	if top := len(mag) - 1; top >= 0 {
+		bitLen = top*bits.UintSize + bits.Len(uint(mag[top]))
+		pow2 = mag[top]&(mag[top]-1) == 0
+		for _, w := range mag[:top] {
+			pow2 = pow2 && w == 0
 		}
-		return b
-	default:
-		// Two's complement for a negative: flip the bits of (|i| - 1). That
-		// works because -n in two's complement is ^(n-1).
-		abs := new(big.Int).Neg(i)
-		abs.Sub(abs, big.NewInt(1))
-		b := abs.Bytes()
-		if len(b) == 0 {
-			return []byte{0xff} // -1
-		}
-		for j := range b {
-			b[j] = ^b[j]
-		}
-		if b[0]&0x80 == 0 {
-			// A clear high bit would read as positive, so we prepend 0xff
-			// to keep the negative sign.
-			b = append([]byte{0xff}, b...)
-		}
-		return b
 	}
+	if neg && pow2 {
+		bitLen--
+	}
+	n := bitLen/8 + 1
+	// The magnitude, most significant byte first. A byte past the last word
+	// is zero.
+	const wordBytes = bits.UintSize / 8
+	start := len(dst)
+	for k := n - 1; k >= 0; k-- {
+		var c byte
+		if w := k / wordBytes; w < len(mag) {
+			c = byte(mag[w] >> (8 * (k % wordBytes)))
+		}
+		dst = append(dst, c)
+	}
+	b := dst[start:]
+	if neg {
+		// -m is ^m + 1.
+		carry := true
+		for j := n - 1; j >= 0; j-- {
+			b[j] = ^b[j]
+			if carry {
+				b[j]++
+				carry = b[j] == 0
+			}
+		}
+	}
+	return dst
 }
 
 // serFixedUUIDReflect serializes a fixed(16) UUID. We take a [16]byte (raw), a
@@ -2566,9 +2740,9 @@ func isUUIDType(t reflect.Type) bool {
 }
 
 // uuidBytes copies v's [16]byte payload into a stack array when v is a
-// UUID-typed array, returning (u, true), and (zero, false) otherwise. The three
+// UUID-typed array, returning (u, true), and (zero, false) otherwise. The four
 // encode sites that must materialize a [16]byte from a reflect.Value share it:
-// serFixedUUIDReflect, serUUID, and the JSON "string"+uuid arm.
+// serFixedUUIDReflect, serUUID, and the JSON string+uuid and fixed+uuid arms.
 func uuidBytes(v reflect.Value) ([16]byte, bool) {
 	if !isUUIDType(v.Type()) {
 		return [16]byte{}, false

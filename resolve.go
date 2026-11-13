@@ -818,11 +818,33 @@ func extractDefaultBytes(val any, typeLabel string) ([]byte, error) {
 // means "this branch does not accept the value", so a compliance verdict
 // there would select a different branch. The encode-side consumers of the
 // pre-encoded bytes report the verdict.
-type defaultChargeSink struct{ err error }
+type defaultChargeSink struct {
+	err error
+	// nest is how many levels of nesting a decoder charges to read the
+	// default back: its deepest record, array, map, or union, counting the
+	// default's own node as level one. Zero for a default that is a leaf.
+	nest int
+}
 
 func (s *defaultChargeSink) record(err error) {
 	if s != nil && err != nil && s.err == nil {
 		s.err = err
+	}
+}
+
+// nests notes a node that a decoder charges a level for, depth levels below
+// the default's own node.
+func (s *defaultChargeSink) nests(depth int) {
+	if s != nil && depth >= s.nest {
+		s.nest = depth + 1
+	}
+}
+
+// merge takes the verdict and the nesting of the union branch that won.
+func (s *defaultChargeSink) merge(won *defaultChargeSink) {
+	s.record(won.err)
+	if s != nil && won.nest > s.nest {
+		s.nest = won.nest
 	}
 }
 
@@ -831,12 +853,12 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 }
 
 // encodeDefaultCharged is encodeDefault for the one caller that installs the
-// result as a field's pre-encoded default: it additionally reports the
-// producer-compliance verdict for the payload it just built.
-func encodeDefaultCharged(val any, node *schemaNode) ([]byte, error, error) {
+// result as a field's pre-encoded default: it additionally reports how deep
+// the payload nests and the producer-compliance verdict for it.
+func encodeDefaultCharged(val any, node *schemaNode) ([]byte, int, error, error) {
 	var sink defaultChargeSink
 	b, err := encodeDefaultDepth(nil, val, node, 0, &sink)
-	return b, sink.err, err
+	return b, sink.nest, sink.err, err
 }
 
 // encodeDefaultDepth bounds the recursion encodeDefault performs while
@@ -934,6 +956,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 		if err != nil {
 			return nil, err
 		}
+		sink.nests(depth)
 		if len(arr) == 0 {
 			return appendVarlong(dst, 0), nil
 		}
@@ -954,6 +977,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 		if err != nil {
 			return nil, err
 		}
+		sink.nests(depth)
 		if len(m) == 0 {
 			return appendVarlong(dst, 0), nil
 		}
@@ -972,6 +996,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 		if err != nil {
 			return nil, err
 		}
+		sink.nests(depth)
 		for _, f := range node.fields {
 			fval, exists := m[f.name]
 			if !exists {
@@ -997,6 +1022,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 		if len(node.branches) == 0 {
 			return nil, fmt.Errorf("empty union")
 		}
+		sink.nests(depth)
 		base := len(dst)
 		for i, branch := range node.branches {
 			attempt := appendVarlong(dst[:base], int64(i))
@@ -1007,7 +1033,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 			// branch index.
 			var attemptSink defaultChargeSink
 			if encoded, err := encodeDefaultDepth(attempt, val, branch, depth+1, &attemptSink); err == nil {
-				sink.record(attemptSink.err)
+				sink.merge(&attemptSink)
 				return encoded, nil
 			}
 		}

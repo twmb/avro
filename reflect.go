@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 var (
@@ -42,21 +43,35 @@ func copyBytesToArray(v reflect.Value, b []byte) {
 // where reflect.Copy would panic on the exact-type mismatch. You have already
 // established that v is an Array whose element Kind is Uint8.
 func byteArrayToSlice(v reflect.Value) []byte {
-	b := make([]byte, v.Len())
+	return appendByteArray(make([]byte, 0, v.Len()), v)
+}
+
+// appendByteArray appends the byte-array v to dst, the append counterpart of
+// [byteArrayToSlice]. An addressable array is one memmove through Bytes. An
+// array in an any is not addressable: an exact-uint8 element gets
+// reflect.Copy's memmove, and a named byte element is read element-wise. You
+// have already established that v is an Array whose element Kind is Uint8.
+func appendByteArray(dst []byte, v reflect.Value) []byte {
+	if v.CanAddr() {
+		return append(dst, v.Bytes()...)
+	}
+	n, l := len(dst), v.Len()
 	if v.Type().Elem() == byteType {
-		reflect.Copy(reflect.ValueOf(b), v)
-		return b
+		dst = append(dst, make([]byte, l)...)
+		reflect.Copy(reflect.ValueOf(dst[n:]), v)
+		return dst
 	}
-	for i := range b {
-		b[i] = byte(v.Index(i).Uint())
+	for i := range l {
+		dst = append(dst, byte(v.Index(i).Uint()))
 	}
-	return b
+	return dst
 }
 
 // reuseOrMakeStringAnyMap reuses v's existing map[string]any when v is an
 // interface wrapping one, the streaming-decode pattern; otherwise we allocate a
-// fresh map sized to hint. deserRecord's interface arm and decodeRecordAny both
-// use it, so the two record-into-*any paths agree on reuse.
+// fresh map sized to hint. deserRecord's interface arm, the resolved decoder's
+// deserInterface, and decodeRecordAny all use it, so every record-into-*any
+// path agrees on reuse.
 //
 // Reuse keeps keys the schema does not name. If you want a fresh decode, clear
 // or replace the map before each call.
@@ -229,6 +244,21 @@ func indirect(v reflect.Value) (reflect.Value, error) {
 	default:
 		return v, nil
 	}
+}
+
+// sliceOf returns v as a []T when v is the unnamed slice type []T. We read an
+// addressable slice where it is: v.Interface would first copy its header to
+// the heap, an allocation for every slice field of a struct you pass by
+// pointer. A named slice type or a value you cannot interface is not ours to
+// take, and the caller reads it element by element.
+func sliceOf[T any](v reflect.Value) ([]T, bool) {
+	if !v.CanInterface() || v.Type() != reflect.TypeFor[[]T]() {
+		return nil, false
+	}
+	if v.CanAddr() {
+		return *(*[]T)(unsafe.Pointer(v.UnsafeAddr())), true
+	}
+	return v.Interface().([]T), true
 }
 
 func indirectAlloc(v reflect.Value) reflect.Value {

@@ -1592,6 +1592,22 @@ func TestMatrix_GenerativeUnionContainerDefaultFill(t *testing.T) {
 						return [][2]any{{s.Root().Fields[0].Default, a1["f"]}}
 					})
 			})
+			// The same leaf and sibling as one union inside the default: f is
+			// a record, and its field x holds [leaf, sibling] directly, as an
+			// array's items, or as a map's values. The field after f is a
+			// union we do supply, which both wires must still choose by the
+			// value's Go type: a string is the string branch, not the enum.
+			t.Run(c.name+"/"+cont.name+"/nested", func(t *testing.T) {
+				union := "[" + c.leaf + "," + c.sib + "]"
+				schema := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"f","type":`+
+					`{"type":"record","name":"NU","fields":[{"name":"x","type":%s},{"name":"n","type":"int"}]},"default":%s},`+
+					`{"name":"g","type":[{"type":"enum","name":"AfterEnum","symbols":["A","B"]},"string"]}]}`,
+					cont.wrap(union), cont.def(c.defLit))
+				udInvariant(t, schema, `{"g":"A"}`, map[string]any{"g": "A"}, udfIsLogical(c.leaf),
+					func(s *avro.Schema, a1 map[string]any) [][2]any {
+						return [][2]any{{s.Root().Fields[0].Default, a1["f"]}}
+					})
+			})
 		}
 	}
 }
@@ -1715,6 +1731,11 @@ func udfCells() []udfCell {
 		{"fixed_wrong_size", `{"type":"fixed","name":"FX","size":4}`, `"string"`, `"AB"`},
 		{"enum_member", `{"type":"enum","name":"EN","symbols":["A","B"]}`, `"string"`, `"A"`},
 		{"enum_nonmember", `{"type":"enum","name":"EN","symbols":["A","B"]}`, `"string"`, `"Z"`},
+		// fixed vs a bytes sibling: both hold a []byte once parsed, as enum
+		// and string both hold a string, so the value's Go type alone names
+		// the sibling.
+		{"fixed_right_size_bytes_sibling", `{"type":"fixed","name":"FX","size":2}`, `"bytes"`, `"AB"`},
+		{"fixed_wrong_size_bytes_sibling", `{"type":"fixed","name":"FX","size":4}`, `"bytes"`, `"AB"`},
 		{"string_any", `"string"`, `"bytes"`, `"hello"`},
 		// logical leaf (long-backed): Default surfaces the raw long while the
 		// wire decodes time.Time. The representation-agnostic rebuild and the
@@ -1773,6 +1794,24 @@ func udInvariant(t *testing.T, schema, fillJSON string, fillVal map[string]any, 
 	j1, err := s.AppendEncodeJSON(nil, fillVal)
 	if err != nil {
 		t.Fatalf("json auto-fill encode: %v", err)
+	}
+
+	// Both wires fill the same union branch. The bare JSON form does not
+	// name a branch, so we compare the tagged forms: the JSON encode's own
+	// tags against the tags a decode of the binary wire reports.
+	jt, err := s.AppendEncodeJSON(nil, fillVal, avro.TaggedUnions())
+	if err != nil {
+		t.Fatalf("tagged json auto-fill encode: %v", err)
+	}
+	var fromJSON, fromBinary any
+	if err := s.DecodeJSON(jt, &fromJSON, avro.TaggedUnions()); err != nil {
+		t.Fatalf("decode of the tagged json auto-fill %s: %v", jt, err)
+	}
+	if _, err := s.Decode(w1, &fromBinary, avro.TaggedUnions()); err != nil {
+		t.Fatalf("tagged decode of the binary auto-fill: %v", err)
+	}
+	if !matEqual(fromJSON, fromBinary) {
+		t.Errorf("JSON auto-fill names a different union branch than binary:\n  json   = %s\n  binary = %#v", jt, fromBinary)
 	}
 
 	// Non-logical: Root().Default equals the binary auto-fill decode, type-exactly
@@ -2115,28 +2154,60 @@ func derefAll(v reflect.Value) reflect.Value {
 }
 
 // ptrValEq compares a peeled base against the expected sample by type+value.
+// DeepEqual rather than ==, so a slice sample compares by content.
 func ptrValEq(got, want reflect.Value) bool {
-	return got.IsValid() && got.Type() == want.Type() && got.Interface() == want.Interface()
+	return got.IsValid() && got.Type() == want.Type() && reflect.DeepEqual(got.Interface(), want.Interface())
 }
 
 // ptrBase is one primitive base type for the pointer-indirection axis.
 type ptrBase struct {
+	label  string        // the Avro kind, or the logical type when there is one; several Go carriers share one
 	avro   string        // the Avro schema text for this primitive
 	sample reflect.Value // a representative non-zero value of the Go base type
 	pad    string        // a union padding branch, token-class-distinct from avro
+	wire   []byte        // the sample's binary encoding, written by hand
 }
+
+const (
+	ptrFixed3    = `{"type":"fixed","name":"PtrFix3","size":3}`
+	ptrTimestamp = `{"type":"long","logicalType":"timestamp-micros"}`
+	ptrDate      = `{"type":"int","logicalType":"date"}`
+	ptrTime      = `{"type":"long","logicalType":"time-micros"}`
+	ptrDuration  = `{"type":"fixed","name":"PtrDur","size":12,"logicalType":"duration"}`
+)
 
 func ptrBases() []ptrBase {
 	// pad is token-class-distinct from the base so a 3+-branch union dispatches
 	// the sample to its own branch, never the pad. Digit-class bases pad with a
-	// string; string/boolean bases pad with a long.
+	// string; string/boolean/bytes/fixed bases pad with a long.
+	//
+	// The byte carriers cross the three copies the byte encoders choose
+	// between: a slice, an exact-uint8 array, and a named-byte-element array.
+	// Depth 0 holds the carrier in an any, where it is not addressable; every
+	// deeper chain makes it addressable.
 	return []ptrBase{
-		{`"int"`, reflect.ValueOf(int32(7)), `"string"`},
-		{`"long"`, reflect.ValueOf(int64(7)), `"string"`},
-		{`"float"`, reflect.ValueOf(float32(1.5)), `"string"`},
-		{`"double"`, reflect.ValueOf(float64(1.5)), `"string"`},
-		{`"string"`, reflect.ValueOf("v"), `"long"`},
-		{`"boolean"`, reflect.ValueOf(true), `"long"`},
+		{"int", `"int"`, reflect.ValueOf(int32(7)), `"string"`, []byte{0x0e}},
+		{"long", `"long"`, reflect.ValueOf(int64(7)), `"string"`, []byte{0x0e}},
+		{"float", `"float"`, reflect.ValueOf(float32(1.5)), `"string"`, []byte{0x00, 0x00, 0xc0, 0x3f}},
+		{"double", `"double"`, reflect.ValueOf(float64(1.5)), `"string"`, []byte{0, 0, 0, 0, 0, 0, 0xf8, 0x3f}},
+		{"string", `"string"`, reflect.ValueOf("v"), `"long"`, []byte{0x02, 'v'}},
+		{"boolean", `"boolean"`, reflect.ValueOf(true), `"long"`, []byte{0x01}},
+		{"bytes", `"bytes"`, reflect.ValueOf([]byte{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0x06, 0xa1, 0xb2, 0xc3}},
+		{"bytes", `"bytes"`, reflect.ValueOf([3]byte{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0x06, 0xa1, 0xb2, 0xc3}},
+		{"bytes", `"bytes"`, reflect.ValueOf(nbeFix3{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0x06, 0xa1, 0xb2, 0xc3}},
+		{"fixed", ptrFixed3, reflect.ValueOf([]byte{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0xa1, 0xb2, 0xc3}},
+		{"fixed", ptrFixed3, reflect.ValueOf([3]byte{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0xa1, 0xb2, 0xc3}},
+		{"fixed", ptrFixed3, reflect.ValueOf(nbeFix3{0xa1, 0xb2, 0xc3}), `"long"`, []byte{0xa1, 0xb2, 0xc3}},
+		// The logical carriers wider than a word. The encoders read one in
+		// place when it is addressable, which every chain past depth 0 makes
+		// it. The wires are 2026-11-11T12:00:00Z in microseconds, 2026-11-11
+		// in days, and 90 minutes in microseconds.
+		{"timestamp-micros", ptrTimestamp, reflect.ValueOf(time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)), `"string"`,
+			[]byte{0x80, 0xc0, 0xbd, 0xf3, 0xdd, 0xff, 0xaf, 0x06}},
+		{"date", ptrDate, reflect.ValueOf(time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)), `"string"`, []byte{0xc0, 0xc4, 0x02}},
+		{"time-micros", ptrTime, reflect.ValueOf(90 * time.Minute), `"string"`, []byte{0x80, 0xd8, 0xeb, 0x9d, 0x28}},
+		{"duration", ptrDuration, reflect.ValueOf(avro.Duration{Months: 1, Days: 2, Milliseconds: 3}), `"long"`,
+			[]byte{1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0}},
 	}
 }
 
@@ -2146,6 +2217,7 @@ func ptrBases() []ptrBase {
 type ptrCtx struct {
 	label  string
 	schema func(b ptrBase) string
+	wire   func(b ptrBase) []byte                   // the context's binary encoding, built by hand from b.wire
 	input  func(b ptrBase, depth int) reflect.Value // context-shaped encode input
 	target func(b ptrBase, depth int) reflect.Value // a *context-shaped fresh decode target
 	check  func(t *testing.T, b ptrBase, target reflect.Value)
@@ -2175,16 +2247,19 @@ func ptrCtxs() []ptrCtx {
 		{
 			label:  "top",
 			schema: func(b ptrBase) string { return b.avro },
+			wire:   func(b ptrBase) []byte { return b.wire },
 			input:  chainTop, target: newChain, check: checkTop,
 		},
 		{
 			label:  "union-null2",
 			schema: func(b ptrBase) string { return fmt.Sprintf(`["null",%s]`, b.avro) },
+			wire:   func(b ptrBase) []byte { return append([]byte{0x02}, b.wire...) }, // branch 1
 			input:  chainTop, target: newChain, check: checkTop,
 		},
 		{
 			label:  "union-multi",
 			schema: func(b ptrBase) string { return fmt.Sprintf(`["null",%s,%s]`, b.avro, b.pad) },
+			wire:   func(b ptrBase) []byte { return append([]byte{0x02}, b.wire...) }, // branch 1
 			input:  chainTop, target: newChain, check: checkTop,
 		},
 		{
@@ -2192,6 +2267,7 @@ func ptrCtxs() []ptrCtx {
 			schema: func(b ptrBase) string {
 				return fmt.Sprintf(`{"type":"record","name":"PtrRec","fields":[{"name":"f","type":%s}]}`, b.avro)
 			},
+			wire: func(b ptrBase) []byte { return b.wire },
 			input: func(b ptrBase, depth int) reflect.Value {
 				v := reflect.New(ptrFieldStruct(b, depth)).Elem()
 				v.Field(0).Set(ptrChain(b.sample, depth))
@@ -2208,6 +2284,9 @@ func ptrCtxs() []ptrCtx {
 		{
 			label:  "array",
 			schema: func(b ptrBase) string { return fmt.Sprintf(`{"type":"array","items":%s}`, b.avro) },
+			wire: func(b ptrBase) []byte { // one block of 2 items, then the end marker
+				return append(append(append([]byte{0x04}, b.wire...), b.wire...), 0x00)
+			},
 			input: func(b ptrBase, depth int) reflect.Value {
 				st := reflect.SliceOf(ptrTypeOf(b.sample.Type(), depth))
 				sl := reflect.MakeSlice(st, 2, 2)
@@ -2234,6 +2313,9 @@ func ptrCtxs() []ptrCtx {
 		{
 			label:  "map",
 			schema: func(b ptrBase) string { return fmt.Sprintf(`{"type":"map","values":%s}`, b.avro) },
+			wire: func(b ptrBase) []byte { // one block of 1 entry keyed "k", then the end marker
+				return append(append([]byte{0x02, 0x02, 'k'}, b.wire...), 0x00)
+			},
 			input: func(b ptrBase, depth int) reflect.Value {
 				mt := reflect.MapOf(stringType, ptrTypeOf(b.sample.Type(), depth))
 				m := reflect.MakeMap(mt)
@@ -2270,7 +2352,7 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 	depths := []int{0, 1, ptrIndirectCap, ptrIndirectCap + 1} // {0, 1, at-cap, past-cap}
 	for _, b := range ptrBases() {
 		for _, pc := range ptrCtxs() {
-			t.Run(strings.Trim(b.avro, `"`)+"/"+pc.label, func(t *testing.T) {
+			t.Run(b.label+"/"+b.sample.Type().String()+"/"+pc.label, func(t *testing.T) {
 				s := avro.MustParse(pc.schema(b))
 				res, err := avro.Resolve(s, s)
 				if err != nil {
@@ -2281,6 +2363,11 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 				cbin, err := s.AppendEncode(nil, pc.input(b, 0).Interface())
 				if err != nil {
 					t.Fatalf("canonical binary encode: %v", err)
+				}
+				// Every deeper wire is compared to cbin below, so cbin itself is
+				// checked against bytes the encoder did not produce.
+				if want := pc.wire(b); !bytes.Equal(cbin, want) {
+					t.Fatalf("canonical binary wire:\n got=%x\nwant=%x", cbin, want)
 				}
 				cjson, err := s.AppendEncodeJSON(nil, pc.input(b, 0).Interface())
 				if err != nil {
@@ -2299,11 +2386,33 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 						if (jsonErr == nil) != accept {
 							t.Fatalf("JSON encode accept=%v, want %v (err=%v)", jsonErr == nil, accept, jsonErr)
 						}
+						// A chain past the cap is refused for the same reason on
+						// both wires, and errors.As gives one verdict for both.
+						if !accept {
+							var bse, jse *avro.SemanticError
+							if errors.As(binErr, &bse) != errors.As(jsonErr, &jse) {
+								t.Errorf("past the cap, the wires disagree on *SemanticError:\n binary: %v\n JSON:   %v", binErr, jsonErr)
+							}
+							const deep = "nests deeper than supported"
+							if !strings.Contains(binErr.Error(), deep) || !strings.Contains(jsonErr.Error(), deep) {
+								t.Errorf("past the cap, want both wires to say %q:\n binary: %v\n JSON:   %v", deep, binErr, jsonErr)
+							}
+						}
 						// An accepted deep input encodes to the same bytes as the
 						// bare base: pointer wrapping is transparent on the wire.
 						if accept {
 							if !bytes.Equal(binW, cbin) {
 								t.Fatalf("deep binary wire differs from bare base:\n got=%x\nwant=%x", binW, cbin)
+							}
+							// A value behind one pointer is read in place, so
+							// encoding it into a buffer with room allocates
+							// nothing.
+							if pc.label == "top" && depth == 1 {
+								ptr := pc.input(b, depth).Interface()
+								buf := make([]byte, 0, 64)
+								if n := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncode(buf[:0], ptr) }); n != 0 {
+									t.Errorf("encoding a value behind a pointer allocates %.0f times, want 0", n)
+								}
 							}
 							if !bytes.Equal(jsonW, cjson) {
 								t.Fatalf("deep JSON wire differs from bare base:\n got=%s\nwant=%s", jsonW, cjson)
@@ -2334,6 +2443,33 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 					})
 				}
 			})
+		}
+	}
+	// A slice of a primitive type behind a pointer, which a slice field of a
+	// struct passed by pointer also is. Both encoders loop over the slice
+	// where it is, so the pointer costs no allocation over the slice by
+	// value.
+	for _, c := range []struct {
+		schema string
+		ptr    any
+	}{
+		{`{"type":"array","items":"string"}`, &[]string{"a", "b"}},
+		{`{"type":"array","items":"boolean"}`, &[]bool{true, false}},
+		{`{"type":"array","items":"int"}`, &[]int32{1, 2}},
+		{`{"type":"array","items":"long"}`, &[]int64{1, 2}},
+		{`{"type":"array","items":"long"}`, &[]int{1, 2}},
+		{`{"type":"array","items":"float"}`, &[]float32{1.5}},
+		{`{"type":"array","items":"double"}`, &[]float64{1.5}},
+	} {
+		s := avro.MustParse(c.schema)
+		byValue := reflect.ValueOf(c.ptr).Elem().Interface()
+		buf := make([]byte, 0, 64)
+		if n := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncode(buf[:0], c.ptr) }); n != 0 {
+			t.Errorf("%T: encoding a slice behind a pointer allocates %.0f times, want 0", c.ptr, n)
+		}
+		want := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncodeJSON(buf[:0], byValue) })
+		if n := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncodeJSON(buf[:0], c.ptr) }); n != want {
+			t.Errorf("%T: JSON encoding a slice behind a pointer allocates %.0f times, and %.0f by value", c.ptr, n, want)
 		}
 	}
 }
@@ -2670,6 +2806,24 @@ func TestMatrix_NullUnionNilEquivalenceParity(t *testing.T) {
 		name string
 		run  func(t *testing.T)
 	}{
+		// ----- the null schema: a nil pointer at the last layer we follow -----
+		{"null-schema/nil-at-the-cap", func(t *testing.T) {
+			v := reflect.Zero(reflect.TypeFor[*int32]())
+			for range ptrIndirectCap {
+				p := reflect.New(v.Type())
+				p.Elem().Set(v)
+				v = p
+			}
+			s := avro.MustParse(`"null"`)
+			bin, berr := s.Encode(v.Interface())
+			js, jerr := s.EncodeJSON(v.Interface())
+			if berr != nil || len(bin) != 0 {
+				t.Errorf("binary: wire %x, err %v, want null", bin, berr)
+			}
+			if jerr != nil || string(js) != "null" {
+				t.Errorf("JSON: %s, err %v, want null", js, jerr)
+			}
+		}},
 		// ----- field context: *Inner, slice base, both positions -----
 		{"field/slice/null-first/nil", func(t *testing.T) {
 			var x []string
@@ -4506,6 +4660,10 @@ func TestMatrix_ConcurrentSchemaUse(t *testing.T) {
 			map[string]any{"a": int32(1), "b": "x"}},
 		{"decimal", `{"type":"bytes","logicalType":"decimal","precision":6,"scale":2}`,
 			[]byte{0x30, 0x39}},
+		// Every goroutine encodes the one *big.Rat, which the encoder reads
+		// in place, against powers of ten it shares.
+		{"decimal-rat", `{"type":"bytes","logicalType":"decimal","precision":38,"scale":10}`,
+			big.NewRat(-12345, 100)},
 		{"timestamp", `{"type":"long","logicalType":"timestamp-millis"}`, int64(1717243496789)},
 		{"recursive", `{"type":"record","name":"CN","fields":[
 			{"name":"v","type":"int"},{"name":"next","type":["null","CN"],"default":null}]}`,
@@ -4669,6 +4827,29 @@ func TestMatrix_ConcurrentFirstUse(t *testing.T) {
 				}
 				if got["keep"] != int32(9) {
 					errs <- fmt.Errorf("first-use skip corrupted: %#v", got)
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Error(err)
+		}
+
+		// The decimal encoder computes each power of ten on first use and
+		// shares it from then on. Each round encodes at a scale of its own,
+		// so its goroutines race the first use of that power.
+		scale := 990 + round
+		dec := avro.MustParse(fmt.Sprintf(`{"type":"bytes","logicalType":"decimal","precision":1000,"scale":%d}`, scale))
+		val := new(big.Rat).SetFrac(big.NewInt(-7), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
+		wantDec := []byte{0x02, 0xf9} // one byte, -7
+		errs = make(chan error, 8)
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if got, err := dec.AppendEncode(nil, val); err != nil || !bytes.Equal(got, wantDec) {
+					errs <- fmt.Errorf("first-use decimal encode at scale %d: got %x err %v, want %x", scale, got, err, wantDec)
 				}
 			}()
 		}

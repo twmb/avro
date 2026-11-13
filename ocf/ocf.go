@@ -102,7 +102,8 @@ type Codec interface {
 	// (e.g. "null", "deflate", "snappy", "zstandard").
 	Name() string
 
-	// Compress encodes a raw data block for storage.
+	// Compress encodes a raw data block for storage. You must not retain
+	// src after Compress returns: a Writer reuses it for its next block.
 	Compress(src []byte) ([]byte, error)
 
 	// Decompress decodes a stored data block back to raw bytes.
@@ -423,6 +424,8 @@ type Writer struct {
 	count      int
 	maxCount   int
 	maxBytes   int
+	dataHint   int // the last block's data length, to size the next block by
+	lastLen    int // the last encoded datum's length, to make room for the next by
 	err        error
 	userMeta   []kv
 	hasSync    bool
@@ -596,6 +599,8 @@ func (w *Writer) Encode(v any) error {
 	if w.err != nil {
 		return w.err
 	}
+	// The datum before this one is our guess at this one's size.
+	w.reserve(w.lastLen)
 	// AppendEncode is append-only into w.buf: on error the first len(w.buf)
 	// bytes are still exactly the previously accepted datums, and the failed
 	// datum's partial bytes sit past them in the backing array (hidden by the
@@ -605,12 +610,36 @@ func (w *Writer) Encode(v any) error {
 	if err != nil {
 		return err
 	}
+	w.lastLen = len(buf) - len(w.buf)
 	w.buf = buf
 	w.count++
 	if w.shouldFlush() {
 		return w.flush()
 	}
 	return nil
+}
+
+// reserve makes room in the block buffer for a datum of about n bytes. When
+// the buffer is out of room, append would move it to one a quarter larger,
+// and a block that fills that way is copied about thirty times. We move it
+// instead to four times what it is about to hold, or to the size its datums
+// predict for a whole block plus an eighth, whichever is smaller. A datum
+// that size has no room for is left to append. We keep the buffer from block
+// to block and never pass it to the io.Writer, so this is a cost of a
+// Writer's first block.
+func (w *Writer) reserve(n int) {
+	need := len(w.buf) + n
+	if need <= cap(w.buf) {
+		return
+	}
+	block := w.maxBytes
+	if avg := need / (w.count + 1); w.maxCount > 0 && avg < block/w.maxCount {
+		block = avg * w.maxCount
+	}
+	block += min(block/8, math.MaxInt-block)
+	if want := min(4*need, block); want >= need && want > cap(w.buf) {
+		w.buf = append(make([]byte, 0, want), w.buf...)
+	}
 }
 
 // Write appends pre-encoded Avro bytes as a single datum to the current
@@ -623,6 +652,7 @@ func (w *Writer) Write(p []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
 	}
+	w.reserve(len(p))
 	w.buf = append(w.buf, p...)
 	w.count++
 	if w.shouldFlush() {
@@ -674,21 +704,64 @@ func (w *Writer) Close() error {
 	}
 }
 
-func (w *Writer) flush() error {
-	compressed, err := w.codec.Compress(w.buf)
-	if err != nil {
-		w.err = err
-		return fmt.Errorf("ocf: compressing block: %w", err)
+// blockHeaderMax is the most a block's two varints, its count and its data
+// length, can take.
+const blockHeaderMax = 2 * binary.MaxVarintLen64
+
+// zstdEncoderOf returns c's encoder when c is our zstd codec, as it is or
+// under [NopCloser], and nil for every other codec.
+func zstdEncoderOf(c Codec) *zstd.Encoder {
+	for {
+		nc, ok := c.(nopCloser)
+		if !ok {
+			break
+		}
+		c = nc.Codec
 	}
+	if z, ok := c.(*zstdCodec); ok {
+		return z.enc
+	}
+	return nil
+}
+
+func (w *Writer) flush() error {
+	// We build the block in one fresh slice: room for the header, then the
+	// data, then the sync marker. The header's length is not known until the
+	// data's is, so we leave blockHeaderMax in front and write the header
+	// right-aligned against the data. The slice is new for every block, so a
+	// destination that keeps what it is handed still holds the right bytes.
 	var block []byte
-	block = binary.AppendVarint(block, int64(w.count))
-	block = binary.AppendVarint(block, int64(len(compressed)))
-	block = append(block, compressed...)
+	if enc := zstdEncoderOf(w.codec); enc != nil {
+		// zstd appends to the slice it is given, so it compresses straight
+		// after the header's room. The capacity is the last block's data
+		// length, or for the first block its uncompressed length; append
+		// grows it when this block compresses worse.
+		hint := w.dataHint
+		if hint == 0 {
+			hint = len(w.buf)
+		}
+		block = enc.EncodeAll(w.buf, make([]byte, blockHeaderMax, blockHeaderMax+hint+len(w.sync)))
+	} else {
+		data, err := w.codec.Compress(w.buf)
+		if err != nil {
+			w.err = err
+			return fmt.Errorf("ocf: compressing block: %w", err)
+		}
+		block = make([]byte, blockHeaderMax, blockHeaderMax+len(data)+len(w.sync))
+		block = append(block, data...)
+	}
+	n := len(block) - blockHeaderMax
+	var hdr [blockHeaderMax]byte
+	h := binary.AppendVarint(hdr[:0], int64(w.count))
+	h = binary.AppendVarint(h, int64(n))
+	start := blockHeaderMax - len(h)
+	copy(block[start:], h)
 	block = append(block, w.sync[:]...)
-	if err := writeFull(w.w, block); err != nil {
+	if err := writeFull(w.w, block[start:]); err != nil {
 		w.err = err
 		return fmt.Errorf("ocf: writing block: %w", err)
 	}
+	w.dataHint = n
 	w.buf = w.buf[:0]
 	w.count = 0
 	return nil

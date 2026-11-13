@@ -96,8 +96,8 @@ func timeToTimestampNanos(t time.Time) (int64, error) {
 }
 
 // timeLogicalToInt64 returns nil if logical is not a long-typed time logical.
-// JSON encode's "long" arm and the binary ser-side timestamp wrappers both go
-// through here, so a new logical is wired in once.
+// JSON encode's "long" arm asks it. The binary serializers name their
+// converter directly.
 func timeLogicalToInt64(logical string) func(time.Time) (int64, error) {
 	switch logical {
 	case "timestamp-millis":
@@ -127,7 +127,8 @@ func dateToTime(val int32) time.Time { return time.Unix(int64(val)*86400, 0).UTC
 // outside roughly +/-5.8 million. Without the check, int32() truncation
 // silently corrupts the wire value.
 func timeToDate(t time.Time) (int32, error) {
-	utc := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	y, m, d := t.Date()
+	utc := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 	days := utc.Unix() / 86400
 	if days < math.MinInt32 || days > math.MaxInt32 {
 		return 0, fmt.Errorf("date %v overflows int32 (days since epoch = %d)", t, days)

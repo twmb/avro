@@ -15,6 +15,7 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"math/bits"
 	"math/rand"
 	"net"
 	"os"
@@ -4177,7 +4178,7 @@ func TestSpecBareTypeNameInObjectAccepted(t *testing.T) {
 
 // TestSpecJSONEncodeBytesAcceptsByteArray locks that EncodeJSON accepts a
 // Go [N]byte for an Avro "bytes" schema, matching the binary path's
-// serBytes (ser.go:460), which accepts both reflect.Array and
+// serBytes, which accepts both reflect.Array and
 // reflect.Slice. Without the Array case, every position the bytes encoder
 // is reached fails for [N]byte. The JSON "fixed" arm already handled
 // Array; "string" rejects [N]byte on both wires consistently, since
@@ -8374,6 +8375,13 @@ func TestMatrix_DateEncodeWallClock(t *testing.T) {
 		{"UTC 1970-01-01", time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC), 0},
 		{"+05 1970-01-01 12:00", time.Date(1970, 1, 1, 12, 0, 0, 0, plus5), 0},
 		{"UTC 1969-12-27", time.Date(1969, 12, 27, 0, 0, 0, 0, time.UTC), -5},
+		// Before 1970 and away from midnight, on each side of the epoch
+		// in a zone, and the two ends of int32.
+		{"UTC 1969-12-31 12:00", time.Date(1969, 12, 31, 12, 0, 0, 0, time.UTC), -1},
+		{"-05 1969-12-31 23:00", time.Date(1969, 12, 31, 23, 0, 0, 0, minus5), -1},
+		{"+05 1970-01-01 01:00", time.Date(1970, 1, 1, 1, 0, 0, 0, plus5), 0},
+		{"first int32 day", time.Date(-5877641, 6, 23, 0, 0, 0, 0, time.UTC), math.MinInt32},
+		{"last int32 day", time.Date(5881580, 7, 11, 0, 0, 0, 0, time.UTC), math.MaxInt32},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -8807,9 +8815,9 @@ func TestMatrix_LenientInputAudit(t *testing.T) {
 // TestMatrix_UnionDispatchAmbiguous locks the encoder's branch-selection
 // rule where multiple branches could accept the same Go input.
 // serUnion.ser tries a tagged-map unwrap, then the Go-type natural Avro
-// kind via unionTypeNameForValue, branchKinds picking that branch
+// kind via unionTypeNameForValue, unionTags.byKind picking that branch
 // regardless of schema order. Try-each in schema order is reached only
-// for Go types whose natural kind is not in branchKinds. We enumerate
+// for Go types whose natural kind is not in unionTags.byKind. We enumerate
 // the natural-kind-first vs schema-order-first distinction. Both
 // encoders share unionTypeNameForValue, so the cells assert the same
 // wantBranch on both wires.
@@ -8869,7 +8877,7 @@ func TestMatrix_UnionDispatchAmbiguous(t *testing.T) {
 		},
 		{
 			// float64 input against [int, float]: natural kind =
-			// "double", not in branchKinds. Falls through to try-each,
+			// "double", not in unionTags.byKind. Falls through to try-each,
 			// which walks schema order; int branch accepts whole-
 			// number floats first.
 			name:       "int vs float: int branch wins for whole-number float64 (fall-through, schema-order)",
@@ -19191,20 +19199,87 @@ func TestProperty_MetadataDefaultMatchesWire(t *testing.T) {
 // the float64 widening's IEEE noise (the regression that rejected
 // float32(0.33) at scale 2).
 
+// twosComplementRef is the reference for a decimal's unscaled bytes: u as
+// big-endian two's complement of n bytes, which by definition is u mod
+// 2^(8n). n == 0 picks the fewest bytes whose range holds u.
+func twosComplementRef(u *big.Int, n int) []byte {
+	if n == 0 {
+		for n = 1; ; n++ {
+			half := new(big.Int).Lsh(big.NewInt(1), uint(8*n-1))
+			if u.Cmp(new(big.Int).Neg(half)) >= 0 && u.Cmp(half) < 0 {
+				break
+			}
+		}
+	}
+	mod := new(big.Int).Lsh(big.NewInt(1), uint(8*n))
+	return new(big.Int).Mod(u, mod).FillBytes(make([]byte, n))
+}
+
 func TestDecimalRoundTripMatrix(t *testing.T) {
 	schemas := []struct {
 		name      string
 		json      string
 		precision int
 		scale     int
+		size      int // the fixed size, 0 for bytes
 	}{
-		{"bytes/p10s2", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, 10, 2},
-		{"bytes/p18s4", `{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}`, 18, 4},
-		{"bytes/p4s0", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":0}`, 4, 0},
-		{"fixed/p8s6", `{"type":"fixed","name":"Dec16","size":16,"logicalType":"decimal","precision":8,"scale":6}`, 8, 6},
-		{"fixed/p38s10", `{"type":"fixed","name":"Dec32","size":32,"logicalType":"decimal","precision":38,"scale":10}`, 38, 10},
+		{"bytes/p10s2", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, 10, 2, 0},
+		{"bytes/p18s4", `{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}`, 18, 4, 0},
+		{"bytes/p4s0", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":0}`, 4, 0, 0},
+		{"bytes/p76s38", `{"type":"bytes","logicalType":"decimal","precision":76,"scale":38}`, 76, 38, 0},
+		{"bytes/p120s19", `{"type":"bytes","logicalType":"decimal","precision":120,"scale":19}`, 120, 19, 0},
+		{"bytes/p160s38", `{"type":"bytes","logicalType":"decimal","precision":160,"scale":38}`, 160, 38, 0},
+		{"fixed/p8s6", `{"type":"fixed","name":"Dec16","size":16,"logicalType":"decimal","precision":8,"scale":6}`, 8, 6, 16},
+		{"fixed/p38s10", `{"type":"fixed","name":"Dec32","size":32,"logicalType":"decimal","precision":38,"scale":10}`, 38, 10, 32},
+		{"fixed/p100s20", `{"type":"fixed","name":"Dec48","size":48,"logicalType":"decimal","precision":100,"scale":20}`, 100, 20, 48},
+		// The encoder shares one 10^n for n up to 1024 and computes a larger
+		// one per call, for the scale and the precision separately.
+		{"bytes/p1024s1024", `{"type":"bytes","logicalType":"decimal","precision":1024,"scale":1024}`, 1024, 1024, 0},
+		{"bytes/p1025s1024", `{"type":"bytes","logicalType":"decimal","precision":1025,"scale":1024}`, 1025, 1024, 0},
+		{"bytes/p1025s1025", `{"type":"bytes","logicalType":"decimal","precision":1025,"scale":1025}`, 1025, 1025, 0},
+		{"fixed/p1024s512", `{"type":"fixed","name":"Dec430","size":430,"logicalType":"decimal","precision":1024,"scale":512}`, 1024, 512, 430},
+	}
+	// The same value as a Rat in lowest terms and as one that is not, which
+	// you get by writing through Num and Denom.
+	forms := []struct {
+		name string
+		mk   func(u, den *big.Int) *big.Rat
+	}{
+		{"reduced", func(u, den *big.Int) *big.Rat { return new(big.Rat).SetFrac(u, den) }},
+		{"unreduced", func(u, den *big.Int) *big.Rat {
+			r := new(big.Rat).SetFrac(u, den)
+			six := big.NewInt(6)
+			r.Num().Mul(r.Num(), six)
+			r.Denom().Mul(r.Denom(), six)
+			return r
+		}},
+		// Both signs flipped, which you also get by writing through Num and
+		// Denom. We divide by the denominator as it reads, sign included, so
+		// the value is the same. math/big itself ignores a denominator's
+		// sign, so we compare a decode against value below, not against this.
+		{"negated", func(u, den *big.Int) *big.Rat {
+			r := new(big.Rat).SetFrac(u, den)
+			r.Num().Neg(r.Num())
+			r.Denom().Neg(r.Denom())
+			return r
+		}},
+		// Times 2^64+1, the denominator takes two words, and its low word
+		// alone still divides the numerator times 10^scale.
+		{"unreduced-wide", func(u, den *big.Int) *big.Rat {
+			r := new(big.Rat).SetFrac(u, den)
+			k := new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(1))
+			r.Num().Mul(r.Num(), k)
+			r.Denom().Mul(r.Denom(), k)
+			return r
+		}},
 	}
 
+	// The encoder computes a value in a stack array when numerator * 10^scale
+	// fits 8 words and the denominator fits one, and in big.Ints otherwise.
+	words := func(x *big.Int) int { return (x.BitLen() + bits.UintSize - 1) / bits.UintSize }
+
+	// Liveness floors: the precision filter below must leave each class.
+	var cells, negPow2, integers, wide, onStack, onHeap int
 	for _, sc := range schemas {
 		t.Run(sc.name, func(t *testing.T) {
 			s := avro.MustParse(sc.json)
@@ -19217,23 +19292,178 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 				big.NewInt(0), big.NewInt(1), big.NewInt(-1),
 				big.NewInt(5), big.NewInt(-5), big.NewInt(99), big.NewInt(-99),
 				new(big.Int).Set(maxUnscaled), new(big.Int).Neg(maxUnscaled),
+				// A multiple of 10^scale is an integer-valued Rat.
+				new(big.Int).Mul(big.NewInt(3), den), new(big.Int).Mul(big.NewInt(-3), den),
+			}
+			// The two's complement length steps at each power of two, and
+			// -2^k is a byte shorter than its magnitude alone suggests. 503
+			// through 512 bits straddle 64 bytes.
+			for _, k := range []uint{7, 8, 15, 16, 63, 64, 127, 128, 503, 504, 511, 512} {
+				pow := new(big.Int).Lsh(big.NewInt(1), k)
+				for _, d := range []int64{-1, 0, 1} {
+					u := new(big.Int).Add(pow, big.NewInt(d))
+					unscaled = append(unscaled, u, new(big.Int).Neg(u))
+				}
+			}
+			// A value with few fractional digits has a short denominator at
+			// any scale: one word through 19 digits, two from 20. A numerator
+			// near 2^384 times the two words of 10^38 straddles 8 words.
+			one := big.NewInt(1)
+			pow384 := new(big.Int).Lsh(one, 384)
+			pow64 := new(big.Int).Lsh(one, 64)
+			for _, digits := range []int{4, 19, 20} {
+				if digits > sc.scale {
+					continue
+				}
+				shift := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(sc.scale-digits)), nil)
+				for _, v := range []*big.Int{
+					big.NewInt(1), big.NewInt(127), big.NewInt(128), big.NewInt(12345),
+					new(big.Int).Sub(pow64, one), pow64, new(big.Int).Add(pow64, one),
+					new(big.Int).Sub(new(big.Int).Lsh(one, 128), one), new(big.Int).Sub(new(big.Int).Lsh(one, 256), one),
+					new(big.Int).Sub(pow384, one), new(big.Int).Add(pow384, one),
+				} {
+					u := new(big.Int).Mul(v, shift)
+					unscaled = append(unscaled, u, new(big.Int).Neg(u))
+				}
 			}
 			for _, u := range unscaled {
-				want := new(big.Rat).SetFrac(u, den) // value = u / 10^scale, exact at this scale
-				wire, err := s.Encode(want)
-				if err != nil {
-					t.Fatalf("Encode(%v): %v", want, err)
+				if u.CmpAbs(maxUnscaled) > 0 {
+					continue
 				}
-				var got *big.Rat
-				if _, err := s.Decode(wire, &got); err != nil {
-					t.Fatalf("Decode(%v wire): %v", want, err)
+				ref := twosComplementRef(u, sc.size)
+				wantWire := ref
+				if sc.size == 0 {
+					wantWire = avroLen(ref)
 				}
-				if got == nil || got.Cmp(want) != 0 {
-					t.Errorf("unscaled %v: round-trip got %v, want %v", u, got, want)
+				for _, form := range forms {
+					value := new(big.Rat).SetFrac(u, den) // u / 10^scale, exact at this scale
+					want := form.mk(u, den)               // the same value, in this form
+					num, denom := new(big.Int).Set(want.Num()), new(big.Int).Set(want.Denom())
+					// A *big.Rat is read in place and a big.Rat is copied.
+					for _, carrier := range []any{want, *want} {
+						cells++
+						if u.Sign() < 0 && new(big.Int).Neg(u).TrailingZeroBits() == uint(u.BitLen()-1) {
+							negPow2++
+						}
+						if want.IsInt() {
+							integers++
+						}
+						if len(ref) > 64 {
+							wide++
+						}
+						wire, err := s.Encode(carrier)
+						if err != nil {
+							t.Fatalf("Encode(%s %T %v): %v", form.name, carrier, want, err)
+						}
+						if !bytes.Equal(wire, wantWire) {
+							t.Fatalf("Encode(%s %T) of unscaled %v:\n got=%x\nwant=%x", form.name, carrier, u, wire, wantWire)
+						}
+						// The stack array is what keeps an encode from
+						// allocating, so a *big.Rat that qualifies for it
+						// encodes with no allocation.
+						if words(want.Num())+words(den) <= 8 && words(want.Denom()) == 1 && want.Denom().Sign() > 0 && sc.scale <= 1024 && sc.precision <= 1024 {
+							onStack++
+							if ptr, ok := carrier.(*big.Rat); ok {
+								var buf []byte
+								if n := testing.AllocsPerRun(5, func() { buf, _ = s.AppendEncode(buf[:0], ptr) }); n != 0 {
+									t.Errorf("Encode(%s) of unscaled %v allocates %.0f times, want 0", form.name, u, n)
+								}
+							}
+						} else {
+							onHeap++
+						}
+						if want.Num().Cmp(num) != 0 || want.Denom().Cmp(denom) != 0 {
+							t.Fatalf("Encode(%s %T) changed its input from %v/%v to %v/%v", form.name, carrier, num, denom, want.Num(), want.Denom())
+						}
+						var got *big.Rat
+						if _, err := s.Decode(wire, &got); err != nil {
+							t.Fatalf("Decode(%v wire): %v", want, err)
+						}
+						if got == nil || got.Cmp(value) != 0 {
+							t.Errorf("unscaled %v: round-trip got %v, want %v", u, got, value)
+						}
+						jwire, err := s.EncodeJSON(carrier)
+						if err != nil {
+							t.Fatalf("EncodeJSON(%s %T %v): %v", form.name, carrier, want, err)
+						}
+						var jgot *big.Rat
+						if err := s.DecodeJSON(jwire, &jgot); err != nil {
+							t.Fatalf("DecodeJSON(%s): %v", jwire, err)
+						}
+						if jgot == nil || jgot.Cmp(value) != 0 {
+							t.Errorf("unscaled %v: JSON round-trip got %v, want %v", u, jgot, value)
+						}
+						// A decoded Rat is yours to change. Writing through
+						// both must not reach a power of ten a later cell
+						// encodes or decodes with.
+						for _, r := range []*big.Rat{got, jgot} {
+							if r != nil {
+								r.Num().SetInt64(7)
+								r.Denom().SetInt64(13)
+							}
+						}
+					}
 				}
+			}
+
+			// One digit past the precision rejects, as does a value 21 digits
+			// past it, which is words longer than 10^precision. The error
+			// counts the digits.
+			for _, past := range []int{1, 21} {
+				over := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(sc.precision+past-1)), nil)
+				wantErr := fmt.Sprintf("decimal value has %d digits, exceeds schema precision %d", sc.precision+past, sc.precision)
+				for _, u := range []*big.Int{over, new(big.Int).Neg(over)} {
+					for _, form := range forms {
+						r := form.mk(u, den)
+						if _, err := s.Encode(r); err == nil || !strings.Contains(err.Error(), wantErr) {
+							t.Errorf("Encode(%s) %d digits past precision %d: got %v, want %q", form.name, past, sc.precision, err, wantErr)
+						}
+						if _, err := s.EncodeJSON(r); err == nil || !strings.Contains(err.Error(), wantErr) {
+							t.Errorf("EncodeJSON(%s) %d digits past precision %d: got %v, want %q", form.name, past, sc.precision, err, wantErr)
+						}
+					}
+					// The error names the Go type you passed, and both wires
+					// word it the same, whichever carrier holds the number.
+					text := new(big.Rat).SetFrac(u, den).FloatString(sc.scale)
+					for _, in := range []any{new(big.Rat).SetFrac(u, den), text, json.Number(text)} {
+						_, berr := s.Encode(in)
+						_, jerr := s.EncodeJSON(in)
+						var bse, jse *avro.SemanticError
+						if !errors.As(berr, &bse) || !errors.As(jerr, &jse) {
+							t.Errorf("%T %d digits past precision: want *SemanticError on both wires, got binary %v, JSON %v", in, past, berr, jerr)
+							continue
+						}
+						want := reflect.TypeOf(in)
+						if want.Kind() == reflect.Pointer {
+							want = want.Elem()
+						}
+						if bse.GoType != want || jse.GoType != want || berr.Error() != jerr.Error() {
+							t.Errorf("%T %d digits past precision: binary names %v, JSON names %v, want %v on both\n binary: %.120s\n JSON:   %.120s",
+								in, past, bse.GoType, jse.GoType, want, berr.Error(), jerr.Error())
+						}
+					}
+				}
+			}
+			// A value finer than the scale rejects rather than rounds.
+			fine := new(big.Rat).SetFrac(big.NewInt(1), new(big.Int).Mul(den, big.NewInt(10)))
+			if _, err := s.Encode(fine); err == nil || !strings.Contains(err.Error(), "without rounding") {
+				t.Errorf("Encode of 10^-%d at scale %d: got %v, want a rounding error", sc.scale+1, sc.scale, err)
 			}
 		})
 	}
+	for _, floor := range []struct {
+		name      string
+		got, want int
+	}{
+		{"cells", cells, 1000}, {"negative powers of two", negPow2, 100}, {"integer-valued Rats", integers, 50},
+		{"values wider than 64 bytes", wide, 100}, {"values computed on the stack", onStack, 300}, {"values computed in big.Ints", onHeap, 300},
+	} {
+		if floor.got < floor.want {
+			t.Errorf("only %d %s ran, want at least %d", floor.got, floor.name, floor.want)
+		}
+	}
+	t.Logf("%d cells: %d negative powers of two, %d integer-valued Rats, %d wider than 64 bytes, %d on the stack, %d in big.Ints",
+		cells, negPow2, integers, wide, onStack, onHeap)
 }
 
 // TestDecimalFloat32SourcePrecision pins that a float32 decimal input is
@@ -22376,6 +22606,73 @@ func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	// A nil pointer where the schema has no null: one error on every path.
+	// The path is the wire, and how the caller passes the record, since a
+	// struct by value, a pointer to a struct, and a map each go through a
+	// different serializer. The error names the record's Go type and the
+	// field.
+	three := int32(3)
+	nils := []struct {
+		name, schema string
+		val          any // field f's value, holding the nil
+	}{
+		{"array-int", `{"type":"array","items":"int"}`, []*int32{&three, nil}},
+		{"array-string", `{"type":"array","items":"string"}`, []*string{nil}},
+		{"array-any", `{"type":"array","items":"long"}`, []any{nil}},
+		{"map-int", `{"type":"map","values":"int"}`, map[string]*int32{"k": nil}},
+		{"map-double", `{"type":"map","values":"double"}`, map[string]*float64{"k": nil}},
+		{"field", `"int"`, (*int32)(nil)},
+		// An untyped nil: the map holds a nil any, and the struct's field is
+		// an any.
+		{"untyped/long", `"long"`, nil},
+		{"untyped/array", `{"type":"array","items":"int"}`, nil},
+		{"untyped/record", `{"type":"record","name":"Sub","fields":[]}`, nil},
+	}
+	for _, n := range nils {
+		s := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":%s}]}`, n.schema))
+		fieldType := reflect.TypeFor[any]()
+		if n.val != nil {
+			fieldType = reflect.TypeOf(n.val)
+		}
+		st := reflect.New(reflect.StructOf([]reflect.StructField{{Name: "F", Type: fieldType, Tag: `avro:"f"`}}))
+		if n.val != nil {
+			st.Elem().Field(0).Set(reflect.ValueOf(n.val))
+		}
+		carriers := []struct {
+			name string
+			v    any
+		}{
+			{"map", map[string]any{"f": n.val}},
+			{"struct", st.Elem().Interface()},
+			{"struct-pointer", st.Interface()},
+		}
+		for _, c := range carriers {
+			t.Run("nil/"+n.name+"/"+c.name, func(t *testing.T) {
+				_, berr := s.AppendEncode(nil, c.v)
+				_, jerr := s.AppendEncodeJSON(nil, c.v)
+				var bse, jse *avro.SemanticError
+				if !errors.As(berr, &bse) || !errors.As(jerr, &jse) {
+					t.Fatalf("want *SemanticError on both wires, got binary %v, JSON %v", berr, jerr)
+				}
+				wantGo := reflect.TypeOf(c.v)
+				if wantGo.Kind() == reflect.Pointer {
+					wantGo = wantGo.Elem()
+				}
+				for _, e := range []struct {
+					wire string
+					se   *avro.SemanticError
+				}{{"binary", bse}, {"JSON", jse}} {
+					if e.se.GoType != wantGo || e.se.AvroType != "record" || e.se.Field != "f" {
+						t.Errorf("%s: GoType %v, AvroType %q, Field %q; want %v, \"record\", \"f\"", e.wire, e.se.GoType, e.se.AvroType, e.se.Field, wantGo)
+					}
+				}
+				if berr.Error() != jerr.Error() {
+					t.Errorf("the wires word the error differently:\n binary: %v\n JSON:   %v", berr, jerr)
+				}
+			})
+		}
 	}
 }
 
