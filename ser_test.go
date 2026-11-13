@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1921,6 +1922,17 @@ func indexOfBlockCount(wire []byte, n int) int {
 //     minimum silently routes an element through the wrong one. That half is
 //     invisible to a decode test, because both rules end in an error for a
 //     truncated wire.
+//
+// maxIntSchema rewrites the largest int64 in a schema's text, and the value one
+// below it, to the largest int of this build and the value one below. The
+// magnitude tests write a fixed size at the top of the integer range, and that
+// size has to parse where int is 32 bits and still be the top of the range
+// there. On a 64-bit build the text is unchanged.
+func maxIntSchema(schema string) string {
+	schema = strings.ReplaceAll(schema, "9223372036854775807", strconv.Itoa(math.MaxInt))
+	return strings.ReplaceAll(schema, "9223372036854775806", strconv.Itoa(math.MaxInt-1))
+}
+
 func TestInvariant_SchemaMinBytesSaturates(t *testing.T) {
 	const huge = `{"type":"fixed","name":"HF","size":9223372036854775807}`
 	// Sums that wrap: a small lead, then magnitudes large enough to carry the
@@ -1971,7 +1983,7 @@ func TestInvariant_SchemaMinBytesSaturates(t *testing.T) {
 	}
 	for _, p := range probes {
 		t.Run(p.name, func(t *testing.T) {
-			s := mustParse(t, p.schema)
+			s := mustParse(t, maxIntSchema(p.schema))
 			got := schemaMinBytes(s.node)
 			if got < 0 {
 				t.Errorf("minimum wire bytes is %d; a byte count cannot be negative, and a negative one inverts every bound derived from it", got)
@@ -2012,7 +2024,7 @@ func TestInvariant_UnionMinimumCoversItsBranches(t *testing.T) {
 		`["null","int"]`,
 		`[{"type":"fixed","name":"UF3","size":4},{"type":"fixed","name":"UF4","size":9}]`,
 	} {
-		s, err := Parse(schema)
+		s, err := Parse(maxIntSchema(schema))
 		if err != nil {
 			t.Fatalf("parse %s: %v", schema, err)
 		}
@@ -2043,7 +2055,7 @@ func TestInvariant_SaturateSchemaMagnitudeIsTotal(t *testing.T) {
 	for _, n := range []int{
 		minInt, minInt + 1, -maxSchemaMagnitude, -1, 0, 1,
 		maxSchemaMagnitude - 1, maxSchemaMagnitude, maxSchemaMagnitude + 1,
-		1 << 40, maxInt - 1, maxInt,
+		min(1<<40, math.MaxInt>>1), maxInt - 1, maxInt,
 	} {
 		got := saturateSchemaMagnitude(n)
 		if got < 0 || got > maxSchemaMagnitude {
@@ -2179,6 +2191,12 @@ var magnitudeSites = []magnitudeSite{
 	{
 		where: "unsafe.go::usArrayRecord", count: 1, verdict: magNotAMagnitude,
 		reason: "elemSize is reflect.Type.Size(); see udArrayDirect",
+	},
+	{
+		where: "ocf/ocf.go::checkedReader.left", count: 1, verdict: magNotAMagnitude,
+		reason: "fi.Size() is a file's length from Stat, not a schema's size. The difference only picks how a " +
+			"declared size the caps already bound is read: a wrong or wrapped answer makes that one read " +
+			"allocate once or grow, and changes no verdict",
 	},
 	{
 		where: "ser.go::appendDecimalWords", count: 11, verdict: magBoundedHere,
@@ -2585,8 +2603,10 @@ func magCountVerdict(v magVerdict) int {
 // does on the bound itself, so the concession costs an error message on absurd
 // schemas and nothing else.
 func TestInvariant_ClippedMagnitudeStillRejects(t *testing.T) {
-	// Each element needs 2^40 bytes; the ceiling clips that to 2^27.
-	s := mustParse(t, `{"type":"array","items":{"type":"fixed","name":"CBF","size":1099511627776}}`)
+	// Each element needs 2^40 bytes, or 2^30 where int is 32 bits; the
+	// ceiling clips that to 2^27.
+	const size = 1 << min(40, strconv.IntSize-2)
+	s := mustParse(t, fmt.Sprintf(`{"type":"array","items":{"type":"fixed","name":"CBF","size":%d}}`, size))
 	for _, count := range []int{1, 4, 1000} {
 		wire := append([]byte{byte(count << 1)}, make([]byte, 1<<16)...)
 		var v any

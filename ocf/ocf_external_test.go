@@ -193,18 +193,29 @@ func ExampleNewReader_evolution() {
 
 // ---------- block_alloc_regression_test.go ----------
 
-// TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate pins that a reader with
-// a raised WithMaxBlockBytes does not eagerly allocate an attacker-declared
-// block size before reading the payload. Raising the cap to a very large value
-// is the natural way to say "accept big blocks", and it used to expose
-// readBlock's make([]byte, declaredSize): a tiny hostile file declaring a 256
-// TiB block with no payload drove that to an unrecoverable "fatal error: out
-// of memory", a runtime.throw no recover() can catch.
+// lenZeroReader is a reader whose Len method reports nothing left, whatever
+// it still has to read.
+type lenZeroReader struct{ io.Reader }
+
+func (lenZeroReader) Len() int { return 0 }
+
+// TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate pins that a reader does
+// not allocate a size the file declares before the bytes arrive. Raising
+// WithMaxBlockBytes to a very large value is the natural way to say "accept big
+// blocks", and it used to expose readBlock's make([]byte, declaredSize): a tiny
+// hostile file declaring a 256 TiB block with no payload drove that to an
+// unrecoverable "fatal error: out of memory", a runtime.throw no recover() can
+// catch. Within the default cap the same make cost up to 64 MiB for a file of
+// a few bytes, and so did the avro.schema value in the header.
 //
-// We now read incrementally once the declared size exceeds the
-// eager-allocation window, so the buffer grows only to the bytes actually
-// present. Reaching the assertion without the process dying is the pin; the
-// boundary-1 case is held by TestRegression_OCFLargeDatumReaderCap.
+// For every declared size we ask the caller's reader how many bytes remain.
+// A reader that can say decides: one allocation when the bytes are
+// there, and an incremental read when they are not, so the buffer grows only
+// to the bytes actually present. A reader that cannot say is read as it always
+// was: one allocation within the default cap, incremental above it. The source
+// axis is how the caller's reader can answer: a Len method, a regular file, a
+// stream that cannot say, and a Len that under-reports. What the reader says
+// picks how we read and never whether we accept.
 func TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate(t *testing.T) {
 	// A valid header for "long", reused for its embedded 16-byte sync marker.
 	var hb bytes.Buffer
@@ -213,21 +224,190 @@ func TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate(t *testing.T) {
 	hdr := hb.Bytes()
 	sync := hdr[len(hdr)-16:]
 
-	// One hostile block: count=1, a 256 TiB declared compressed size, and
+	// block is one hostile block: count=1, a declared compressed size, and
 	// *no* payload bytes (the file ends right after the size + sync framing).
-	var file bytes.Buffer
-	file.Write(hdr)
-	file.Write(binary.AppendVarint(nil, 1))     // count
-	file.Write(binary.AppendVarint(nil, 1<<48)) // declared size = 256 TiB
-	file.Write(sync)
-
-	// Cap raised *above* the declared size, so the size>maxBlockBytes guard
-	// does not fire and the read path itself must stay bounded.
-	r := ocftest.MustNewReader(t, bytes.NewReader(file.Bytes()), ocf.WithMaxBlockBytes(1<<50))
-	var v int64
-	if err := r.Decode(&v); err == nil {
-		t.Fatal("expected an error for a 256 TiB declared-size block with no payload, got nil")
+	block := func(size int64) []byte {
+		var file bytes.Buffer
+		file.Write(hdr)
+		file.Write(binary.AppendVarint(nil, 1))    // count
+		file.Write(binary.AppendVarint(nil, size)) // declared size
+		file.Write(sync)
+		return file.Bytes()
 	}
+	// header is a file that ends inside its header: one metadata entry whose
+	// value declares size bytes and has none.
+	header := func(key string, size int64) []byte {
+		file := []byte("Obj\x01")
+		file = binary.AppendVarint(file, 1) // one entry
+		file = binary.AppendVarint(file, int64(len(key)))
+		file = append(file, key...)
+		return binary.AppendVarint(file, size)
+	}
+
+	sources := []struct {
+		name string
+		// says is whether the reader reports how many bytes remain, and
+		// truthful is whether the report is right.
+		says, truthful bool
+		open           func(t *testing.T, file []byte) io.Reader
+	}{
+		{"bytes.Reader", true, true, func(_ *testing.T, file []byte) io.Reader { return bytes.NewReader(file) }},
+		{"os.File", true, true, func(t *testing.T, file []byte) io.Reader {
+			f, err := os.Create(filepath.Join(t.TempDir(), "f.avro"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { f.Close() })
+			if _, err := f.Write(file); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				t.Fatal(err)
+			}
+			return f
+		}},
+		{"stream", false, false, func(_ *testing.T, file []byte) io.Reader { return struct{ io.Reader }{bytes.NewReader(file)} }},
+		{"Len reports zero", true, false, func(_ *testing.T, file []byte) io.Reader { return lenZeroReader{bytes.NewReader(file)} }},
+	}
+
+	for _, tc := range []struct {
+		name string
+		file []byte
+		opts []ocf.ReaderOpt
+		// overDefaultCap is a declared size past the default cap, which
+		// is read incrementally whatever the reader says.
+		overDefaultCap bool
+	}{
+		// Cap raised *above* the declared size, so the size>maxBlockBytes
+		// guard does not fire and the read path itself must stay bounded.
+		{"block 256 TiB, raised cap", block(1 << 48), []ocf.ReaderOpt{ocf.WithMaxBlockBytes(1 << 50)}, true},
+		// Within the default cap the guard never fires either.
+		{"block 48 MiB, default cap", block(48 << 20), nil, false},
+		{"block 2 MiB, default cap", block(2 << 20), nil, false},
+		{"avro.schema 48 MiB", header("avro.schema", 48<<20), nil, false},
+	} {
+		for _, src := range sources {
+			t.Run("absent/"+tc.name+"/"+src.name, func(t *testing.T) {
+				in := src.open(t, tc.file)
+				var m0, m1 runtime.MemStats
+				runtime.ReadMemStats(&m0)
+				r, err := ocf.NewReader(in, tc.opts...)
+				if err == nil {
+					var v int64
+					err = r.Decode(&v)
+					r.Close()
+				}
+				runtime.ReadMemStats(&m1)
+				if err == nil {
+					t.Fatal("expected an error for a declared size with no payload, got nil")
+				}
+				// A read that makes the declared size up front shows as a
+				// TotalAlloc delta near that size. Within the default cap,
+				// only a reader that says how much is left avoids it.
+				if alloc := m1.TotalAlloc - m0.TotalAlloc; (src.says || tc.overDefaultCap) && alloc > 1<<20 {
+					t.Errorf("a %d-byte file allocated %d bytes: the declared size was allocated before its bytes arrived", len(tc.file), alloc)
+				}
+			})
+		}
+	}
+
+	// A block whose bytes are all there reads back from every source, and
+	// is allocated once unless the reader says the bytes are not there. One
+	// allocation is the block plus the decoded copy, about twice the block;
+	// growing into it costs about three and a half times.
+	const big = 12 << 20
+	blob := make([]byte, big)
+	blob[0], blob[big-1] = 0xAB, 0xCD
+	var fb bytes.Buffer
+	bw := ocftest.MustNewWriter(t, &fb, avro.MustParse(`"bytes"`))
+	if err := bw.Encode(blob); err != nil {
+		t.Fatal(err)
+	}
+	avrotest.MustClose(t, bw)
+	for _, src := range sources {
+		t.Run("present/"+src.name, func(t *testing.T) {
+			r, err := ocf.NewReader(src.open(t, fb.Bytes()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			var got []byte
+			var m0, m1 runtime.MemStats
+			runtime.ReadMemStats(&m0)
+			err = r.Decode(&got)
+			runtime.ReadMemStats(&m1)
+			if err != nil {
+				t.Fatalf("a %d-byte block whose bytes are present must read back: %v", big, err)
+			}
+			if len(got) != big || got[0] != 0xAB || got[big-1] != 0xCD {
+				t.Fatalf("the block read back wrong: len %d", len(got))
+			}
+			alloc := m1.TotalAlloc - m0.TotalAlloc
+			if oneShot := !src.says || src.truthful; oneShot && alloc > 32<<20 {
+				t.Errorf("a %d-byte block allocated %d bytes, want one allocation of the block", big, alloc)
+			} else if !oneShot && alloc < 32<<20 {
+				t.Errorf("a %d-byte block allocated %d bytes from a reader that says nothing is left, want the incremental read", big, alloc)
+			}
+		})
+	}
+
+	// A file is asked its size once. When a later block does not fit what
+	// was left then, the file is asked again, since a file can grow, and a
+	// block appended after our first read is still allocated once.
+	t.Run("present/os.File that grows", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "grow.avro")
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		gw := ocftest.MustNewWriter(t, f, avro.MustParse(`"bytes"`))
+		if err := gw.Encode([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		avrotest.MustClose(t, gw)
+
+		rf, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rf.Close()
+		r, err := ocf.NewReader(rf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		var got []byte
+		if err := r.Decode(&got); err != nil {
+			t.Fatalf("first block: %v", err)
+		}
+
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+		aw, err := ocf.NewAppendWriter(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := aw.Encode(blob); err != nil {
+			t.Fatal(err)
+		}
+		avrotest.MustClose(t, aw)
+
+		var m0, m1 runtime.MemStats
+		runtime.ReadMemStats(&m0)
+		err = r.Decode(&got)
+		runtime.ReadMemStats(&m1)
+		if err != nil {
+			t.Fatalf("the appended block must read back: %v", err)
+		}
+		if len(got) != big || got[0] != 0xAB || got[big-1] != 0xCD {
+			t.Fatalf("the appended block read back wrong: len %d", len(got))
+		}
+		if alloc := m1.TotalAlloc - m0.TotalAlloc; alloc > 32<<20 {
+			t.Errorf("a %d-byte block appended after the first read allocated %d bytes, want one allocation of the block", big, alloc)
+		}
+	})
 }
 
 // ---------- codec_cap_regression_test.go ----------

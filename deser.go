@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1253,16 +1254,14 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	if fixedArray {
 		return s.deserFixedArray(src, v, sl)
 	}
-	// For interface targets we build a []any. We populate sliceVal lazily so
-	// the first block's count can serve as a capacity hint, avoiding a
-	// MakeSlice+reflect.Copy on the typical single-block path.
+	// For an interface target we build a []any and box it once at the end.
+	// A typed target is decoded in place through sliceVal.
 	var (
+		anys      []any
 		sliceVal  reflect.Value
 		sliceType reflect.Type
 	)
-	if iface {
-		sliceType = sliceAnyType
-	} else {
+	if !iface {
 		v.SetLen(0)
 		sliceVal = v
 		sliceType = v.Type()
@@ -1293,10 +1292,10 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		src = rest
 		if end {
 			if iface {
-				if !sliceVal.IsValid() {
-					sliceVal = reflect.MakeSlice(sliceType, 0, 0)
+				if anys == nil {
+					anys = []any{}
 				}
-				return src, setIface(v, sliceVal, "array")
+				return src, setIface(v, reflect.ValueOf(anys), "array")
 			}
 			// An empty Avro array decodes to a non-nil empty slice, as on
 			// every other decode path, so you can tell it from an absent
@@ -1314,29 +1313,22 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			return nil, fmt.Errorf("array block count %d exceeds platform max int", count)
 		}
 		n := int(count)
-		// Lazy-allocate the iface backing slice on the first block using
-		// its count as a capacity hint.
-		if iface && !sliceVal.IsValid() {
-			sliceVal = reflect.MakeSlice(sliceType, 0, n)
+		start := len(anys)
+		if !iface {
+			start = sliceVal.Len()
 		}
-		start := sliceVal.Len()
 		if start > math.MaxInt-n {
 			return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
 		}
 		newLen := start + n
-		switch {
-		case sliceVal.Cap() < newLen:
-			ns := reflect.MakeSlice(sliceVal.Type(), newLen, newLen)
-			reflect.Copy(ns, sliceVal)
-			sliceVal = ns
-			if !iface {
-				v.Set(sliceVal)
+		// Both arms grow as append does. Growing to the exact length on
+		// every block would copy the whole slice once per block.
+		if iface {
+			anys = slices.Grow(anys, n)[:newLen]
+		} else {
+			if sliceVal.Cap() < newLen {
+				sliceVal.Grow(n)
 			}
-		case iface:
-			// MakeSlice-derived values are unaddressable, so SetLen
-			// would panic. Re-slice instead, on the same backing memory.
-			sliceVal = sliceVal.Slice(0, newLen)
-		default:
 			sliceVal.SetLen(newLen)
 		}
 		if useFastNative {
@@ -1358,13 +1350,18 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			continue
 		}
 		if useFastIface {
-			// sliceVal wraps a []any; mutating via the extracted slice is
-			// visible through sliceVal too (same underlying array). The
-			// final setIface(v, sliceVal, "array") picks up all writes.
-			slice := sliceVal.Interface().([]any)
-			src, err = s.fastIfaceLoop(src, slice, start, n, sl)
+			src, err = s.fastIfaceLoop(src, anys, start, n, sl)
 			if err != nil {
 				return nil, err
+			}
+			continue
+		}
+		if iface {
+			for i := start; i < newLen; i++ {
+				src, err = s.deserItem(src, reflect.ValueOf(&anys[i]).Elem(), sl)
+				if err != nil {
+					return nil, err
+				}
 			}
 			continue
 		}

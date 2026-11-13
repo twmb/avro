@@ -1667,13 +1667,12 @@ func udArrayBlocks(
 			return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
 		}
 		newLen := start + n
+		// Grow is append's growth. Growing to the exact length on every
+		// block would copy the whole slice once per block.
 		if v.Cap() < newLen {
-			ns := reflect.MakeSlice(sliceType, newLen, newLen)
-			reflect.Copy(ns, v)
-			v.Set(ns)
-		} else {
-			v.SetLen(newLen)
+			v.Grow(n)
 		}
+		v.SetLen(newLen)
 		if src, err = onBlock(src, v, p, start, n, sl); err != nil {
 			return nil, err
 		}

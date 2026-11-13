@@ -301,7 +301,7 @@ lowercase spelling, as in the Java, Python (fastavro), and goavro
 implementations. A key differing from a reserved name only by letter case
 (`"ITEMS"`, `"Namespace"`) is an ordinary custom property, preserved in
 `Props`. Note that hamba/avro matches these keys case-insensitively, so a
-schema that parsed there but fails here has a miscased reserved key. A miscased
+schema with a miscased reserved key can parse there and fail here. A miscased
 *structural* key fails at parse time: `{"type":"array","Items":"int"}` errors
 with "array is missing items schema", so fix the casing. A miscased
 non-structural key (`"Doc"`, `"Aliases"`) becomes a custom property instead of

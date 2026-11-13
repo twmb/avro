@@ -7222,6 +7222,9 @@ func TestSchemaCacheDiamondFixed(t *testing.T) {
 func TestSchemaCacheDedupPreservesLargeNumbers(t *testing.T) {
 	// Verify that JSON normalization preserves large integers exactly,
 	// so two schemas with the same large "size" value dedup correctly.
+	if strconv.IntSize < 64 {
+		t.Skip("a fixed size above 2^53 does not fit a 32-bit int")
+	}
 	cache := &SchemaCache{}
 
 	schema1 := `{"type":"fixed","name":"Big","size":9007199254740993}`
@@ -7349,15 +7352,48 @@ func cacheStrayGDef(fieldType string) string {
 	return `{"type":"record","name":"n.G","fields":[{"name":"g","type":"` + fieldType + `"}]}`
 }
 
-// cacheStrayCarrier wraps payload under the given stray key on a
-// primitive-kind object. For "items"/"values" the payload sits directly
-// under the key; for "fields" it sits as a field's type, the position the
-// fields walk would descend.
+// cacheStrayCarrierKinds is the carrier axis of the stray-key matrices: two
+// primitives, and every kind that binds a structural key of its own.
+var cacheStrayCarrierKinds = []string{"int", "string", "array", "map", "record", "error", "enum", "fixed"}
+
+// cacheStrayCarrierOwnKeys is what each carrier kind needs to parse, before
+// the stray key: a primitive needs nothing, and a kind that binds a key
+// needs that key and, when it is named, a name.
+var cacheStrayCarrierOwnKeys = map[string]string{
+	"array":  `"items":"int",`,
+	"map":    `"values":"int",`,
+	"record": `"name":"n.C","fields":[{"name":"z","type":"int"}],`,
+	"error":  `"name":"n.C","fields":[{"name":"z","type":"int"}],`,
+	"enum":   `"name":"n.C","symbols":["A"],`,
+	"fixed":  `"name":"n.C","size":4,`,
+}
+
+// cacheStrayCarrierBinds is the structural key each carrier kind binds, which
+// is therefore never a stray key on it.
+var cacheStrayCarrierBinds = map[string]string{"array": "items", "map": "values", "record": "fields", "error": "fields"}
+
+// cacheStrayCarrierValue is a value each carrier kind encodes.
+var cacheStrayCarrierValue = map[string]any{
+	"int":    int32(7),
+	"string": "v",
+	"array":  []any{int32(1)},
+	"map":    map[string]any{"k": int32(1)},
+	"record": map[string]any{"z": int32(1)},
+	"error":  map[string]any{"z": int32(1)},
+	"enum":   "A",
+	"fixed":  []byte{1, 2, 3, 4},
+}
+
+// cacheStrayCarrier wraps payload under the given stray key on an object of
+// the given kind. For "items"/"values" the payload sits directly under the
+// key; for "fields" it sits as a field's type, the position the fields walk
+// would descend.
 func cacheStrayCarrier(kind, key, payload string) string {
+	own := cacheStrayCarrierOwnKeys[kind]
 	if key == "fields" {
-		return `{"type":"` + kind + `","fields":[{"name":"f","type":` + payload + `}]}`
+		return `{"type":"` + kind + `",` + own + `"fields":[{"name":"f","type":` + payload + `}]}`
 	}
-	return `{"type":"` + kind + `","` + key + `":` + payload + `}`
+	return `{"type":"` + kind + `",` + own + `"` + key + `":` + payload + `}`
 }
 
 // cacheParseSeq parses texts in order into one fresh SchemaCache and
@@ -7750,11 +7786,11 @@ func TestInvariant_StrayFieldElementRoutesAreSpanned(t *testing.T) {
 // TestMatrix_CacheStrayStructuralKey crosses the stray-key gate's full domain:
 // carrier kind x stray key x definition relation. Each cell asserts every
 // metadata surface against a stray-free control, plus the wire verdict.
-// Carriers split three ways by parse posture. Primitive carriers accept the
-// stray as inert, and those are the gate cells. fixed/enum reject a foreign
-// structural key outright, pinning the reject that keeps such carriers
-// structurally un-poisonable. And array/map/record bind the key, the controls
-// proving the gate does not block genuine definitions.
+// Carriers split two ways by parse posture. A carrier whose kind does not
+// bind the key accepts the stray as inert, a primitive and a kind that binds
+// a different key alike, and those are the gate cells. And array/map/record
+// carrying their own key bind it, the controls proving the gate does not
+// block genuine definitions.
 //
 // Relations for the gate cells. The conflicting stray body parsed before and
 // after the real definition, the store being first-wins, so order decided the
@@ -7773,8 +7809,13 @@ func TestMatrix_CacheStrayStructuralKey(t *testing.T) {
 		"recursive":   `{"type":"record","name":"n.G","fields":[{"name":"s","type":["null","n.G"]}]}`,
 	}
 
-	for _, carrier := range []string{"int", "string"} {
+	gateCells := 0
+	for _, carrier := range cacheStrayCarrierKinds {
 		for _, key := range []string{"items", "values", "fields"} {
+			if cacheStrayCarrierBinds[carrier] == key {
+				continue
+			}
+			gateCells++
 			for bodyName, body := range strayBodies {
 				for _, order := range []string{"stray_first", "real_first"} {
 					name := fmt.Sprintf("%s_%s_%s_%s", carrier, key, bodyName, order)
@@ -7824,27 +7865,9 @@ func TestMatrix_CacheStrayStructuralKey(t *testing.T) {
 		}
 	}
 
-	// Foreign structural keys on fixed/enum reject at parse: these
-	// carriers are structurally un-poisonable, and the reject is the
-	// guard that keeps them so.
-	for name, carrier := range map[string]string{
-		"fixed": `{"type":"fixed","name":"Fx","size":4,`,
-		"enum":  `{"type":"enum","name":"E","symbols":["A"],`,
-	} {
-		for _, key := range []string{"items", "values", "fields"} {
-			t.Run(fmt.Sprintf("%s_%s_rejects", name, key), func(t *testing.T) {
-				var text string
-				if key == "fields" {
-					text = carrier + `"fields":[{"name":"f","type":` + cacheStrayGDef("int") + `}]}`
-				} else {
-					text = carrier + `"` + key + `":` + cacheStrayGDef("int") + `}`
-				}
-				_, err := Parse(text)
-				if err == nil || !strings.Contains(err.Error(), "has schema for other types") {
-					t.Fatalf("foreign structural key on %s: got %v, want the structural-exclusivity reject", name, err)
-				}
-			})
-		}
+	// 8 carriers x 3 stray keys, less the 4 a carrier binds.
+	if gateCells != 20 {
+		t.Fatalf("drove %d carrier x key pairs, want 20: the carrier axis lost a member", gateCells)
 	}
 
 	// Genuinely-binding carriers: a definition in a bound container key
@@ -7928,12 +7951,11 @@ func TestMatrix_MalformedStrayBodyAcceptedAsProps(t *testing.T) {
 	}
 }
 
-// The adjudicated reject boundaries do not loosen with the malformed-body
-// acceptance. A binding kind still shape-validates its own key. A container
-// kind still rejects another kind's schema-shaped defining key. And a
+// The adjudicated reject boundaries do not loosen with the stray-key
+// acceptance. A binding kind still shape-validates its own key. And a
 // schema-shaped structural key on a wrapped reference still rejects. A stray
-// name makes no two arrays or maps distinct in a union and fills no missing
-// body.
+// name or a stray structural key makes no two arrays or maps distinct in a
+// union and fills no missing body.
 func TestMatrix_StrayShapeRejectBoundaries(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct{ schema, wantErr string }{
@@ -7942,7 +7964,8 @@ func TestMatrix_StrayShapeRejectBoundaries(t *testing.T) {
 		{`{"type":"record","name":"N","fields":3}`, `"fields" must be a JSON array`},
 		{`{"type":"enum","name":"N","symbols":3}`, "array"},
 		{`{"type":"fixed","name":"N","size":"x"}`, ""},
-		{`{"type":"array","items":"int","fields":[{"name":"x","type":"int"}]}`, "has schema for other types"},
+		{`{"type":"array","size":3}`, "is missing"},
+		{`["null",{"type":"array","items":"int","size":1},{"type":"array","items":"int","size":2}]`, "duplicate union type"},
 		{`["null",{"type":"map","name":"a","values":"int"},{"type":"map","name":"b","values":"string"}]`, "duplicate union type"},
 		{`["null",{"type":"array","name":"a","items":"int"},{"type":"array","name":"b","items":"string"}]`, "duplicate union type"},
 		{`{"type":"array","name":"a"}`, "is missing"},
@@ -7968,10 +7991,11 @@ func TestMatrix_StrayShapeRejectBoundaries(t *testing.T) {
 // the carrier object, the carrier shape that forces the rebuild's object
 // render. A bare primitive emits as its type string.
 func cacheStrayCarrierProps(kind, key, payload string) string {
+	own := cacheStrayCarrierOwnKeys[kind]
 	if key == "fields" {
-		return `{"type":"` + kind + `","foo":1,"fields":[{"name":"f","type":` + payload + `}]}`
+		return `{"type":"` + kind + `",` + own + `"foo":1,"fields":[{"name":"f","type":` + payload + `}]}`
 	}
-	return `{"type":"` + kind + `","foo":1,"` + key + `":` + payload + `}`
+	return `{"type":"` + kind + `",` + own + `"foo":1,"` + key + `":` + payload + `}`
 }
 
 // TestMatrix_CacheStrayRebuildSurface crosses carrier kind × stray key ×
@@ -7993,9 +8017,11 @@ func TestMatrix_CacheStrayRebuildSurface(t *testing.T) {
 		"conflicting": `"name":"g"`,
 		"recursive":   `"name":"s"`,
 	}
-	carrierValue := map[string]any{"int": int32(7), "string": "v"}
-	for _, carrier := range []string{"int", "string"} {
+	for _, carrier := range cacheStrayCarrierKinds {
 		for _, key := range []string{"items", "values", "fields"} {
+			if cacheStrayCarrierBinds[carrier] == key {
+				continue
+			}
 			for bodyName, body := range strayBodies {
 				for _, props := range []string{"bare", "withprop"} {
 					for _, order := range []string{"stray_first", "real_first"} {
@@ -8011,8 +8037,8 @@ func TestMatrix_CacheStrayRebuildSurface(t *testing.T) {
 								fa, fb = fb, fa
 							}
 							s := MustParse(`{"type":"record","name":"Top","fields":[` + fa + `,` + fb + `]}`)
-							accept := map[string]any{"a": carrierValue[carrier], "b": map[string]any{"h": "x"}}
-							reject := map[string]any{"a": carrierValue[carrier], "b": map[string]any{"g": int32(9)}}
+							accept := map[string]any{"a": cacheStrayCarrierValue[carrier], "b": map[string]any{"h": "x"}}
+							reject := map[string]any{"a": cacheStrayCarrierValue[carrier], "b": map[string]any{"g": int32(9)}}
 							if _, err := s.Encode(accept); err != nil {
 								t.Fatalf("encode of the bound-definition value: %v", err)
 							}

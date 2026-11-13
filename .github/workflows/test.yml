@@ -63,6 +63,44 @@ jobs:
 
       - run: go test -race ./...
 
+  # A 32-bit and a big-endian target. int is 32 bits on 386, so a count or
+  # length that fits an int64 can overflow an int there, and s390x is
+  # big-endian, so a byte-order assumption shows as wrong bytes. No other job
+  # runs either. Neither takes -race: the race detector does not support 386,
+  # and the `test` job above already runs it.
+  #
+  # s390x runs under QEMU's user-mode emulation, about twenty times slower
+  # than native. Three tests there are wall-clock watchdogs (a walk must
+  # finish within seconds), and they time out under emulation whatever the
+  # byte order, so the s390x leg skips them.
+  test-arch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: "386"
+            flags: ""
+          - arch: s390x
+            flags: >-
+              -exec qemu-s390x
+              -skip 'TestRegression_SchemaNodeDuplicateNamedDefinitionBounded|TestMatrix_SchemaNodeWalkBudgetBattery|TestInvariant_EveryReachingPathBoundIsMeasured'
+    name: test (${{ matrix.arch }})
+    env:
+      GOARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.27"
+
+      - if: matrix.arch == 's390x'
+        run: sudo apt-get update && sudo apt-get install -y qemu-user
+
+      - run: go test ${{ matrix.flags }} ./...
+
   # Differential testing against fastavro (an independent reference impl).
   # The fastavro oracle subprocess cross-checks twmb's encode/decode as Avro
   # bytes; without it TestDifferentialFastavro skips, so the `test` job above
