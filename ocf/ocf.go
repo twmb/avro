@@ -1,10 +1,10 @@
 // Package ocf implements Avro [Object Container Files] (OCF).
 //
-// An OCF is self-describing: the schema is in the file header, so you do not
-// need it out of band. Data is stored in compressed blocks separated by sync
-// markers, which makes files splittable for parallel processing. OCF is the
-// standard way to store Avro on disk. To send individual values over the wire,
-// see [avro.AppendSingleObject] instead.
+// An OCF is self-describing: the schema lives in the file header. Data is
+// stored in compressed blocks separated by sync markers, which makes files
+// splittable for parallel processing. OCF is the standard way to store Avro
+// on disk. To send individual values over the wire, see
+// [avro.AppendSingleObject] instead.
 //
 // See the [Avro specification] for the full format definition.
 //
