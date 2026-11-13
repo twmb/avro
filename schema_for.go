@@ -23,15 +23,15 @@ type withNamespace string
 func (withNamespace) schemaOpt() {}
 
 // WithNamespace sets the Avro namespace for the top-level record in
-// [SchemaFor]. Ignored by [Parse].
+// [SchemaFor]. [Parse] ignores WithNamespace.
 func WithNamespace(ns string) SchemaOpt { return withNamespace(ns) }
 
 type withName string
 
 func (withName) schemaOpt() {}
 
-// WithName overrides the Avro record name in [SchemaFor], which otherwise
-// uses the Go struct name. Ignored by [Parse].
+// WithName overrides the Avro record name in [SchemaFor], which otherwise uses
+// the Go struct name. [Parse] ignores WithName.
 func WithName(name string) SchemaOpt { return withName(name) }
 
 // SchemaFor infers an Avro schema from the Go type T. T must be a struct.

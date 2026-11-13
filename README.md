@@ -106,11 +106,11 @@ must match: decoding bytes into `[N]byte`, or encoding or decoding any value
 as fixed, requires the byte length to equal N, and `[N]array` requires
 exactly N elements.
 
-An `ArrayRecord` holds a record's values by position, with no names: value
-i belongs to field i, and every field must be present. It is never an array,
-and a plain `[]any` is never a record. Each value in one is an `any`, so a
-record nested inside one decodes as a `map[string]any`, as into any other
-`any`.
+An `ArrayRecord` is a record's field values as a `[]any`: the slice index
+corresponds to the field index in the schema. `Encode` does not support schema
+defaults for an `ArrayRecord`, and instead returns an error if a value is nil
+(unless the field is a union with null). `Encode` also returns an error if the
+slice length is not the number of fields.
 
 Decoding into `any` yields the natural Go type: `int32` and `int64` for int
 and long, `float32` and `float64` for float and double, `[]any` for arrays,
@@ -147,19 +147,19 @@ Supported options:
 
 - **inline**: flatten a nested struct's fields into the parent record, as if
   they were declared directly on the parent. The field must be a struct or
-  pointer to struct. This works like anonymous (embedded) struct fields, but
+  pointer to struct. `inline` works like anonymous (embedded) struct fields, but
   for named fields. When using inline, the name portion of the tag must be
-  empty and no other tag options are allowed, since the flattened struct has
-  no field of its own for `default=`, `alias=`, or a logical-type tag to apply
-  to. Put those options on the inlined struct's fields directly.
+  empty and no other tag options are allowed, since the flattened struct has no
+  field of its own for `default=`, `alias=`, or a logical-type tag to apply to.
+  Put those options on the inlined struct's fields directly.
 
 - **omitzero**: when encoding, a zero value (or a field whose `IsZero() bool`
   method returns true) is encoded as if its key were omitted from a
   `map[string]any`: the field's schema default is used. A nullable field with
   no default encodes `null`; a non-nullable field with no default keeps its
-  zero value, since there is nothing to fill with. This is useful for optional
-  fields in `["null", T]` / `["T", "null"]` unions or fields with explicit
-  defaults.
+  zero value, since there is nothing to fill with. `omitzero` is useful for
+  optional fields in `["null", T]` / `["T", "null"]` unions or fields with
+  explicit defaults.
 
 Embedded (anonymous) struct fields are automatically inlined: their fields are
 promoted into the parent as if declared directly. To prevent inlining an
@@ -176,14 +176,14 @@ When multiple fields resolve to the same Avro field name, a tagged field wins
 over an untagged one at any depth; among fields with the same tagged status,
 the shallowest field wins. Two fields that resolve to the same name at the same
 depth with the same tagged status are ambiguous (Go itself makes such a field
-reference a compile error). We error rather than silently selecting one:
-`SchemaFor` rejects the type, while encode and decode reject only when the
-schema actually has a field with the ambiguous name.
+reference a compile error). We error rather than pick one: `SchemaFor` rejects
+the type, while encode and decode reject only when the schema actually has a
+field with the ambiguous name.
 
 By default, decoding into a struct that has no field for some record field is
 an error. Pass `SkipUnknown()` to skip the fields your struct does not map
-instead. This is decode only; encoding a partial struct still errors, because
-the missing fields would go out as zero values.
+instead. `SkipUnknown()` is decode only; encoding a partial struct still
+errors, because the missing fields would go out as zero values.
 
 ## Schema Inference
 
@@ -201,7 +201,7 @@ type User struct {
 schema := avro.MustSchemaFor[User](avro.WithNamespace("com.example"))
 ```
 
-This produces the equivalent of:
+`SchemaFor` produces the equivalent of:
 
 ```json
 {
@@ -238,8 +238,8 @@ Additional tag options for schema inference:
 adds an alias to the **field**, letting a writer field with a different name
 match this reader field. `type-alias` adds an alias to the **named type**
 (record, enum, or fixed) that the field references, letting a writer type with
-a different name match the reader type. The alias is applied to the innermost
-named type, walking through pointers, slices, and maps:
+a different name match the reader type. `type-alias` applies to the innermost
+named type, through pointers, slices, and maps:
 
 ```go
 type FieldSummary struct {
@@ -296,16 +296,16 @@ node := &avro.SchemaNode{
 schema, err := node.Schema()
 ```
 
-Reserved attribute names (`type`, `name`, `items`, ...) match only their
-exact lowercase spelling, as in the Java, Python (fastavro), and goavro
+Reserved attribute names (`type`, `name`, `items`, ...) match only their exact
+lowercase spelling, as in the Java, Python (fastavro), and goavro
 implementations. A key differing from a reserved name only by letter case
 (`"ITEMS"`, `"Namespace"`) is an ordinary custom property, preserved in
 `Props`. Note that hamba/avro matches these keys case-insensitively, so a
-schema that parsed there but fails here has a miscased reserved key. A
-miscased *structural* key fails at parse time: `{"type":"array","Items":"int"}`
-errors with "array is missing items schema", so fix the casing. A miscased
-non-structural key (`"Doc"`, `"Aliases"`) simply becomes a custom property
-instead of binding the attribute.
+schema that parsed there but fails here has a miscased reserved key. A miscased
+*structural* key fails at parse time: `{"type":"array","Items":"int"}` errors
+with "array is missing items schema", so fix the casing. A miscased
+non-structural key (`"Doc"`, `"Aliases"`) becomes a custom property instead of
+binding the attribute.
 
 ## Logical Types
 
@@ -333,15 +333,15 @@ fields accept float64 and numeric strings (e.g. "3.14"). Values that do not
 match the expected format fall through to the underlying type's encoder, which
 returns an error.
 
-Encoding a `time.Time` as `time-millis` or `time-micros` is lossy. These
-logical types are time-of-day only, so the wire bytes cannot carry a date or
-zone. On encode, only the wall-clock fields (hour, minute, second, nanosecond)
-are written, and the year, month, day, and location are dropped. On decode
-into a `time.Time`, the wire value is placed at the Unix epoch (`1970-01-01
-UTC`) plus the time-of-day. A round-trip through `time.Time` therefore keeps
-the time-of-day but resets the date and zone: `2024-01-15 12:34:56 PST` comes
-back as `1970-01-01 12:34:56 UTC`. If you need the date, use
-`timestamp-millis` or `timestamp-micros`, or convert to and from
+Encoding a `time.Time` as `time-millis` or `time-micros` is lossy.
+`time-millis` and `time-micros` are time-of-day only, so the wire bytes cannot
+carry a date or zone. On encode, only the wall-clock fields (hour, minute,
+second, nanosecond) are written, and the year, month, day, and location are
+dropped. On decode into a `time.Time`, the wire value is placed at the Unix
+epoch (`1970-01-01 UTC`) plus the time-of-day. A round-trip through `time.Time`
+therefore keeps the time-of-day but resets the date and zone: `2024-01-15
+12:34:56 PST` comes back as `1970-01-01 12:34:56 UTC`. If you need the date,
+use `timestamp-millis` or `timestamp-micros`, or convert to and from
 `time.Duration` yourself. A `time.Duration` round-trips exactly when its
 nanoseconds are a whole multiple of the schema's resolution (a millisecond for
 `time-millis`, a microsecond for `time-micros`); anything finer is truncated
@@ -440,7 +440,7 @@ avro.CheckCompatibility(newSchema, oldSchema)
 
 When working with a schema registry, schemas often reference types defined in
 other schemas. `SchemaCache` accumulates named types across multiple Parse
-calls so they can be resolved:
+calls, so that a schema can reference types from earlier calls:
 
 ```go
 var cache avro.SchemaCache
@@ -546,9 +546,9 @@ node := avro.SchemaNode{
 ct := avro.CustomType{LogicalType: atype.Decimal}
 ```
 
-They are untyped string constants and can be used anywhere a string is
-expected, and they catch typos (`atype.TimestampMicros` vs
-`"timestam-micros"`) at compile time.
+The constants are untyped strings and can be used anywhere a string is
+expected, and they catch typos (`atype.TimestampMicros` vs `"timestam-micros"`)
+at compile time.
 
 ## Object Container Files
 
@@ -610,14 +610,15 @@ decode options such as `TaggedUnions()` through to each `Decode`.
 
 Built-in codecs: **null** (default, no compression), **deflate**
 (`DeflateCodec`), **snappy** (`SnappyCodec`), and **zstandard** (`ZstdCodec`).
-Custom codecs can be provided via the `Codec` interface.
+You can supply your own codec with the `Codec` interface.
 
-**Memory bounds.** The reader caps both the compressed block size it reads off
-the wire (`WithMaxBlockBytes`) and the size a block decompresses to
-(`WithMaxDecompressedBlockBytes`), each 64 MiB by default. The decompressed
-cap is applied before allocating, through the `BoundedDecompressor` interface,
-which all built-in codecs implement. A custom codec that does not implement it
-decompresses unbounded, so for untrusted input supply one that bounds itself.
+The reader caps both the compressed block size it reads off the wire
+(`WithMaxBlockBytes`) and the size a block decompresses to
+(`WithMaxDecompressedBlockBytes`), each 64 MiB by default. The decompressed cap
+is applied before allocating, through the `BoundedDecompressor` interface,
+which all built-in codecs implement. A custom codec that does not implement
+`BoundedDecompressor` decompresses unbounded, so for untrusted input supply a
+codec that bounds itself.
 
 ### Appending
 
@@ -721,13 +722,13 @@ Encode and decode errors can be inspected with `errors.As`:
 Struct field access uses `unsafe` pointer arithmetic (similar to
 `encoding/json` v2) to avoid `reflect.Value` overhead on every encode/decode.
 All schemas, type mappings, and codec state are cached after first use so
-repeated operations pay no extra allocation cost.
+repeated operations allocate nothing extra.
 
 Decoded strings and byte slices are copied out of the input by default. Pass
-`AliasInput()` to `Decode` to have them point into the input instead, which
-skips the copy entirely. You must not modify the input or the decoded values
-afterward, and one aliased field keeps the whole input alive, so only use it
-when you own the buffer and do not reuse it.
+`AliasInput()` to `Decode` to have decoded strings and byte slices point into
+the input instead, which skips the copy. You must not modify the input or the
+decoded values afterward, and one aliased field keeps the whole input alive, so
+only use `AliasInput()` when you own the buffer and do not reuse the buffer.
 
 ## Encode/decode behavior contract
 
@@ -739,7 +740,7 @@ below are deliberate exceptions.
 ### Round-trips that lose data
 
 - **`time.Time` as `time-millis` / `time-micros`** keeps only the time-of-day;
-  date and zone are dropped. The decoded `time.Time` sits at the Unix epoch with
+  date and zone are dropped. The decoded `time.Time` is at the Unix epoch with
   the original time-of-day. Use `timestamp-*` to keep the full instant.
 - **`time.Time` as `date`** keeps only the UTC date; time-of-day and zone are dropped.
 - **`big-decimal` trailing-zero scale** is not preserved: scale is derived per
@@ -747,16 +748,18 @@ below are deliberate exceptions.
 
 ### Numbers
 
-- **Precision follows the reader schema.** A `float`/`double` schema rounds
-  silently into a Go float (overflowing to ±Inf on encode), but decoding one into
-  a Go *integer* still requires a whole number in range. An `int`/`long` schema
-  never loses precision silently: decoding into a Go type that cannot hold the
-  value exactly errors. For exact large-integer round-trips keep the schema `long`
-  with an `int64` target; evolving to `double` opts into rounding.
+- **The reader schema decides precision.** A `float`/`double` schema rounds
+  silently into a Go float (overflowing to ±Inf on encode), but decoding a
+  `float`/`double` value into a Go *integer* still requires a whole number in
+  range. An `int`/`long` schema never loses precision silently: decoding into a
+  Go type that cannot hold the value exactly errors. For exact large-integer
+  round-trips keep the schema `long` with an `int64` target; evolving to
+  `double` opts into rounding.
 - **Union branch is chosen by the Go type, not the value.** A Go `int` always
   selects a union's `long` branch, never `int`, even when the value would fit,
-  because dispatch keys off the static type, keeping wire size deterministic.
-  Force the `int` branch with an `int32` value or `map[string]any{"int": v}`.
+  because we choose the branch from the static type, which keeps the wire size
+  deterministic. Force the `int` branch with an `int32` value or
+  `map[string]any{"int": v}`.
 - **Encoding a `json.Number` into an `int`/`long` works even in fractional or
   exponent form, as long as the value is whole.** `json.Number("9.5e17")`
   succeeds (it is exactly 950000000000000000). Note that the same literal as a

@@ -46,12 +46,13 @@ type SchemaNode struct {
 
 	Name string // name for record, enum, fixed; on any other kind, an inert attribute as written
 
-	// Namespace is the named type's resolved namespace. [Schema.Root] fills it
-	// for every named type, a child that inherits its enclosing namespace
-	// shows that namespace here, and "" always means the null namespace,
-	// never "inherit". [SchemaNode.Schema] emits a "namespace":"" escape when
-	// a null-namespace type sits inside a namespaced scope, so the distinction
-	// survives the round trip. A dotted Name takes precedence over this field.
+	// Namespace is the named type's resolved namespace. [Schema.Root]
+	// fills it for every named type, a child that inherits its enclosing
+	// namespace shows that namespace here, and "" always means the null
+	// namespace, never "inherit". [SchemaNode.Schema] emits a
+	// "namespace":"" escape when a null-namespace type is inside a
+	// namespaced scope, so a round trip keeps the distinction. A dotted
+	// Name takes precedence over this field.
 	Namespace string
 
 	Aliases []string // alternate names for named types (record, enum, fixed)
@@ -95,10 +96,10 @@ type SchemaNode struct {
 	//
 	// When you build a node by hand, a map key with a MarshalText method
 	// renders as that text whatever the key's kind, a float-kind key is an
-	// error, and invalid UTF-8 in a string or key becomes U+FFFD. None of
-	// this depends on the Go version. encoding/json changed all three
-	// between Go 1.26 and Go 1.27, so we name keys and replace bytes
-	// ourselves before it runs.
+	// error, and invalid UTF-8 in a string or key becomes U+FFFD. No part
+	// of this handling depends on the Go version: encoding/json changed
+	// all three behaviors between Go 1.26 and Go 1.27, so we name keys and
+	// replace bytes ourselves before encoding/json runs.
 	Props map[string]any
 
 	// refTarget is set only by [Schema.Root], on name-reference nodes, and
@@ -147,8 +148,9 @@ type SchemaField struct {
 	//   - record, array, and map give map[string]any or []any, each leaf
 	//     following these same rules.
 	//
-	// Union defaults pick the first branch that accepts the value, and the Go
-	// type tells you which: ["float","int"] with default 42 gives float32(42).
+	// Union defaults pick the first branch that accepts the value, and the
+	// Go type tells you which branch: ["float","int"] with default 42
+	// gives float32(42).
 	//
 	// Unlike Props, a numeric Default is never json.Number: we reject defaults
 	// that do not fit the declared type.
@@ -183,19 +185,19 @@ type SchemaField struct {
 //
 // A node extracted from a [Schema.Root] tree may reference definitions living
 // elsewhere in the enclosing schema: an earlier field, a prior [SchemaCache]
-// parse, or the enclosing type itself for a recursive schema. Those resolve
-// automatically. We emit the definition at the reference's first occurrence,
-// so the result needs neither the enclosing schema nor any cache. A name the
-// tree defines itself wins over the enclosing schema's definition. Custom
-// properties on a wrapped reference move onto the emitted definition, while
-// reserved usage-site attributes (doc, namespace) do not survive. Hand-built
-// nodes have no enclosing schema, so there a reference the tree does not
-// define is an error.
+// parse, or the enclosing type itself for a recursive schema. We resolve such
+// a reference automatically. We emit the definition at the reference's first
+// occurrence, so the result needs neither the enclosing schema nor any cache.
+// A name the tree defines itself wins over the enclosing schema's definition.
+// Custom properties on a wrapped reference move onto the emitted definition,
+// while reserved usage-site attributes (doc, namespace) are dropped.
+// Hand-built nodes have no enclosing schema, so there a reference the tree
+// does not define is an error.
 //
 // opts pass through to the internal [Parse]. If you parsed the original schema
-// with [SchemaOpt]s that change what Parse accepts or wires ([WithLaxNames],
+// with [SchemaOpt]s that change what Parse accepts or builds ([WithLaxNames],
 // [CustomType] registrations), pass the same opts here. Otherwise the rebuilt
-// schema fails to parse or silently lacks the custom wiring.
+// schema fails to parse or silently lacks your custom types.
 func (n *SchemaNode) Schema(opts ...SchemaOpt) (*Schema, error) {
 	d := &deduper{
 		defined: make(map[string]*SchemaNode),
@@ -229,9 +231,9 @@ func (n *SchemaNode) Schema(opts ...SchemaOpt) (*Schema, error) {
 // unexpanded copy rather than a partial one.
 //
 // [SchemaNode.Schema] collapses repeats back to references on emit, so
-// n.ExpandReferences().Schema() and n.Schema() produce the same schema. It
-// spells a collapsed repeat by fullname, so a reference you wrote as an
-// in-scope short name comes back qualified.
+// n.ExpandReferences().Schema() and n.Schema() produce the same schema.
+// SchemaNode.Schema spells a collapsed repeat by fullname, so a reference you
+// wrote as an in-scope short name comes back qualified.
 func (n *SchemaNode) ExpandReferences() *SchemaNode {
 	if n == nil {
 		return nil

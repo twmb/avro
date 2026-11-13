@@ -77,8 +77,8 @@ func ExampleNewWriter() {
 // that distinguishes old from new file variants, say, or a writer-schema shape
 // that changed between versions of the producer. The callback runs after
 // NewReader has read the header, so rd.Schema() and rd.Metadata() are
-// populated. Whatever schema it returns becomes the reader schema, resolved
-// against the writer schema.
+// populated. The schema the callback returns becomes the reader schema,
+// resolved against the writer schema.
 func ExampleWithReaderSchemaFunc() {
 	// Producer v1 wrote records with a legacy field name:
 	v1Schema := avro.MustParse(`{

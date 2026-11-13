@@ -26,10 +26,10 @@ var ErrSkipCustomType = errors.New("avro: skip custom type")
 //   - Neither: matches every schema node (use with [ErrSkipCustomType]
 //     for property-based dispatch like Kafka Connect types)
 //
-// At encode time we check GoType too: your Encode function only fires when
-// the value's type matches GoType. This keeps the codec from intercepting
-// native values (e.g. a raw int64 passes through without conversion for a
-// custom-typed long field).
+// At encode time we check GoType too: we only call your Encode function when
+// the value's type matches GoType. The GoType check keeps a custom type from
+// intercepting native values (e.g. a raw int64 passes through without
+// conversion for a custom-typed long field).
 //
 // A matching CustomType replaces our built-in logical type deserializer.
 // Among your registrations, the first match wins.
@@ -40,24 +40,24 @@ type CustomType struct {
 	// LogicalType narrows matching to schema nodes with this logicalType.
 	LogicalType string
 
-	// AvroType narrows matching to schema nodes of this Avro type
-	// (e.g. "long", "bytes", "record"). Also used by SchemaFor to
-	// infer the underlying Avro type.
+	// AvroType narrows matching to schema nodes of this Avro type (e.g.
+	// "long", "bytes", "record"). SchemaFor also uses AvroType to infer
+	// the underlying Avro type.
 	AvroType string
 
-	// GoType adds an encode-time filter: when set, your Encode function
-	// only fires when the value's concrete type matches GoType. Values
-	// of other types pass through to the underlying serializer unchanged.
-	// If nil, Encode fires for all values on matched schema nodes
-	// (those matching LogicalType/AvroType).
+	// GoType adds an encode-time filter: when set, we only call your
+	// Encode function when the value's concrete type matches GoType.
+	// Values of other types pass through to the underlying serializer
+	// unchanged. If nil, we call Encode for all values on matched schema
+	// nodes (those matching LogicalType/AvroType).
 	//
 	// [SchemaFor] uses GoType to match struct fields: when a field's Go
 	// type equals GoType, we emit AvroType + LogicalType (or Schema)
-	// instead of the default type mapping. Because the custom supplies
-	// the whole field schema, a logical-type tag on a matched field has
-	// no effect and is rejected: set LogicalType (or Schema) here
-	// instead. If nil, the custom type does not affect schema
-	// generation, but we still wire it into the returned [*Schema] for
+	// instead of the default type mapping. Because the custom type
+	// supplies the whole field schema, a logical-type tag on a matched
+	// field has no effect and is rejected: set LogicalType (or Schema)
+	// here instead. If nil, the custom type does not affect schema
+	// generation, but we still use it in the returned [*Schema] for
 	// encode/decode.
 	GoType reflect.Type
 
@@ -76,8 +76,8 @@ type CustomType struct {
 	//
 	// We work on a private copy, so SchemaFor never mutates your
 	// SchemaNode or anything reachable from it. A schema over the
-	// schema-tree budgets, or one holding an unnamed pointer cycle, fails
-	// the build with an error.
+	// schema-tree budgets, or a schema with an unnamed pointer cycle,
+	// fails the build with an error.
 	//
 	// A union branch may be written either as a bare name ("null") or as
 	// a wrapped object ({"type":"null"}); we treat the two as the same
@@ -99,10 +99,10 @@ type CustomType struct {
 	// values (int64, int32, etc.).
 	//
 	// We build the schema argument once at Parse and share it across all
-	// concurrent invocations. Treat it as read-only; in particular, do
-	// not mutate schema.Props or schema.Symbols, whose slices and maps
-	// alias the parser's internal state: concurrent writes from multiple
-	// goroutines decoding the same [*Schema] will race.
+	// concurrent invocations. Treat the schema argument as read-only; in
+	// particular, do not mutate schema.Props or schema.Symbols, whose
+	// slices and maps alias the parser's internal state: concurrent writes
+	// from multiple goroutines decoding the same [*Schema] will race.
 	Encode func(v any, schema *SchemaNode) (any, error)
 
 	// Decode converts a raw Avro-native value to your Go value. We call
@@ -130,8 +130,8 @@ type CustomType struct {
 	//
 	// Under [AliasInput], a []byte v points into the decode input, and a
 	// field filled from its schema default points into the parsed
-	// [Schema], which every decode of that schema shares. Read it or copy
-	// from it, but do not write through it. Returning it is fine.
+	// [Schema], which every decode of that schema shares. Read v or copy
+	// from v, but do not write through v. Returning v is fine.
 	Decode func(v any, schema *SchemaNode) (any, error)
 
 	// Set by NewCustomType; if true and AvroType is "", Parse returns
@@ -159,11 +159,11 @@ func (ct CustomType) matches(node *schemaNode) bool {
 // NewCustomType returns a type-safe [CustomType] for the common case of
 // mapping a custom Go type to/from a primitive Avro type.
 //
-// G is your custom Go type (e.g. Money). A is the Avro-native Go type:
-// int32 for int, int64 for long, float32 for float, float64 for double,
-// string for string, []byte for bytes, bool for boolean. A may also be a
-// named type whose underlying kind is one of these (e.g. type Cents int64);
-// we infer the Avro type from A's kind and convert the decoded value to A.
+// G is your custom Go type (e.g. Money). A is the Avro-native Go type: int32
+// for int, int64 for long, float32 for float, float64 for double, string for
+// string, []byte for bytes, bool for boolean. A may also be a named type over
+// one of the listed types (e.g. type Cents int64); we infer the Avro type from
+// A's kind and convert the decoded value to A.
 //
 // We infer GoType and AvroType from the type parameters. If A is not a
 // supported Avro-native type, [Parse] or [SchemaFor] returns an error.
