@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -9248,6 +9249,70 @@ func frameVariants(items [][]byte) map[string][]byte {
 	return variants
 }
 
+// manyBlockCounts are the block counts the framing matrix drives its cost
+// check at. Both stay under the 4096 cap on zero-byte items.
+var manyBlockCounts = []int{1000, 4000}
+
+// oneBlock frames n copies of item as an array wire with a single block.
+func oneBlock(item []byte, n int) []byte {
+	out := putZigzag(nil, int64(n))
+	for range n {
+		out = append(out, item...)
+	}
+	return append(out, 0x00)
+}
+
+// blockPerItem frames n copies of item as an array wire with one item to a
+// block.
+func blockPerItem(item []byte, n int) []byte {
+	var out []byte
+	for range n {
+		out = putZigzag(out, 1)
+		out = append(out, item...)
+	}
+	return append(out, 0x00)
+}
+
+// allocatedBy returns the bytes fn allocates.
+func allocatedBy(fn func()) int64 {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return int64(after.TotalAlloc - before.TotalAlloc)
+}
+
+// wantBlockCountLinear decodes the same items framed as one block and as one
+// block per item, and fails when the second allocates more than a constant
+// factor over the first. A writer may split an array into any number of blocks
+// (hamba/avro writes 100 items to a block by default), so a decoder that redoes
+// work on every block, such as regrowing its slice to the exact length, turns
+// quadratic and fails here by an order of magnitude.
+func wantBlockCountLinear(t *testing.T, label string, item []byte, decode func(wire []byte) error) {
+	t.Helper()
+	for _, n := range manyBlockCounts {
+		single, perItem := oneBlock(item, n), blockPerItem(item, n)
+		// The first decode into a Go type compiles and caches its
+		// deserializer, so we run one before we count.
+		if err := decode(single); err != nil {
+			t.Fatalf("%s: %d items in one block: %v", label, n, err)
+		}
+		var err error
+		base := allocatedBy(func() { err = decode(single) })
+		if err != nil {
+			t.Fatalf("%s: %d items in one block: %v", label, n, err)
+		}
+		got := allocatedBy(func() { err = decode(perItem) })
+		if err != nil {
+			t.Fatalf("%s: %d items in %d blocks: %v", label, n, n, err)
+		}
+		if limit := 4*base + 512<<10; got > limit {
+			t.Errorf("%s: %d items allocated %d bytes in %d blocks and %d bytes in one block, want at most %d",
+				label, n, got, n, base, limit)
+		}
+	}
+}
+
 func TestMatrix_ForeignContainerFraming(t *testing.T) {
 	for _, fr := range matFrags() {
 		t.Run(fr.label, func(t *testing.T) {
@@ -9358,6 +9423,42 @@ func TestMatrix_ForeignContainerFraming(t *testing.T) {
 						}
 					}
 				}
+			}
+
+			// The cost of many blocks, for every item kind into an any and
+			// for each typed target that has its own block loop.
+			wantBlockCountLinear(t, "any", item, func(wire []byte) error {
+				var got any
+				_, err := arrSchema.Decode(wire, &got)
+				return err
+			})
+			if fr.label == "int" {
+				wantBlockCountLinear(t, "[]int32", item, func(wire []byte) error {
+					var got []int32
+					_, err := arrSchema.Decode(wire, &got)
+					return err
+				})
+				wantBlockCountLinear(t, "[]*int32", item, func(wire []byte) error {
+					var got []*int32
+					_, err := arrSchema.Decode(wire, &got)
+					return err
+				})
+				// A record with one array field has the array's own wire.
+				recSchema := avro.MustParse(`{"type":"record","name":"manyBlocks","fields":[{"name":"xs","type":{"type":"array","items":"int"}}]}`)
+				wantBlockCountLinear(t, "struct field []int32", item, func(wire []byte) error {
+					var got struct {
+						Xs []int32 `avro:"xs"`
+					}
+					_, err := recSchema.Decode(wire, &got)
+					return err
+				})
+				wantBlockCountLinear(t, "struct field []*int32", item, func(wire []byte) error {
+					var got struct {
+						Xs []*int32 `avro:"xs"`
+					}
+					_, err := recSchema.Decode(wire, &got)
+					return err
+				})
 			}
 		})
 	}
