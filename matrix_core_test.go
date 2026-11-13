@@ -9253,29 +9253,9 @@ func frameVariants(items [][]byte) map[string][]byte {
 	return variants
 }
 
-// manyBlockCounts are the block counts the framing matrix drives its cost
-// check at. Both stay under the 4096 cap on zero-byte items.
-var manyBlockCounts = []int{1000, 4000}
-
-// oneBlock frames n copies of item as an array wire with a single block.
-func oneBlock(item []byte, n int) []byte {
-	out := putZigzag(nil, int64(n))
-	for range n {
-		out = append(out, item...)
-	}
-	return append(out, 0x00)
-}
-
-// blockPerItem frames n copies of item as an array wire with one item to a
-// block.
-func blockPerItem(item []byte, n int) []byte {
-	var out []byte
-	for range n {
-		out = putZigzag(out, 1)
-		out = append(out, item...)
-	}
-	return append(out, 0x00)
-}
+// manyBlocks is the block count the framing matrix drives its cost check at.
+// It stays under the 4096 cap on zero-byte items.
+const manyBlocks = 4000
 
 // allocatedBy returns the bytes fn allocates.
 func allocatedBy(fn func()) int64 {
@@ -9294,26 +9274,26 @@ func allocatedBy(fn func()) int64 {
 // quadratic and fails here by an order of magnitude.
 func wantBlockCountLinear(t *testing.T, label string, item []byte, decode func(wire []byte) error) {
 	t.Helper()
-	for _, n := range manyBlockCounts {
-		single, perItem := oneBlock(item, n), blockPerItem(item, n)
-		// The first decode into a Go type compiles and caches its
-		// deserializer, so we run one before we count.
-		if err := decode(single); err != nil {
-			t.Fatalf("%s: %d items in one block: %v", label, n, err)
-		}
-		var err error
-		base := allocatedBy(func() { err = decode(single) })
-		if err != nil {
-			t.Fatalf("%s: %d items in one block: %v", label, n, err)
-		}
-		got := allocatedBy(func() { err = decode(perItem) })
-		if err != nil {
-			t.Fatalf("%s: %d items in %d blocks: %v", label, n, n, err)
-		}
-		if limit := 4*base + 512<<10; got > limit {
-			t.Errorf("%s: %d items allocated %d bytes in %d blocks and %d bytes in one block, want at most %d",
-				label, n, got, n, base, limit)
-		}
+	const n = manyBlocks
+	single := append(append(putZigzag(nil, n), bytes.Repeat(item, n)...), 0x00)
+	perItem := frameVariants(slices.Repeat([][]byte{item}, n))["block-per-item"]
+	// The first decode into a Go type compiles and caches its deserializer,
+	// so we run one before we count.
+	if err := decode(single); err != nil {
+		t.Fatalf("%s: %d items in one block: %v", label, n, err)
+	}
+	var err error
+	base := allocatedBy(func() { err = decode(single) })
+	if err != nil {
+		t.Fatalf("%s: %d items in one block: %v", label, n, err)
+	}
+	got := allocatedBy(func() { err = decode(perItem) })
+	if err != nil {
+		t.Fatalf("%s: %d items in %d blocks: %v", label, n, n, err)
+	}
+	if limit := 4*base + 512<<10; got > limit {
+		t.Errorf("%s: %d items allocated %d bytes in %d blocks and %d bytes in one block, want at most %d",
+			label, n, got, n, base, limit)
 	}
 }
 
