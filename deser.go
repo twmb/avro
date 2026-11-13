@@ -1511,6 +1511,10 @@ func zeroStale(v reflect.Value, start, end int) {
 }
 
 func (s *deserArray) deserFixedArray(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	// An any element starts from nil, as in a slice of any.
+	if v.Type().Elem() == anyType {
+		v.SetZero()
+	}
 	arrLen := v.Len()
 	idx := 0
 	var err error

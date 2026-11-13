@@ -12144,8 +12144,8 @@ func TestDifferentialFastavroResolvedJSONUnion(t *testing.T) {
 // their own documented contracts, and historically their own bugs. Map targets
 // retain non-schema keys while schema fields overwrite (encoding/json parity),
 // slices are rewritten to exactly the new length, and pointers are reused. An
-// any element of a slice is the exception: the element starts from nil, so a
-// value you took out of the slice survives the next decode.
+// any element of a slice or of a Go array is the exception: the element starts
+// from nil, so a value you took out of the element survives the next decode.
 // Every fragment kind drives a decode-twice cycle on the same target, on both
 // wire formats.
 // ---------------------------------------------------------------------------
@@ -12269,6 +12269,23 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 						t.Errorf("%s: second decode of %d into the used slice:\n got=%#v\nwant=%#v", name, n, *target.elems, want)
 					}
 				}
+			}
+
+			// The same for a Go array of any, which takes two items.
+			second, err := arr.AppendEncode(nil, []any{fr.values[1], fr.values[1]})
+			if err != nil {
+				t.Fatalf("encode second array: %v", err)
+			}
+			var goArr, wantArr [2]any
+			avrotest.MustDecode(t, arr, second, &wantArr)
+			avrotest.MustDecode(t, arr, first, &goArr)
+			kept := goArr
+			avrotest.MustDecode(t, arr, second, &goArr)
+			if !matEqual(kept[:], wantKept) {
+				t.Errorf("Go array: the second decode wrote a value taken from the first:\n got=%#v\nwant=%#v", kept, wantKept)
+			}
+			if !matEqual(goArr[:], wantArr[:]) {
+				t.Errorf("Go array: second decode into the used array:\n got=%#v\nwant=%#v", goArr, wantArr)
 			}
 		})
 	}
