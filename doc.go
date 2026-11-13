@@ -42,18 +42,18 @@
 //
 // You can encode generically-decoded JSON data (map[string]any with float64
 // numbers and string timestamps) directly. We fill missing map keys from
-// schema defaults. [encoding/json.Number] is accepted for numeric Avro types
-// only: string, bytes, fixed, and enum reject it, so use a Go string or
-// []byte for those. Timestamp fields accept RFC 3339 strings, and string
+// schema defaults. We accept [encoding/json.Number] for numeric Avro types
+// only: string, bytes, fixed, and enum reject a Number, so use a Go string or
+// []byte for those types. Timestamp fields accept RFC 3339 strings, and string
 // fields accept [encoding.TextAppender] and [encoding.TextMarshaler]
 // implementations (with [encoding.TextUnmarshaler] on decode).
 //
 // # Schema evolution
 //
 // Avro data is always written with a specific schema, the "writer schema".
-// When you read it later, your application may expect a different "reader
-// schema": you may have added a field, removed one, or widened an int to a
-// long.
+// When you read that data later, your application may expect a different
+// "reader schema": you may have added a field, removed one, or widened an int
+// to a long.
 //
 // [Resolve] takes the writer and reader schemas and returns a schema that
 // decodes data in the writer's wire format into the reader's layout:
@@ -107,13 +107,13 @@
 // A null union branch decodes to the target's Go zero value, replacing any
 // prior value. Use *T if you need to tell null from zero.
 //
-// Precision follows the reader schema. A float or double schema rounds
-// silently on both encode and decode, and a finite value out of range
-// becomes +/-Inf on the wire. An int, long, bytes, or string schema never
-// loses precision silently: decoding into a Go type that cannot hold the
-// value exactly, such as a long above 2^53 into a float64, is an error. If
-// you need large integers to round-trip exactly, keep the reader schema long
-// and decode into an int64.
+// The reader schema decides precision. A float or double schema rounds
+// silently on both encode and decode, and a finite value out of range becomes
+// +/-Inf on the wire. An int, long, bytes, or string schema never loses
+// precision silently: decoding into a Go type that cannot hold the value
+// exactly, such as a long above 2^53 into a float64, is an error. If you need
+// large integers to round-trip exactly, keep the reader schema long and decode
+// into an int64.
 //
 // # Struct tags
 //
@@ -140,10 +140,10 @@
 // The logical types you can override with are timestamp-millis,
 // timestamp-micros, timestamp-nanos, date, time-millis, and time-micros.
 //
-// The alias tag adds an alias to the field itself. The type-alias tag adds
-// an alias to the named type (record, enum, or fixed) that the field
-// references; we walk through pointers, slices, and maps to find it. You
-// need it when a writer schema uses a different name for the same type: a
+// The alias tag adds an alias to the field itself. The type-alias tag adds an
+// alias to the named type (record, enum, or fixed) that the field references;
+// we walk through pointers, slices, and maps to find the named type. You need
+// type-alias when a writer schema uses a different name for the same type: a
 // legacy schema naming a record "r508" instead of "FieldSummary".
 //
 // An [ArrayRecord] is a record's field values as a []any: the slice index
@@ -164,8 +164,8 @@
 // default can exist there, and omitzero encodes null where map fill errors on
 // the missing key.
 //
-// We inline embedded (anonymous) struct fields automatically; an explicit
-// name tag prevents it. When several fields resolve to one name, a tagged
+// We inline embedded (anonymous) struct fields automatically; an explicit name
+// tag prevents the inlining. When several fields resolve to one name, a tagged
 // field wins over an untagged one at any depth, and among equally tagged
 // fields the shallowest wins. Two fields at the same depth with the same
 // tagged status are ambiguous, and we error rather than pick one. [SchemaFor]

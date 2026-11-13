@@ -1,10 +1,10 @@
 // Package ocf implements Avro [Object Container Files] (OCF).
 //
-// An OCF is self-describing: the schema lives in the file header, so you do
-// not need it out of band. Data sits in compressed blocks separated by sync
+// An OCF is self-describing: the schema is in the file header, so you do not
+// need it out of band. Data is stored in compressed blocks separated by sync
 // markers, which makes files splittable for parallel processing. OCF is the
-// standard way to store Avro on disk. To send individual values over the
-// wire, see [avro.AppendSingleObject] instead.
+// standard way to store Avro on disk. To send individual values over the wire,
+// see [avro.AppendSingleObject] instead.
 //
 // See the [Avro specification] for the full format definition.
 //
@@ -68,7 +68,7 @@
 //	r, err := ocf.NewReader(f, ocf.WithMaxDecompressedBlockBytes(128<<20))
 //
 // Match the cap to the largest block your writer produces. For single large
-// values that is the datum size, not [WithBlockBytes].
+// values, the largest block is the datum size, not [WithBlockBytes].
 //
 // [Object Container Files]: https://avro.apache.org/docs/current/specification/#object-container-files
 // [Avro specification]: https://avro.apache.org/docs/current/specification/#object-container-files
@@ -103,25 +103,25 @@ type Codec interface {
 	Name() string
 
 	// Compress encodes a raw data block for storage. You must not retain
-	// src after Compress returns: a Writer reuses it for its next block.
+	// src after Compress returns: a Writer reuses src for the next block.
 	Compress(src []byte) ([]byte, error)
 
 	// Decompress decodes a stored data block back to raw bytes.
 	Decompress(src []byte) ([]byte, error)
 
-	// Close releases whatever the codec holds. A codec that holds nothing
-	// can return nil.
+	// Close releases the codec's resources. A codec with no resources can
+	// return nil.
 	Close() error
 }
 
 // BoundedDecompressor is an optional interface a [Codec] can implement. If
 // yours does, we call DecompressBounded with our per-block cap (from
 // [WithMaxDecompressedBlockBytes]) rather than [Codec.Decompress], so you can
-// refuse an oversized block *before* allocating it. That is the only real
-// defense against a decompression bomb, since checking the size afterward
-// means the allocation already happened. A Codec without this method
-// decompresses unbounded, so for untrusted data supply one that bounds
-// itself. All built-in codecs do.
+// refuse an oversized block *before* allocating it. Refusing before allocating
+// is the only real defense against a decompression bomb, since checking the
+// size afterward means the allocation already happened. A Codec without this
+// method decompresses unbounded, so for untrusted data supply a Codec that
+// bounds itself. All built-in codecs implement BoundedDecompressor.
 //
 // Note that a wrapper embedding [Codec] does not inherit this method, because
 // embedding an interface promotes only that interface's methods. Your wrapper
@@ -212,9 +212,10 @@ type optDecodeOpts []avro.Opt
 func (optDecodeOpts) readerOpt() {}
 
 // WithCodec sets the compression codec, overriding the default of null (no
-// compression). It is both a [WriterOpt] and a [ReaderOpt]. You do not need
-// to register the four built-in codecs (null, deflate, snappy, zstandard) to
-// read them. A custom codec whose name matches a built-in overrides it.
+// compression). It is both a [WriterOpt] and a [ReaderOpt]. You do not need to
+// register the four built-in codecs (null, deflate, snappy, zstandard) to read
+// them. A custom codec whose name matches a built-in codec overrides the
+// built-in codec.
 //
 // We take ownership of the codec you pass and close it exactly once: in
 // [Writer.Close] or [Reader.Close] when the constructor succeeds, or in the
@@ -226,24 +227,26 @@ func (optDecodeOpts) readerOpt() {}
 // If you share one codec across several writers, readers, or files, give it
 // a Close that returns nil, or wrap it in [NopCloser].
 //
-// We ignore a nil codec, whether a nil Codec or a non-nil Codec holding a nil
-// pointer, on every constructor: we never name, adopt, or close it, and the
-// constructor behaves as though you had not passed it. If it is the only
-// codec supplied for a name the file uses, the constructor reports an
+// We ignore a nil codec, whether a nil Codec or a nil pointer in a non-nil
+// Codec, on every constructor: we never name, adopt, or close it, and the
+// constructor behaves as though you had not passed it. If a nil codec is the
+// only codec supplied for a name the file uses, the constructor reports an
 // unknown codec.
 //
 // For reader-side decompression bounding, see [WithMaxDecompressedBlockBytes].
-// It applies to any codec you supply that implements [BoundedDecompressor],
-// which every built-in does, including one wrapped by [NopCloser].
+// The bound applies to any codec you supply that implements
+// [BoundedDecompressor], including a codec wrapped by [NopCloser]. Every
+// built-in codec implements BoundedDecompressor.
 func WithCodec(c Codec) Opt { return optCodec{c} }
 
-// WithBlockCount caps the number of items per block, overriding the default
-// of 0 (unlimited). We flush a block when either this or [WithBlockBytes] is
-// reached.
+// WithBlockCount caps the number of items per block, overriding the default of
+// 0 (unlimited). We flush a block when either the count cap or the
+// [WithBlockBytes] cap is reached.
 func WithBlockCount(n int) WriterOpt { return optBlockCount{n} }
 
 // WithBlockBytes caps a block's uncompressed bytes, overriding the default of
-// 64 KiB. We flush a block when either this or [WithBlockCount] is reached.
+// 64 KiB. We flush a block when either the byte cap or the [WithBlockCount]
+// cap is reached.
 func WithBlockBytes(n int) WriterOpt { return optBlockBytes{n} }
 
 // WithMetadata adds custom metadata to the file header. The spec reserves
@@ -251,14 +254,15 @@ func WithBlockBytes(n int) WriterOpt { return optBlockBytes{n} }
 func WithMetadata(m map[string][]byte) WriterOpt { return optMetadata{m} }
 
 // WithSyncMarker sets the 16-byte sync marker between blocks, overriding the
-// random one we generate. Mostly useful for deterministic test output.
+// random one we generate. You mostly need a fixed marker for deterministic
+// test output.
 func WithSyncMarker(sync [16]byte) WriterOpt { return optSyncMarker{sync} }
 
 // WithSchema sets the schema JSON we write to the file header, overriding the
 // default of [avro.Schema.String]: the original JSON you passed to
 // [avro.Parse], with logicalType, precision, scale, doc, aliases, and default
-// all preserved, matching Java's DataFileWriter and fastavro. Use this if you
-// want different header text, say the Parsing Canonical Form from
+// all preserved, matching Java's DataFileWriter and fastavro. Use WithSchema
+// if you want different header text, say the Parsing Canonical Form from
 // [avro.Schema.Canonical].
 func WithSchema(schema string) WriterOpt { return optSchema{schema} }
 
@@ -317,31 +321,31 @@ const defaultMaxBlockBytes = 1 << 26
 // allocation up to the raised cap.
 const ocfEagerBlockAllocLimit = defaultMaxBlockBytes
 
-// WithMaxDecompressedBlockBytes sets the maximum decompressed size in bytes
-// of a single block we accept when reading, overriding the default of 64 MiB.
-// [WithMaxBlockBytes] bounds the compressed size we read off the wire; this
-// bounds what that block inflates to, guarding against "zip bomb" inputs
-// where a tiny compressed block expands to a huge output. A block's record
-// count is bounded by its decompressed length, so this also bounds the
-// per-block decode loop. Raise it if you write blocks (via [WithBlockBytes])
-// that decompress beyond the default.
+// WithMaxDecompressedBlockBytes sets the maximum decompressed size in bytes of
+// a single block we accept when reading, overriding the default of 64 MiB.
+// [WithMaxBlockBytes] bounds the compressed size of a block we read off the
+// wire; WithMaxDecompressedBlockBytes bounds what the block decompresses to,
+// guarding against "zip bomb" inputs where a tiny compressed block expands to
+// a huge output. A block's record count is bounded by its decompressed length,
+// so the limit also bounds the per-block decode loop. Raise the limit if you
+// write blocks (via [WithBlockBytes]) that decompress beyond the default.
 //
 // We pass the limit to the codec's [BoundedDecompressor.DecompressBounded],
-// which refuses an over-cap block before allocating it. This applies to every
-// codec implementing that interface: one we resolve by name from the file
-// header, and one you supply via [WithCodec], including one wrapped by
-// [NopCloser]. All four built-in codecs implement it. A codec that does not
-// decompresses unbounded, and there is no post-decompression check, since the
-// allocation would already have happened. Supply a self-bounding codec for
-// untrusted data.
+// which refuses an over-cap block before allocating it. The limit applies to
+// every codec that implements BoundedDecompressor: a codec we resolve by name
+// from the file header, and a codec you supply via [WithCodec], including a
+// codec wrapped by [NopCloser]. All four built-in codecs implement it. A codec
+// that does not implement BoundedDecompressor decompresses unbounded, and
+// there is no post-decompression check, since the allocation would already
+// have happened. Supply a self-bounding codec for untrusted data.
 func WithMaxDecompressedBlockBytes(n int64) ReaderOpt { return optMaxDecompressedBytes{n} }
 
 // WithSchemaOpts passes [avro.SchemaOpt] values, such as [avro.CustomType] or
 // [avro.WithLaxNames], to the [avro.Parse] of the header's embedded schema.
 // [NewReader] uses it to register custom type conversions and to accept
 // lax-named header schemas. [NewAppendWriter] needs it whenever the header
-// schema requires an option to parse at all. [NewWriter] ignores it: you
-// already parsed its schema.
+// schema requires an option to parse at all. [NewWriter] ignores
+// WithSchemaOpts: you already parsed the schema you pass to NewWriter.
 func WithSchemaOpts(opts ...avro.SchemaOpt) Opt { return optSchemaOpts(opts) }
 
 // WithDecodeOpts passes [avro.Opt] values to the [avro.Schema.Decode] behind
@@ -383,8 +387,8 @@ func SnappyCodec() Codec { return snappyCodec{} }
 // [WithMaxDecompressedBlockBytes] cap, and then cache that decoder. Note that
 // a ZstdCodec shared across readers with different caps therefore honors the
 // first reader's cap; set [zstd.WithDecoderMaxMemory] in dopts to pin a bound
-// regardless of reader. We raise a cap below [zstd.MinWindowSize] (1 KiB) up
-// to it, since a smaller limit would reject every frame.
+// regardless of reader. We raise a cap below [zstd.MinWindowSize] (1 KiB) to
+// zstd.MinWindowSize, since a smaller limit would reject every frame.
 func ZstdCodec(eopts []zstd.EOption, dopts []zstd.DOption) (Codec, error) {
 	eopts = append([]zstd.EOption{zstd.WithEncoderConcurrency(1)}, eopts...)
 	enc, err := zstd.NewWriter(nil, eopts...)
@@ -1152,8 +1156,9 @@ func (rd *Reader) Schema() *avro.Schema { return rd.schema }
 // your own keys. Do not modify the returned map.
 func (rd *Reader) Metadata() map[string][]byte { return rd.meta }
 
-// Close closes the codec, releasing what it holds. Close is idempotent: later
-// calls return nil without re-closing. After Close, Decode returns an error.
+// Close closes the codec, releasing the codec's resources. Close is
+// idempotent: later calls return nil without re-closing. After Close, Decode
+// returns an error.
 func (rd *Reader) Close() error {
 	if rd.closed {
 		return nil

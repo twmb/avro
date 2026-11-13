@@ -208,9 +208,10 @@ func (sl *slab) put() {
 //   - uuid on fixed(16): [16]byte
 //   - duration: [Duration]
 //
-// To produce JSON from decoded *any data use [Schema.EncodeJSON], not a generic
-// JSON encoder: it is schema-aware and converts these types back to their Avro
-// representations (time.Time to epoch integers, []byte to \uXXXX strings).
+// To produce JSON from decoded *any data use [Schema.EncodeJSON], not a
+// generic JSON encoder: EncodeJSON is schema-aware and converts decoded values
+// back to their Avro representations (time.Time to epoch integers, []byte to
+// \uXXXX strings).
 //
 // Decode is liberal in what it accepts: we tolerate non-canonical input rather
 // than rejecting it, such as a non-0/1 boolean byte that Java also reads as
@@ -2543,9 +2544,9 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 }
 
 // RatFromBytes converts Avro decimal bytes (big-endian two's complement) to a
-// *big.Rat with the given scale. This is the conversion you would otherwise
-// write yourself in a [CustomType] Decode callback that overrides our built-in
-// decimal handling, since such a callback receives the raw []byte.
+// *big.Rat with the given scale. Use RatFromBytes in a [CustomType] Decode
+// callback that overrides our built-in decimal handling, since such a callback
+// receives the raw []byte.
 //
 // We read a negative scale as unscaled * 10^|scale|, matching Java and
 // avro-rs. We bound |scale| and the unscaled byte length; input past either

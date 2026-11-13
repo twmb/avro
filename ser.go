@@ -1859,8 +1859,8 @@ func durationOf(v reflect.Value) Duration {
 	return v.Interface().(Duration)
 }
 
-// Duration is the Avro duration logical type: a 12-byte fixed value holding
-// three little-endian uint32s, months and days and milliseconds.
+// Duration is the Avro duration logical type: a 12-byte fixed value of three
+// little-endian uint32s (months, days, and milliseconds).
 type Duration struct {
 	Months       uint32
 	Days         uint32

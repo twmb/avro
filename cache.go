@@ -10,7 +10,7 @@ import (
 
 // SchemaCache accumulates named types across multiple [SchemaCache.Parse]
 // calls, so that a schema can reference types defined in previously parsed
-// schemas. This is how a schema registry's inter-schema references work.
+// schemas, as a schema registry's inter-schema references require.
 //
 // Parse schemas in dependency order: a referenced type must be parsed before
 // the schemas that reference it.
@@ -24,16 +24,17 @@ import (
 // form: schemas differing only in formatting dedupe, while differences in
 // non-canonical fields like doc or aliases return a duplicate type error.
 //
-// Each returned [*Schema] is fully resolved and independent of the cache.
-// That extends to sub-schemas: a node extracted from [Schema.Root] converts
+// Each returned [*Schema] is fully resolved and independent of the cache. A
+// sub-schema is independent too: a node extracted from [Schema.Root] converts
 // via [SchemaNode.Schema] with every cross-parse reference resolved, so you
 // never need the cache again once Parse returns.
 //
-// Note that [WithLaxNames] is sticky: if a type is defined with it, pass it
-// to every later Parse that references that type. A schema containing a lax
-// name is not parseable without it, cache or no cache, so re-parsing the
-// referencing schema's [Schema.String] or [Schema.Canonical] output also
-// needs WithLaxNames. [Schema.Encode] and [Schema.Decode] are unaffected.
+// Note that if a type is defined with [WithLaxNames], you must pass
+// WithLaxNames to every later Parse that references that type. A schema
+// containing a lax name does not parse without WithLaxNames, with or without a
+// cache, so re-parsing the referencing schema's [Schema.String] or
+// [Schema.Canonical] output also needs WithLaxNames. [Schema.Encode] and
+// [Schema.Decode] are unaffected.
 //
 // The zero value is ready to use. A SchemaCache is safe for concurrent use.
 type SchemaCache struct {

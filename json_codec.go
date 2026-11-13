@@ -29,8 +29,8 @@ func (taggedUnions) opt() {}
 // [Schema.EncodeJSON] emits the tagged form. [Schema.Decode] and
 // [Schema.DecodeJSON] wrap union values as map[string]any{branchName: value},
 // but only when your decode target is *any. A typed target (a concrete struct
-// field, *T, or a non-empty interface) cannot hold the wrapper, so it gets the
-// bare branch value.
+// field, *T, or a non-empty interface) cannot hold the wrapper, so a typed
+// target gets the bare branch value.
 //
 // [Schema.DecodeJSON] and [Schema.Encode] take both tagged and bare union
 // input either way.
@@ -42,16 +42,16 @@ func (taggedUnions) opt() {}
 // (NewCodecForStandardJSON and NewCodecForStandardJSONFull) and for plain
 // map[string]any consumers. See AVRO-2899 for the upstream discussion.
 //
-// Note that a bare union value does not name its branch, so [Schema.DecodeJSON]
-// cannot tell which branch the writer used when several share a JSON token
-// class: a bare 7 matches int, long, float and double, and a bare "x" matches
-// string, bytes, fixed and enum. We use the *first* such branch in declaration
-// order. That can differ from the writer's branch, and it bypasses a
-// [CustomType] registered on a later branch of the same class: its Decode
-// never runs, and a typed target is filled by plain coercion from the first
-// branch. Binary [Schema.Decode] is unaffected, since the wire carries the
-// branch index. If branch identity or a branch-bound CustomType matters to
-// you, encode and decode with TaggedUnions.
+// Note that a bare union value does not name its branch, so
+// [Schema.DecodeJSON] cannot tell which branch the writer used when several
+// share a JSON token class: a bare 7 matches int, long, float, and double, and
+// a bare "x" matches string, bytes, fixed, and enum. We use the *first* such
+// branch in declaration order. The first branch can differ from the writer's
+// branch, and we skip a [CustomType] registered on a later branch of the same
+// class: the CustomType's Decode never runs, and a typed target is filled by
+// plain coercion from the first branch. Binary [Schema.Decode] is unaffected,
+// since the wire carries the branch index. If branch identity or a
+// branch-bound CustomType matters to you, encode and decode with TaggedUnions.
 func TaggedUnions() Opt { return taggedUnions{} }
 
 type tagLogicalTypes struct{}
@@ -59,10 +59,10 @@ type tagLogicalTypes struct{}
 func (tagLogicalTypes) opt() {}
 
 // TagLogicalTypes qualifies union branch names with their logical type,
-// "long.timestamp-millis" rather than the spec's "long". This is the
-// linkedin/goavro convention. It applies to [Schema.EncodeJSON] and
-// [Schema.Decode], and only alongside [TaggedUnions]; without that option it
-// does nothing.
+// "long.timestamp-millis" rather than the spec's "long", which is the
+// linkedin/goavro convention. TagLogicalTypes applies to [Schema.EncodeJSON]
+// and [Schema.Decode], and only alongside [TaggedUnions]; without
+// TaggedUnions, TagLogicalTypes does nothing.
 func TagLogicalTypes() Opt { return tagLogicalTypes{} }
 
 type skipUnknown struct{}
@@ -71,13 +71,14 @@ func (skipUnknown) opt() {}
 
 // SkipUnknown allows decoding into a struct that maps only some of a record's
 // fields, skipping the fields your struct lacks rather than erroring as we do
-// by default. Nested records follow the same rule. This applies to
-// [Schema.Decode], [Schema.DecodeJSON] and [Schema.DecodeSingleObject]. It is
+// by default. Nested records follow the same rule. SkipUnknown applies to
+// [Schema.Decode], [Schema.DecodeJSON], and [Schema.DecodeSingleObject]. It is
 // decode only: encoding from a struct that does not cover the record still
 // errors, since the missing fields would go out as zero values.
 //
-// Note that an ambiguous field name (two same-depth fields claiming it) still
-// errors. Your type has fields for it, so there is nothing to skip.
+// Note that an ambiguous field name (two fields at the same depth with that
+// name) still errors. Your type has fields for the name, so there is nothing
+// to skip.
 func SkipUnknown() Opt { return skipUnknown{} }
 
 type aliasInput struct{}
@@ -89,9 +90,10 @@ func (aliasInput) opt() {}
 func (aliasInput) AvroOptAliasesInput() {}
 
 // AliasInput makes decoded strings and byte slices point into the bytes they
-// were read from, rather than copying them as we do by default. This applies
-// to [Schema.Decode] and [Schema.DecodeSingleObject]. [Schema.DecodeJSON]
-// ignores it, because a JSON string with an escape cannot alias.
+// were read from, rather than copying them as we do by default. AliasInput
+// applies to [Schema.Decode] and [Schema.DecodeSingleObject].
+// [Schema.DecodeJSON] ignores it, because a JSON string with an escape cannot
+// alias.
 //
 // You must not modify src after the decode, and you must not modify anything
 // the decode returns. An aliased value *is* the memory it was read from: if
@@ -100,19 +102,20 @@ func (aliasInput) AvroOptAliasesInput() {}
 // memory is your src, but a field filled from a schema default aliases the
 // parsed [Schema] itself, which every decode of that schema shares.
 //
-// One aliased field keeps the whole buffer it points into alive for as long as
-// you hold it. Do not use this option if you reuse the buffer, or if you keep
-// one small field of a large message around.
+// One aliased field keeps the whole buffer alive for as long as you keep the
+// field. Do not use this option if you reuse the buffer, or if you keep one
+// small field of a large message around.
 //
-// We alias string and []byte targets of the string, bytes and fixed kinds,
+// We alias string and []byte targets of the string, bytes, and fixed kinds,
 // including inside an any, under a uuid logical type, and as map keys. We
 // still copy for [N]byte, [encoding.TextUnmarshaler], and any logical type
 // that builds a new Go value (decimal, the timestamps, and the hex-dash uuid
 // form).
 //
-// This is an [Opt] rather than a [SchemaOpt] on purpose: ocf.WithSchemaOpts
-// forwards SchemaOpts into an OCF reader, and a reader must not alias its
-// block buffer. ocf.WithDecodeOpts drops this option for the same reason.
+// AliasInput is an [Opt] rather than a [SchemaOpt] on purpose:
+// ocf.WithSchemaOpts forwards SchemaOpts into an OCF reader, and a reader must
+// not alias its block buffer. ocf.WithDecodeOpts drops this option for the
+// same reason.
 func AliasInput() Opt { return aliasInput{} }
 
 type linkedinFloats struct{}
@@ -121,15 +124,17 @@ func (linkedinFloats) opt() {}
 
 // LinkedinFloats encodes NaN as JSON null and +/-Infinity as +/-1e999 in
 // [Schema.EncodeJSON], the linkedin/goavro convention, overriding our default
-// of the JSON strings "NaN", "Infinity" and "-Infinity" (the Java convention).
+// of the JSON strings "NaN", "Infinity", and "-Infinity" (the Java
+// convention).
 //
 // [Schema.DecodeJSON] accepts both conventions for a float or double decoded
 // directly or as a tagged union branch ({"float":null} decodes to NaN). Note
-// that a NaN inside a *bare* union does not round-trip: it encodes as a bare
-// null, and on decode the union's null branch claims that null (or the union
-// rejects it if it has no null branch) before we try the float branch. Use
-// [TaggedUnions] if you need NaN to round-trip through a union. +/-Infinity is
-// a number token and round-trips in a bare union regardless.
+// that a NaN inside a *bare* union does not round-trip: the NaN encodes as a
+// bare null, and on decode the union's null branch takes that null (or the
+// union rejects the null if the union has no null branch) before we try the
+// float branch. Use [TaggedUnions] if you need NaN to round-trip through a
+// union. +/-Infinity is a number token and round-trips in a bare union
+// regardless.
 func LinkedinFloats() Opt { return linkedinFloats{} }
 
 type optConfig struct {
@@ -167,7 +172,7 @@ func parseOpts(opts []Opt) optConfig {
 // default we write union values bare and escape non-ASCII bytes/fixed bytes as
 // \uXXXX; see [Opt] for the options that change the output.
 //
-// We encode NaN and Infinity as the JSON strings "NaN", "Infinity" and
+// We encode NaN and Infinity as the JSON strings "NaN", "Infinity", and
 // "-Infinity" (the Java convention), or as null and +/-1e999 with
 // [LinkedinFloats]. A generic JSON encoder rejects non-finite floats outright;
 // these forms keep the output valid JSON for any strict parser.
@@ -180,10 +185,9 @@ func parseOpts(opts []Opt) optConfig {
 // EncodeJSON accepts the same Go types as [Schema.Encode]. We do not sort map
 // keys, so their output order is non-deterministic.
 //
-// Note that Java's JsonDecoder, fastavro's JSON decoder and avro-tools
-// fromjson all require the {"type_name": value} envelope and reject bare
-// union values. Pass [TaggedUnions] for those tools; see its doc and
-// AVRO-2899.
+// Note that Java's JsonDecoder, fastavro's JSON decoder, and avro-tools
+// fromjson all require the {"type_name": value} envelope and reject bare union
+// values. Pass [TaggedUnions] for those tools; see its doc and AVRO-2899.
 func (s *Schema) EncodeJSON(v any, opts ...Opt) ([]byte, error) {
 	return s.AppendEncodeJSON(nil, v, opts...)
 }

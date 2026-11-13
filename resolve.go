@@ -14,20 +14,20 @@ import (
 // schema registry); the reader schema is what your application expects now.
 //
 // Decoding with the returned schema handles field addition (defaults), field
-// removal (skip), renaming (aliases), reordering, and type promotion.
-// Encoding with it uses the reader's format.
+// removal (skip), renaming (aliases), reordering, and type promotion. Encoding
+// with the returned schema uses the reader's format.
 //
 // We run [CheckCompatibility] first and return any incompatibility as a
 // [*CompatibilityError]. If the check passes and the two canonical forms are
 // identical, you get reader back as-is. The check runs first because the
-// parsing canonical form strips logicalType, precision and scale, so two
+// parsing canonical form strips logicalType, precision, and scale, so two
 // schemas with equal canonical forms can still be incompatible (a decimal
 // precision/scale mismatch, for example), and such a pair would otherwise
 // silently rescale the decoded value.
 //
 // Note that the argument order is (writer, reader), matching the
-// source-then-destination convention and Java's GenericDatumReader. This
-// differs from the Avro spec text and hamba/avro, which put reader first.
+// source-then-destination convention and Java's GenericDatumReader. The Avro
+// spec text and hamba/avro put reader first.
 func Resolve(writer, reader *Schema) (*Schema, error) {
 	if err := CheckCompatibility(writer, reader); err != nil {
 		return nil, err
