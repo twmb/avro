@@ -75,7 +75,9 @@ var sliceAnyType = reflect.SliceOf(anyType)
 // slab batches small string allocations into a single backing buffer.
 // Strings are immutable so sharing backing memory is safe.
 type slab struct {
-	buf             []byte
+	buf []byte
+	// nums is the rest of the current number slab. See boxNum.
+	nums            []uint64
 	depth           int // recursion depth; bumped at recursive dispatch sites
 	taggedUnions    bool
 	tagLogicalTypes bool
@@ -115,6 +117,70 @@ func (s *slab) carve(n int) []byte {
 	return b
 }
 
+// numSlabLen is how many numbers decoded into an any share one allocation.
+// One number you keep keeps its whole slab alive, so the slab is small: 64
+// numbers is 512 bytes.
+const numSlabLen = 64
+
+// eface is the layout of an interface value with no methods: a type word and
+// a data word.
+type eface struct{ typ, data unsafe.Pointer }
+
+// These fail to compile if an any is not the size of an eface.
+var (
+	_ [unsafe.Sizeof(eface{}) - unsafe.Sizeof(any(nil))]struct{}
+	_ [unsafe.Sizeof(any(nil)) - unsafe.Sizeof(eface{})]struct{}
+)
+
+// boxedNum is a number type we decode into an any.
+type boxedNum interface {
+	int32 | int64 | float32 | float64
+}
+
+// numTypeWord returns the type word of an any that has a T.
+func numTypeWord[T boxedNum]() unsafe.Pointer {
+	var v any = T(0)
+	return (*eface)(unsafe.Pointer(&v)).typ
+}
+
+var (
+	int32Word   = numTypeWord[int32]()
+	int64Word   = numTypeWord[int64]()
+	float32Word = numTypeWord[float32]()
+	float64Word = numTypeWord[float64]()
+)
+
+// boxNum returns v in an any, as any(v) does, where typ is numTypeWord[T]().
+// any(v) allocates 8 bytes for each number. We take the 8 bytes from the
+// slab's number slab instead, so that numSlabLen numbers share one
+// allocation, and point the any's data word at them. We never write a slot
+// again after we hand it out, since the runtime treats the value behind an
+// any as immutable.
+//
+// Without a slab, or for a value whose bits are under 256, we use any(v): the
+// runtime boxes such a value with no allocation.
+func boxNum[T boxedNum](sl *slab, v T, typ unsafe.Pointer) any {
+	var small bool
+	if unsafe.Sizeof(v) == 4 {
+		small = *(*uint32)(unsafe.Pointer(&v)) < 256
+	} else {
+		small = *(*uint64)(unsafe.Pointer(&v)) < 256
+	}
+	if sl == nil || small {
+		return v
+	}
+	if len(sl.nums) == 0 {
+		sl.nums = make([]uint64, numSlabLen)
+	}
+	slot := unsafe.Pointer(&sl.nums[0])
+	sl.nums = sl.nums[1:]
+	*(*T)(slot) = v
+	var boxed any
+	e := (*eface)(unsafe.Pointer(&boxed))
+	e.typ, e.data = typ, slot
+	return boxed
+}
+
 // aliases reports whether decoded strings and byte slices may point into the
 // decode input. Nil-safe for the arms that reach it off the slab-free path,
 // where no option was ever parsed. See [AliasInput].
@@ -148,10 +214,11 @@ func (s *slab) bytes(src []byte, n int) []byte {
 
 var slabPool = sync.Pool{New: func() any { return &slab{} }}
 
-// slabFreeKinds are the scalar leaf kinds whose desers never touch the slab
+// slabFreeKinds are the scalar leaf kinds whose desers never need the slab
 // for any logical type and any target: only string decodes use its string
 // buffer, only recursive dispatch bumps its depth, and only custom-decoder
-// wrappers write its remaining state. "string" is absent; "bytes" is safe
+// wrappers write its remaining state. A number decoded into an any uses the
+// number slab when there is a slab, and boxes with any(v) when there is none. "string" is absent; "bytes" is safe
 // because a string target of a bytes schema copies via string(b).
 var slabFreeKinds = map[string]bool{
 	"null":    true,
@@ -425,7 +492,10 @@ func deserInt(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return src, setIntValue(indirectAlloc(v), val)
+	if v = indirectAlloc(v); v.Kind() == reflect.Interface {
+		return src, setIface(v, reflect.ValueOf(boxNum(sl, val, int32Word)), "int")
+	}
+	return src, setIntValue(v, val)
 }
 
 func deserLong(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -433,7 +503,10 @@ func deserLong(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return src, setLongValue(indirectAlloc(v), val)
+	if v = indirectAlloc(v); v.Kind() == reflect.Interface {
+		return src, setIface(v, reflect.ValueOf(boxNum(sl, val, int64Word)), "long")
+	}
+	return src, setLongValue(v, val)
 }
 
 // setFloat32WireValue stores a 32-bit "float" wire value into v. A float32
@@ -456,7 +529,10 @@ func deserFloat(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return src, setFloat32WireValue(indirectAlloc(v), u)
+	if v = indirectAlloc(v); v.Kind() == reflect.Interface {
+		return src, setIface(v, reflect.ValueOf(boxNum(sl, math.Float32frombits(u), float32Word)), "float")
+	}
+	return src, setFloat32WireValue(v, u)
 }
 
 func deserDouble(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -464,7 +540,10 @@ func deserDouble(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return src, setFloatValue(indirectAlloc(v), math.Float64frombits(u), "double", 64)
+	if v = indirectAlloc(v); v.Kind() == reflect.Interface {
+		return src, setIface(v, reflect.ValueOf(boxNum(sl, math.Float64frombits(u), float64Word)), "double")
+	}
+	return src, setFloatValue(v, math.Float64frombits(u), "double", 64)
 }
 
 func deserBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -1499,6 +1578,36 @@ func deserArrayIfaceLoop[T any](readOne func(src []byte, sl *slab) (T, []byte, e
 	}
 }
 
+// deserArrayNumIfaceLoop is deserArrayIfaceLoop for a number, which boxNum
+// boxes.
+func deserArrayNumIfaceLoop[T boxedNum](readOne func(src []byte, sl *slab) (T, []byte, error)) func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
+	typ := numTypeWord[T]()
+	return func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
+		for i := start; i < start+count; i++ {
+			v, rest, err := readOne(src, sl)
+			if err != nil {
+				return nil, err
+			}
+			// boxNum makes the same check. We repeat the check here
+			// because a generic callee is not inlined, and a small value
+			// would cost a second call.
+			var small bool
+			if unsafe.Sizeof(v) == 4 {
+				small = *(*uint32)(unsafe.Pointer(&v)) < 256
+			} else {
+				small = *(*uint64)(unsafe.Pointer(&v)) < 256
+			}
+			if small {
+				slice[i] = v
+			} else {
+				slice[i] = boxNum(sl, v, typ)
+			}
+			src = rest
+		}
+		return src, nil
+	}
+}
+
 // Per-primitive readOne functions feed both the typed-slice and iface loops.
 // Each checks its own bounds, so a caller needs no guard of its own.
 func readOneString(src []byte, sl *slab) (string, []byte, error) {
@@ -1550,10 +1659,10 @@ var (
 
 	deserArrayStringIfaceLoop  = deserArrayIfaceLoop(readOneString)
 	deserArrayBooleanIfaceLoop = deserArrayIfaceLoop(readOneBool)
-	deserArrayIntIfaceLoop     = deserArrayIfaceLoop(readOneInt)
-	deserArrayLongIfaceLoop    = deserArrayIfaceLoop(readOneLong)
-	deserArrayFloatIfaceLoop   = deserArrayIfaceLoop(readOneFloat)
-	deserArrayDoubleIfaceLoop  = deserArrayIfaceLoop(readOneDouble)
+	deserArrayIntIfaceLoop     = deserArrayNumIfaceLoop(readOneInt)
+	deserArrayLongIfaceLoop    = deserArrayNumIfaceLoop(readOneLong)
+	deserArrayFloatIfaceLoop   = deserArrayNumIfaceLoop(readOneFloat)
+	deserArrayDoubleIfaceLoop  = deserArrayNumIfaceLoop(readOneDouble)
 )
 
 type deserMap struct {
@@ -1881,12 +1990,24 @@ func deserIface[T any](readOne func(src []byte, sl *slab) (T, []byte, error)) de
 	}
 }
 
+// deserNumIface is deserIface for a number, which boxNum boxes.
+func deserNumIface[T boxedNum](readOne func(src []byte, sl *slab) (T, []byte, error)) deserIfaceFn {
+	typ := numTypeWord[T]()
+	return func(src []byte, sl *slab) (any, []byte, error) {
+		v, src, err := readOne(src, sl)
+		if err != nil {
+			return nil, nil, err
+		}
+		return boxNum(sl, v, typ), src, nil
+	}
+}
+
 var (
 	deserBooleanIface = deserIface(readOneBool)
-	deserIntIface     = deserIface(readOneInt)
-	deserLongIface    = deserIface(readOneLong)
-	deserFloatIface   = deserIface(readOneFloat)
-	deserDoubleIface  = deserIface(readOneDouble)
+	deserIntIface     = deserNumIface(readOneInt)
+	deserLongIface    = deserNumIface(readOneLong)
+	deserFloatIface   = deserNumIface(readOneFloat)
+	deserDoubleIface  = deserNumIface(readOneDouble)
 	deserStringIface  = deserIface(readOneString)
 )
 

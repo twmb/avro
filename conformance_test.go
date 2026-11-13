@@ -23859,6 +23859,52 @@ func TestScalarDecodeNoAllocAfterGC(t *testing.T) {
 	}
 }
 
+// TestDecodeNumbersIntoAnyShareAllocations pins that numbers decoded into an
+// any share allocations, where any(v) allocates once per number, and that a
+// number you keep is never written by a later decode. The nullable row takes
+// the general decode path, and the other rows take the array fast loop. A
+// value under 256 is boxed with no allocation and must stay that way.
+func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
+	const items = 1000
+	for _, tc := range []struct {
+		name, schema string
+		val          func(i int) any
+	}{
+		{"long", `"long"`, func(i int) any { return int64(1000 + i) }},
+		{"negative long", `"long"`, func(i int) any { return int64(-1 - i) }},
+		{"int", `"int"`, func(i int) any { return int32(1000 + i) }},
+		{"float", `"float"`, func(i int) any { return float32(i) + 0.5 }},
+		{"double", `"double"`, func(i int) any { return float64(i) + 0.5 }},
+		{"nullable long", `["null","long"]`, func(i int) any { return int64(1000 + i) }},
+		{"long under 256", `"long"`, func(i int) any { return int64(i % 200) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := avro.MustParse(fmt.Sprintf(`{"type":"array","items":%s}`, tc.schema))
+			want, other := make([]any, items), make([]any, items)
+			for i := range items {
+				want[i], other[i] = tc.val(i), tc.val(i+5000)
+			}
+			wire := avrotest.MustAppendEncode(t, s, nil, want)
+			otherWire := avrotest.MustAppendEncode(t, s, nil, other)
+
+			var kept any
+			avrotest.MustDecode(t, s, wire, &kept)
+			allocs := testing.AllocsPerRun(5, func() {
+				var out any
+				if _, err := s.Decode(otherWire, &out); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if allocs > items/10 {
+				t.Errorf("decoding %d numbers into an any allocated %.0f times, want at most %d", items, allocs, items/10)
+			}
+			if !reflect.DeepEqual(kept, any(want)) {
+				t.Errorf("later decodes wrote numbers kept from an earlier decode")
+			}
+		})
+	}
+}
+
 // ---------- named_byte_element_test.go ----------
 
 // A Go byte-container type whose element type is a named byte (type B byte;
