@@ -305,10 +305,10 @@ func dropAliasingOpts(opts []Opt) []Opt {
 	return opts
 }
 
-// kindNests reports whether a node of this kind can hold another node. The
-// JSON encoder and decoder charge a level of nesting to these nodes only, as
-// the binary deserializers do. A leaf at the limit ends the nesting and is
-// not refused.
+// kindNests reports whether a node of this kind can contain another node. The
+// JSON encoder and decoder charge a level of nesting only to a node that can
+// contain another node, as the binary deserializers do. A leaf at the limit
+// ends the nesting and is not refused.
 func kindNests(kind string) bool {
 	return kind == "union" || unionBranchRecurses(kind)
 }
@@ -1000,8 +1000,8 @@ func appendJSONFieldDefault(buf []byte, f fieldNode, cfg *optConfig, depth int) 
 		return nil, errors.New("missing key")
 	}
 	if f.defaultVal == nil {
-		// A null for a union is charged the union's level, as a null you
-		// supply is; nothing below walks it.
+		// A null for a union is charged the union's level, because nothing
+		// below walks the null.
 		if kindNests(f.node.kind) && fillTooDeep(depth, 1) {
 			return nil, errTooDeep
 		}

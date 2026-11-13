@@ -603,7 +603,7 @@ func (w *Writer) Encode(v any) error {
 	if w.err != nil {
 		return w.err
 	}
-	// The datum before this one is our guess at this one's size.
+	// The previous datum's length is our guess at this datum's length.
 	w.reserve(w.lastLen)
 	// AppendEncode is append-only into w.buf: on error the first len(w.buf)
 	// bytes are still exactly the previously accepted datums, and the failed
@@ -624,13 +624,13 @@ func (w *Writer) Encode(v any) error {
 }
 
 // reserve makes room in the block buffer for a datum of about n bytes. When
-// the buffer is out of room, append would move it to one a quarter larger,
-// and a block that fills that way is copied about thirty times. We move it
-// instead to four times what it is about to hold, or to the size its datums
-// predict for a whole block plus an eighth, whichever is smaller. A datum
-// that size has no room for is left to append. We keep the buffer from block
-// to block and never pass it to the io.Writer, so this is a cost of a
-// Writer's first block.
+// the buffer is out of room, append would move the buffer to a new array a
+// quarter larger, and a block that fills that way is copied about thirty
+// times. We instead move the buffer to four times what the block is about to
+// need, or to the size the block's datums predict for a whole block plus an
+// eighth, whichever is smaller. A datum too large for that size is left to
+// append. We keep the buffer from block to block and never pass the buffer to
+// the io.Writer, so the moves are a cost of a Writer's first block.
 func (w *Writer) reserve(n int) {
 	need := len(w.buf) + n
 	if need <= cap(w.buf) {

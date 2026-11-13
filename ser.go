@@ -1842,7 +1842,7 @@ var (
 	bigRatType       = reflect.TypeFor[big.Rat]()
 )
 
-// timeOf returns the time.Time v holds. v.Interface would copy an addressable
+// timeOf returns v as a time.Time. v.Interface would copy an addressable
 // value to the heap first, and a value behind a pointer is addressable.
 func timeOf(v reflect.Value) time.Time {
 	if v.CanAddr() {
@@ -2387,7 +2387,7 @@ func appendDecimalWords(buf []byte, r *big.Rat, scale, precision int) ([]byte, b
 		z = z[:len(z)-1]
 	}
 	// The value fits the precision when its magnitude is below 10^precision.
-	// Neither slice has a leading zero word, so a longer one is larger.
+	// Neither slice has a leading zero word, so a longer slice is larger.
 	if l := limit.Bits(); len(z) > len(l) {
 		return nil, false
 	} else if len(z) == len(l) {
@@ -2589,15 +2589,16 @@ func finiteScale(r *big.Rat) (int, bool) {
 	return b, true
 }
 
-// pow10Cache holds 10^n for n below its length, each computed on first use.
-// The length covers the precisions and scales schemas declare in practice and
-// bounds what the cache can hold: all 1025 entries together are under 300 KiB.
-// decimalScaleLimit is far higher, and caching up to it would let a hostile
-// set of schemas pin close to a gigabyte.
+// pow10Cache is 10^n at index n, each computed on first use. The length
+// covers the precisions and scales schemas declare in practice and bounds the
+// cache's size: all 1025 entries together are under 300 KiB.
+// decimalScaleLimit is far higher, and caching up to decimalScaleLimit would
+// let a hostile set of schemas pin close to a gigabyte.
 var pow10Cache [1025]atomic.Pointer[big.Int]
 
-// cachedPow10 returns 10^n from pow10Cache, or false when n is past it. You
-// must not modify the result: every caller shares it.
+// cachedPow10 returns 10^n from pow10Cache, or false when n is past the
+// cache's length. You must not modify the result: every caller shares the
+// result.
 func cachedPow10(n int) (*big.Int, bool) {
 	if n < 0 || n >= len(pow10Cache) {
 		return nil, false
