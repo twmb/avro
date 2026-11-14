@@ -852,6 +852,14 @@ type deserArray struct {
 	// pointers to structs then decodes each block through the record's
 	// compiled fields, which we look up once per block.
 	rec *deserRecord
+	// itemMeta is the items' metadata, which a struct field compiles its
+	// unsafe decoder from. typedBlock reads elemFns for a block of primitive
+	// items that fastLoop did not take. It has, for each element type, the
+	// unsafe decoder of one item into one element, or a nil udeserfn where the
+	// unsafe path declines that type, one map per SkipUnknown mode:
+	// map[reflect.Type]udeserfn.
+	itemMeta *fieldMeta
+	elemFns  [2]sync.Map
 	// minItemBytes is the minimum wire bytes for one encoded item.
 	// Used to tightly bound block counts: count > len(src)/minItemBytes
 	// rejects DoS-sized counts. 0 means items can take 0 wire bytes
@@ -1479,6 +1487,21 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	}
 }
 
+// elemFor returns the unsafe decoder a struct field of type t gets for one
+// item in mode skipUnknown, or nil where that path declines t.
+func (s *deserArray) elemFor(t reflect.Type, skipUnknown bool) udeserfn {
+	m := &s.elemFns[0]
+	if skipUnknown {
+		m = &s.elemFns[1]
+	}
+	if fn, ok := m.Load(t); ok {
+		return fn.(udeserfn)
+	}
+	fn := tryCompileFieldDeser(&deserRecordField{meta: s.itemMeta}, t, skipUnknown)
+	actual, _ := m.LoadOrStore(t, fn)
+	return actual.(udeserfn)
+}
+
 // typedBlock decodes items into slots [start, start+n) of the typed slice
 // sliceVal, whose length is at least start+n.
 func (s *deserArray) typedBlock(src []byte, sliceVal reflect.Value, start, n int, sl *slab) ([]byte, error) {
@@ -1491,6 +1514,24 @@ func (s *deserArray) typedBlock(src []byte, sliceVal reflect.Value, start, n int
 		case elemType.Kind() == reflect.Pointer && elemType.Elem().Kind() == reflect.Struct:
 			ptrs := unsafe.Slice((*unsafe.Pointer)(data), start+n)[start:]
 			return udPtrRecordBlock(src, s.rec, elemType.Elem(), ptrs, sl)
+		}
+	}
+	// Primitive items reach here only when fastLoop did not take the block:
+	// the element's Go kind differs from the item's, as for an int from a
+	// long, or the element is a string type fastLoop must not write. Each
+	// element then decodes as a struct field of its type does.
+	if s.fastLoop != nil {
+		if fn := s.elemFor(elemType, sl.skipUnknown); fn != nil {
+			data := sliceVal.UnsafePointer()
+			size := elemType.Size()
+			var err error
+			for i := start; i < start+n; i++ {
+				src, err = fn(src, unsafe.Add(data, uintptr(i)*size), sl)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return src, nil
 		}
 	}
 	if elemType.Kind() == reflect.Pointer {

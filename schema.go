@@ -2865,6 +2865,7 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 	*inner = af.meta
 	inner.minBytes = itemMin
 	b.meta = fieldMeta{avroType: "array", inner: inner}
+	da.itemMeta = inner
 	arrayNode := &schemaNode{
 		kind:  "array",
 		items: af.node,
