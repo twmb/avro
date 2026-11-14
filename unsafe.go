@@ -132,7 +132,7 @@ func compileFastDeser(rec *deserRecord, t reflect.Type, skipUnknown bool) *fastR
 		offset, goType, ok := computeFieldOffset(t, mapping.indices[i])
 		var fn udeserfn
 		if ok {
-			fn = tryCompileFieldDeser(f, goType)
+			fn = tryCompileFieldDeser(f, goType, skipUnknown)
 		}
 		if fn != nil {
 			fast.fields[i] = fastFieldDeser{
@@ -477,7 +477,9 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 
 // tryCompileFieldDeser returns a udeserfn for a field we can write directly
 // through unsafe, or nil for one that must take the reflect slow path.
-func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
+// skipUnknown is the mode of the record we compile the field for, which is the
+// mode of every decode that runs the result.
+func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type, skipUnknown bool) udeserfn {
 	if f.meta != nil && (f.meta.hasCustomType || (f.meta.inner != nil && f.meta.inner.hasCustomType)) {
 		return nil
 	}
@@ -516,7 +518,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		if inner.deserRecord != nil {
 			return udNullUnionRecord(inner.deserRecord, innerGoType, valIdx, nullByte, valByte)
 		}
-		innerFn := tryCompileFieldDeser(&deserRecordField{meta: inner}, innerGoType)
+		innerFn := tryCompileFieldDeser(&deserRecordField{meta: inner}, innerGoType, skipUnknown)
 		if innerFn != nil {
 			return udNullUnionPtr(innerFn, innerGoType, valIdx, nullByte, valByte)
 		}
@@ -546,7 +548,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 				return udArrayPtrRecord(inner.deserRecord, elemGoType.Elem(), goType, inner.minBytes)
 			}
 		default:
-			innerFn := tryCompileFieldDeser(&deserRecordField{meta: inner}, elemGoType)
+			innerFn := tryCompileFieldDeser(&deserRecordField{meta: inner}, elemGoType, skipUnknown)
 			if innerFn != nil {
 				return udArrayDirect(innerFn, elemGoType.Size(), goType, inner.minBytes)
 			}
@@ -563,6 +565,14 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 			return nil
 		}
 		rec := f.meta.deserRecord
+		// A struct cannot contain its own type by value, so compiling the
+		// field's record here ends. A record we cannot compile all-fast keeps
+		// the per-decode lookup.
+		if fast := rec.loadOrCompileFast(goType, skipUnknown); fast != nil && fast.allFast {
+			return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+				return deserRecordFastPtr(src, fast, p, sl)
+			}
+		}
 		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			return deserRecordVia(src, rec.fastFor(goType, sl.skipUnknown), rec, goType, p, sl)
 		}

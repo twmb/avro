@@ -1409,10 +1409,10 @@ func TestMatrix_FastPathDeclinesOnIncompleteFieldMeta(t *testing.T) {
 						t.Fatalf("declined the COMPLETE twin, so the refusal above is not attributable to the missing metadata")
 					}
 				case "decode":
-					if got := tryCompileFieldDeser(&deserRecordField{meta: c.incomplete}, c.goType); got != nil {
+					if got := tryCompileFieldDeser(&deserRecordField{meta: c.incomplete}, c.goType, false); got != nil {
 						t.Fatalf("compiled a fast path from incomplete metadata")
 					}
-					if got := tryCompileFieldDeser(&deserRecordField{meta: complete}, c.goType); got == nil {
+					if got := tryCompileFieldDeser(&deserRecordField{meta: complete}, c.goType, false); got == nil {
 						t.Fatalf("declined the COMPLETE twin, so the refusal above is not attributable to the missing metadata")
 					}
 				}
@@ -1433,10 +1433,10 @@ func TestMatrix_FastPathDeclinesOnIncompleteFieldMeta(t *testing.T) {
 	})
 	realized++
 	t.Run("decode/record/no-table", func(t *testing.T) {
-		if got := tryCompileFieldDeser(&deserRecordField{meta: &fieldMeta{avroType: "record"}}, recGo); got != nil {
+		if got := tryCompileFieldDeser(&deserRecordField{meta: &fieldMeta{avroType: "record"}}, recGo, false); got != nil {
 			t.Fatalf("compiled a record fast path with no deserRecord")
 		}
-		if got := tryCompileFieldDeser(&deserRecordField{meta: &fieldMeta{avroType: "record", deserRecord: rec.node.deserRecord}}, recGo); got == nil {
+		if got := tryCompileFieldDeser(&deserRecordField{meta: &fieldMeta{avroType: "record", deserRecord: rec.node.deserRecord}}, recGo, false); got == nil {
 			t.Fatalf("declined the COMPLETE twin, so the refusal above is not attributable to the missing table")
 		}
 	})
