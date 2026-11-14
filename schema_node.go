@@ -1462,6 +1462,15 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		n.Type != "union" && nodeCarriesOnlyType(n) {
 		return refType
 	}
+	// A complex kind carrying nothing but its Type, where the tree defines a
+	// type with that name in scope, is a reference to that type, which Root()
+	// builds from the bare string "array". We emit the bare string, since the
+	// object {"type":"array"} declares an array with no items.
+	if d != nil && !stray && isComplexKind(n.Type) && nodeCarriesOnlyType(n) {
+		if _, _, ok := lookupScoped(d.localNames, n.Type, enclosingNS); ok {
+			return n.Type
+		}
+	}
 
 	// We remember this named type's node for the next occurrence's conflict
 	// check, storing the node rather than its marshaled body: eager marshaling
@@ -1740,6 +1749,12 @@ func isRecordKind(typ string) bool {
 // travels with "record". The named-type analogue of [isRecordKind].
 func isNamedKind(typ string) bool {
 	return typ == "record" || typ == "error" || typ == "enum" || typ == "fixed"
+}
+
+// isComplexKind reports whether typ is a kind that an object declares with
+// keys of its own: a named kind, an array, or a map.
+func isComplexKind(typ string) bool {
+	return isNamedKind(typ) || typ == "array" || typ == "map"
 }
 
 // nodeFullname returns n's fullname by resolveScope over the node's own

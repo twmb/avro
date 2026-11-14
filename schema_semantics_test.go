@@ -6830,6 +6830,80 @@ func TestMatrix_EmptyNameComponentCompatResolveAgree(t *testing.T) {
 	t.Logf("cells: %d", cells)
 }
 
+// TestMatrix_NamelessKindObjectIgnoresStrayKeys crosses a nameless object
+// whose "type" is a complex kind over the keys its kind does not bind, with
+// and without the kind's own key, under the default validator and one that
+// accepts the empty name, with and without a type named after the kind in
+// scope. The object declares its kind whatever else it carries, as the spec,
+// Java, and fastavro read it, so a stray key is inert: the object and its
+// stray-free twin must parse to the same verdict and the same canonical form.
+// A type named after the kind must never turn the object into a reference to
+// that type.
+func TestMatrix_NamelessKindObjectIgnoresStrayKeys(t *testing.T) {
+	own := map[string]string{
+		"record": `"fields":[]`, "error": `"fields":[]`, "enum": `"symbols":[]`,
+		"fixed": `"size":0`, "array": `"items":"int"`, "map": `"values":"int"`,
+	}
+	strays := []struct{ key, body string }{
+		{"fields", `[{"name":"x","type":"int"}]`}, {"symbols", `["S"]`}, {"size", `4`},
+		{"items", `"long"`}, {"values", `"long"`},
+	}
+	var cells, accepted, refused int
+	for _, kind := range []string{"record", "error", "enum", "fixed", "array", "map"} {
+		named := fmt.Sprintf(`{"name":"a","type":{"type":"fixed","name":%q,"size":2}},`, kind)
+		if kind == "fixed" {
+			named = `{"name":"a","type":{"type":"enum","name":"fixed","symbols":["A"]}},`
+		}
+		for _, scope := range []string{"", named} {
+			for _, withOwn := range []bool{false, true} {
+				twin := fmt.Sprintf(`{"type":%q`, kind)
+				if withOwn {
+					twin += "," + own[kind]
+				}
+				for _, st := range strays {
+					if strings.HasPrefix(own[kind], `"`+st.key+`"`) {
+						continue
+					}
+					obj := twin + fmt.Sprintf(`,%q:%s}`, st.key, st.body)
+					wrap := func(b string) string {
+						return `{"type":"record","name":"R","fields":[` + scope + `{"name":"b","type":` + b + `}]}`
+					}
+					for _, opt := range []struct {
+						name string
+						opts []avro.SchemaOpt
+					}{{"strict", nil}, {"lax", []avro.SchemaOpt{laxAny}}} {
+						cells++
+						name := fmt.Sprintf("%s/scope=%v/own=%v/%s/%s", kind, scope != "", withOwn, st.key, opt.name)
+						s, err := avro.Parse(wrap(obj), opt.opts...)
+						tw, twErr := avro.Parse(wrap(twin+"}"), opt.opts...)
+						if (err == nil) != (twErr == nil) {
+							t.Errorf("%s: the stray key changed the verdict\n  with:    %v\n  without: %v", name, err, twErr)
+							continue
+						}
+						if err != nil {
+							refused++
+							continue
+						}
+						accepted++
+						if !bytes.Equal(s.Canonical(), tw.Canonical()) {
+							t.Errorf("%s: the stray key changed the schema\n  with:    %s\n  without: %s", name, s.Canonical(), tw.Canonical())
+						}
+						if scope != "" && strings.Contains(string(tw.Canonical()), fmt.Sprintf(`{"name":"b","type":%q}`, kind)) {
+							t.Errorf("%s: the nameless object became a reference to the type named %q: %s", name, kind, tw.Canonical())
+						}
+					}
+				}
+			}
+		}
+	}
+	// The net must see both verdicts, or its axes collapsed: the default
+	// validator refuses every nameless named kind, and the lax one accepts
+	// them.
+	if accepted < 40 || refused < 40 {
+		t.Fatalf("the net collapsed: %d cells, %d accepted, %d refused", cells, accepted, refused)
+	}
+}
+
 // TestMatrix_EmptyFieldNameAliasClaimAgreement is the shape that a name-valued
 // absence sentinel hides. Two writer fields resolve to one reader slot, one
 // by the reader field's name and one by its alias, which both the resolver and

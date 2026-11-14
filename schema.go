@@ -2327,27 +2327,23 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	// type-defining keys, which Java's parser accepts. A forward reference
 	// returns unknownPrimitiveError so the caller can queue a fixup, as on
 	// the bare-string path. Any type-defining key present means you are
-	// defining a new type, so we fall through to the regular dispatch.
-	if o.Name == "" &&
+	// defining a new type, so we fall through to the regular dispatch. An
+	// object whose type is a complex kind declares that kind, as in the spec,
+	// Java, and fastavro, even when a type named after the kind is in scope:
+	// {"type":"array"} is an array missing its items, and only the bare
+	// string "array" names that type.
+	if !isComplexKind(o.Type) && o.Name == "" &&
 		len(o.Fields) == 0 && len(o.Symbols) == 0 &&
 		o.Items == nil && o.Values == nil && o.Size == nil {
 		if found, err := b.tryAssignNamedRef(o.Type, parentName); err != nil || found {
 			return err
 		}
-		// Not a recognized base/complex type and not a declared named
-		// type: treat as a forward reference. The caller (record-field
-		// build, union dispatch, etc.) catches unknownPrimitiveError and
-		// queues a fixup keyed on the name in the error.
-		switch o.Type {
-		case "record", "error", "enum", "fixed", "array", "map":
-			// real complex-type-without-required-fields: fall through
-			// to the existing switch which reports the right error.
-		default:
-			if _, isPrim := serPrimitive[o.Type]; !isPrim {
-				b.canon = aschema{primitive: o.Type}
-				return &unknownPrimitiveError{o.Type}
-			}
-		}
+		// Not a declared named type: treat it as a forward reference. The
+		// caller (record-field build, union dispatch, etc.) catches
+		// unknownPrimitiveError and queues a fixup keyed on the name in the
+		// error.
+		b.canon = aschema{primitive: o.Type}
+		return &unknownPrimitiveError{o.Type}
 	}
 
 	// Canonical form keeps only type, name, fields, symbols, items, values,

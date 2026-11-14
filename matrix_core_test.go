@@ -3827,23 +3827,29 @@ func schemaMutants(schemaJSON string) []schemaMutant {
 		s, _ := obj["type"].(string)
 		return s == t
 	}
+	// defines reports whether obj is a definition of kind t that carries key.
+	// A field whose type is a bare reference to a type named t is not one.
+	defines := func(obj map[string]any, t, key string) bool {
+		_, ok := obj[key]
+		return ok && isType(obj, t)
+	}
 
 	add("fixed-missing-size", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "fixed") {
+		if defines(o, "fixed", "size") {
 			delete(o, "size")
 			return true
 		}
 		return false
 	}))
 	add("fixed-negative-size", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "fixed") {
+		if defines(o, "fixed", "size") {
 			o["size"] = -1
 			return true
 		}
 		return false
 	}))
 	add("enum-missing-symbols", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "enum") {
+		if defines(o, "enum", "symbols") {
 			delete(o, "symbols")
 			return true
 		}
@@ -3878,7 +3884,7 @@ func schemaMutants(schemaJSON string) []schemaMutant {
 		return false
 	}))
 	add("record-missing-fields", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "record") {
+		if defines(o, "record", "fields") {
 			delete(o, "fields")
 			return true
 		}
@@ -3905,14 +3911,14 @@ func schemaMutants(schemaJSON string) []schemaMutant {
 		return false
 	}))
 	add("array-missing-items", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "array") {
+		if defines(o, "array", "items") {
 			delete(o, "items")
 			return true
 		}
 		return false
 	}))
 	add("map-missing-values", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "map") {
+		if defines(o, "map", "values") {
 			delete(o, "values")
 			return true
 		}
@@ -3922,6 +3928,30 @@ func schemaMutants(schemaJSON string) []schemaMutant {
 		if _, ok := o["type"]; ok {
 			delete(o, "type")
 			return true
+		}
+		return false
+	}))
+	// A bare reference to a type named after a kind, written as an object:
+	// {"type":"array"} declares an array, which needs items, and never names
+	// the type called "array".
+	add("kind-name-object", mutateOnce(schemaJSON, func(o map[string]any) bool {
+		binds := map[string]string{"record": "fields", "error": "fields", "enum": "symbols", "fixed": "size", "array": "items", "map": "values"}
+		for _, key := range []string{"type", "items", "values"} {
+			switch v := o[key].(type) {
+			case string:
+				// A definition's own "type" carries the key its kind binds.
+				if _, defines := o[binds[v]]; binds[v] != "" && (key != "type" || !defines) {
+					o[key] = map[string]any{"type": v}
+					return true
+				}
+			case []any:
+				for i, b := range v {
+					if k, _ := b.(string); binds[k] != "" {
+						v[i] = map[string]any{"type": k}
+						return true
+					}
+				}
+			}
 		}
 		return false
 	}))
@@ -3946,7 +3976,8 @@ func schemaMutants(schemaJSON string) []schemaMutant {
 }
 
 // acceptanceCells samples the composed schemas the acceptance axis sweeps:
-// every fragment × three structural contexts.
+// every fragment in each of three structural contexts, then the
+// kindNamedCells.
 func acceptanceCells() []string {
 	var cells []string
 	for _, fr := range matFrags() {
@@ -3963,16 +3994,69 @@ func acceptanceCells() []string {
 			cells = append(cells, cx.schema(fr.schema(u), fr.kind, u))
 		}
 	}
+	for _, c := range kindNamedCells() {
+		cells = append(cells, c.schema(c.kind))
+	}
+	return cells
+}
+
+// kindNamedCell is a schema that defines a type named after a complex kind,
+// which the spec permits, as field a, and references it by its bare name in
+// field b. use places the reference in b's schema.
+type kindNamedCell struct {
+	kind, ns, use string
+	recursive     bool // the type is a record that references itself
+}
+
+// schema writes the cell with the type named name.
+func (c kindNamedCell) schema(name string) string {
+	def := fmt.Sprintf(`{"type":"fixed","name":%q,"size":2}`, name)
+	switch {
+	case c.recursive:
+		def = fmt.Sprintf(`{"type":"record","name":%q,"fields":[{"name":"n","type":["null",%q]}]}`, name, name)
+	case c.kind == "fixed":
+		def = fmt.Sprintf(`{"type":"enum","name":%q,"symbols":["A"]}`, name)
+	}
+	nsAttr := ""
+	if c.ns != "" {
+		nsAttr = fmt.Sprintf(`"namespace":%q,`, c.ns)
+	}
+	return fmt.Sprintf(`{"type":"record","name":"R",%s"fields":[{"name":"a","type":%s},{"name":"b","type":%s}]}`,
+		nsAttr, def, fmt.Sprintf(c.use, name))
+}
+
+// kindNamedCells crosses the kinds over the null namespace and a named one,
+// a plain and a recursive type, and the field, array items, map values, and
+// union branch positions.
+func kindNamedCells() []kindNamedCell {
+	var cells []kindNamedCell
+	for _, kind := range []string{"record", "error", "enum", "fixed", "array", "map"} {
+		for _, ns := range []string{"", "ns"} {
+			for _, recursive := range []bool{false, true} {
+				for _, use := range []string{`"%s"`, `{"type":"array","items":"%s"}`, `{"type":"map","values":"%s"}`, `["null","%s"]`} {
+					cells = append(cells, kindNamedCell{kind, ns, use, recursive})
+				}
+			}
+		}
+	}
 	return cells
 }
 
 // TestMatrix_AcceptanceMutantsRejectLocally: every mutant must fail twmb's
 // Parse, the local half of the parity. The oracle halves assert fastavro
-// and Java agree.
+// and Java agree. Every unmutated cell must also rebuild from Root() to the
+// same canonical form and fingerprint.
 func TestMatrix_AcceptanceMutantsRejectLocally(t *testing.T) {
 	for _, cell := range acceptanceCells() {
-		if _, err := avro.Parse(cell); err != nil {
+		s, err := avro.Parse(cell)
+		if err != nil {
 			t.Fatalf("unmutated cell must parse: %v\n%s", err, cell)
+		}
+		root := s.Root()
+		if rb, err := root.Schema(); err != nil {
+			t.Errorf("Root().Schema() cannot rebuild the cell: %v\n%s", err, cell)
+		} else if !bytes.Equal(rb.Canonical(), s.Canonical()) || !bytes.Equal(rb.Fingerprint(avro.NewRabin()), s.Fingerprint(avro.NewRabin())) {
+			t.Errorf("Root().Schema() rebuilt a different schema:\n  cell    %s\n  rebuilt %s", s.Canonical(), rb.Canonical())
 		}
 		for _, m := range schemaMutants(cell) {
 			if _, err := avro.Parse(m.schema); err == nil {
