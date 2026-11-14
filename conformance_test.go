@@ -22202,9 +22202,60 @@ func TestMatrix_ForwardRefCustomTypeBinaryJSONParity(t *testing.T) {
 			}
 		})
 	}
+
+	// A record field, a null union, and the null union items of an array that
+	// forward-reference a custom record go through the custom type into and
+	// out of a struct, as the in-order field "b" does.
+	ct := avro.CustomType{LogicalType: "pt", AvroType: "record", GoType: reflect.TypeOf(testPt{}),
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) { return map[string]any{"x": v.(testPt).X * 10}, nil },
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return testPt{X: v.(map[string]any)["x"].(int64) + 1}, nil
+		},
+	}
+	const schema = `{"type":"record","name":"R","fields":[
+		{"name":"a","type":"P"},
+		{"name":"na","type":["null","P"]},
+		{"name":"ana","type":{"type":"array","items":["null","P"]}},
+		{"name":"b","type":{"type":"record","name":"P","logicalType":"pt","fields":[{"name":"x","type":"long"}]}}]}`
+	type rs struct {
+		A   testPt    `avro:"a"`
+		NA  *testPt   `avro:"na"`
+		ANA []*testPt `avro:"ana"`
+		B   testPt    `avro:"b"`
+	}
+	t.Run("record-field/decode", func(t *testing.T) {
+		x := func(n int64) map[string]any { return map[string]any{"x": n} }
+		bin := avrotest.MustAppendEncode(t, avro.MustParse(schema), nil, map[string]any{
+			"a": x(1), "na": x(2), "ana": []any{x(3)}, "b": x(4),
+		})
+		s := avro.MustParse(schema, ct)
+		var m map[string]any
+		var got rs
+		avrotest.MustDecode(t, s, bin, &m)
+		avrotest.MustDecode(t, s, bin, &got)
+		if got.NA == nil || len(got.ANA) != 1 || got.ANA[0] == nil {
+			t.Fatalf("struct decode left a nil pointer: %+v, any decode %v", got, m)
+		}
+		if got.A != m["a"] || *got.NA != m["na"] || *got.ANA[0] != m["ana"].([]any)[0] || got.B != m["b"] {
+			t.Errorf("struct decode a=%v na=%v ana=%v b=%v differs from any decode %v", got.A, *got.NA, *got.ANA[0], got.B, m)
+		}
+	})
+	t.Run("record-field/encode", func(t *testing.T) {
+		s := avro.MustParse(schema, ct)
+		fromMap := avrotest.MustAppendEncode(t, s, nil, map[string]any{"a": testPt{1}, "na": testPt{2}, "ana": []any{testPt{3}}, "b": testPt{4}})
+		// A pointer makes the struct addressable, which the fast path needs.
+		fromStruct := avrotest.MustAppendEncode(t, s, nil, &rs{A: testPt{1}, NA: &testPt{2}, ANA: []*testPt{{3}}, B: testPt{4}})
+		if !bytes.Equal(fromStruct, fromMap) {
+			t.Errorf("struct encode %x differs from map encode %x", fromStruct, fromMap)
+		}
+	})
 }
 
 type testColor int32
+
+type testPt struct {
+	X int64 `avro:"x"`
+}
 
 // A no-Decode CustomType that suppresses a logical produces the raw
 // Avro-native value, and the wires must agree on it. Take a fixed-size

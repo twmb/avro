@@ -1382,6 +1382,9 @@ func (b *builder) finalize() error {
 		}
 		m.meta.serRecord = nt.node.serRecord
 		m.meta.deserRecord = nt.node.deserRecord
+		// We mark a custom type, as applyCustomTypes does for an in-order
+		// reference, so the unsafe paths keep the wrap on the branch.
+		m.meta.hasCustomType = b.custom[nt.node] != nil
 	}
 	// Phase 1: wire every forward-referenced record-field node. We defer
 	// default encoding to phase 2 below so it runs only after every field
@@ -1402,6 +1405,9 @@ func (b *builder) finalize() error {
 			m.nd.serRecord.fields[m.idx].meta.serRecord = nt.node.serRecord
 			m.nd.deserRecord.fields[m.idx].meta.deserRecord = nt.node.deserRecord
 		}
+		// We mark a custom type, as applyCustomTypes does for an in-order
+		// reference, so the unsafe paths keep the wrap on fn.
+		m.nd.serRecord.fields[m.idx].meta.hasCustomType = b.custom[nt.node] != nil
 		m.nd.fields[m.idx].node = nt.node
 	}
 	// Phase 1b: wire every forward-referenced array/map container child.
