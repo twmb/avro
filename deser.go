@@ -133,6 +133,17 @@ var (
 	_ [unsafe.Sizeof(any(nil)) - unsafe.Sizeof(eface{})]struct{}
 )
 
+// numSlabOK reports whether an any that we point at a number reads back as
+// that number. It is false only for a toolchain whose interface value is not
+// laid out as eface is, and boxNum then boxes with any(v).
+var numSlabOK = func() bool {
+	const want = int64(1) << 40
+	slot := want
+	boxed := any(int64(0))
+	(*eface)(unsafe.Pointer(&boxed)).data = unsafe.Pointer(&slot)
+	return boxed == any(want)
+}()
+
 // numLike is a number type we decode into an any.
 type numLike interface {
 	int32 | int64 | float32 | float64
@@ -153,7 +164,7 @@ func boxNum[T numLike](sl *slab, v T) any {
 	} else {
 		small = *(*uint64)(unsafe.Pointer(&v)) < 256
 	}
-	if sl == nil || small {
+	if sl == nil || small || !numSlabOK {
 		return v
 	}
 	if len(sl.nums) == 0 {
