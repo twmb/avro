@@ -252,7 +252,7 @@ func matFrags() []frag {
 			schema: func(u *uniq) string {
 				return fmt.Sprintf(`{"type":"record","name":%q,"fields":[{"name":"x","type":"int"},{"name":"y","type":"string"}]}`, u.name("Rec"))
 			},
-			values: []any{map[string]any{"x": int32(7), "y": "v"}}},
+			values: []any{map[string]any{"x": int32(7), "y": "v"}, map[string]any{"x": int32(-3), "y": ""}}},
 		{label: "rec0", kind: "record",
 			schema: func(u *uniq) string {
 				return fmt.Sprintf(`{"type":"record","name":%q,"fields":[]}`, u.name("Empty"))
@@ -9253,29 +9253,9 @@ func frameVariants(items [][]byte) map[string][]byte {
 	return variants
 }
 
-// manyBlockCounts are the block counts the framing matrix drives its cost
-// check at. Both stay under the 4096 cap on zero-byte items.
-var manyBlockCounts = []int{1000, 4000}
-
-// oneBlock frames n copies of item as an array wire with a single block.
-func oneBlock(item []byte, n int) []byte {
-	out := putZigzag(nil, int64(n))
-	for range n {
-		out = append(out, item...)
-	}
-	return append(out, 0x00)
-}
-
-// blockPerItem frames n copies of item as an array wire with one item to a
-// block.
-func blockPerItem(item []byte, n int) []byte {
-	var out []byte
-	for range n {
-		out = putZigzag(out, 1)
-		out = append(out, item...)
-	}
-	return append(out, 0x00)
-}
+// manyBlocks is the block count the framing matrix drives its cost check at.
+// It stays under the 4096 cap on zero-byte items.
+const manyBlocks = 4000
 
 // allocatedBy returns the bytes fn allocates.
 func allocatedBy(fn func()) int64 {
@@ -9294,26 +9274,26 @@ func allocatedBy(fn func()) int64 {
 // quadratic and fails here by an order of magnitude.
 func wantBlockCountLinear(t *testing.T, label string, item []byte, decode func(wire []byte) error) {
 	t.Helper()
-	for _, n := range manyBlockCounts {
-		single, perItem := oneBlock(item, n), blockPerItem(item, n)
-		// The first decode into a Go type compiles and caches its
-		// deserializer, so we run one before we count.
-		if err := decode(single); err != nil {
-			t.Fatalf("%s: %d items in one block: %v", label, n, err)
-		}
-		var err error
-		base := allocatedBy(func() { err = decode(single) })
-		if err != nil {
-			t.Fatalf("%s: %d items in one block: %v", label, n, err)
-		}
-		got := allocatedBy(func() { err = decode(perItem) })
-		if err != nil {
-			t.Fatalf("%s: %d items in %d blocks: %v", label, n, n, err)
-		}
-		if limit := 4*base + 512<<10; got > limit {
-			t.Errorf("%s: %d items allocated %d bytes in %d blocks and %d bytes in one block, want at most %d",
-				label, n, got, n, base, limit)
-		}
+	const n = manyBlocks
+	single := append(append(putZigzag(nil, n), bytes.Repeat(item, n)...), 0x00)
+	perItem := frameVariants(slices.Repeat([][]byte{item}, n))["block-per-item"]
+	// The first decode into a Go type compiles and caches its deserializer,
+	// so we run one before we count.
+	if err := decode(single); err != nil {
+		t.Fatalf("%s: %d items in one block: %v", label, n, err)
+	}
+	var err error
+	base := allocatedBy(func() { err = decode(single) })
+	if err != nil {
+		t.Fatalf("%s: %d items in one block: %v", label, n, err)
+	}
+	got := allocatedBy(func() { err = decode(perItem) })
+	if err != nil {
+		t.Fatalf("%s: %d items in %d blocks: %v", label, n, n, err)
+	}
+	if limit := 4*base + 512<<10; got > limit {
+		t.Errorf("%s: %d items allocated %d bytes in %d blocks and %d bytes in one block, want at most %d",
+			label, n, got, n, base, limit)
 	}
 }
 
@@ -12163,7 +12143,9 @@ func TestDifferentialFastavroResolvedJSONUnion(t *testing.T) {
 // matrix core always decodes into fresh targets. The reuse semantics have
 // their own documented contracts, and historically their own bugs. Map targets
 // retain non-schema keys while schema fields overwrite (encoding/json parity),
-// slices are rewritten to exactly the new length, and pointers are reused.
+// slices are rewritten to exactly the new length, and pointers are reused. An
+// any element of a slice or of a Go array is the exception: the element starts
+// from nil, so a value you took out of the element survives the next decode.
 // Every fragment kind drives a decode-twice cycle on the same target, on both
 // wire formats.
 // ---------------------------------------------------------------------------
@@ -12220,6 +12202,14 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 			if err != nil || !bytes.Equal(re, w2) {
 				t.Fatalf("reused tree re-encode: err=%v\n re=%x\n w2=%x", err, re, w2)
 			}
+			// A decode that fails leaves your value in the target. A
+			// truncated wire that still decodes is not checked.
+			if len(w2) > 0 {
+				prev := any("caller")
+				if _, err := s.Decode(w2[:len(w2)-1], &prev); err != nil && prev != "caller" {
+					t.Fatalf("a failed decode left %#v in the target, want the caller's value", prev)
+				}
+			}
 
 			// JSON decode into the same pre-populated map behaves alike.
 			j2, err := s.AppendEncodeJSON(nil, want2)
@@ -12236,6 +12226,100 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 			}
 			if !matEqual(jm["f"], want2.(map[string]any)["f"]) {
 				t.Fatalf("JSON reuse field stale: %#v", jm["f"])
+			}
+
+			// A value you take out of a []any survives the next decode into
+			// the same slice, whether the next array fits the slice or
+			// outgrows it. A record with one array field has the array's
+			// own wire.
+			arr := avro.MustParse(fmt.Sprintf(`{"type":"array","items":%s}`, fr.schema(&uniq{})))
+			holder := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"ReuseHolder","fields":[{"name":"f","type":%s}]}`, arr.String()))
+			first, err := arr.AppendEncode(nil, []any{fr.values[0], fr.values[0]})
+			if err != nil {
+				t.Fatalf("encode first array: %v", err)
+			}
+			var wantKept []any
+			if _, err := arr.Decode(first, &wantKept); err != nil {
+				t.Fatalf("fresh decode of the first array: %v", err)
+			}
+			item, err := avro.MustParse(fr.schema(&uniq{})).AppendEncode(nil, fr.values[1])
+			if err != nil {
+				t.Fatalf("encode item: %v", err)
+			}
+			for _, n := range []int{1, 3} {
+				// One block per item, so that every block after the first
+				// starts inside the used slice.
+				second := frameVariants(slices.Repeat([][]byte{item}, n))["block-per-item"]
+				var want []any
+				if _, err := arr.Decode(second, &want); err != nil {
+					t.Fatalf("fresh decode of the second array: %v", err)
+				}
+				var top []any
+				var field struct {
+					F []any `avro:"f"`
+				}
+				for name, target := range map[string]struct {
+					schema *avro.Schema
+					ptr    any
+					elems  *[]any
+				}{
+					"slice":        {arr, &top, &top},
+					"struct field": {holder, &field, &field.F},
+				} {
+					if _, err := target.schema.Decode(first, target.ptr); err != nil {
+						t.Fatalf("%s: first decode: %v", name, err)
+					}
+					kept := slices.Clone(*target.elems)
+					if _, err := target.schema.Decode(second, target.ptr); err != nil {
+						t.Fatalf("%s: second decode of %d: %v", name, n, err)
+					}
+					if !matEqual(kept, wantKept) {
+						t.Errorf("%s: the second decode of %d wrote a value taken from the first:\n got=%#v\nwant=%#v", name, n, kept, wantKept)
+					}
+					if !matEqual(*target.elems, want) {
+						t.Errorf("%s: second decode of %d into the used slice:\n got=%#v\nwant=%#v", name, n, *target.elems, want)
+					}
+				}
+			}
+
+			// The same for a Go array of any, which takes two items.
+			second, err := arr.AppendEncode(nil, []any{fr.values[1], fr.values[1]})
+			if err != nil {
+				t.Fatalf("encode second array: %v", err)
+			}
+			var goArr, wantArr [2]any
+			avrotest.MustDecode(t, arr, second, &wantArr)
+			avrotest.MustDecode(t, arr, first, &goArr)
+			kept := goArr
+			avrotest.MustDecode(t, arr, second, &goArr)
+			if !matEqual(kept[:], wantKept) {
+				t.Errorf("Go array: the second decode wrote a value taken from the first:\n got=%#v\nwant=%#v", kept, wantKept)
+			}
+			if !matEqual(goArr[:], wantArr[:]) {
+				t.Errorf("Go array: second decode into the used array:\n got=%#v\nwant=%#v", goArr, wantArr)
+			}
+			// DecodeJSON follows the same rule for a Go array. A slice
+			// target of DecodeJSON is always a new slice.
+			jsonFirst := avrotest.MustAppendEncodeJSON(t, arr, nil, []any{fr.values[0], fr.values[0]})
+			jsonSecond := avrotest.MustAppendEncodeJSON(t, arr, nil, []any{fr.values[1], fr.values[1]})
+			var jsonArr, wantJSONKept [2]any
+			avrotest.MustDecodeJSON(t, arr, jsonFirst, &wantJSONKept)
+			avrotest.MustDecodeJSON(t, arr, jsonFirst, &jsonArr)
+			keptJSON := jsonArr
+			avrotest.MustDecodeJSON(t, arr, jsonSecond, &jsonArr)
+			if !matEqual(keptJSON[:], wantJSONKept[:]) {
+				t.Errorf("Go array, DecodeJSON: the second decode wrote a value taken from the first:\n got=%#v\nwant=%#v", keptJSON, wantJSONKept)
+			}
+
+			// An interface type with no methods is an any by another name.
+			var named []reuseEmptyInterface
+			avrotest.MustDecode(t, arr, first, &named)
+			keptNamed := slices.Clone(named)
+			avrotest.MustDecode(t, arr, second, &named)
+			for i, k := range keptNamed {
+				if !matEqual(any(k), wantKept[i]) {
+					t.Errorf("defined empty interface: the second decode wrote element %d taken from the first:\n got=%#v\nwant=%#v", i, k, wantKept[i])
+				}
 			}
 		})
 	}
@@ -12279,6 +12363,28 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 		}
 		if target[0] != nil || target[1] == nil || *target[1] != 7 || target[2] != nil {
 			t.Fatalf("pointer-slice reuse wrong: %v", target)
+		}
+		// A slice that grows keeps the pointers it had, as a slice that
+		// fits does.
+		kept := target[1]
+		w3, _ := s.AppendEncode(nil, []any{nil, int32(8), nil, nil, int32(9)})
+		if _, err := s.Decode(w3, &target); err != nil {
+			t.Fatalf("decode #3 into a []*int32 that must grow: %v", err)
+		}
+		if target[1] != kept || *kept != 8 || *target[4] != 9 {
+			t.Fatalf("pointer-slice regrow: kept pointer reused=%v, reads %d; target[4]=%d", target[1] == kept, *kept, *target[4])
+		}
+	})
+	t.Run("pointer-in-any-element-is-replaced", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"array","items":{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}}`)
+		wire, _ := s.AppendEncode(nil, []any{map[string]any{"a": int64(1)}})
+		mine := &reuseArrayElemP{}
+		target := []any{mine}
+		if _, err := s.Decode(wire, &target); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if _, ok := target[0].(map[string]any); !ok || mine.A != 0 {
+			t.Fatalf("an any element with the caller's pointer decoded to %T and the caller's value has A=%d, want a map[string]any and 0", target[0], mine.A)
 		}
 	})
 	t.Run("typed-map-accumulates", func(t *testing.T) {
@@ -12327,6 +12433,8 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 		}
 	})
 }
+
+type reuseEmptyInterface interface{}
 
 type reuseArrayElemP struct {
 	A int64 `avro:"a"`

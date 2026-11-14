@@ -62,7 +62,7 @@ type Schema struct {
 	// Resolve builds its custom-free writer view whenever either is set.
 	customBaked bool
 
-	// slabFree marks a schema whose compiled deser never touches the per-call
+	// slabFree marks a schema whose compiled deser never needs the per-call
 	// slab: a scalar leaf kind with no custom-decoder wiring. Decode then
 	// passes a nil slab, so scalar decodes stay allocation-free even when GC
 	// has drained the pool. false is the safe default.
@@ -863,6 +863,11 @@ type fieldMeta struct {
 	inner         *fieldMeta // for nullunion fields: the inner branch's metadata
 	nullSecond    bool       // true for ["T","null"] unions (null is index 1)
 	hasCustomType bool       // true if a CustomType was applied; disables unsafe fast path
+	// iface is a null union's iface-direct decoder, which a record field, an
+	// array item, or a map value decodes into an any with. It is nil for
+	// every other kind and for a null union whose value branch is not a plain
+	// primitive. See deserNullUnionIface.
+	iface deserIfaceFn
 	// minBytes is the minimum wire bytes required to encode one value
 	// of this type. Set on the items' fieldMeta when an array is built;
 	// used by the unsafe array deser to bound block counts. 0 means
@@ -1377,6 +1382,9 @@ func (b *builder) finalize() error {
 		}
 		m.meta.serRecord = nt.node.serRecord
 		m.meta.deserRecord = nt.node.deserRecord
+		// We mark a custom type, as applyCustomTypes does for an in-order
+		// reference, so the unsafe paths keep the wrap on the branch.
+		m.meta.hasCustomType = b.custom[nt.node] != nil
 	}
 	// Phase 1: wire every forward-referenced record-field node. We defer
 	// default encoding to phase 2 below so it runs only after every field
@@ -1397,6 +1405,9 @@ func (b *builder) finalize() error {
 			m.nd.serRecord.fields[m.idx].meta.serRecord = nt.node.serRecord
 			m.nd.deserRecord.fields[m.idx].meta.deserRecord = nt.node.deserRecord
 		}
+		// We mark a custom type, as applyCustomTypes does for an in-order
+		// reference, so the unsafe paths keep the wrap on fn.
+		m.nd.serRecord.fields[m.idx].meta.hasCustomType = b.custom[nt.node] != nil
 		m.nd.fields[m.idx].node = nt.node
 	}
 	// Phase 1b: wire every forward-referenced array/map container child.
@@ -2112,10 +2123,12 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		b.ser = serNullUnion(ser)
 		b.deser = deserNullUnion(deser)
 		b.meta = b.buildNullUnionMeta(parentName, missing, branchMetas, 1, false)
+		b.meta.iface = deserNullUnionIface(&b.meta, b.deser)
 	case len(s.union) == 2 && s.union[1].isNullBranch():
 		b.ser = serNullSecondUnion(ser)
 		b.deser = deserNullSecondUnion(deser)
 		b.meta = b.buildNullUnionMeta(parentName, missing, branchMetas, 0, true)
+		b.meta.iface = deserNullUnionIface(&b.meta, b.deser)
 	default:
 		b.ser = ser.ser
 		b.deser = deser.deser
@@ -2662,7 +2675,7 @@ func (b *builder) buildRecord(o *aobject) error {
 			name:    of.Name,
 			nameVal: reflect.ValueOf(of.Name),
 			fn:      bf.deser,
-			fnIface: ifaceFnForPrimitive(meta),
+			fnIface: ifaceFnFor(meta),
 			meta:    meta,
 		}
 		fn := fieldNode{
@@ -2780,7 +2793,7 @@ func (b *builder) buildEnum(o *aobject) error {
 	}
 	symbolIdx := enumSymbolIndex(o.Symbols)
 	b.ser = newSerEnum(o.Symbols, symbolIdx).ser
-	b.deser = (&deserEnum{symbols: o.Symbols}).deser
+	b.deser = newDeserEnum(o.Symbols).deser
 	b.meta = fieldMeta{avroType: "enum"}
 
 	nd := &schemaNode{
@@ -2837,6 +2850,11 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 	// da's was patched by the forward-ref fixup below.
 	itemMin := b.minBytes.minBytesOf(af.node)
 	da := &deserArray{deserItem: af.deser, minItemBytes: itemMin}
+	// The same gate as the unsafe []*record field (tryCompileFieldDeser): a
+	// forward reference is not wired yet, and a custom type wraps deserItem.
+	if !isFwdRef && !af.meta.hasCustomType && af.meta.deserRecord != nil {
+		da.rec = af.meta.deserRecord
+	}
 	// Specialized array ser/deser fast paths bypass the inner
 	// schema's wrapped ser/deser functions. They are correct only
 	// when no per-element conversion is needed: no custom type,
@@ -2855,11 +2873,19 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 	} else {
 		b.ser = sa.ser
 	}
+	// Items with no primFast loop but an iface-direct decoder, such as a null
+	// union or bytes, decode into a []any through that decoder.
+	if !isFwdRef && da.fastIfaceLoop == nil {
+		if fn := ifaceFnFor(&af.meta); fn != nil {
+			da.fastIfaceLoop = deserArrayFnIfaceLoop(fn)
+		}
+	}
 	b.deser = da.deser
 	inner := new(fieldMeta)
 	*inner = af.meta
 	inner.minBytes = itemMin
 	b.meta = fieldMeta{avroType: "array", inner: inner}
+	da.itemMeta = inner
 	arrayNode := &schemaNode{
 		kind:  "array",
 		items: af.node,
@@ -2909,6 +2935,11 @@ func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) err
 	// block-count against remaining-buffer to prevent memory
 	// amplification on hostile input.
 	dm := &deserMap{deserItem: mf.deser, minEntryBytes: mapEntryMinBytes(b.minBytes.minBytesOf(mf.node))}
+	// The same gate as the unsafe []*record field (tryCompileFieldDeser): a
+	// forward reference is not wired yet, and a custom type wraps deserItem.
+	if !isFwdRef && !mf.meta.hasCustomType && mf.meta.deserRecord != nil {
+		dm.rec = mf.meta.deserRecord
+	}
 	// Same gate as the array case above: we skip specialization when
 	// values have a custom type, a logical type, or a forward
 	// reference (the fast-path closure can't capture an unresolved
@@ -2923,6 +2954,10 @@ func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) err
 		dm.nativeBlock = info.deserMapNative
 	} else {
 		b.ser = sm.ser
+	}
+	// The same for values as for array items above.
+	if !isFwdRef && dm.fastIfaceVal == nil {
+		dm.fastIfaceVal = ifaceFnFor(&mf.meta)
 	}
 	b.deser = dm.deser
 	b.meta = fieldMeta{avroType: "map"}

@@ -314,12 +314,11 @@ const defaultMaxDecompressedBytes = 64 << 20
 // literal.
 const defaultMaxBlockBytes = 1 << 26
 
-// ocfEagerBlockAllocLimit is the largest declared compressed block size that
-// readBlock allocates in one shot. It is the default WithMaxBlockBytes,
-// derived rather than restated, so a reader at the default cap never leaves
-// the eager path; a larger block, reachable only once you raise the cap, is
-// read incrementally so a declared-but-absent size cannot force an
-// allocation up to the raised cap.
+// ocfEagerBlockAllocLimit is the largest declared size we allocate in one
+// shot when your reader cannot say how many bytes remain. It is the default
+// WithMaxBlockBytes, derived rather than restated. A larger block needs a
+// raised cap, and we read it incrementally from such a reader, so a
+// declared-but-absent size cannot force an allocation up to the raised cap.
 const ocfEagerBlockAllocLimit = defaultMaxBlockBytes
 
 // WithMaxDecompressedBlockBytes sets the maximum decompressed size in bytes of
@@ -905,7 +904,7 @@ type checkedReader struct {
 	// regular file had left when read was fileAt, so that left asks a file
 	// once and counts down from the answer, not once per block. fileState
 	// is 0 before we ask, 1 when fileLeft is set, and -1 when r is not a
-	// regular file.
+	// regular file or its Stat or Seek fails.
 	read      int64
 	fileLeft  int64
 	fileAt    int64
@@ -1005,16 +1004,13 @@ type Reader struct {
 // shot. A caller's reader src that can say how many bytes remain decides: one
 // shot when the bytes are there, incremental when they are not, so a
 // declared-but-absent size costs the bytes that are present. A reader that
-// cannot say is read as it always was, in one shot within
-// ocfEagerBlockAllocLimit.
+// cannot say gets one shot within ocfEagerBlockAllocLimit, and an incremental
+// read above it.
 //
 // The reader's answer only picks how we read. A reader that answers wrong
-// makes that read allocate more or copy more, and never changes what it
-// returns.
+// makes that read allocate more or copy more, and never changes the bytes we
+// return or whether the read fails.
 func allocDeclared(n int64, src *checkedReader, br *bufio.Reader) bool {
-	if src == nil {
-		return n <= ocfEagerBlockAllocLimit
-	}
 	// br holds bytes it has read from src and not yet handed to us.
 	buffered := int64(br.Buffered())
 	left, known := src.left(false)
