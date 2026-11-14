@@ -717,10 +717,17 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		// (streaming decode, OCF reader, batch consumer reusing &out). We
 		// do it here rather than in indirectAlloc because the unwrapped
 		// non-addressable interface payload would break decoders that
-		// v.Set(...) on the result. Here we only SetMapIndex, which works
-		// on the non-addressable Map. See [reuseOrMakeStringAnyMap].
+		// v.Set(...) on the result. We write into the map we take out, which
+		// needs no address. See [reuseOrMakeStringAnyMap].
+		//
+		// A field with no fnIface decodes into v itself, so we allocate no
+		// cell for it. From the first such field to the v.Set below, v has nil
+		// or a field's value, and orig has the caller's value: code in
+		// between must read orig, not v, for the caller's value, and every
+		// return in between must first put orig back with restoreIface.
 		m := reuseOrMakeStringAnyMap(v, len(s.fields))
-		var elem reflect.Value
+		var orig any
+		scratch := false
 		var err error
 		for i := range s.fields {
 			f := &s.fields[i]
@@ -728,19 +735,25 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 				var val any
 				val, src, err = f.fnIface(src, sl)
 				if err != nil {
+					if scratch {
+						restoreIface(v, orig)
+					}
 					return nil, recordFieldError(nil, f.name, err)
 				}
 				m[f.name] = val
 				continue
 			}
-			if !elem.IsValid() {
-				elem = reflect.New(anyType).Elem()
+			if !scratch {
+				orig, scratch = v.Interface(), true
 			}
-			if src, err = f.fn(src, elem, sl); err != nil {
+			// v must be nil here: a record field decoded into v reuses the
+			// map v has, which may be m or another field's map.
+			v.SetZero()
+			if src, err = f.fn(src, v, sl); err != nil {
+				restoreIface(v, orig)
 				return nil, recordFieldError(nil, f.name, err)
 			}
-			m[f.name] = elem.Interface()
-			elem.SetZero()
+			m[f.name] = v.Interface()
 		}
 		v.Set(reflect.ValueOf(m))
 		return src, nil
@@ -787,6 +800,15 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	// re-call to report the error.
 	_, err = typeFieldMappingSkip(s.names, &s.cache, t, sl.skipUnknown)
 	return nil, err
+}
+
+// restoreIface sets the interface v back to orig, the value it had.
+func restoreIface(v reflect.Value, orig any) {
+	if orig == nil {
+		v.SetZero()
+		return
+	}
+	v.Set(reflect.ValueOf(orig))
 }
 
 // deserArrayRecord decodes the record's fields into row, one per position.
