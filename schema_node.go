@@ -30,7 +30,9 @@ import (
 //   - map: Values required.
 //   - fixed: Name, Size required; LogicalType, Precision, Scale, Namespace,
 //     Props optional.
-//   - union: Branches lists the member schemas.
+//   - union: Branches lists the member schemas. An empty union has an
+//     empty, non-nil Branches. When the tree defines a type named "union", a
+//     node with Type "union" and nil Branches is a reference to that type.
 //
 // To reference a named type (record, enum, fixed) defined elsewhere in the
 // schema, set Type to its full name (e.g. com.example.Address) and nothing
