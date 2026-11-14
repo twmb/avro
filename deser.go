@@ -1912,7 +1912,7 @@ func nativeMapBlockFor[V any](readOne func([]byte, *slab) (V, []byte, error)) fu
 
 func nativeArrayLoopFor[V any](readOne func([]byte, *slab) (V, []byte, error)) func(reflect.Value, []byte, int, int, *slab) (bool, []byte, error) {
 	return func(sliceVal reflect.Value, src []byte, start, count int, sl *slab) (bool, []byte, error) {
-		s, ok := sliceVal.Interface().([]V)
+		s, ok := sliceOf[V](sliceVal)
 		if !ok {
 			return false, src, nil
 		}
