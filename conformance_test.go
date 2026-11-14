@@ -23863,20 +23863,22 @@ func TestScalarDecodeNoAllocAfterGC(t *testing.T) {
 // any share allocations, where any(v) allocates once per number, and that a
 // number you keep is never written by a later decode. The nullable row takes
 // the general decode path, and the other rows take the array fast loop. A
-// value under 256 is boxed with no allocation and must stay that way.
+// value under 256 is boxed with no allocation and takes no slab slot, which
+// the last row's lower bound pins.
 func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 	const items = 1000
 	for _, tc := range []struct {
 		name, schema string
+		max          float64
 		val          func(i int) any
 	}{
-		{"long", `"long"`, func(i int) any { return int64(1000 + i) }},
-		{"negative long", `"long"`, func(i int) any { return int64(-1 - i) }},
-		{"int", `"int"`, func(i int) any { return int32(1000 + i) }},
-		{"float", `"float"`, func(i int) any { return float32(i) + 0.5 }},
-		{"double", `"double"`, func(i int) any { return float64(i) + 0.5 }},
-		{"nullable long", `["null","long"]`, func(i int) any { return int64(1000 + i) }},
-		{"long under 256", `"long"`, func(i int) any { return int64(i % 200) }},
+		{"long", `"long"`, items / 10, func(i int) any { return int64(1000 + i) }},
+		{"negative long", `"long"`, items / 10, func(i int) any { return int64(-1 - i) }},
+		{"int", `"int"`, items / 10, func(i int) any { return int32(1000 + i) }},
+		{"float", `"float"`, items / 10, func(i int) any { return float32(i) + 0.5 }},
+		{"double", `"double"`, items / 10, func(i int) any { return float64(i) + 0.5 }},
+		{"nullable long", `["null","long"]`, items / 10, func(i int) any { return int64(1000 + i) }},
+		{"long under 256", `"long"`, 5, func(i int) any { return int64(i % 200) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := avro.MustParse(fmt.Sprintf(`{"type":"array","items":%s}`, tc.schema))
@@ -23895,8 +23897,8 @@ func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 					t.Fatal(err)
 				}
 			})
-			if allocs > items/10 {
-				t.Errorf("decoding %d numbers into an any allocated %.0f times, want at most %d", items, allocs, items/10)
+			if allocs > tc.max {
+				t.Errorf("decoding %d numbers into an any allocated %.0f times, want at most %.0f", items, allocs, tc.max)
 			}
 			if !reflect.DeepEqual(kept, any(want)) {
 				t.Errorf("later decodes wrote numbers kept from an earlier decode")

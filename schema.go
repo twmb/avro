@@ -62,7 +62,7 @@ type Schema struct {
 	// Resolve builds its custom-free writer view whenever either is set.
 	customBaked bool
 
-	// slabFree marks a schema whose compiled deser never touches the per-call
+	// slabFree marks a schema whose compiled deser never needs the per-call
 	// slab: a scalar leaf kind with no custom-decoder wiring. Decode then
 	// passes a nil slab, so scalar decodes stay allocation-free even when GC
 	// has drained the pool. false is the safe default.

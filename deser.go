@@ -73,7 +73,8 @@ var anyType = reflect.TypeFor[any]()
 var sliceAnyType = reflect.SliceOf(anyType)
 
 // slab batches small string allocations into a single backing buffer.
-// Strings are immutable so sharing backing memory is safe.
+// Strings are immutable so sharing backing memory is safe. nums does the same
+// for numbers decoded into an any.
 type slab struct {
 	buf []byte
 	// nums is the rest of the current number slab. See boxNum.
@@ -132,34 +133,20 @@ var (
 	_ [unsafe.Sizeof(any(nil)) - unsafe.Sizeof(eface{})]struct{}
 )
 
-// boxedNum is a number type we decode into an any.
-type boxedNum interface {
+// numLike is a number type we decode into an any.
+type numLike interface {
 	int32 | int64 | float32 | float64
 }
 
-// numTypeWord returns the type word of an any that has a T.
-func numTypeWord[T boxedNum]() unsafe.Pointer {
-	var v any = T(0)
-	return (*eface)(unsafe.Pointer(&v)).typ
-}
-
-var (
-	int32Word   = numTypeWord[int32]()
-	int64Word   = numTypeWord[int64]()
-	float32Word = numTypeWord[float32]()
-	float64Word = numTypeWord[float64]()
-)
-
-// boxNum returns v in an any, as any(v) does, where typ is numTypeWord[T]().
-// any(v) allocates 8 bytes for each number. We take the 8 bytes from the
-// slab's number slab instead, so that numSlabLen numbers share one
-// allocation, and point the any's data word at them. We never write a slot
-// again after we hand it out, since the runtime treats the value behind an
-// any as immutable.
+// boxNum returns v in an any, as any(v) does. any(v) allocates for each
+// number. We take 8 bytes from the slab's number slab instead, so that
+// numSlabLen numbers share one allocation, and point the any's data word at
+// them. We never write a slot again after we hand it out, since the runtime
+// treats the value behind an any as immutable.
 //
 // Without a slab, or for a value whose bits are under 256, we use any(v): the
 // runtime boxes such a value with no allocation.
-func boxNum[T boxedNum](sl *slab, v T, typ unsafe.Pointer) any {
+func boxNum[T numLike](sl *slab, v T) any {
 	var small bool
 	if unsafe.Sizeof(v) == 4 {
 		small = *(*uint32)(unsafe.Pointer(&v)) < 256
@@ -175,9 +162,9 @@ func boxNum[T boxedNum](sl *slab, v T, typ unsafe.Pointer) any {
 	slot := unsafe.Pointer(&sl.nums[0])
 	sl.nums = sl.nums[1:]
 	*(*T)(slot) = v
-	var boxed any
-	e := (*eface)(unsafe.Pointer(&boxed))
-	e.typ, e.data = typ, slot
+	// A zero T is boxed with no allocation and has T's type word.
+	boxed := any(T(0))
+	(*eface)(unsafe.Pointer(&boxed)).data = slot
 	return boxed
 }
 
@@ -218,8 +205,9 @@ var slabPool = sync.Pool{New: func() any { return &slab{} }}
 // for any logical type and any target: only string decodes use its string
 // buffer, only recursive dispatch bumps its depth, and only custom-decoder
 // wrappers write its remaining state. A number decoded into an any uses the
-// number slab when there is a slab, and boxes with any(v) when there is none. "string" is absent; "bytes" is safe
-// because a string target of a bytes schema copies via string(b).
+// number slab when there is a slab, and boxes with any(v) when there is none.
+// "string" is absent; "bytes" is safe because a string target of a bytes
+// schema copies via string(b).
 var slabFreeKinds = map[string]bool{
 	"null":    true,
 	"boolean": true,
@@ -232,8 +220,8 @@ var slabFreeKinds = map[string]bool{
 	"enum":    true,
 }
 
-// put resets sl's per-call state and returns it to the pool. We keep buf
-// so the next caller reuses its backing memory.
+// put resets sl's per-call state and returns it to the pool. We keep buf and
+// nums so the next caller reuses their backing memory.
 func (sl *slab) put() {
 	sl.depth = 0
 	sl.taggedUnions = false
@@ -289,7 +277,7 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, errors.New("decode requires a non-nil pointer")
 	}
-	// Slab-free schemas (scalar leaves, no custom wiring) never touch the
+	// Slab-free schemas (scalar leaves, no custom wiring) never need the
 	// slab, so we skip the pool entirely. A nil slab keeps scalar decodes
 	// allocation-free even when GC has drained the pool. Opts only ever alter
 	// slab state, and they are inert outside union and record paths, which are
@@ -493,7 +481,7 @@ func deserInt(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	if v = indirectAlloc(v); v.Kind() == reflect.Interface {
-		return src, setIface(v, reflect.ValueOf(boxNum(sl, val, int32Word)), "int")
+		return src, setIface(v, reflect.ValueOf(boxNum(sl, val)), "int")
 	}
 	return src, setIntValue(v, val)
 }
@@ -504,7 +492,7 @@ func deserLong(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	if v = indirectAlloc(v); v.Kind() == reflect.Interface {
-		return src, setIface(v, reflect.ValueOf(boxNum(sl, val, int64Word)), "long")
+		return src, setIface(v, reflect.ValueOf(boxNum(sl, val)), "long")
 	}
 	return src, setLongValue(v, val)
 }
@@ -518,9 +506,6 @@ func setFloat32WireValue(v reflect.Value, u uint32) error {
 		*(*uint32)(unsafe.Pointer(v.UnsafeAddr())) = u
 		return nil
 	}
-	if v.Kind() == reflect.Interface {
-		return setIface(v, reflect.ValueOf(math.Float32frombits(u)), "float")
-	}
 	return setFloatValue(v, float64(math.Float32frombits(u)), "float", 32)
 }
 
@@ -530,7 +515,7 @@ func deserFloat(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	if v = indirectAlloc(v); v.Kind() == reflect.Interface {
-		return src, setIface(v, reflect.ValueOf(boxNum(sl, math.Float32frombits(u), float32Word)), "float")
+		return src, setIface(v, reflect.ValueOf(boxNum(sl, math.Float32frombits(u))), "float")
 	}
 	return src, setFloat32WireValue(v, u)
 }
@@ -541,7 +526,7 @@ func deserDouble(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	if v = indirectAlloc(v); v.Kind() == reflect.Interface {
-		return src, setIface(v, reflect.ValueOf(boxNum(sl, math.Float64frombits(u), float64Word)), "double")
+		return src, setIface(v, reflect.ValueOf(boxNum(sl, math.Float64frombits(u))), "double")
 	}
 	return src, setFloatValue(v, math.Float64frombits(u), "double", 64)
 }
@@ -1357,7 +1342,8 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	// For interface targets with primitive avro items, use the iface
 	// fast loop that operates directly on []any.
 	useFastIface := iface && s.fastIfaceLoop != nil
-	// For a slice of any, stale is how many slots at the front of v's backing
+	// For a slice of any, or of another interface type with no methods, stale
+	// is how many slots at the front of v's backing
 	// array a previous decode into v may have filled. We set each such slot
 	// to nil before we decode into it. Otherwise we would decode into the
 	// map or the pointer the slot has, and a value you took out of the slice
@@ -1365,7 +1351,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	// capacity from Grow, and Grow zeros new capacity. An element of any
 	// other type is decoded in place.
 	var stale int
-	if !iface && sliceType.Elem() == anyType {
+	if !iface && isEmptyInterface(sliceType.Elem()) {
 		stale = v.Cap()
 	}
 	// Avro arrays are encoded as a series of blocks. Each block starts
@@ -1421,7 +1407,8 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			}
 			sliceVal.SetLen(newLen)
 			if start < stale {
-				zeroStale(sliceVal, start, min(newLen, stale))
+				// An interface type with no methods has any's layout.
+				clear((*(*[]any)(sliceVal.Addr().UnsafePointer()))[start:min(newLen, stale)])
 			}
 		}
 		if useFastNative {
@@ -1494,25 +1481,15 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	}
 }
 
-// zeroStale zeros slots [start, end) of the slice v, whose length is at least
-// end.
-func zeroStale(v reflect.Value, start, end int) {
-	if start == 0 {
-		// Clear zeros a slice through its length, in one pass.
-		n := v.Len()
-		v.SetLen(end)
-		v.Clear()
-		v.SetLen(n)
-		return
-	}
-	for i := start; i < end; i++ {
-		v.Index(i).SetZero()
-	}
+// isEmptyInterface reports whether t is any or another interface type with no
+// methods.
+func isEmptyInterface(t reflect.Type) bool {
+	return t.Kind() == reflect.Interface && t.NumMethod() == 0
 }
 
 func (s *deserArray) deserFixedArray(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	// An any element starts from nil, as in a slice of any.
-	if v.Type().Elem() == anyType {
+	if isEmptyInterface(v.Type().Elem()) {
 		v.SetZero()
 	}
 	arrLen := v.Len()
@@ -1584,8 +1561,7 @@ func deserArrayIfaceLoop[T any](readOne func(src []byte, sl *slab) (T, []byte, e
 
 // deserArrayNumIfaceLoop is deserArrayIfaceLoop for a number, which boxNum
 // boxes.
-func deserArrayNumIfaceLoop[T boxedNum](readOne func(src []byte, sl *slab) (T, []byte, error)) func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
-	typ := numTypeWord[T]()
+func deserArrayNumIfaceLoop[T numLike](readOne func(src []byte, sl *slab) (T, []byte, error)) func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
 	return func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
 		for i := start; i < start+count; i++ {
 			v, rest, err := readOne(src, sl)
@@ -1593,8 +1569,8 @@ func deserArrayNumIfaceLoop[T boxedNum](readOne func(src []byte, sl *slab) (T, [
 				return nil, err
 			}
 			// boxNum makes the same check. We repeat the check here
-			// because a generic callee is not inlined, and a small value
-			// would cost a second call.
+			// because boxNum is not inlined into this closure, and a
+			// small value would cost a second call.
 			var small bool
 			if unsafe.Sizeof(v) == 4 {
 				small = *(*uint32)(unsafe.Pointer(&v)) < 256
@@ -1604,7 +1580,7 @@ func deserArrayNumIfaceLoop[T boxedNum](readOne func(src []byte, sl *slab) (T, [
 			if small {
 				slice[i] = v
 			} else {
-				slice[i] = boxNum(sl, v, typ)
+				slice[i] = boxNum(sl, v)
 			}
 			src = rest
 		}
@@ -1995,14 +1971,13 @@ func deserIface[T any](readOne func(src []byte, sl *slab) (T, []byte, error)) de
 }
 
 // deserNumIface is deserIface for a number, which boxNum boxes.
-func deserNumIface[T boxedNum](readOne func(src []byte, sl *slab) (T, []byte, error)) deserIfaceFn {
-	typ := numTypeWord[T]()
+func deserNumIface[T numLike](readOne func(src []byte, sl *slab) (T, []byte, error)) deserIfaceFn {
 	return func(src []byte, sl *slab) (any, []byte, error) {
 		v, src, err := readOne(src, sl)
 		if err != nil {
 			return nil, nil, err
 		}
-		return boxNum(sl, v, typ), src, nil
+		return boxNum(sl, v), src, nil
 	}
 }
 

@@ -12234,11 +12234,14 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 			if _, err := arr.Decode(first, &wantKept); err != nil {
 				t.Fatalf("fresh decode of the first array: %v", err)
 			}
+			item, err := avro.MustParse(fr.schema(&uniq{})).AppendEncode(nil, fr.values[1])
+			if err != nil {
+				t.Fatalf("encode item: %v", err)
+			}
 			for _, n := range []int{1, 3} {
-				second, err := arr.AppendEncode(nil, slices.Repeat([]any{fr.values[1]}, n))
-				if err != nil {
-					t.Fatalf("encode second array: %v", err)
-				}
+				// One block per item, so that every block after the first
+				// starts inside the used slice.
+				second := frameVariants(slices.Repeat([][]byte{item}, n))["block-per-item"]
 				var want []any
 				if _, err := arr.Decode(second, &want); err != nil {
 					t.Fatalf("fresh decode of the second array: %v", err)
@@ -12286,6 +12289,17 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 			}
 			if !matEqual(goArr[:], wantArr[:]) {
 				t.Errorf("Go array: second decode into the used array:\n got=%#v\nwant=%#v", goArr, wantArr)
+			}
+
+			// An interface type with no methods is an any by another name.
+			var named []reuseEmptyInterface
+			avrotest.MustDecode(t, arr, first, &named)
+			keptNamed := slices.Clone(named)
+			avrotest.MustDecode(t, arr, second, &named)
+			for i, k := range keptNamed {
+				if !matEqual(any(k), wantKept[i]) {
+					t.Errorf("defined empty interface: the second decode wrote element %d taken from the first:\n got=%#v\nwant=%#v", i, k, wantKept[i])
+				}
 			}
 		})
 	}
@@ -12341,6 +12355,18 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 			t.Fatalf("pointer-slice regrow: kept pointer reused=%v, reads %d; target[4]=%d", target[1] == kept, *kept, *target[4])
 		}
 	})
+	t.Run("pointer-in-any-element-is-replaced", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"array","items":{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}}`)
+		wire, _ := s.AppendEncode(nil, []any{map[string]any{"a": int64(1)}})
+		mine := &reuseArrayElemP{}
+		target := []any{mine}
+		if _, err := s.Decode(wire, &target); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if _, ok := target[0].(map[string]any); !ok || mine.A != 0 {
+			t.Fatalf("an any element with the caller's pointer decoded to %T and the caller's value has A=%d, want a map[string]any and 0", target[0], mine.A)
+		}
+	})
 	t.Run("typed-map-accumulates", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"map","values":"int"}`)
 		w1, _ := s.AppendEncode(nil, map[string]int32{"a": 1})
@@ -12387,6 +12413,8 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 		}
 	})
 }
+
+type reuseEmptyInterface interface{}
 
 type reuseArrayElemP struct {
 	A int64 `avro:"a"`
