@@ -683,7 +683,8 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		m := reuseOrMakeStringAnyMap(v, len(s.fields))
 		var elem reflect.Value
 		var err error
-		for _, f := range s.fields {
+		for i := range s.fields {
+			f := &s.fields[i]
 			if f.fnIface != nil {
 				var val any
 				val, src, err = f.fnIface(src, sl)
