@@ -600,7 +600,10 @@ type deserRecord struct {
 	fields []deserRecordField
 	names  []string
 	cache  sync.Map // map[mappingKey]*cachedMapping
-	fast   sync.Map // map[mappingKey]*fastRecordDeser, per-Go-type compiled unsafe path
+	// fast is the compiled unsafe path per Go type, one map per SkipUnknown
+	// mode: map[reflect.Type]*fastRecordDeser. A reflect.Type key hashes as
+	// one pointer, and a mappingKey key hashes field by field.
+	fast [2]sync.Map
 	// node and mbw back the per-field skippers [SkipUnknown] needs; see
 	// fieldSkips. mbw is the parse's skip walk, shared by every record it
 	// built.
@@ -631,9 +634,16 @@ func (s *deserRecord) fieldSkips() []skipfn {
 	return s.skips
 }
 
+func (s *deserRecord) fastMap(skipUnknown bool) *sync.Map {
+	if skipUnknown {
+		return &s.fast[1]
+	}
+	return &s.fast[0]
+}
+
 // Sibling of [serRecord.fastFor]; see that comment.
 func (s *deserRecord) fastFor(t reflect.Type, skipUnknown bool) *fastRecordDeser {
-	if v, ok := s.fast.Load(mappingKey{t, skipUnknown}); ok {
+	if v, ok := s.fastMap(skipUnknown).Load(t); ok {
 		return v.(*fastRecordDeser)
 	}
 	return nil
@@ -648,7 +658,7 @@ func (s *deserRecord) loadOrCompileFast(t reflect.Type, skipUnknown bool) *fastR
 	if fast == nil {
 		return nil
 	}
-	actual, _ := s.fast.LoadOrStore(mappingKey{t, skipUnknown}, fast)
+	actual, _ := s.fastMap(skipUnknown).LoadOrStore(t, fast)
 	return actual.(*fastRecordDeser)
 }
 
