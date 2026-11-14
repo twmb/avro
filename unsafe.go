@@ -210,7 +210,8 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 // deserRecordFastPtr, the other fast entry, is reached on child edges that
 // bypass deserRecord.deser, so it keeps its own bump.
 func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *slab) ([]byte, error) {
-	base := v.Addr().UnsafePointer()
+	// UnsafeAddr, not Addr: Addr looks up the pointer type of v on every call.
+	base := unsafe.Pointer(v.UnsafeAddr())
 	var err error
 	for i := range fast.fields {
 		f := &fast.fields[i]
