@@ -22202,9 +22202,60 @@ func TestMatrix_ForwardRefCustomTypeBinaryJSONParity(t *testing.T) {
 			}
 		})
 	}
+
+	// A record field, a null union, and the null union items of an array that
+	// forward-reference a custom record go through the custom type into and
+	// out of a struct, as the in-order field "b" does.
+	ct := avro.CustomType{LogicalType: "pt", AvroType: "record", GoType: reflect.TypeOf(testPt{}),
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) { return map[string]any{"x": v.(testPt).X * 10}, nil },
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return testPt{X: v.(map[string]any)["x"].(int64) + 1}, nil
+		},
+	}
+	const schema = `{"type":"record","name":"R","fields":[
+		{"name":"a","type":"P"},
+		{"name":"na","type":["null","P"]},
+		{"name":"ana","type":{"type":"array","items":["null","P"]}},
+		{"name":"b","type":{"type":"record","name":"P","logicalType":"pt","fields":[{"name":"x","type":"long"}]}}]}`
+	type rs struct {
+		A   testPt    `avro:"a"`
+		NA  *testPt   `avro:"na"`
+		ANA []*testPt `avro:"ana"`
+		B   testPt    `avro:"b"`
+	}
+	t.Run("record-field/decode", func(t *testing.T) {
+		x := func(n int64) map[string]any { return map[string]any{"x": n} }
+		bin := avrotest.MustAppendEncode(t, avro.MustParse(schema), nil, map[string]any{
+			"a": x(1), "na": x(2), "ana": []any{x(3)}, "b": x(4),
+		})
+		s := avro.MustParse(schema, ct)
+		var m map[string]any
+		var got rs
+		avrotest.MustDecode(t, s, bin, &m)
+		avrotest.MustDecode(t, s, bin, &got)
+		if got.NA == nil || len(got.ANA) != 1 || got.ANA[0] == nil {
+			t.Fatalf("struct decode left a nil pointer: %+v, any decode %v", got, m)
+		}
+		if got.A != m["a"] || *got.NA != m["na"] || *got.ANA[0] != m["ana"].([]any)[0] || got.B != m["b"] {
+			t.Errorf("struct decode a=%v na=%v ana=%v b=%v differs from any decode %v", got.A, *got.NA, *got.ANA[0], got.B, m)
+		}
+	})
+	t.Run("record-field/encode", func(t *testing.T) {
+		s := avro.MustParse(schema, ct)
+		fromMap := avrotest.MustAppendEncode(t, s, nil, map[string]any{"a": testPt{1}, "na": testPt{2}, "ana": []any{testPt{3}}, "b": testPt{4}})
+		// A pointer makes the struct addressable, which the fast path needs.
+		fromStruct := avrotest.MustAppendEncode(t, s, nil, &rs{A: testPt{1}, NA: &testPt{2}, ANA: []*testPt{{3}}, B: testPt{4}})
+		if !bytes.Equal(fromStruct, fromMap) {
+			t.Errorf("struct encode %x differs from map encode %x", fromStruct, fromMap)
+		}
+	})
 }
 
 type testColor int32
+
+type testPt struct {
+	X int64 `avro:"x"`
+}
 
 // A no-Decode CustomType that suppresses a logical produces the raw
 // Avro-native value, and the wires must agree on it. Take a fixed-size
@@ -23856,6 +23907,54 @@ func TestScalarDecodeNoAllocAfterGC(t *testing.T) {
 	}
 	if minMallocs != 0 {
 		t.Errorf("scalar Decode allocated on every post-GC iteration (min %d mallocs/op); slab pool should be bypassed for slab-free schemas", minMallocs)
+	}
+}
+
+// TestDecodeNumbersIntoAnyShareAllocations pins that numbers decoded into an
+// any share allocations, where any(v) allocates once per number, and that a
+// number you keep is never written by a later decode. The nullable row takes
+// the general decode path, and the other rows take the array fast loop. A
+// value under 256 is boxed with no allocation and takes no slab slot, which
+// the last row's lower bound pins.
+func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
+	const items = 1000
+	for _, tc := range []struct {
+		name, schema string
+		max          float64
+		val          func(i int) any
+	}{
+		{"long", `"long"`, items / 10, func(i int) any { return int64(1000 + i) }},
+		{"negative long", `"long"`, items / 10, func(i int) any { return int64(-1 - i) }},
+		{"int", `"int"`, items / 10, func(i int) any { return int32(1000 + i) }},
+		{"float", `"float"`, items / 10, func(i int) any { return float32(i) + 0.5 }},
+		{"double", `"double"`, items / 10, func(i int) any { return float64(i) + 0.5 }},
+		{"nullable long", `["null","long"]`, items / 10, func(i int) any { return int64(1000 + i) }},
+		{"long under 256", `"long"`, 5, func(i int) any { return int64(i % 200) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := avro.MustParse(fmt.Sprintf(`{"type":"array","items":%s}`, tc.schema))
+			want, other := make([]any, items), make([]any, items)
+			for i := range items {
+				want[i], other[i] = tc.val(i), tc.val(i+5000)
+			}
+			wire := avrotest.MustAppendEncode(t, s, nil, want)
+			otherWire := avrotest.MustAppendEncode(t, s, nil, other)
+
+			var kept any
+			avrotest.MustDecode(t, s, wire, &kept)
+			allocs := testing.AllocsPerRun(5, func() {
+				var out any
+				if _, err := s.Decode(otherWire, &out); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if allocs > tc.max {
+				t.Errorf("decoding %d numbers into an any allocated %.0f times, want at most %.0f", items, allocs, tc.max)
+			}
+			if !reflect.DeepEqual(kept, any(want)) {
+				t.Errorf("later decodes wrote numbers kept from an earlier decode")
+			}
+		})
 	}
 }
 

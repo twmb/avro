@@ -132,7 +132,7 @@ func compileFastDeser(rec *deserRecord, t reflect.Type, skipUnknown bool) *fastR
 		offset, goType, ok := computeFieldOffset(t, mapping.indices[i])
 		var fn udeserfn
 		if ok {
-			fn = tryCompileFieldDeser(f, goType)
+			fn = tryCompileFieldDeser(f, goType, skipUnknown)
 		}
 		if fn != nil {
 			fast.fields[i] = fastFieldDeser{
@@ -210,7 +210,8 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 // deserRecordFastPtr, the other fast entry, is reached on child edges that
 // bypass deserRecord.deser, so it keeps its own bump.
 func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *slab) ([]byte, error) {
-	base := v.Addr().UnsafePointer()
+	// UnsafeAddr, not Addr: Addr looks up the pointer type of v on every call.
+	base := unsafe.Pointer(v.UnsafeAddr())
 	var err error
 	for i := range fast.fields {
 		f := &fast.fields[i]
@@ -251,20 +252,24 @@ func serRecordFastPtr(dst []byte, fast *fastRecordSer, base unsafe.Pointer, dept
 
 // deserRecordFastPtr deserializes a record whose fields all have unsafe
 // deser fns.
+//
+// We decrement inline rather than defer, as udNullUnionRecord does: every
+// array element of a record runs this. Every post-bump return decrements first.
 func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, sl *slab) ([]byte, error) {
 	if sl.depth >= maxDepth {
 		return nil, errTooDeep
 	}
 	sl.depth++
-	defer func() { sl.depth-- }()
 	var err error
 	for i := range fast.fields {
 		f := &fast.fields[i]
 		src, err = f.deser(src, unsafe.Add(base, f.offset), sl)
 		if err != nil {
+			sl.depth--
 			return nil, recordFieldError(fast.typ, f.name, err)
 		}
 	}
+	sl.depth--
 	return src, nil
 }
 
@@ -472,7 +477,9 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 
 // tryCompileFieldDeser returns a udeserfn for a field we can write directly
 // through unsafe, or nil for one that must take the reflect slow path.
-func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
+// skipUnknown is the mode of the record we compile the field for, which is the
+// mode of every decode that runs the result.
+func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type, skipUnknown bool) udeserfn {
 	if f.meta != nil && (f.meta.hasCustomType || (f.meta.inner != nil && f.meta.inner.hasCustomType)) {
 		return nil
 	}
@@ -511,7 +518,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		if inner.deserRecord != nil {
 			return udNullUnionRecord(inner.deserRecord, innerGoType, valIdx, nullByte, valByte)
 		}
-		innerFn := tryCompileFieldDeser(&deserRecordField{meta: inner}, innerGoType)
+		innerFn := tryCompileFieldDeser(&deserRecordField{meta: inner}, innerGoType, skipUnknown)
 		if innerFn != nil {
 			return udNullUnionPtr(innerFn, innerGoType, valIdx, nullByte, valByte)
 		}
@@ -541,7 +548,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 				return udArrayPtrRecord(inner.deserRecord, elemGoType.Elem(), goType, inner.minBytes)
 			}
 		default:
-			innerFn := tryCompileFieldDeser(&deserRecordField{meta: inner}, elemGoType)
+			innerFn := tryCompileFieldDeser(&deserRecordField{meta: inner}, elemGoType, skipUnknown)
 			if innerFn != nil {
 				return udArrayDirect(innerFn, elemGoType.Size(), goType, inner.minBytes)
 			}
@@ -558,6 +565,14 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 			return nil
 		}
 		rec := f.meta.deserRecord
+		// A struct cannot contain its own type by value, so compiling the
+		// field's record here ends. A record we cannot compile all-fast keeps
+		// the per-decode lookup.
+		if fast := rec.loadOrCompileFast(goType, skipUnknown); fast != nil && fast.allFast {
+			return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+				return deserRecordFastPtr(src, fast, p, sl)
+			}
+		}
 		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			return deserRecordVia(src, rec.fastFor(goType, sl.skipUnknown), rec, goType, p, sl)
 		}
@@ -1629,7 +1644,7 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 // deserializers. onBlock fills slots [start, start+n) of v's backing array
 // and returns the advanced src. minItemBytes bounds the block count to
 // len(src)/minItemBytes, as deserArray.deser does, so a hostile float-array
-// stream cannot drive a 4x MakeSlice allocation per wire byte.
+// stream cannot drive a 4x slice allocation per wire byte.
 func udArrayBlocks(
 	src []byte, p unsafe.Pointer, sl *slab,
 	sliceType reflect.Type, minItemBytes int,
@@ -1682,46 +1697,72 @@ func udArrayBlocks(
 // udArrayPtrRecord handles array deser for []*T where items are records. We
 // manage the slice with reflect and decode each element through unsafe.
 func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minItemBytes int) udeserfn {
-	innerSize := innerType.Size()
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,
 			func(src []byte, _ reflect.Value, p unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
 				s := *(*[]unsafe.Pointer)(p)
-				// One contiguous allocation backs every nil pointer slot.
-				var need int
-				for i := range n {
-					if s[start+i] == nil {
-						need++
-					}
-				}
-				if need > 0 {
-					backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
-					backingBase := backing.Index(0).Addr().UnsafePointer()
-					j := 0
-					for i := range n {
-						if s[start+i] == nil {
-							s[start+i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
-							j++
-						}
-					}
-				}
-				fast := rec.fastFor(innerType, sl.skipUnknown)
-				useFast := fast != nil && fast.allFast
-				var err error
-				for i := range n {
-					elemP := s[start+i]
-					if useFast {
-						src, err = deserRecordFastPtr(src, fast, elemP, sl)
-					} else {
-						src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem(), sl)
-					}
-					if err != nil {
-						return nil, err
-					}
-				}
-				return src, nil
+				return udPtrRecordBlock(src, rec, innerType, s[start:start+n], sl)
 			})
 	}
+}
+
+// udPtrRecordBlock decodes one record through each *innerType in s. A nil
+// pointer gets new backing, one allocation for every nil pointer in s, and a
+// non-nil pointer is decoded in place.
+func udPtrRecordBlock(src []byte, rec *deserRecord, innerType reflect.Type, s []unsafe.Pointer, sl *slab) ([]byte, error) {
+	var need int
+	for _, p := range s {
+		if p == nil {
+			need++
+		}
+	}
+	if need > 0 {
+		backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
+		backingBase := backing.Index(0).Addr().UnsafePointer()
+		innerSize := innerType.Size()
+		j := 0
+		for i := range s {
+			if s[i] == nil {
+				s[i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
+				j++
+			}
+		}
+	}
+	fast := rec.fastFor(innerType, sl.skipUnknown)
+	useFast := fast != nil && fast.allFast
+	var err error
+	for _, elemP := range s {
+		if useFast {
+			src, err = deserRecordFastPtr(src, fast, elemP, sl)
+		} else {
+			src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem(), sl)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return src, nil
+}
+
+// udRecordBlock decodes one record into each struct of type t in slots
+// [start, start+n) of the slice whose first element is at data, in place.
+func udRecordBlock(src []byte, rec *deserRecord, t reflect.Type, data unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
+	fast := rec.fastFor(t, sl.skipUnknown)
+	useFast := fast != nil && fast.allFast
+	size := t.Size()
+	var err error
+	for i := start; i < start+n; i++ {
+		elemP := unsafe.Add(data, uintptr(i)*size)
+		if useFast {
+			src, err = deserRecordFastPtr(src, fast, elemP, sl)
+		} else {
+			src, err = rec.deser(src, reflect.NewAt(t, elemP).Elem(), sl)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return src, nil
 }
 
 // udArrayDirect handles array deser for []T where items are primitives. We

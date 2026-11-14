@@ -1409,10 +1409,10 @@ func TestMatrix_FastPathDeclinesOnIncompleteFieldMeta(t *testing.T) {
 						t.Fatalf("declined the COMPLETE twin, so the refusal above is not attributable to the missing metadata")
 					}
 				case "decode":
-					if got := tryCompileFieldDeser(&deserRecordField{meta: c.incomplete}, c.goType); got != nil {
+					if got := tryCompileFieldDeser(&deserRecordField{meta: c.incomplete}, c.goType, false); got != nil {
 						t.Fatalf("compiled a fast path from incomplete metadata")
 					}
-					if got := tryCompileFieldDeser(&deserRecordField{meta: complete}, c.goType); got == nil {
+					if got := tryCompileFieldDeser(&deserRecordField{meta: complete}, c.goType, false); got == nil {
 						t.Fatalf("declined the COMPLETE twin, so the refusal above is not attributable to the missing metadata")
 					}
 				}
@@ -1433,10 +1433,10 @@ func TestMatrix_FastPathDeclinesOnIncompleteFieldMeta(t *testing.T) {
 	})
 	realized++
 	t.Run("decode/record/no-table", func(t *testing.T) {
-		if got := tryCompileFieldDeser(&deserRecordField{meta: &fieldMeta{avroType: "record"}}, recGo); got != nil {
+		if got := tryCompileFieldDeser(&deserRecordField{meta: &fieldMeta{avroType: "record"}}, recGo, false); got != nil {
 			t.Fatalf("compiled a record fast path with no deserRecord")
 		}
-		if got := tryCompileFieldDeser(&deserRecordField{meta: &fieldMeta{avroType: "record", deserRecord: rec.node.deserRecord}}, recGo); got == nil {
+		if got := tryCompileFieldDeser(&deserRecordField{meta: &fieldMeta{avroType: "record", deserRecord: rec.node.deserRecord}}, recGo, false); got == nil {
 			t.Fatalf("declined the COMPLETE twin, so the refusal above is not attributable to the missing table")
 		}
 	})
@@ -7695,6 +7695,27 @@ func TestCustomTypeErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("decode_panic", func(t *testing.T) {
+		// A panic in Decode leaves your value in an any target.
+		s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"long","logicalType":"money"}}]}`, CustomType{
+			LogicalType: "money",
+			Decode:      func(any, *SchemaNode) (any, error) { panic("boom") },
+		})
+		data, _ := s.Encode(map[string]any{"m": int64(1)})
+		var v any = "caller"
+		func() {
+			defer func() {
+				if r := recover(); r != "boom" {
+					t.Errorf("recovered %v, want the panic from Decode", r)
+				}
+			}()
+			s.Decode(data, &v)
+		}()
+		if v != "caller" {
+			t.Errorf("got %#v, want the caller's value", v)
+		}
+	})
+
 	t.Run("encode_fatal", func(t *testing.T) {
 		myErr := errors.New("encode boom")
 		s, _ := Parse(`{"type":"long","logicalType":"money"}`, CustomType{
@@ -7792,6 +7813,58 @@ func TestCustomTypeBackedByRecord(t *testing.T) {
 	g := v.(map[string]any)["loc"].(testGeoPoint)
 	if math.Abs(g.Lat-37.7749) > 0.0001 || math.Abs(g.Lng+122.4194) > 0.0001 {
 		t.Errorf("got %+v", g)
+	}
+
+	// Each record in a slice or a map goes through Decode. Decode skips a
+	// record with lat 0, so we decode that one into your type without the
+	// custom type, which compiles the record for your type.
+	type geo struct {
+		Lat float64 `avro:"lat"`
+		Lng float64 `avro:"lng"`
+	}
+	ct := CustomType{LogicalType: "geo", AvroType: "record", Decode: func(v any, _ *SchemaNode) (any, error) {
+		m := v.(map[string]any)
+		if m["lat"] == 0.0 {
+			return nil, ErrSkipCustomType
+		}
+		return geo{Lat: m["lat"].(float64) * 10, Lng: m["lng"].(float64) * 10}, nil
+	}}
+	const loc = `{"type":"record","name":"Loc","logicalType":"geo","fields":[{"name":"lat","type":"double"},{"name":"lng","type":"double"}]}`
+	skip, conv := map[string]any{"lat": 0.0, "lng": 1.0}, map[string]any{"lat": 1.0, "lng": 2.0}
+	want := []geo{{0, 1}, {10, 20}}
+	arrSchema := `{"type":"array","items":` + loc + `}`
+	arrWire, err := MustParse(arrSchema).Encode([]any{skip, conv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr := MustParse(arrSchema, ct)
+	var vals []geo
+	if _, err := arr.Decode(arrWire, &vals); err != nil || !reflect.DeepEqual(vals, want) {
+		t.Errorf("[]geo: got %v, %v, want %v", vals, err, want)
+	}
+	var ptrs []*geo
+	_, err = arr.Decode(arrWire, &ptrs)
+	var derefs []geo
+	for _, p := range ptrs {
+		derefs = append(derefs, *p)
+	}
+	if err != nil || !reflect.DeepEqual(derefs, want) {
+		t.Errorf("[]*geo: got %v, %v, want %v", derefs, err, want)
+	}
+	mapSchema := `{"type":"map","values":` + loc + `}`
+	plainMap, mp := MustParse(mapSchema), MustParse(mapSchema, ct)
+	got := map[string]geo{}
+	for _, e := range []map[string]any{{"s": skip}, {"c": conv}} {
+		w, err := plainMap.Encode(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mp.Decode(w, &got); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if wantMap := map[string]geo{"s": want[0], "c": want[1]}; !reflect.DeepEqual(got, wantMap) {
+		t.Errorf("map[string]geo: got %v, want %v", got, wantMap)
 	}
 }
 

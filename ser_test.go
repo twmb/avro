@@ -2185,8 +2185,16 @@ var magnitudeSites = []magnitudeSite{
 		reason: "elemSize is reflect.Type.Size(); see udArrayDirect",
 	},
 	{
-		where: "unsafe.go::udArrayPtrRecord", count: 1, verdict: magNotAMagnitude,
+		where: "unsafe.go::udPtrRecordBlock", count: 1, verdict: magNotAMagnitude,
 		reason: "innerSize is reflect.Type.Size(); see udArrayDirect",
+	},
+	{
+		where: "unsafe.go::udRecordBlock", count: 1, verdict: magNotAMagnitude,
+		reason: "size is reflect.Type.Size(); see udArrayDirect",
+	},
+	{
+		where: "deser.go::deserArray.typedBlock", count: 1, verdict: magNotAMagnitude,
+		reason: "size is reflect.Type.Size(); see udArrayDirect",
 	},
 	{
 		where: "unsafe.go::usArrayRecord", count: 1, verdict: magNotAMagnitude,

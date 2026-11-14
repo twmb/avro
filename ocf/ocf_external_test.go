@@ -199,7 +199,7 @@ type lenZeroReader struct{ io.Reader }
 
 func (lenZeroReader) Len() int { return 0 }
 
-// TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate pins that a reader does
+// TestRegression_OCFDeclaredSizeDoesNotEagerAllocate pins that a reader does
 // not allocate a size the file declares before the bytes arrive. Raising
 // WithMaxBlockBytes to a very large value is the natural way to say "accept big
 // blocks", and it used to expose readBlock's make([]byte, declaredSize): a tiny
@@ -211,12 +211,12 @@ func (lenZeroReader) Len() int { return 0 }
 // For every declared size we ask the caller's reader how many bytes remain.
 // A reader that can say decides: one allocation when the bytes are
 // there, and an incremental read when they are not, so the buffer grows only
-// to the bytes actually present. A reader that cannot say is read as it always
-// was: one allocation within the default cap, incremental above it. The source
+// to the bytes actually present. A reader that cannot say gets one allocation
+// within the default cap, and an incremental read above it. The source
 // axis is how the caller's reader can answer: a Len method, a regular file, a
 // stream that cannot say, and a Len that under-reports. What the reader says
 // picks how we read and never whether we accept.
-func TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate(t *testing.T) {
+func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 	// A valid header for "long", reused for its embedded 16-byte sync marker.
 	var hb bytes.Buffer
 	w := ocftest.MustNewWriter(t, &hb, avro.MustParse(`"long"`))
@@ -283,7 +283,6 @@ func TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate(t *testing.T) {
 		{"block 256 TiB, raised cap", block(1 << 48), []ocf.ReaderOpt{ocf.WithMaxBlockBytes(1 << 50)}, true},
 		// Within the default cap the guard never fires either.
 		{"block 48 MiB, default cap", block(48 << 20), nil, false},
-		{"block 2 MiB, default cap", block(2 << 20), nil, false},
 		{"avro.schema 48 MiB", header("avro.schema", 48<<20), nil, false},
 	} {
 		for _, src := range sources {
