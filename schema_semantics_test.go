@@ -6906,19 +6906,34 @@ func TestMatrix_NamelessKindObjectIgnoresStrayKeys(t *testing.T) {
 
 // TestMatrix_KindNamedTypeReferences takes every kindNamedCell, a type named
 // after a complex kind or "union" and referenced by its bare name, and holds
-// the reference to two surfaces the acceptance rebuild check does not reach:
-// a field type extracted from Root() and converted on its own, and
-// ExpandReferences. A recursive cell also extracts the type's reference to
-// itself. The oracle is the same cell with the type renamed, so that no kind
-// name is involved.
+// the reference to Root().Schema(), to a field type extracted from Root() and
+// converted on its own, and to ExpandReferences. A recursive cell also
+// extracts the type's reference to itself. The type named "union" is also
+// referenced wrapped, alone or with a doc or a custom property, since no
+// object declares a union. fastavro rejects a wrapped reference, so the
+// acceptance cells leave these spellings out. The oracle is the same cell
+// with the type renamed, so that no kind name is involved, and the rebuilt
+// schema must also keep the parsed canonical form and fingerprint.
 func TestMatrix_KindNamedTypeReferences(t *testing.T) {
+	cells := kindNamedCells()
 	for _, c := range kindNamedCells() {
+		if c.kind != "union" {
+			continue
+		}
+		for _, wrapped := range []string{`{"type":"%s"}`, `{"type":"%s","doc":"x"}`, `{"type":"%s","foo":"bar"}`} {
+			w := c
+			w.use = strings.Replace(c.use, `"%s"`, wrapped, 1)
+			cells = append(cells, w)
+		}
+	}
+	for _, c := range cells {
 		twinName := "Z" + c.kind
 		// back renames the twin's type in its text, so the two texts compare.
 		back := func(s string) string { return strings.ReplaceAll(s, twinName, c.kind) }
 		name := fmt.Sprintf("%s/ns=%q/recursive=%v/%s", c.kind, c.ns, c.recursive, fmt.Sprintf(c.use, "T"))
 		s, tw := avro.MustParse(c.schema(c.kind)), avro.MustParse(c.schema(twinName))
 		surfaces := map[string]func(root *avro.SchemaNode) (*avro.Schema, error){
+			"rebuild": func(root *avro.SchemaNode) (*avro.Schema, error) { return root.Schema() },
 			"extract": func(root *avro.SchemaNode) (*avro.Schema, error) { return (&root.Fields[1].Type).Schema() },
 			"expand": func(root *avro.SchemaNode) (*avro.Schema, error) {
 				return root.ExpandReferences().Fields[1].Type.Schema()
@@ -6941,6 +6956,9 @@ func TestMatrix_KindNamedTypeReferences(t *testing.T) {
 			}
 			if g, w := got.String(), back(want.String()); g != w {
 				t.Errorf("%s: %s gave a different schema than the renamed twin:\n  got  %s\n  want %s", name, label, g, w)
+			}
+			if label == "rebuild" && (!bytes.Equal(got.Canonical(), s.Canonical()) || !bytes.Equal(got.Fingerprint(avro.NewRabin()), s.Fingerprint(avro.NewRabin()))) {
+				t.Errorf("%s: rebuild changed the canonical form:\n  got  %s\n  want %s", name, got.Canonical(), s.Canonical())
 			}
 		}
 	}

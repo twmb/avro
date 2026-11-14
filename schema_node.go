@@ -1438,16 +1438,19 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		}
 	}
 
-	// A complex kind or "union" carrying nothing but its Type is a reference
-	// to a type of that name, which Root() builds from the bare string
-	// "array", when the stamp named an emitted definition or the tree defines
-	// the name in scope. We emit the name, since the object {"type":"array"}
-	// declares an array with no items, and a union node renders as its
-	// branches.
-	if d != nil && !stray && reusedKindName(n.Type) && nodeCarriesOnlyType(n) {
-		if _, _, ok := lookupScoped(d.localNames, n.Type, enclosingNS); ok || stampedRef {
-			return refType
-		}
+	// A complex kind or "union" node of kindRefShape is a reference to a type
+	// of that name when the stamp named an emitted definition or the tree
+	// defines the name in scope. A reference carrying nothing but its Type
+	// emits the bare name, since the object {"type":"array"} declares an array
+	// with no items. A reference to a type named "union" with a doc or props
+	// skips the union arm below and renders as its object.
+	kindRef := false
+	if d != nil && !stray && reusedKindName(n.Type) && kindRefShape(n) {
+		_, _, ok := lookupScoped(d.localNames, n.Type, enclosingNS)
+		kindRef = ok || stampedRef
+	}
+	if kindRef && nodeCarriesOnlyType(n) {
+		return refType
 	}
 
 	switch n.Type {
@@ -1459,11 +1462,13 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			return n.Type
 		}
 	case "union":
-		branches := make([]any, len(n.Branches))
-		for i := range n.Branches {
-			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1, b, stray)
+		if !kindRef {
+			branches := make([]any, len(n.Branches))
+			for i := range n.Branches {
+				branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1, b, stray)
+			}
+			return branches
 		}
-		return branches
 	}
 
 	// The same losslessness question as the primitive arm above, for a name
@@ -1767,6 +1772,20 @@ func reusedKindName(typ string) bool {
 	return isComplexKind(typ) || typ == "union"
 }
 
+// kindRefShape reports whether n, whose Type is a reusedKindName, has the
+// shape of a reference to a type of that name. A complex kind's name is a
+// reference only as the bare string "array", which Root() builds as a node
+// carrying nothing but its Type. No object declares a union, so an object
+// such as {"type":"union","doc":"x"} also references a type named "union",
+// and a union node with nil Branches has the shape when it carries only what
+// such an object may carry.
+func kindRefShape(n *SchemaNode) bool {
+	if n.Type == "union" {
+		return nodeIsNameRefShape(n)
+	}
+	return nodeCarriesOnlyType(n)
+}
+
 // nodeFullname returns n's fullname by resolveScope over the node's own
 // Name and Namespace. Namespace is already resolved, so it stands in for a
 // written attribute and "" means the null namespace; a dotted Name takes
@@ -1800,10 +1819,9 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *Sche
 		return nil
 	}
 	// A primitive is never a reference. A complex kind, "error" included per
-	// [isRecordKind], or "union" is a definition, unless the node carries
-	// nothing but its Type: then it is the bare reference "array" to a type
-	// named after the kind, as the parser reads that string.
-	if _, prim := serPrimitive[t.Type]; prim || reusedKindName(t.Type) && !nodeCarriesOnlyType(t) {
+	// [isRecordKind], or "union" is a definition, unless the node has the
+	// shape of a reference to a type named after the kind.
+	if _, prim := serPrimitive[t.Type]; prim || reusedKindName(t.Type) && !kindRefShape(t) {
 		return nil
 	}
 	_, r, _ := lookupScoped(table, t.Type, ns)

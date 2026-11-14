@@ -4203,14 +4203,20 @@ func TestMatrix_CacheSelfContainedNamespaces(t *testing.T) {
 	refNSs := []string{"null", "same", "diff"}
 	// The name axis: a type may take a complex kind's name or "union", and
 	// the bare name then references it. Only "union" also references it
-	// wrapped, since {"type":"array"} declares an array.
+	// wrapped, alone or with a doc or a custom property, since
+	// {"type":"array"} declares an array.
 	var poss []struct{ pos, n string }
 	for _, n := range []string{"T", "record", "error", "enum", "fixed", "array", "map", "union"} {
 		for _, pos := range []string{"field", "array", "map", "union"} {
 			poss = append(poss, struct{ pos, n string }{pos, n})
 		}
 	}
-	poss = append(poss, struct{ pos, n string }{"wrapped", "T"}, struct{ pos, n string }{"wrapped", "union"})
+	wraps := map[string]string{"wrapped": "", "wrapped-doc": `,"doc":"x"`, "wrapped-prop": `,"foo":"bar"`}
+	for _, n := range []string{"T", "union"} {
+		for _, pos := range []string{"wrapped", "wrapped-doc", "wrapped-prop"} {
+			poss = append(poss, struct{ pos, n string }{pos, n})
+		}
+	}
 
 	for _, k := range kinds {
 		for _, dns := range defNSs {
@@ -4243,8 +4249,8 @@ func TestMatrix_CacheSelfContainedNamespaces(t *testing.T) {
 
 						refNSval := map[string]string{"null": "", "same": defns, "diff": "z.z"}[rns]
 						ref := fmt.Sprintf("%q", fullname)
-						if pos == "wrapped" {
-							pos, ref = "field", `{"type":`+ref+`}`
+						if extra, ok := wraps[pos]; ok {
+							pos, ref = "field", `{"type":`+ref+extra+`}`
 						}
 						refSchema := fmt.Sprintf(`{"type":"record","name":"Ref"%s,"fields":[{"name":"f","type":%s}]}`,
 							nsAttr(refNSval), posWrap(pos, ref))
