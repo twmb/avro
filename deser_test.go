@@ -7793,6 +7793,58 @@ func TestCustomTypeBackedByRecord(t *testing.T) {
 	if math.Abs(g.Lat-37.7749) > 0.0001 || math.Abs(g.Lng+122.4194) > 0.0001 {
 		t.Errorf("got %+v", g)
 	}
+
+	// Each record in a slice or a map goes through Decode. Decode skips a
+	// record with lat 0, so we decode that one into your type without the
+	// custom type, which compiles the record for your type.
+	type geo struct {
+		Lat float64 `avro:"lat"`
+		Lng float64 `avro:"lng"`
+	}
+	ct := CustomType{LogicalType: "geo", AvroType: "record", Decode: func(v any, _ *SchemaNode) (any, error) {
+		m := v.(map[string]any)
+		if m["lat"] == 0.0 {
+			return nil, ErrSkipCustomType
+		}
+		return geo{Lat: m["lat"].(float64) * 10, Lng: m["lng"].(float64) * 10}, nil
+	}}
+	const loc = `{"type":"record","name":"Loc","logicalType":"geo","fields":[{"name":"lat","type":"double"},{"name":"lng","type":"double"}]}`
+	skip, conv := map[string]any{"lat": 0.0, "lng": 1.0}, map[string]any{"lat": 1.0, "lng": 2.0}
+	want := []geo{{0, 1}, {10, 20}}
+	arrSchema := `{"type":"array","items":` + loc + `}`
+	arrWire, err := MustParse(arrSchema).Encode([]any{skip, conv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr := MustParse(arrSchema, ct)
+	var vals []geo
+	if _, err := arr.Decode(arrWire, &vals); err != nil || !reflect.DeepEqual(vals, want) {
+		t.Errorf("[]geo: got %v, %v, want %v", vals, err, want)
+	}
+	var ptrs []*geo
+	_, err = arr.Decode(arrWire, &ptrs)
+	var derefs []geo
+	for _, p := range ptrs {
+		derefs = append(derefs, *p)
+	}
+	if err != nil || !reflect.DeepEqual(derefs, want) {
+		t.Errorf("[]*geo: got %v, %v, want %v", derefs, err, want)
+	}
+	mapSchema := `{"type":"map","values":` + loc + `}`
+	plainMap, mp := MustParse(mapSchema), MustParse(mapSchema, ct)
+	got := map[string]geo{}
+	for _, e := range []map[string]any{{"s": skip}, {"c": conv}} {
+		w, err := plainMap.Encode(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mp.Decode(w, &got); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if wantMap := map[string]geo{"s": want[0], "c": want[1]}; !reflect.DeepEqual(got, wantMap) {
+		t.Errorf("map[string]geo: got %v, want %v", got, wantMap)
+	}
 }
 
 func TestCustomTypeSchemaProps(t *testing.T) {
