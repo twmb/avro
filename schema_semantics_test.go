@@ -6962,6 +6962,50 @@ func TestMatrix_KindNamedTypeReferences(t *testing.T) {
 			}
 		}
 	}
+
+	// A node extracted from Root() converts in the null namespace. A field
+	// type that is not a named record can hold both a definition and a
+	// reference to it by short name, which then binds nothing in a namespaced
+	// parent. The extracted node must convert to the schema it has inside its
+	// parent, which we cut out of the parent's canonical form, since a renamed
+	// twin is an ordinary name in the same position. "Z" is that ordinary name.
+	// The reference sits in a map where the type is named "array", since a
+	// union cannot hold both a type named "array" and an array.
+	for _, kind := range []string{"record", "error", "enum", "fixed", "array", "map", "union", "Z"} {
+		ref := fmt.Sprintf(`{"type":"array","items":%q}`, kind)
+		if kind == "array" {
+			ref = fmt.Sprintf(`{"type":"map","values":%q}`, kind)
+		}
+		for _, ns := range []string{"", "ns"} {
+			for _, recursive := range []bool{false, true} {
+				for _, holder := range []string{`[%s]`, `{"type":"array","items":[%s]}`, `{"type":"map","values":[%s]}`} {
+					c := kindNamedCell{kind: kind, ns: ns, recursive: recursive}
+					nsAttr := ""
+					if ns != "" {
+						nsAttr = fmt.Sprintf(`"namespace":%q,`, ns)
+					}
+					s := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"R",%s"fields":[{"name":"f","type":%s}]}`,
+						nsAttr, fmt.Sprintf(holder, `"null",`+c.def(kind)+`,`+ref)))
+					name := fmt.Sprintf("contained %s/ns=%q/recursive=%v/%s", kind, ns, recursive, fmt.Sprintf(holder, `"null",DEF,`+ref))
+					var parent struct {
+						Fields []struct{ Type json.RawMessage }
+					}
+					if err := json.Unmarshal(s.Canonical(), &parent); err != nil || len(parent.Fields) != 1 {
+						t.Fatalf("%s: cannot read the field out of the parent's canonical form: %v", name, err)
+					}
+					want := avro.MustParse(string(parent.Fields[0].Type))
+					got, err := (&s.Root().Fields[0].Type).Schema()
+					if err != nil {
+						t.Errorf("%s: extract: %v", name, err)
+						continue
+					}
+					if !bytes.Equal(got.Canonical(), want.Canonical()) || !bytes.Equal(got.Fingerprint(avro.NewRabin()), want.Fingerprint(avro.NewRabin())) {
+						t.Errorf("%s: extract gave a different schema than the field inside its parent:\n  got  %s\n  want %s", name, got.Canonical(), want.Canonical())
+					}
+				}
+			}
+		}
+	}
 }
 
 // TestMatrix_EmptyFieldNameAliasClaimAgreement is the shape that a name-valued

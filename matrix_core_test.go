@@ -4031,15 +4031,20 @@ type kindNamedCell struct {
 	recursive     bool // the type is a record that references itself
 }
 
-// schema writes the cell with the type named name.
-func (c kindNamedCell) schema(name string) string {
-	def := fmt.Sprintf(`{"type":"fixed","name":%q,"size":2}`, name)
+// def writes the cell's definition of the type named name.
+func (c kindNamedCell) def(name string) string {
 	switch {
 	case c.recursive:
-		def = fmt.Sprintf(`{"type":"record","name":%q,"fields":[{"name":"n","type":["null",%q]}]}`, name, name)
+		return fmt.Sprintf(`{"type":"record","name":%q,"fields":[{"name":"n","type":["null",%q]}]}`, name, name)
 	case c.kind == "fixed":
-		def = fmt.Sprintf(`{"type":"enum","name":%q,"symbols":["A"]}`, name)
+		return fmt.Sprintf(`{"type":"enum","name":%q,"symbols":["A"]}`, name)
 	}
+	return fmt.Sprintf(`{"type":"fixed","name":%q,"size":2}`, name)
+}
+
+// schema writes the cell with the type named name.
+func (c kindNamedCell) schema(name string) string {
+	def := c.def(name)
 	nsAttr := ""
 	if c.ns != "" {
 		nsAttr = fmt.Sprintf(`"namespace":%q,`, c.ns)

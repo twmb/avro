@@ -1403,9 +1403,10 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// A reference to a name this tree does not define emits the stamped
 	// definition at its first occurrence through this same recursion, so an
 	// extracted subtree is self-contained. Gated on !stray, and a snapshot
-	// splices nothing. A reference the tree defines locally stays as written.
+	// splices nothing. A reference the tree defines locally stays as written
+	// when the written name binds a type at this position.
 	refType := n.Type
-	stampedRef := false // n names a definition outside the tree
+	stampedRef := false // the stamp, not the written name, binds n here
 	if d != nil && !stray && nodeRefTargetAgrees(n) && nodeIsNameRefShape(n) {
 		if fn := nodeFullname(n.refTarget); fn != "" && !d.localNames[fn] {
 			if _, emitted := d.defined[fn]; !emitted && !d.snapshot {
@@ -1447,15 +1448,20 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			if !d.snapshot {
 				refType = fn
 			}
+		} else if _, _, ok := lookupScoped(d.localNames, n.Type, enclosingNS); !ok {
+			// The tree defines the target, but the written name binds no type
+			// here, as a short name does in an extracted subtree, which
+			// converts in the null namespace. We emit the fullname.
+			refType, stampedRef = fn, true
 		}
 	}
 
 	// A complex kind or "union" node of kindRefShape is a reference to a type
-	// of that name when the stamp names a definition outside the tree or the
-	// tree defines the name in scope. A reference carrying nothing but its
-	// Type emits the bare name, since the object {"type":"array"} declares an
-	// array with no items. A reference to a type named "union" with a doc or
-	// props skips the union arm below and renders as its object.
+	// of that name when the tree defines the name in scope or the stamp binds
+	// the node. A reference carrying nothing but its Type emits the bare name,
+	// since the object {"type":"array"} declares an array with no items. A
+	// reference to a type named "union" with a doc or props skips the union
+	// arm below and renders as its object.
 	kindRef := false
 	if d != nil && !stray && reusedKindName(n.Type) && kindRefShape(n) {
 		_, _, ok := lookupScoped(d.localNames, n.Type, enclosingNS)
