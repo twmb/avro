@@ -406,7 +406,7 @@ var censusRegistry = []censusQuestion{
 		id:       "Q15",
 		question: "Is this kind a NAMED type (occupies a fullname others can reference), and is it a RECORD?",
 		authority: "isNamedKind / isRecordKind (schema_node.go) are the shared predicates. The same " +
-			"classification is ALSO written as literal case sets in four other files, which is why the " +
+			"classification is ALSO written as literal case sets in three other files, which is why the " +
 			"question is here: those copies cannot call the predicates from inside a switch, so they can " +
 			"only be kept honest by driving the classification's observable consequence",
 		answerers: []censusAnswerer{
@@ -449,7 +449,7 @@ var censusRegistry = []censusQuestion{
 				"compat.go",
 			}},
 			{pattern: `"record", "error"`, files: []string{
-				"schema_node.go", "schema_parse.go", "schema.go",
+				"schema_parse.go", "schema.go",
 			}},
 			// Rejected tell: `== "record"` also matches the recursion question
 			// (json_decode.go's `kind == "record" || kind == "array" || kind

@@ -1397,6 +1397,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// snapshots stay splice-free, and on !stray. A reference the tree defines
 	// locally stays as written.
 	refType := n.Type
+	stampedRef := false // refType is the fullname of an emitted definition
 	if d != nil && !stray && nodeRefTargetAgrees(n) && nodeIsNameRefShape(n) {
 		if fn := nodeFullname(n.refTarget); fn != "" && !d.localNames[fn] {
 			if _, emitted := d.defined[fn]; !emitted {
@@ -1433,7 +1434,19 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			// definition): reference it by fullname, the spelling that
 			// re-binds regardless of the standalone parse's
 			// namespace scope at this position.
-			refType = fn
+			refType, stampedRef = fn, true
+		}
+	}
+
+	// A complex kind or "union" carrying nothing but its Type is a reference
+	// to a type of that name, which Root() builds from the bare string
+	// "array", when the stamp named an emitted definition or the tree defines
+	// the name in scope. We emit the name, since the object {"type":"array"}
+	// declares an array with no items, and a union node renders as its
+	// branches.
+	if d != nil && !stray && reusedKindName(n.Type) && nodeCarriesOnlyType(n) {
+		if _, _, ok := lookupScoped(d.localNames, n.Type, enclosingNS); ok || stampedRef {
+			return refType
 		}
 	}
 
@@ -1461,15 +1474,6 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	if n.Type != "array" && n.Type != "map" && !isNamedKind(n.Type) &&
 		n.Type != "union" && nodeCarriesOnlyType(n) {
 		return refType
-	}
-	// A complex kind carrying nothing but its Type, where the tree defines a
-	// type with that name in scope, is a reference to that type, which Root()
-	// builds from the bare string "array". We emit the bare string, since the
-	// object {"type":"array"} declares an array with no items.
-	if d != nil && !stray && isComplexKind(n.Type) && nodeCarriesOnlyType(n) {
-		if _, _, ok := lookupScoped(d.localNames, n.Type, enclosingNS); ok {
-			return n.Type
-		}
 	}
 
 	// We remember this named type's node for the next occurrence's conflict
@@ -1757,6 +1761,12 @@ func isComplexKind(typ string) bool {
 	return isNamedKind(typ) || typ == "array" || typ == "map"
 }
 
+// reusedKindName reports whether typ names a kind that the spec lets a named
+// type reuse as its name: a complex kind or "union".
+func reusedKindName(typ string) bool {
+	return isComplexKind(typ) || typ == "union"
+}
+
 // nodeFullname returns n's fullname by resolveScope over the node's own
 // Name and Namespace. Namespace is already resolved, so it stands in for a
 // written attribute and "" means the null namespace; a dotted Name takes
@@ -1789,15 +1799,11 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *Sche
 	if t == nil {
 		return nil
 	}
-	// Structural kinds (primitives, "record"/"error", "enum", "fixed",
-	// "array", "map", "union") are schema definitions, not name-ref
-	// targets. "error" is in this list per [isRecordKind]: without it,
-	// a SchemaNode with t.Type=="error" would fall through to
-	// table["error"] and wrongly resolve to any record literally named
-	// "error" in the schema.
-	switch t.Type {
-	case "null", "boolean", "int", "long", "float", "double",
-		"bytes", "string", "record", "error", "enum", "fixed", "array", "map", "union":
+	// A primitive is never a reference. A complex kind, "error" included per
+	// [isRecordKind], or "union" is a definition, unless the node carries
+	// nothing but its Type: then it is the bare reference "array" to a type
+	// named after the kind, as the parser reads that string.
+	if _, prim := serPrimitive[t.Type]; prim || reusedKindName(t.Type) && !nodeCarriesOnlyType(t) {
 		return nil
 	}
 	_, r, _ := lookupScoped(table, t.Type, ns)

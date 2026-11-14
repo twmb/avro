@@ -6904,6 +6904,48 @@ func TestMatrix_NamelessKindObjectIgnoresStrayKeys(t *testing.T) {
 	}
 }
 
+// TestMatrix_KindNamedTypeReferences takes every kindNamedCell, a type named
+// after a complex kind or "union" and referenced by its bare name, and holds
+// the reference to two surfaces the acceptance rebuild check does not reach:
+// a field type extracted from Root() and converted on its own, and
+// ExpandReferences. A recursive cell also extracts the type's reference to
+// itself. The oracle is the same cell with the type renamed, so that no kind
+// name is involved.
+func TestMatrix_KindNamedTypeReferences(t *testing.T) {
+	for _, c := range kindNamedCells() {
+		twinName := "Z" + c.kind
+		// back renames the twin's type in its text, so the two texts compare.
+		back := func(s string) string { return strings.ReplaceAll(s, twinName, c.kind) }
+		name := fmt.Sprintf("%s/ns=%q/recursive=%v/%s", c.kind, c.ns, c.recursive, fmt.Sprintf(c.use, "T"))
+		s, tw := avro.MustParse(c.schema(c.kind)), avro.MustParse(c.schema(twinName))
+		surfaces := map[string]func(root *avro.SchemaNode) (*avro.Schema, error){
+			"extract": func(root *avro.SchemaNode) (*avro.Schema, error) { return (&root.Fields[1].Type).Schema() },
+			"expand": func(root *avro.SchemaNode) (*avro.Schema, error) {
+				return root.ExpandReferences().Fields[1].Type.Schema()
+			},
+		}
+		if c.recursive {
+			surfaces["extract self-reference"] = func(root *avro.SchemaNode) (*avro.Schema, error) {
+				return (&root.Fields[0].Type.Fields[0].Type).Schema()
+			}
+		}
+		for label, surface := range surfaces {
+			got, err := surface(s.Root())
+			if err != nil {
+				t.Errorf("%s: %s: %v", name, label, err)
+				continue
+			}
+			want, err := surface(tw.Root())
+			if err != nil {
+				t.Fatalf("%s: %s of the renamed twin: %v", name, label, err)
+			}
+			if g, w := got.String(), back(want.String()); g != w {
+				t.Errorf("%s: %s gave a different schema than the renamed twin:\n  got  %s\n  want %s", name, label, g, w)
+			}
+		}
+	}
+}
+
 // TestMatrix_EmptyFieldNameAliasClaimAgreement is the shape that a name-valued
 // absence sentinel hides. Two writer fields resolve to one reader slot, one
 // by the reader field's name and one by its alias, which both the resolver and

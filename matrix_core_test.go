@@ -4000,9 +4000,9 @@ func acceptanceCells() []string {
 	return cells
 }
 
-// kindNamedCell is a schema that defines a type named after a complex kind,
-// which the spec permits, as field a, and references it by its bare name in
-// field b. use places the reference in b's schema.
+// kindNamedCell is a schema that defines a type named after a complex kind or
+// "union", which the spec permits, as field a, and references it by its bare
+// name in field b. use places the reference in b's schema.
 type kindNamedCell struct {
 	kind, ns, use string
 	recursive     bool // the type is a record that references itself
@@ -4030,7 +4030,7 @@ func (c kindNamedCell) schema(name string) string {
 // union branch positions.
 func kindNamedCells() []kindNamedCell {
 	var cells []kindNamedCell
-	for _, kind := range []string{"record", "error", "enum", "fixed", "array", "map"} {
+	for _, kind := range []string{"record", "error", "enum", "fixed", "array", "map", "union"} {
 		for _, ns := range []string{"", "ns"} {
 			for _, recursive := range []bool{false, true} {
 				for _, use := range []string{`"%s"`, `{"type":"array","items":"%s"}`, `{"type":"map","values":"%s"}`, `["null","%s"]`} {
@@ -4178,30 +4178,40 @@ func TestMatrix_CacheSelfContainedNamespaces(t *testing.T) {
 
 	defNSs := []string{"null", "explicit", "inherited", "dotted"}
 	refNSs := []string{"null", "same", "diff"}
-	poss := []string{"field", "array", "map", "union"}
+	// The name axis: a type may take a complex kind's name or "union", and
+	// the bare name then references it. Only "union" also references it
+	// wrapped, since {"type":"array"} declares an array.
+	var poss []struct{ pos, n string }
+	for _, n := range []string{"T", "record", "error", "enum", "fixed", "array", "map", "union"} {
+		for _, pos := range []string{"field", "array", "map", "union"} {
+			poss = append(poss, struct{ pos, n string }{pos, n})
+		}
+	}
+	poss = append(poss, struct{ pos, n string }{"wrapped", "T"}, struct{ pos, n string }{"wrapped", "union"})
 
 	for _, k := range kinds {
 		for _, dns := range defNSs {
 			for _, rns := range refNSs {
-				for _, pos := range poss {
-					t.Run(fmt.Sprintf("%s/%s/%s/%s", k.name, dns, rns, pos), func(t *testing.T) {
+				for _, pn := range poss {
+					pos, n := pn.pos, pn.n
+					t.Run(fmt.Sprintf("%s/%s/%s/%s/%s", k.name, dns, rns, pos, n), func(t *testing.T) {
 						// Resolve the definition into (fullname, resolved namespace,
 						// registration schemas).
 						var fullname, defns string
 						var regs []string
 						switch dns {
 						case "null":
-							fullname, defns = "T", ""
-							regs = []string{k.def("T", "")}
+							fullname, defns = n, ""
+							regs = []string{k.def(n, "")}
 						case "explicit":
-							fullname, defns = "a.b.T", "a.b"
-							regs = []string{k.def("T", `,"namespace":"a.b"`)}
+							fullname, defns = "a.b."+n, "a.b"
+							regs = []string{k.def(n, `,"namespace":"a.b"`)}
 						case "inherited":
-							fullname, defns = "a.b.T", "a.b"
-							regs = []string{fmt.Sprintf(`{"type":"record","name":"Wrap","namespace":"a.b","fields":[{"name":"w","type":%s}]}`, k.def("T", ""))}
+							fullname, defns = "a.b."+n, "a.b"
+							regs = []string{fmt.Sprintf(`{"type":"record","name":"Wrap","namespace":"a.b","fields":[{"name":"w","type":%s}]}`, k.def(n, ""))}
 						case "dotted":
-							fullname, defns = "a.b.T", "a.b"
-							regs = []string{k.def("a.b.T", "")}
+							fullname, defns = "a.b."+n, "a.b"
+							regs = []string{k.def("a.b."+n, "")}
 						}
 						// The self-contained oracle definition always carries an
 						// explicit namespace. That includes "" to force null
@@ -4209,8 +4219,12 @@ func TestMatrix_CacheSelfContainedNamespaces(t *testing.T) {
 						selfDef := k.def(short(fullname), fmt.Sprintf(`,"namespace":%q`, defns))
 
 						refNSval := map[string]string{"null": "", "same": defns, "diff": "z.z"}[rns]
+						ref := fmt.Sprintf("%q", fullname)
+						if pos == "wrapped" {
+							pos, ref = "field", `{"type":`+ref+`}`
+						}
 						refSchema := fmt.Sprintf(`{"type":"record","name":"Ref"%s,"fields":[{"name":"f","type":%s}]}`,
-							nsAttr(refNSval), posWrap(pos, fmt.Sprintf("%q", fullname)))
+							nsAttr(refNSval), posWrap(pos, ref))
 						inlineSchema := fmt.Sprintf(`{"type":"record","name":"Ref"%s,"fields":[{"name":"f","type":%s}]}`,
 							nsAttr(refNSval), posWrap(pos, selfDef))
 
