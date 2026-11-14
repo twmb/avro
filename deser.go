@@ -1899,16 +1899,14 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	// For interface targets with primitive avro values, use the
 	// iface-block fast path that operates directly on map[string]any.
 	useFastIface := iface && s.fastIfaceVal != nil
-	// We pre-allocate reusable key and elem containers to avoid per-entry
-	// reflect.ValueOf / reflect.New allocations. keyVal gets your actual map
-	// key type (e.g. `type UserID string`); reusing this Value for SetMapIndex
-	// avoids the panic that plain reflect.ValueOf(s) would fire when the map's
-	// key is a named string subtype.
+	// The reflect loops below reuse one key and one elem container to avoid
+	// per-entry reflect.ValueOf / reflect.New allocations. keyVal gets your
+	// actual map key type (e.g. `type UserID string`); reusing this Value for
+	// SetMapIndex avoids the panic that plain reflect.ValueOf(s) would fire
+	// when the map's key is a named string subtype. We allocate both on the
+	// first block that needs them, because an empty map and the native and
+	// iface loops never use them.
 	var keyVal, elemVal reflect.Value
-	if !useFastIface {
-		keyVal = reflect.New(mapTyp.Key()).Elem()
-		elemVal = reflect.New(elemTyp).Elem()
-	}
 	var err error
 	for {
 		count, _, rest, end, headerErr := readBlockHeader(src, "map", false)
@@ -1956,6 +1954,10 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			}
 			useFastNative = false // named map type: fall back to fastBlock henceforth
 		}
+		if !useFastIface && !keyVal.IsValid() {
+			keyVal = reflect.New(mapTyp.Key()).Elem()
+			elemVal = reflect.New(elemTyp).Elem()
+		}
 		if useFast {
 			src, err = s.fastBlock(src, mapVal, keyVal, elemVal, int(count), sl)
 			if err != nil {
@@ -1975,7 +1977,7 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			continue
 		}
 		keyType := mapTyp.Key()
-		// elemVal comes from reflect.New above, so its address stays the same
+		// elemVal comes from one reflect.New, so its address stays the same
 		// for the whole decode.
 		var fast *fastRecordDeser
 		var elemP unsafe.Pointer

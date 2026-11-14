@@ -847,6 +847,9 @@ func appendAvroJSONMap(buf []byte, v reflect.Value, node *schemaNode, cfg *optCo
 			return out, nil
 		}
 	}
+	if v.Len() == 0 {
+		return append(buf, '{', '}'), nil // no entry needs the scratch below
+	}
 	buf = append(buf, '{')
 	first := true
 	keyType := v.Type().Key()

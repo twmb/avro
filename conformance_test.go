@@ -23958,6 +23958,93 @@ func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 	}
 }
 
+// minAllocsPerRun returns the fewest allocations one call of f makes over
+// trials calls. Under -race, sync.Pool drops a quarter of the values put back
+// into it, so a call that takes a slab from the pool sometimes allocates a
+// fresh one; the fewest is the count without that.
+func minAllocsPerRun(trials int, f func()) float64 {
+	least := math.Inf(1)
+	for range trials {
+		least = min(least, testing.AllocsPerRun(1, f))
+	}
+	return least
+}
+
+// TestMatrix_MapAllocations crosses map value types over decoding into a nil
+// map and encoding an empty map. A decode allocates only the map when the map
+// is empty, or when Decode writes the entries straight into a map[string]V of
+// a builtin V. An empty map encodes with no allocation on either wire.
+func TestMatrix_MapAllocations(t *testing.T) {
+	type named string
+	type namedMap map[string]int32
+	type rec struct {
+		A int32 `avro:"a"`
+	}
+	for _, c := range []struct {
+		name, values string
+		val          any
+		native       bool // Decode writes the entries into the Go map directly
+	}{
+		{"string", `"string"`, map[string]string{"a": "x", "b": "y"}, true},
+		{"long", `"long"`, map[string]int64{"a": 1000, "b": -1}, true},
+		{"named value", `"string"`, map[string]named{"a": "x"}, false},
+		{"named map", `"int"`, namedMap{"a": 1}, false},
+		{"record value", `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`, map[string]rec{"a": {1}}, false},
+		{"json.Number key", `"string"`, map[json.Number]string{"1": "x"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := avro.MustParse(`{"type":"map","values":` + c.values + `}`)
+			wire := avrotest.MustAppendEncode(t, s, nil, c.val)
+
+			// The want side builds the same map from Values made beforehand.
+			typ := reflect.TypeOf(c.val)
+			mv := reflect.ValueOf(c.val)
+			keys := mv.MapKeys()
+			vals := make([]reflect.Value, len(keys))
+			for i, k := range keys {
+				vals[i] = mv.MapIndex(k)
+			}
+			out := reflect.New(typ)
+			for _, a := range []struct {
+				wire []byte
+				n    int
+			}{{[]byte{0}, 0}, {wire, len(keys)}} {
+				if a.n > 0 && !c.native {
+					continue
+				}
+				want := testing.AllocsPerRun(20, func() {
+					m := reflect.MakeMapWithSize(typ, a.n)
+					for i := range a.n {
+						m.SetMapIndex(keys[i], vals[i])
+					}
+				})
+				var err error
+				got := minAllocsPerRun(20, func() {
+					out.Elem().SetZero()
+					_, err = s.Decode(a.wire, out.Interface())
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != want {
+					t.Errorf("decoding %d entries into a nil %v allocates %.0f times, want %.0f (the map)", a.n, typ, got, want)
+				}
+			}
+
+			empty := reflect.MakeMap(typ).Interface()
+			buf := make([]byte, 0, 64)
+			for _, w := range []struct {
+				name   string
+				append func([]byte, any, ...avro.Opt) ([]byte, error)
+			}{{"AppendEncode", s.AppendEncode}, {"AppendEncodeJSON", s.AppendEncodeJSON}} {
+				if n := minAllocsPerRun(20, func() { buf, _ = w.append(buf[:0], empty) }); n != 0 {
+					t.Errorf("%s of an empty %v allocates %.0f times, want 0", w.name, typ, n)
+				}
+			}
+		})
+	}
+}
+
 // ---------- named_byte_element_test.go ----------
 
 // A Go byte-container type whose element type is a named byte (type B byte;
