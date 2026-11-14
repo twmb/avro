@@ -12290,6 +12290,18 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 			if !matEqual(goArr[:], wantArr[:]) {
 				t.Errorf("Go array: second decode into the used array:\n got=%#v\nwant=%#v", goArr, wantArr)
 			}
+			// DecodeJSON follows the same rule for a Go array. A slice
+			// target of DecodeJSON is always a new slice.
+			jsonFirst := avrotest.MustAppendEncodeJSON(t, arr, nil, []any{fr.values[0], fr.values[0]})
+			jsonSecond := avrotest.MustAppendEncodeJSON(t, arr, nil, []any{fr.values[1], fr.values[1]})
+			var jsonArr, wantJSONKept [2]any
+			avrotest.MustDecodeJSON(t, arr, jsonFirst, &wantJSONKept)
+			avrotest.MustDecodeJSON(t, arr, jsonFirst, &jsonArr)
+			keptJSON := jsonArr
+			avrotest.MustDecodeJSON(t, arr, jsonSecond, &jsonArr)
+			if !matEqual(keptJSON[:], wantJSONKept[:]) {
+				t.Errorf("Go array, DecodeJSON: the second decode wrote a value taken from the first:\n got=%#v\nwant=%#v", keptJSON, wantJSONKept)
+			}
 
 			// An interface type with no methods is an any by another name.
 			var named []reuseEmptyInterface

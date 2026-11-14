@@ -771,6 +771,10 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 	// Typed array target ([N]T): we require exactly len(v) elements, as the
 	// binary side does.
 	if v.Kind() == reflect.Array {
+		// An any element starts from nil, as in the binary decoder.
+		if isEmptyInterface(v.Type().Elem()) {
+			v.SetZero()
+		}
 		arrLen := v.Len()
 		idx := 0
 		if ctx.scanner.peek() != ']' {
