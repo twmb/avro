@@ -863,6 +863,11 @@ type fieldMeta struct {
 	inner         *fieldMeta // for nullunion fields: the inner branch's metadata
 	nullSecond    bool       // true for ["T","null"] unions (null is index 1)
 	hasCustomType bool       // true if a CustomType was applied; disables unsafe fast path
+	// iface is a null union's iface-direct decoder, which a record field, an
+	// array item, or a map value decodes into an any with. It is nil for
+	// every other kind and for a null union whose value branch is not a plain
+	// primitive. See deserNullUnionIface.
+	iface deserIfaceFn
 	// minBytes is the minimum wire bytes required to encode one value
 	// of this type. Set on the items' fieldMeta when an array is built;
 	// used by the unsafe array deser to bound block counts. 0 means
@@ -2112,10 +2117,12 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		b.ser = serNullUnion(ser)
 		b.deser = deserNullUnion(deser)
 		b.meta = b.buildNullUnionMeta(parentName, missing, branchMetas, 1, false)
+		b.meta.iface = deserNullUnionIface(&b.meta, b.deser)
 	case len(s.union) == 2 && s.union[1].isNullBranch():
 		b.ser = serNullSecondUnion(ser)
 		b.deser = deserNullSecondUnion(deser)
 		b.meta = b.buildNullUnionMeta(parentName, missing, branchMetas, 0, true)
+		b.meta.iface = deserNullUnionIface(&b.meta, b.deser)
 	default:
 		b.ser = ser.ser
 		b.deser = deser.deser
@@ -2662,7 +2669,7 @@ func (b *builder) buildRecord(o *aobject) error {
 			name:    of.Name,
 			nameVal: reflect.ValueOf(of.Name),
 			fn:      bf.deser,
-			fnIface: ifaceFnForPrimitive(meta),
+			fnIface: ifaceFnFor(meta),
 			meta:    meta,
 		}
 		fn := fieldNode{
@@ -2860,6 +2867,13 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 	} else {
 		b.ser = sa.ser
 	}
+	// Items with no primFast loop but an iface-direct decoder, such as a null
+	// union or bytes, decode into a []any through that decoder.
+	if !isFwdRef && da.fastIfaceLoop == nil {
+		if fn := ifaceFnFor(&af.meta); fn != nil {
+			da.fastIfaceLoop = deserArrayFnIfaceLoop(fn)
+		}
+	}
 	b.deser = da.deser
 	inner := new(fieldMeta)
 	*inner = af.meta
@@ -2934,6 +2948,10 @@ func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) err
 		dm.nativeBlock = info.deserMapNative
 	} else {
 		b.ser = sm.ser
+	}
+	// The same for values as for array items above.
+	if !isFwdRef && dm.fastIfaceVal == nil {
+		dm.fastIfaceVal = ifaceFnFor(&mf.meta)
 	}
 	b.deser = dm.deser
 	b.meta = fieldMeta{avroType: "map"}

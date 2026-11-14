@@ -448,6 +448,45 @@ func deserNullUnionAt(u *deserUnion, valIdx int, nullByte, valByte byte) deserfn
 	}
 }
 
+// deserNullUnionIface returns the iface-direct decoder of the ["null", T] or
+// [T, "null"] union that meta describes and fn decodes, or nil unless T is a
+// plain primitive. With TaggedUnions we decode through fn, so that maybeWrap
+// stays the one place that tags a value.
+func deserNullUnionIface(meta *fieldMeta, fn deserfn) deserIfaceFn {
+	inner := ifaceFnForPrimitive(meta.inner)
+	if inner == nil {
+		return nil
+	}
+	nullByte, valByte := nullUnionBytes(meta.nullSecond)
+	valIdx := 1
+	if meta.nullSecond {
+		valIdx = 0
+	}
+	return func(src []byte, sl *slab) (any, []byte, error) {
+		if sl.taggedUnions {
+			cell := reflect.New(anyType).Elem()
+			src, err := fn(src, cell, sl)
+			if err != nil {
+				return nil, nil, err
+			}
+			return cell.Interface(), src, nil
+		}
+		// deserNullUnionAt bumps the depth around T's decode. A primitive T
+		// never reads the depth, so the check alone does the same here.
+		if sl.depth >= maxDepth {
+			return nil, nil, errTooDeep
+		}
+		isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !isVal {
+			return nil, src, nil
+		}
+		return inner(src, sl)
+	}
+}
+
 ////////////////
 // PRIMITIVES //
 ////////////////
@@ -860,8 +899,8 @@ type deserArray struct {
 	nativeLoop   func(sliceVal reflect.Value, src []byte, start, count int, sl *slab) (bool, []byte, error)
 	fastElemKind reflect.Kind
 	// fastIfaceLoop decodes one block of items directly into a []any,
-	// bypassing reflect for primitive items. Selected at schema-build
-	// time based on the avro item type. nil for non-primitive items.
+	// bypassing reflect. Selected at schema-build time based on the avro
+	// item type. nil for items with no iface-direct decoder; see ifaceFnFor.
 	fastIfaceLoop func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error)
 	// rec is the items' record when deserItem is that record's own deser, with
 	// no custom type wrapped around it. A slice of structs or of single
@@ -1664,6 +1703,19 @@ func deserArrayIfaceLoop[T any](readOne func(src []byte, sl *slab) (T, []byte, e
 	}
 }
 
+// deserArrayFnIfaceLoop is deserArrayIfaceLoop for items that fn decodes.
+func deserArrayFnIfaceLoop(fn deserIfaceFn) func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
+	return func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
+		var err error
+		for i := start; i < start+count; i++ {
+			if slice[i], src, err = fn(src, sl); err != nil {
+				return nil, err
+			}
+		}
+		return src, nil
+	}
+}
+
 // deserArrayNumIfaceLoop is deserArrayIfaceLoop for a number, which boxNum
 // boxes.
 func deserArrayNumIfaceLoop[T numLike](readOne func(src []byte, sl *slab) (T, []byte, error)) func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
@@ -1758,10 +1810,10 @@ type deserMap struct {
 	// map types get handled=false and fall back to fastBlock.
 	nativeBlock  func(mapVal reflect.Value, src []byte, count int, sl *slab) (bool, []byte, error)
 	fastElemKind reflect.Kind
-	// fastIfaceVal decodes one primitive value directly into a Go any,
-	// bypassing reflect; deserMapPrimitiveIfaceBlock drives the per-block
-	// loop. nil for non-primitive value types; the generic reflect path
-	// handles those.
+	// fastIfaceVal decodes one value directly into a Go any, bypassing
+	// reflect; deserMapPrimitiveIfaceBlock drives the per-block loop. nil for
+	// values with no iface-direct decoder (see ifaceFnFor); the generic
+	// reflect path handles those.
 	fastIfaceVal deserIfaceFn
 	// rec is the values' record when deserItem is that record's own deser,
 	// with no custom type wrapped around it. A struct value then decodes
@@ -2112,6 +2164,24 @@ var (
 	deserStringIface  = deserIface(readOneString)
 )
 
+// deserBytesIface is deserBytes into an any.
+func deserBytesIface(src []byte, sl *slab) (any, []byte, error) {
+	n, src, err := readLength(src, "bytes")
+	if err != nil {
+		return nil, nil, err
+	}
+	return sl.bytes(src, n), src[n:], nil
+}
+
+// ifaceFnFor returns the iface-direct decoder for meta: a plain primitive's,
+// or a null union's (see fieldMeta.iface). It is nil otherwise.
+func ifaceFnFor(meta *fieldMeta) deserIfaceFn {
+	if meta != nil && meta.iface != nil {
+		return meta.iface
+	}
+	return ifaceFnForPrimitive(meta)
+}
+
 // ifaceFnForPrimitive returns the iface-direct decoder for a plain primitive
 // field, or nil where a logical type or custom decoder applies, or the kind
 // is not a primitive.
@@ -2126,6 +2196,7 @@ func ifaceFnForPrimitive(meta *fieldMeta) deserIfaceFn {
 // decoder. We build it from the deser*Iface vars above so a new primitive
 // gets wired in one place only.
 var deserIfaceFnByKind = map[string]deserIfaceFn{
+	"bytes":   deserBytesIface,
 	"boolean": deserBooleanIface,
 	"int":     deserIntIface,
 	"long":    deserLongIface,
