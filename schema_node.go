@@ -277,20 +277,25 @@ type expander struct {
 }
 
 // resolve returns the definition n names and the fullname to key it by, or nil
-// when n is not a bare reference to anything. n's own tree wins, then the
-// [Schema.Root] stamp, the order [SchemaNode.Schema] splices in, so the two
-// paths cannot bind one reference to different definitions. A stamped target
-// from outside the tree joins the table, so every later pass sees it.
+// when n is not a bare reference to anything. The [Schema.Root] stamp wins,
+// since it is the target the name bound where it was written, as in Java and
+// fastavro, and the tree's own definition of that fullname stands in for it.
+// Without a stamp, n's own tree binds the name. [SchemaNode.Schema] binds in
+// the same order, so the two paths cannot bind one reference to different
+// definitions. A stamped target from outside the tree joins the table, so
+// every later pass sees it.
 func (x *expander) resolve(n *SchemaNode, ns string) (*SchemaNode, string) {
 	if !nodeCarriesOnlyType(n) {
 		return nil, ""
 	}
-	t := lookupNameRef(n, x.table, ns)
-	if t == nil {
-		if !nodeRefTargetAgrees(n) {
-			return nil, ""
-		}
+	var t *SchemaNode
+	if nodeRefTargetAgrees(n) {
 		t = n.refTarget
+		if def, ok := x.table[nodeFullname(t)]; ok {
+			t = def
+		}
+	} else if t = lookupNameRef(n, x.table, ns); t == nil {
+		return nil, ""
 	}
 	fn := nodeFullname(t)
 	if fn == "" {
@@ -1404,7 +1409,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// definition at its first occurrence through this same recursion, so an
 	// extracted subtree is self-contained. Gated on !stray, and a snapshot
 	// splices nothing. A reference the tree defines locally stays as written
-	// when the written name binds a type at this position.
+	// when the written name binds the stamped target at this position.
 	refType := n.Type
 	stampedRef := false // the stamp, not the written name, binds n here
 	if d != nil && !stray && nodeRefTargetAgrees(n) && nodeIsNameRefShape(n) {
@@ -1448,10 +1453,12 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			if !d.snapshot {
 				refType = fn
 			}
-		} else if _, _, ok := lookupScoped(d.localNames, n.Type, enclosingNS); !ok {
-			// The tree defines the target, but the written name binds no type
-			// here, as a short name does in an extracted subtree, which
-			// converts in the null namespace. We emit the fullname.
+		} else if k, _, _ := lookupScoped(d.localNames, n.Type, enclosingNS); k != fn {
+			// The tree defines the target, but the written name binds another
+			// type or none here, as a short name can in an extracted subtree,
+			// which converts in the null namespace. We emit the fullname, so
+			// the reference keeps the target it had where it was written, as
+			// in Java and fastavro.
 			refType, stampedRef = fn, true
 		}
 	}

@@ -6966,41 +6966,74 @@ func TestMatrix_KindNamedTypeReferences(t *testing.T) {
 	// A node extracted from Root() converts in the null namespace. A field
 	// type that is not a named record can hold both a definition and a
 	// reference to it by short name, which then binds nothing in a namespaced
-	// parent. The extracted node must convert to the schema it has inside its
-	// parent, which we cut out of the parent's canonical form, since a renamed
-	// twin is an ordinary name in the same position. "Z" is that ordinary name.
-	// The reference sits in a map where the type is named "array", since a
-	// union cannot hold both a type named "array" and an array.
-	for _, kind := range []string{"record", "error", "enum", "fixed", "array", "map", "union", "Z"} {
-		ref := fmt.Sprintf(`{"type":"array","items":%q}`, kind)
-		if kind == "array" {
-			ref = fmt.Sprintf(`{"type":"map","values":%q}`, kind)
+	// parent, or binds a decoy: a type with the same short name in the null
+	// namespace. The decoy sits in "other" for a parent in the null namespace,
+	// where the short name binds the definition either way. The extracted node,
+	// converted and expanded, must keep the schema it has inside its parent, as
+	// Java and fastavro keep it. We cut that schema out of the parent's
+	// canonical form, since a renamed twin is an ordinary name in the same
+	// position. "Z" is that ordinary name. Where the definition is outside the
+	// field, the oracle is the field with the definition written at the
+	// reference. The reference sits in a map where the type is named "array",
+	// since a union cannot hold both a type named "array" and an array.
+	field := func(s *avro.Schema, name string) *avro.Schema {
+		var parent struct {
+			Fields []struct{ Type json.RawMessage }
 		}
+		if err := json.Unmarshal(s.Canonical(), &parent); err != nil || len(parent.Fields) == 0 {
+			t.Fatalf("%s: cannot read the field out of the parent's canonical form: %v", name, err)
+		}
+		return avro.MustParse(string(parent.Fields[len(parent.Fields)-1].Type))
+	}
+	for _, kind := range []string{"record", "error", "enum", "fixed", "array", "map", "union", "Z"} {
+		refTo := func(items string) string {
+			if kind == "array" {
+				return `{"type":"map","values":` + items + `}`
+			}
+			return `{"type":"array","items":` + items + `}`
+		}
+		ref := refTo(fmt.Sprintf("%q", kind))
 		for _, ns := range []string{"", "ns"} {
+			nsAttr, decoyNS := "", "other"
+			if ns != "" {
+				nsAttr, decoyNS = fmt.Sprintf(`"namespace":%q,`, ns), ""
+			}
+			decoy := fmt.Sprintf(`{"type":"fixed","name":%q,"namespace":%q,"size":3}`, kind, decoyNS)
 			for _, recursive := range []bool{false, true} {
-				for _, holder := range []string{`[%s]`, `{"type":"array","items":[%s]}`, `{"type":"map","values":[%s]}`} {
-					c := kindNamedCell{kind: kind, ns: ns, recursive: recursive}
-					nsAttr := ""
-					if ns != "" {
-						nsAttr = fmt.Sprintf(`"namespace":%q,`, ns)
-					}
-					s := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"R",%s"fields":[{"name":"f","type":%s}]}`,
-						nsAttr, fmt.Sprintf(holder, `"null",`+c.def(kind)+`,`+ref)))
-					name := fmt.Sprintf("contained %s/ns=%q/recursive=%v/%s", kind, ns, recursive, fmt.Sprintf(holder, `"null",DEF,`+ref))
-					var parent struct {
-						Fields []struct{ Type json.RawMessage }
-					}
-					if err := json.Unmarshal(s.Canonical(), &parent); err != nil || len(parent.Fields) != 1 {
-						t.Fatalf("%s: cannot read the field out of the parent's canonical form: %v", name, err)
-					}
-					want := avro.MustParse(string(parent.Fields[0].Type))
-					got, err := (&s.Root().Fields[0].Type).Schema()
-					if err != nil {
-						t.Errorf("%s: extract: %v", name, err)
-						continue
-					}
-					if !bytes.Equal(got.Canonical(), want.Canonical()) || !bytes.Equal(got.Fingerprint(avro.NewRabin()), want.Fingerprint(avro.NewRabin())) {
-						t.Errorf("%s: extract gave a different schema than the field inside its parent:\n  got  %s\n  want %s", name, got.Canonical(), want.Canonical())
+				def := kindNamedCell{kind: kind, ns: ns, recursive: recursive}.def(kind)
+				for _, place := range []string{"alone", "decoy", "decoy, definition outside"} {
+					for _, holder := range []string{`[%s]`, `{"type":"array","items":[%s]}`, `{"type":"map","values":[%s]}`} {
+						record := func(fields string) *avro.Schema {
+							return avro.MustParse(fmt.Sprintf(`{"type":"record","name":"R",%s"fields":[%s]}`, nsAttr, fields))
+						}
+						var s, want *avro.Schema
+						name := fmt.Sprintf("contained %s/ns=%q/recursive=%v/%s/%s", kind, ns, recursive, place, fmt.Sprintf(holder, `"null",DEF,`+ref))
+						switch place {
+						case "alone":
+							s = record(`{"name":"f","type":` + fmt.Sprintf(holder, `"null",`+def+`,`+ref) + `}`)
+							want = field(s, name)
+						case "decoy":
+							s = record(`{"name":"f","type":` + fmt.Sprintf(holder, `"null",`+decoy+`,`+def+`,`+ref) + `}`)
+							want = field(s, name)
+						default:
+							s = record(`{"name":"a","type":` + def + `},{"name":"f","type":` + fmt.Sprintf(holder, `"null",`+decoy+`,`+ref) + `}`)
+							want = field(record(`{"name":"f","type":`+fmt.Sprintf(holder, `"null",`+decoy+`,`+refTo(def))+`}`), name)
+						}
+						last := len(s.Root().Fields) - 1
+						surfaces := map[string]func() (*avro.Schema, error){
+							"extract": func() (*avro.Schema, error) { return (&s.Root().Fields[last].Type).Schema() },
+							"expand":  func() (*avro.Schema, error) { return (&s.Root().Fields[last].Type).ExpandReferences().Schema() },
+						}
+						for label, surface := range surfaces {
+							got, err := surface()
+							if err != nil {
+								t.Errorf("%s: %s: %v", name, label, err)
+								continue
+							}
+							if !bytes.Equal(got.Canonical(), want.Canonical()) || !bytes.Equal(got.Fingerprint(avro.NewRabin()), want.Fingerprint(avro.NewRabin())) {
+								t.Errorf("%s: %s gave a different schema than the field inside its parent:\n  got  %s\n  want %s", name, label, got.Canonical(), want.Canonical())
+							}
+						}
 					}
 				}
 			}
