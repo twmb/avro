@@ -10,14 +10,14 @@ import (
 	"unsafe"
 )
 
-func decodeLogicalInt(val int32, node *schemaNode) any {
+func decodeLogicalInt(val int32, node *schemaNode, sl *slab) any {
 	switch node.logical {
 	case "date":
 		return dateToTime(val)
 	case "time-millis":
-		return timeMillisToDuration(val)
+		return boxNum(sl, timeMillisToDuration(val))
 	}
-	return val
+	return boxNum(sl, val)
 }
 
 // timestampToTimeConv returns the wire-int64 to time.Time converter for the
@@ -38,14 +38,18 @@ func timestampToTimeConv(logical string) (func(int64) time.Time, bool) {
 // decodeLogicalLong converts long-backed logicals for an *any target. It errors
 // only for time-micros, when val * time.Microsecond would wrap; the timestamp
 // conversions are total.
-func decodeLogicalLong(val int64, node *schemaNode) (any, error) {
+func decodeLogicalLong(val int64, node *schemaNode, sl *slab) (any, error) {
 	if conv, ok := timestampToTimeConv(node.logical); ok {
 		return conv(val), nil
 	}
 	if node.logical == "time-micros" {
-		return timeMicrosToDuration(val)
+		d, err := timeMicrosToDuration(val)
+		if err != nil {
+			return nil, err
+		}
+		return boxNum(sl, d), nil
 	}
-	return val, nil
+	return boxNum(sl, val), nil
 }
 
 // decodeLogicalBytes converts bytes-backed logicals for an *any target,
@@ -78,10 +82,10 @@ func jsonDecodeAppliesLogical(node *schemaNode) bool {
 	}
 	switch node.kind {
 	case "int":
-		_, raw := decodeLogicalInt(0, node).(int32)
+		_, raw := decodeLogicalInt(0, node, nil).(int32)
 		return !raw
 	case "long":
-		v, err := decodeLogicalLong(0, node)
+		v, err := decodeLogicalLong(0, node, nil)
 		if err != nil { // only a transforming arm (time-micros) can error
 			return true
 		}
@@ -352,9 +356,9 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny, raw 
 	}
 	if toAny {
 		if raw {
-			return setIface(v, reflect.ValueOf(val), "int")
+			return setIface(v, reflect.ValueOf(boxNum(ctx.slab, val)), "int")
 		}
-		return setIface(v, reflect.ValueOf(decodeLogicalInt(val, node)), "int")
+		return setIface(v, reflect.ValueOf(decodeLogicalInt(val, node, ctx.slab)), "int")
 	}
 	if raw {
 		// A matching no-Decode CustomType suppressed the logical: assign the
@@ -400,9 +404,9 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny, raw
 	}
 	if toAny {
 		if raw {
-			return setIface(v, reflect.ValueOf(val), "long")
+			return setIface(v, reflect.ValueOf(boxNum(ctx.slab, val)), "long")
 		}
-		logical, err := decodeLogicalLong(val, node)
+		logical, err := decodeLogicalLong(val, node, ctx.slab)
 		if err != nil {
 			return err
 		}
@@ -516,7 +520,7 @@ func (ctx *jsonDecoder) decodeFloat(v reflect.Value) error {
 	if err != nil {
 		return err
 	}
-	return setFloatValue(v, f, "float", 32)
+	return setFloatValue(v, f, "float", 32, ctx.slab)
 }
 
 func (ctx *jsonDecoder) decodeDouble(v reflect.Value) error {
@@ -524,7 +528,7 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value) error {
 	if err != nil {
 		return err
 	}
-	return setFloatValue(v, f, "double", 64)
+	return setFloatValue(v, f, "double", 64, ctx.slab)
 }
 
 func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny, raw bool) error {

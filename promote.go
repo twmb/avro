@@ -27,14 +27,14 @@ var promotions = map[string]deserfn{
 
 func promoteRead[Wire any](
 	read func([]byte) (Wire, []byte, error),
-	apply func(reflect.Value, Wire) error,
+	apply func(reflect.Value, Wire, *slab) error,
 ) deserfn {
-	return func(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		val, src, err := read(src)
 		if err != nil {
 			return nil, err
 		}
-		return src, apply(indirectAlloc(v), val)
+		return src, apply(indirectAlloc(v), val, sl)
 	}
 }
 
@@ -45,32 +45,39 @@ func promoteRead[Wire any](
 // createDoubleConverter all do. Note that the same-schema decode is stricter:
 // decoding a long schema into a float64 still rejects, because there only
 // your Go type is lossy, not the reader schema.
-func promoteIntFloatMantissa(v reflect.Value, n int64, avroType string, bitSize int) error {
+func promoteIntFloatMantissa(v reflect.Value, n int64, avroType string, bitSize int, sl *slab) error {
 	var f float64
 	if bitSize == 32 {
 		f = float64(float32(n))
 	} else {
 		f = float64(n)
 	}
-	return setFloatValue(v, f, avroType, bitSize)
+	return setFloatValue(v, f, avroType, bitSize, sl)
 }
 
 var (
-	// setLongValue handles the Interface arm internally, so no special-case
-	// needed here.
 	promoteIntToLong = promoteRead(readVarint,
-		func(v reflect.Value, n int32) error { return setLongValue(v, int64(n)) })
+		func(v reflect.Value, n int32, sl *slab) error {
+			if v.Kind() == reflect.Interface {
+				return setIface(v, reflect.ValueOf(boxNum(sl, int64(n))), "long")
+			}
+			return setLongValue(v, int64(n))
+		})
 	promoteIntToFloat = promoteRead(readVarint,
-		func(v reflect.Value, n int32) error { return promoteIntFloatMantissa(v, int64(n), "float", 32) })
+		func(v reflect.Value, n int32, sl *slab) error {
+			return promoteIntFloatMantissa(v, int64(n), "float", 32, sl)
+		})
 	promoteIntToDouble = promoteRead(readVarint,
-		func(v reflect.Value, n int32) error { return promoteIntFloatMantissa(v, int64(n), "double", 64) })
+		func(v reflect.Value, n int32, sl *slab) error {
+			return promoteIntFloatMantissa(v, int64(n), "double", 64, sl)
+		})
 	promoteLongToFloat = promoteRead(readVarlong,
-		func(v reflect.Value, n int64) error { return promoteIntFloatMantissa(v, n, "float", 32) })
+		func(v reflect.Value, n int64, sl *slab) error { return promoteIntFloatMantissa(v, n, "float", 32, sl) })
 	promoteLongToDouble = promoteRead(readVarlong,
-		func(v reflect.Value, n int64) error { return promoteIntFloatMantissa(v, n, "double", 64) })
+		func(v reflect.Value, n int64, sl *slab) error { return promoteIntFloatMantissa(v, n, "double", 64, sl) })
 	promoteFloatToDouble = promoteRead(readUint32,
-		func(v reflect.Value, u uint32) error {
-			return setFloatValue(v, float64(math.Float32frombits(u)), "double", 64)
+		func(v reflect.Value, u uint32, sl *slab) error {
+			return setFloatValue(v, float64(math.Float32frombits(u)), "double", 64, sl)
 		})
 )
 
@@ -164,12 +171,12 @@ func promoteIntToLongTime(conv func(int64) time.Time) deserfn {
 // promoteIntToLongTimeMicros mirrors deserTimeMicros, but we read the writer's
 // varint (int) and widen to int64 before converting. time-micros has its own
 // overflow check inside timeMicrosToDuration; we keep it.
-func promoteIntToLongTimeMicros(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+func promoteIntToLongTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
 	}
-	return src, setTimeMicrosTarget(indirectAlloc(v), int64(val))
+	return src, setTimeMicrosTarget(indirectAlloc(v), int64(val), sl)
 }
 
 // promoteStringToBytesDecimal is deserBytesDecimal with the length-read shape
