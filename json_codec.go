@@ -238,7 +238,7 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 	sl.tagLogicalTypes = cfg.tagLogical
 	sl.skipUnknown = cfg.skipUnknown
 	ctx := &jsonDecoder{
-		scanner: &jsonScanner{data: src},
+		scanner: jsonScanner{data: src},
 		slab:    sl,
 	}
 	err := ctx.decodeValue(rv.Elem(), s.node)

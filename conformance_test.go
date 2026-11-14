@@ -3650,11 +3650,14 @@ func TestMatrix_SkipValueBareSpecialFloat(t *testing.T) {
 // TestMatrix_JSONRecordDuplicateKeys crosses a record JSON object that names
 // one field twice over the two ways that can happen. The same key repeated is
 // last-wins, as in Java, fastavro, and encoding/json. A field's canonical name
-// beside one of its aliases is producer ambiguity and rejects, naming both
-// spellings, while either spelling alone still binds.
+// beside one of its aliases, or two of its aliases, is producer ambiguity and
+// rejects, naming both spellings, while either spelling alone still binds.
+// The wide rows put another field's alias between the two keys.
 func TestMatrix_JSONRecordDuplicateKeys(t *testing.T) {
 	plain := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"long"}]}`)
 	aliased := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"new_name","type":"int","aliases":["old_name"]}]}`)
+	wide := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"long"},{"name":"g","type":"long"},` +
+		`{"name":"new_name","type":"int","aliases":["old_name","older_name"]}]}`)
 	for _, c := range []struct {
 		name    string
 		schema  *avro.Schema
@@ -3669,6 +3672,9 @@ func TestMatrix_JSONRecordDuplicateKeys(t *testing.T) {
 		{"alias then canonical rejects", aliased, `{"old_name":11,"new_name":22}`, "resolved from both", "", nil},
 		{"canonical alone binds", aliased, `{"new_name":42}`, "", "new_name", int32(42)},
 		{"alias alone binds", aliased, `{"old_name":42}`, "", "new_name", int32(42)},
+		{"wide: same key around an alias is last-wins", wide, `{"f":11,"g":1,"old_name":1,"f":22}`, "", "f", int64(22)},
+		{"wide: two aliases reject", wide, `{"f":1,"g":1,"old_name":1,"older_name":2}`, "resolved from both", "", nil},
+		{"wide: canonical after an alias rejects", wide, `{"old_name":1,"f":1,"g":1,"new_name":2}`, "resolved from both", "", nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var got map[string]any
@@ -3686,6 +3692,19 @@ func TestMatrix_JSONRecordDuplicateKeys(t *testing.T) {
 				t.Fatalf("DecodeJSON(%s)[%s] = %#v, want %#v", c.doc, c.field, got[c.field], c.want)
 			}
 		})
+	}
+
+	// While every key is its field's name, tracking the claiming keys costs
+	// no allocation: a decode into a struct allocates once, for the decoder.
+	var row struct {
+		F int64 `avro:"f"`
+		G int64 `avro:"g"`
+		N int32 `avro:"new_name"`
+	}
+	doc := []byte(`{"f":1,"g":2,"new_name":3}`)
+	var err error
+	if n := minAllocsPerRun(20, func() { err = wide.DecodeJSON(doc, &row) }); err != nil || n != 1 {
+		t.Errorf("DecodeJSON(%s) into a struct allocates %.0f times (err %v), want 1", doc, n, err)
 	}
 }
 

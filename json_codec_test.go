@@ -1676,7 +1676,7 @@ func TestDecodeJSONDecodeValueUnknownKind(t *testing.T) {
 	// Create a node with bogus kind to exercise the default error path.
 	// This can't happen through Parse, so test directly.
 	ctx := &jsonDecoder{
-		scanner: &jsonScanner{data: []byte(`42`)},
+		scanner: jsonScanner{data: []byte(`42`)},
 		slab:    &slab{},
 	}
 	var out any
@@ -2005,7 +2005,7 @@ func TestDecodeJSONRecordStructMissingDeserRecord(t *testing.T) {
 	// This can't happen through Parse, so test the decoder directly.
 	node := &schemaNode{kind: "record", fields: []fieldNode{{name: "a"}}}
 	// No deserRecord set.
-	ctx := &jsonDecoder{scanner: &jsonScanner{data: []byte(`{"a":1}`)}}
+	ctx := &jsonDecoder{scanner: jsonScanner{data: []byte(`{"a":1}`)}}
 	ctx.scanner.pos = 1 // past the '{'
 	type R struct {
 		A int `avro:"a"`
