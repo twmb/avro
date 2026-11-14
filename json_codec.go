@@ -1377,17 +1377,23 @@ func unionStandardNames(branches []*schemaNode) []string {
 }
 
 // unionEmitTag returns the tag branch emits inside union, under tagLogical.
-// It is the one source of truth for the JSON encoder; the binary side reads
-// the equivalent value out of deserUnion.logicalNames, which fillUnionTagTables
-// builds with this same rule.
+// fillUnionTagTables builds every branch's logical tag at parse with the rule
+// below, into the union's tags and into deserUnion.logicalNames, so we read
+// it there and a value never builds "long.timestamp-millis". A union without
+// the table falls to the rule itself.
 func unionEmitTag(union, branch *schemaNode, tagLogical bool) string {
-	if !tagLogical {
-		return unionBranchName(branch) // skips building the logical name
+	bn := unionBranchName(branch)
+	if !tagLogical || branch.logical == "" || bn != branch.kind {
+		return bn // no primitive logical qualifier to build or look up
 	}
-	bn, ln := unionBranchNames(branch)
-	if ln == bn {
-		return bn
+	if t := union.tags; t != nil && len(t.emit) == len(union.branches) {
+		for i, b := range union.branches {
+			if b == branch {
+				return t.emit[i]
+			}
+		}
 	}
+	_, ln := unionBranchNames(branch)
 	for _, b := range union.branches {
 		if b != nil && b != branch && unionBranchName(b) == ln {
 			return bn

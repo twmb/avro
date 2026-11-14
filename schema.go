@@ -2028,7 +2028,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		branchMetas = make([]fieldMeta, len(s.union))
 		branchNodes = make([]*schemaNode, len(s.union))
 		// Per-branch tag spellings, collected across the loop and turned
-		// into the three tag tables in one place afterward: the collision
+		// into the four tag tables in one place afterward: the collision
 		// rule needs every branch's exact name, so it cannot be applied
 		// branch-by-branch inside the loop.
 		unionStd = make([]string, 0, len(s.union))
@@ -2163,6 +2163,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 type unionTags struct {
 	byName map[string]int // the tag you write, to branch index
 	byKind map[string]int // primitive branch kind to branch index; first wins
+	emit   []string       // the tag each branch emits under TagLogicalTypes
 }
 
 func (t *unionTags) branchByName(name string) (int, bool) {
@@ -2181,8 +2182,9 @@ func (t *unionTags) branchByKind(kind string) (int, bool) {
 	return i, ok
 }
 
-// fillUnionTagTables builds a union's three tag tables: the two the decoder
-// emits and the one the encoders and the JSON decoder resolve a written tag
+// fillUnionTagTables builds a union's four tag tables: the two the decoder
+// emits, a copy of the logical one that the JSON encoder and decoder emit,
+// and the one the encoders and the JSON decoder resolve a written tag
 // through. An exact branch name outranks a logical qualifier, so a branch
 // never emits a tag the decoder would hand to a different branch.
 func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNode, standard, logical []string) {
@@ -2194,6 +2196,7 @@ func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNo
 		}
 		deser.logicalNames = append(deser.logicalNames, ln)
 	}
+	tags.emit = append(tags.emit[:0], deser.logicalNames...)
 	// We build the accept table by offering every branch to every tier in
 	// order, so it is the same set findUnionBranch accepts: across tiers
 	// first write wins, and within a guarded tier a name two branches could
