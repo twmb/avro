@@ -1456,18 +1456,74 @@ func TestSchemaNodeDedupNamedTypes(t *testing.T) {
 	}
 }
 
+// TestSchemaNodeDedupConflictingNameErrors holds two distinct definitions of
+// one name to the conflict check. The union rows put two definitions of a
+// record X side by side that differ only in a union-shaped node, at a field,
+// array items, or map values. A reference to a type named "union" conflicts
+// with an empty union, and two such references with different docs conflict,
+// as references to an ordinary name do. Equal references do not conflict, and
+// neither do nil and empty Branches where no type is named "union", since both
+// are the empty union. A reference stamped by Root() whose definition is
+// outside the tree is a reference too.
 func TestSchemaNodeDedupConflictingNameErrors(t *testing.T) {
-	node := SchemaNode{
-		Type: "record",
-		Name: "r",
-		Fields: []SchemaField{
-			{Name: "a", Type: SchemaNode{Type: "fixed", Name: "f", Size: 16}},
-			{Name: "b", Type: SchemaNode{Type: "fixed", Name: "f", Size: 8}}, // same name, different size
-		},
+	type row struct {
+		name     string
+		fields   []SchemaField
+		conflict bool
 	}
-	_, err := node.Schema()
-	if err == nil {
-		t.Fatal("expected error for conflicting named type definitions")
+	rows := []row{{"fixed-size", []SchemaField{
+		{Name: "a", Type: SchemaNode{Type: "fixed", Name: "f", Size: 16}},
+		{Name: "b", Type: SchemaNode{Type: "fixed", Name: "f", Size: 8}}, // same name, different size
+	}, true}}
+
+	ref, empty := SchemaNode{Type: "union"}, SchemaNode{Type: "union", Branches: []SchemaNode{}}
+	doc := func(typ, doc string) SchemaNode { return SchemaNode{Type: typ, Doc: doc} }
+	stamped := MustParse(`{"type":"record","name":"R","fields":[{"name":"d","type":{"type":"fixed","name":"union","size":2}},{"name":"u","type":"union"}]}`).Root().Fields[1].Type
+	pairs := []struct {
+		name     string
+		def      string // the type name the tree defines, or "" for none
+		u1, u2   SchemaNode
+		conflict bool
+	}{
+		{"union-ref-vs-empty-union", "union", ref, empty, true},
+		{"union-ref-docs", "union", doc("union", "x"), doc("union", "y"), true},
+		{"ordinary-ref-docs", "Z", doc("Z", "x"), doc("Z", "y"), true},
+		{"union-ref-equal", "union", doc("union", "x"), doc("union", "x"), false},
+		{"empty-union-nil-vs-empty", "", ref, empty, false},
+		{"stamped-union-ref-vs-empty-union", "", stamped, empty, true},
+		{"stamped-union-ref-equal", "", stamped, stamped, false},
+	}
+	wraps := []struct {
+		name string
+		wrap func(SchemaNode) SchemaNode
+	}{
+		{"field", func(u SchemaNode) SchemaNode { return u }},
+		{"items", func(u SchemaNode) SchemaNode { return SchemaNode{Type: "array", Items: &u} }},
+		{"values", func(u SchemaNode) SchemaNode { return SchemaNode{Type: "map", Values: &u} }},
+	}
+	for _, p := range pairs {
+		for _, w := range wraps {
+			x := func(u SchemaNode) SchemaNode {
+				return SchemaNode{Type: "record", Name: "X", Fields: []SchemaField{{Name: "u", Type: w.wrap(u)}}}
+			}
+			var fields []SchemaField
+			if p.def != "" {
+				fields = append(fields, SchemaField{Name: "d", Type: SchemaNode{Type: "fixed", Name: p.def, Size: 2}})
+			}
+			fields = append(fields, SchemaField{Name: "a", Type: x(p.u1)}, SchemaField{Name: "b", Type: x(p.u2)})
+			rows = append(rows, row{p.name + "/" + w.name, fields, p.conflict})
+		}
+	}
+
+	for _, r := range rows {
+		node := SchemaNode{Type: "record", Name: "r", Fields: r.fields}
+		_, err := node.Schema()
+		switch {
+		case r.conflict && (err == nil || !strings.Contains(err.Error(), "conflicting definitions for named type")):
+			t.Errorf("%s: want a conflicting-definitions error, got %v", r.name, err)
+		case !r.conflict && err != nil:
+			t.Errorf("%s: want no error, got %v", r.name, err)
+		}
 	}
 }
 
