@@ -786,6 +786,17 @@ func reuseOrMakeArrayRecord(row ArrayRecord, n int) ArrayRecord {
 
 type deserEnum struct {
 	symbols []string
+	// boxed has each symbol in an any, so that a decode into an any does not
+	// allocate a string header for each value.
+	boxed []any
+}
+
+func newDeserEnum(symbols []string) *deserEnum {
+	boxed := make([]any, len(symbols))
+	for i, s := range symbols {
+		boxed[i] = s
+	}
+	return &deserEnum{symbols: symbols, boxed: boxed}
 }
 
 // setEnumTarget assigns the (idx, symbol) pair to v per the enum target
@@ -833,7 +844,11 @@ func (s *deserEnum) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 	if idx < 0 || int(idx) >= len(s.symbols) {
 		return nil, fmt.Errorf("enum index %d out of range [0, %d)", idx, len(s.symbols))
 	}
-	return src, setEnumTarget(indirectAlloc(v), int(idx), s.symbols[idx])
+	// setEnumTarget's interface arm, with the symbol boxed at parse.
+	if v = indirectAlloc(v); v.Kind() == reflect.Interface {
+		return src, setIface(v, reflect.ValueOf(s.boxed[idx]), "enum")
+	}
+	return src, setEnumTarget(v, int(idx), s.symbols[idx])
 }
 
 type deserArray struct {

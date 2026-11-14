@@ -2780,7 +2780,7 @@ func (b *builder) buildEnum(o *aobject) error {
 	}
 	symbolIdx := enumSymbolIndex(o.Symbols)
 	b.ser = newSerEnum(o.Symbols, symbolIdx).ser
-	b.deser = (&deserEnum{symbols: o.Symbols}).deser
+	b.deser = newDeserEnum(o.Symbols).deser
 	b.meta = fieldMeta{avroType: "enum"}
 
 	nd := &schemaNode{
