@@ -803,7 +803,7 @@ var censusRegistry = []censusQuestion{
 			"calibration-free and needs no reference: a tag must name exactly one branch, and a value's tagged " +
 			"round trip must land where it started",
 		answerers: []censusAnswerer{
-			{repr: "JSON encode envelope (EMIT)", site: "appendTaggedUnion", file: "json_codec.go"},
+			{repr: "JSON encode envelope (EMIT)", site: "appendUnionBranch", file: "json_codec.go"},
 			{repr: "JSON decode tagged-map wrap (EMIT)", site: "wrapUnion", file: "json_decode.go"},
 			{repr: "resolved union wrap tables (EMIT)", site: "resolveReaderUnion / resolveUnionUnion", file: "resolve.go"},
 			{
@@ -819,7 +819,7 @@ var censusRegistry = []censusQuestion{
 		tells: []censusTell{
 			{pattern: `unionEmitTag`, files: []string{
 				// Definition, its doc heading, and the one call in
-				// appendTaggedUnion.
+				// appendUnionBranch.
 				"json_codec.go",
 				// wrapUnion's call plus the comment naming why it is shared
 				// with the encode side.

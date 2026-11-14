@@ -2773,6 +2773,20 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 							if !bytes.Equal(jsonW, cjson) {
 								t.Fatalf("deep JSON wire differs from bare base:\n got=%s\nwant=%s", jsonW, cjson)
 							}
+							// A union encodes its branch into the output, so a
+							// union value costs no JSON allocation over the
+							// same value outside a union.
+							if strings.HasPrefix(pc.label, "union") && depth == 1 {
+								ptr := pc.input(b, depth).Interface()
+								bare := avro.MustParse(b.avro)
+								buf := make([]byte, 0, 64)
+								for _, opts := range [][]avro.Opt{nil, {avro.TaggedUnions()}} {
+									want := minAllocsPerRun(20, func() { buf, _ = bare.AppendEncodeJSON(buf[:0], ptr, opts...) })
+									if n := minAllocsPerRun(20, func() { buf, _ = s.AppendEncodeJSON(buf[:0], ptr, opts...) }); n != want {
+										t.Errorf("JSON encoding a union value (%d options) allocates %.0f times, and %.0f outside a union", len(opts), n, want)
+									}
+								}
+							}
 						}
 
 						// --- decode parity: every {wire}×{natural,resolved} path

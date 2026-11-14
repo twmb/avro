@@ -1033,11 +1033,11 @@ func appendJSONDefaultUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *
 		if _, err := encodeDefault(nil, val, branch); err != nil {
 			continue
 		}
-		encoded, err := appendAvroJSON(nil, v, branch, cfg, nil, depth+1)
+		out, err := appendUnionBranch(buf, v, node, branch, cfg, nil, depth)
 		if err != nil {
 			return nil, err
 		}
-		return appendUnionBranch(buf, node, branch, encoded, cfg), nil
+		return out, nil
 	}
 	return nil, fmt.Errorf("avro json: union default %s does not match any branch", truncValueForError(val))
 }
@@ -1182,15 +1182,28 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 	return append(buf, '}'), nil
 }
 
-// appendUnionBranch wraps encoded in the tagged form {type_name: value} when
-// cfg.tagged is set and the branch is non-null, holding the "wrap iff
-// non-null" rule in one place for every dispatcher site. The spec
-// defines a union null as bare null, as Java's JsonEncoder.writeIndex does.
-func appendUnionBranch(buf []byte, union, branch *schemaNode, encoded []byte, cfg *optConfig) []byte {
-	if cfg.tagged && branch.kind != "null" {
-		return appendTaggedUnion(buf, union, branch, encoded, cfg.tagLogical)
+// appendUnionBranch appends v encoded as branch, wrapped in the tagged form
+// {type_name: value} when cfg.tagged is set and the branch is non-null,
+// holding the "wrap iff non-null" rule in one place for every dispatcher
+// site. The spec defines a union null as bare null, as Java's
+// JsonEncoder.writeIndex does. We encode into buf itself; on an error the
+// caller still holds its buf, whose length a failed append never changes, and
+// can try the next branch on it.
+func appendUnionBranch(buf []byte, v reflect.Value, union, branch *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
+	tagged := cfg.tagged && branch.kind != "null"
+	if tagged {
+		buf = append(buf, '{')
+		buf = appendJSONString(buf, unionEmitTag(union, branch, cfg.tagLogical))
+		buf = append(buf, ':')
 	}
-	return append(buf, encoded...)
+	out, err := appendAvroJSON(buf, v, branch, cfg, custom, depth+1)
+	if err != nil {
+		return nil, err
+	}
+	if tagged {
+		out = append(out, '}')
+	}
+	return out, nil
 }
 
 func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
@@ -1226,8 +1239,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 		key := iter.Key()
 		if key.Kind() == reflect.String {
 			if branch := findUnionBranch(node, key.String()); branch != nil {
-				inner := iter.Value()
-				encoded, err := appendAvroJSON(nil, inner, branch, cfg, custom, depth+1)
+				out, err := appendUnionBranch(buf, iter.Value(), node, branch, cfg, custom, depth)
 				if err != nil {
 					if errors.Is(err, errTooDeep) {
 						return nil, err
@@ -1236,7 +1248,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 					// matching Encode's serUnion behavior.
 					goto tryAll
 				}
-				return appendUnionBranch(buf, node, branch, encoded, cfg), nil
+				return out, nil
 			}
 		}
 	}
@@ -1246,7 +1258,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 	// []byte against ["null","bytes"] emits null rather than empty bytes.
 	if isNilValue(v) {
 		if branch := unionBranchOfKind(node, "null"); branch != nil {
-			return appendUnionBranch(buf, node, branch, []byte("null"), cfg), nil
+			return append(buf, "null"...), nil
 		}
 	}
 
@@ -1260,9 +1272,9 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 		if branch := unionBranchOfKind(node, name); branch != nil {
 			// Only one branch has this kind, so there is nothing to fall
 			// through *to*: a failure here goes straight to try-each.
-			encoded, err := appendAvroJSON(nil, v, branch, cfg, custom, depth+1)
+			out, err := appendUnionBranch(buf, v, node, branch, cfg, custom, depth)
 			if err == nil {
-				return appendUnionBranch(buf, node, branch, encoded, cfg), nil
+				return out, nil
 			}
 			if errors.Is(err, errTooDeep) {
 				return nil, err
@@ -1283,9 +1295,9 @@ tryAll:
 		if len(node.branches) == 2 && branch.kind == "null" {
 			continue
 		}
-		encoded, err := appendAvroJSON(nil, v, branch, cfg, custom, depth+1)
+		out, err := appendUnionBranch(buf, v, node, branch, cfg, custom, depth)
 		if err == nil {
-			return appendUnionBranch(buf, node, branch, encoded, cfg), nil
+			return out, nil
 		}
 		// We propagate too-deep without trying further branches. The trial
 		// loop would otherwise mask the recursion limit error behind a
@@ -1369,8 +1381,11 @@ func unionStandardNames(branches []*schemaNode) []string {
 // the equivalent value out of deserUnion.logicalNames, which fillUnionTagTables
 // builds with this same rule.
 func unionEmitTag(union, branch *schemaNode, tagLogical bool) string {
+	if !tagLogical {
+		return unionBranchName(branch) // skips building the logical name
+	}
 	bn, ln := unionBranchNames(branch)
-	if !tagLogical || ln == bn {
+	if ln == bn {
 		return bn
 	}
 	for _, b := range union.branches {
@@ -1379,15 +1394,6 @@ func unionEmitTag(union, branch *schemaNode, tagLogical bool) string {
 		}
 	}
 	return ln
-}
-
-func appendTaggedUnion(buf []byte, union, branch *schemaNode, encoded []byte, tagLogical bool) []byte {
-	name := unionEmitTag(union, branch, tagLogical)
-	buf = append(buf, '{')
-	buf = appendJSONString(buf, name)
-	buf = append(buf, ':')
-	buf = append(buf, encoded...)
-	return append(buf, '}')
 }
 
 // unionTagTier is one tier of the union tag namespace: the rule by which a
