@@ -1275,8 +1275,8 @@ func (rd *Reader) readBlock() error {
 		var compressed []byte
 		if allocDeclared(size, rd.src, rd.r) {
 			compressed = make([]byte, int(size))
-			if _, err := io.ReadFull(rd.r, compressed); err != nil {
-				return fmt.Errorf("ocf: reading block data: %w", noEOF(err))
+			if n, err := io.ReadFull(rd.r, compressed); err != nil {
+				return fmt.Errorf("ocf: reading block data (%d of %d bytes): %w", n, size, noEOF(err))
 			}
 		} else {
 			var buf bytes.Buffer
