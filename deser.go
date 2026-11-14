@@ -706,7 +706,16 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		return nil, errTooDeep
 	}
 	sl.depth++
-	defer func() { sl.depth-- }()
+	// While scratch is set, your any target v has a field's value and orig
+	// has yours. We put orig back on an error or a panic.
+	var orig any
+	scratch := false
+	defer func() {
+		sl.depth--
+		if scratch {
+			restoreIface(v, orig)
+		}
+	}()
 	v = indirectAlloc(v)
 	k := v.Kind()
 	if k == reflect.Interface {
@@ -722,12 +731,9 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		//
 		// A field with no fnIface decodes into v itself, so we allocate no
 		// cell for it. From the first such field to the v.Set below, v has nil
-		// or a field's value, and orig has the caller's value: code in
-		// between must read orig, not v, for the caller's value, and every
-		// return in between must first put orig back with restoreIface.
+		// or a field's value: code in between must read orig, not v, for
+		// your value.
 		m := reuseOrMakeStringAnyMap(v, len(s.fields))
-		var orig any
-		scratch := false
 		var err error
 		for i := range s.fields {
 			f := &s.fields[i]
@@ -735,9 +741,6 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 				var val any
 				val, src, err = f.fnIface(src, sl)
 				if err != nil {
-					if scratch {
-						restoreIface(v, orig)
-					}
 					return nil, recordFieldError(nil, f.name, err)
 				}
 				m[f.name] = val
@@ -750,11 +753,11 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 			// map v has, which may be m or another field's map.
 			v.SetZero()
 			if src, err = f.fn(src, v, sl); err != nil {
-				restoreIface(v, orig)
 				return nil, recordFieldError(nil, f.name, err)
 			}
 			m[f.name] = v.Interface()
 		}
+		scratch = false
 		v.Set(reflect.ValueOf(m))
 		return src, nil
 	}

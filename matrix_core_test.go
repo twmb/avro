@@ -12202,6 +12202,14 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 			if err != nil || !bytes.Equal(re, w2) {
 				t.Fatalf("reused tree re-encode: err=%v\n re=%x\n w2=%x", err, re, w2)
 			}
+			// A decode that fails leaves your value in the target. A
+			// truncated wire that still decodes is not checked.
+			if len(w2) > 0 {
+				prev := any("caller")
+				if _, err := s.Decode(w2[:len(w2)-1], &prev); err != nil && prev != "caller" {
+					t.Fatalf("a failed decode left %#v in the target, want the caller's value", prev)
+				}
+			}
 
 			// JSON decode into the same pre-populated map behaves alike.
 			j2, err := s.AppendEncodeJSON(nil, want2)

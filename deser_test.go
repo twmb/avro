@@ -7695,6 +7695,27 @@ func TestCustomTypeErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("decode_panic", func(t *testing.T) {
+		// A panic in Decode leaves your value in an any target.
+		s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"long","logicalType":"money"}}]}`, CustomType{
+			LogicalType: "money",
+			Decode:      func(any, *SchemaNode) (any, error) { panic("boom") },
+		})
+		data, _ := s.Encode(map[string]any{"m": int64(1)})
+		var v any = "caller"
+		func() {
+			defer func() {
+				if r := recover(); r != "boom" {
+					t.Errorf("recovered %v, want the panic from Decode", r)
+				}
+			}()
+			s.Decode(data, &v)
+		}()
+		if v != "caller" {
+			t.Errorf("got %#v, want the caller's value", v)
+		}
+	})
+
 	t.Run("encode_fatal", func(t *testing.T) {
 		myErr := errors.New("encode boom")
 		s, _ := Parse(`{"type":"long","logicalType":"money"}`, CustomType{
