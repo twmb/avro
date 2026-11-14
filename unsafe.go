@@ -1697,46 +1697,72 @@ func udArrayBlocks(
 // udArrayPtrRecord handles array deser for []*T where items are records. We
 // manage the slice with reflect and decode each element through unsafe.
 func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minItemBytes int) udeserfn {
-	innerSize := innerType.Size()
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,
 			func(src []byte, _ reflect.Value, p unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
 				s := *(*[]unsafe.Pointer)(p)
-				// One contiguous allocation backs every nil pointer slot.
-				var need int
-				for i := range n {
-					if s[start+i] == nil {
-						need++
-					}
-				}
-				if need > 0 {
-					backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
-					backingBase := backing.Index(0).Addr().UnsafePointer()
-					j := 0
-					for i := range n {
-						if s[start+i] == nil {
-							s[start+i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
-							j++
-						}
-					}
-				}
-				fast := rec.fastFor(innerType, sl.skipUnknown)
-				useFast := fast != nil && fast.allFast
-				var err error
-				for i := range n {
-					elemP := s[start+i]
-					if useFast {
-						src, err = deserRecordFastPtr(src, fast, elemP, sl)
-					} else {
-						src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem(), sl)
-					}
-					if err != nil {
-						return nil, err
-					}
-				}
-				return src, nil
+				return udPtrRecordBlock(src, rec, innerType, s[start:start+n], sl)
 			})
 	}
+}
+
+// udPtrRecordBlock decodes one record through each *innerType in s. A nil
+// pointer gets new backing, one allocation for every nil pointer in s, and a
+// non-nil pointer is decoded in place.
+func udPtrRecordBlock(src []byte, rec *deserRecord, innerType reflect.Type, s []unsafe.Pointer, sl *slab) ([]byte, error) {
+	var need int
+	for _, p := range s {
+		if p == nil {
+			need++
+		}
+	}
+	if need > 0 {
+		backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
+		backingBase := backing.Index(0).Addr().UnsafePointer()
+		innerSize := innerType.Size()
+		j := 0
+		for i := range s {
+			if s[i] == nil {
+				s[i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
+				j++
+			}
+		}
+	}
+	fast := rec.fastFor(innerType, sl.skipUnknown)
+	useFast := fast != nil && fast.allFast
+	var err error
+	for _, elemP := range s {
+		if useFast {
+			src, err = deserRecordFastPtr(src, fast, elemP, sl)
+		} else {
+			src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem(), sl)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return src, nil
+}
+
+// udRecordBlock decodes one record into each struct of type t in slots
+// [start, start+n) of the slice whose first element is at data, in place.
+func udRecordBlock(src []byte, rec *deserRecord, t reflect.Type, data unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
+	fast := rec.fastFor(t, sl.skipUnknown)
+	useFast := fast != nil && fast.allFast
+	size := t.Size()
+	var err error
+	for i := start; i < start+n; i++ {
+		elemP := unsafe.Add(data, uintptr(i)*size)
+		if useFast {
+			src, err = deserRecordFastPtr(src, fast, elemP, sl)
+		} else {
+			src, err = rec.deser(src, reflect.NewAt(t, elemP).Elem(), sl)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return src, nil
 }
 
 // udArrayDirect handles array deser for []T where items are primitives. We

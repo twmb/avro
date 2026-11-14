@@ -2837,6 +2837,11 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 	// da's was patched by the forward-ref fixup below.
 	itemMin := b.minBytes.minBytesOf(af.node)
 	da := &deserArray{deserItem: af.deser, minItemBytes: itemMin}
+	// The same gate as the unsafe []*record field (tryCompileFieldDeser): a
+	// forward reference is not wired yet, and a custom type wraps deserItem.
+	if !isFwdRef && !af.meta.hasCustomType && af.meta.deserRecord != nil {
+		da.rec = af.meta.deserRecord
+	}
 	// Specialized array ser/deser fast paths bypass the inner
 	// schema's wrapped ser/deser functions. They are correct only
 	// when no per-element conversion is needed: no custom type,

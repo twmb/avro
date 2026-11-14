@@ -847,6 +847,11 @@ type deserArray struct {
 	// bypassing reflect for primitive items. Selected at schema-build
 	// time based on the avro item type. nil for non-primitive items.
 	fastIfaceLoop func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error)
+	// rec is the items' record when deserItem is that record's own deser, with
+	// no custom type wrapped around it. A slice of structs or of single
+	// pointers to structs then decodes each block through the record's
+	// compiled fields, which we look up once per block.
+	rec *deserRecord
 	// minItemBytes is the minimum wire bytes for one encoded item.
 	// Used to tightly bound block counts: count > len(src)/minItemBytes
 	// rejects DoS-sized counts. 0 means items can take 0 wire bytes
@@ -1466,40 +1471,62 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			}
 			continue
 		}
-		elemType := sliceVal.Type().Elem()
-		if elemType.Kind() == reflect.Pointer {
-			innerType := elemType.Elem()
-			// We batch-allocate backing for nil slots only and reuse any
-			// non-nil retained pointer, so an element aliased from a prior
-			// decode is updated in place. That matches the unsafe struct-field
-			// path (udArrayPtrRecord) and the documented pointer-reuse
-			// contract. A slice that grows keeps the pointers it had, since
-			// Grow copies them, so only the new slots get fresh backing.
-			var need int
-			for i := range n {
-				if sliceVal.Index(start + i).IsNil() {
-					need++
-				}
-			}
-			if need > 0 {
-				backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
-				j := 0
-				for i := range n {
-					slot := sliceVal.Index(start + i)
-					if slot.IsNil() {
-						slot.Set(backing.Index(j).Addr())
-						j++
-					}
-				}
+		// The block body is a function of its own so that deser keeps few
+		// enough returns for the compiler to open-code its defer.
+		if src, err = s.typedBlock(src, sliceVal, start, n, sl); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// typedBlock decodes items into slots [start, start+n) of the typed slice
+// sliceVal, whose length is at least start+n.
+func (s *deserArray) typedBlock(src []byte, sliceVal reflect.Value, start, n int, sl *slab) ([]byte, error) {
+	elemType := sliceVal.Type().Elem()
+	if s.rec != nil {
+		data := sliceVal.UnsafePointer()
+		switch {
+		case elemType.Kind() == reflect.Struct:
+			return udRecordBlock(src, s.rec, elemType, data, start, n, sl)
+		case elemType.Kind() == reflect.Pointer && elemType.Elem().Kind() == reflect.Struct:
+			ptrs := unsafe.Slice((*unsafe.Pointer)(data), start+n)[start:]
+			return udPtrRecordBlock(src, s.rec, elemType.Elem(), ptrs, sl)
+		}
+	}
+	if elemType.Kind() == reflect.Pointer {
+		innerType := elemType.Elem()
+		// We batch-allocate backing for nil slots only and reuse any
+		// non-nil retained pointer, so an element aliased from a prior
+		// decode is updated in place. That matches the unsafe struct-field
+		// path (udArrayPtrRecord) and the documented pointer-reuse
+		// contract. A slice that grows keeps the pointers it had, since
+		// Grow copies them, so only the new slots get fresh backing.
+		var need int
+		for i := range n {
+			if sliceVal.Index(start + i).IsNil() {
+				need++
 			}
 		}
-		for i := start; i < newLen; i++ {
-			src, err = s.deserItem(src, sliceVal.Index(i), sl)
-			if err != nil {
-				return nil, err
+		if need > 0 {
+			backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
+			j := 0
+			for i := range n {
+				slot := sliceVal.Index(start + i)
+				if slot.IsNil() {
+					slot.Set(backing.Index(j).Addr())
+					j++
+				}
 			}
 		}
 	}
+	var err error
+	for i := start; i < start+n; i++ {
+		src, err = s.deserItem(src, sliceVal.Index(i), sl)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return src, nil
 }
 
 // isEmptyInterface reports whether t is any or another interface type with no
