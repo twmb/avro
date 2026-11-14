@@ -24033,6 +24033,51 @@ func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 	}
 }
 
+// TestMatrix_JSONUnionFailureKeepsTarget pins that a union value DecodeJSON
+// cannot decode leaves the caller's value in an any target, with and without
+// TaggedUnions: a tagged form whose value decodes but whose object does not
+// close, where the bare fallback then fails too; a record branch that fails
+// partway; and a number no branch holds. The last row decodes, to show the
+// target is written at all.
+func TestMatrix_JSONUnionFailureKeepsTarget(t *testing.T) {
+	rec := `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int"}]}`
+	for _, c := range []struct {
+		name, union, doc string
+		want             any // nil: the decode must fail
+	}{
+		{"tagged then bare fails", `["long",{"type":"map","values":"string"}]`, `{"long":42,"x":1}`, nil},
+		{"record fails partway", `["null",` + rec + `]`, `{"a":1,"b":"x"}`, nil},
+		{"no branch holds the number", `["null","int"]`, `9999999999`, nil},
+		{"decodes", `["null","long"]`, `{"long":42}`, int64(42)},
+	} {
+		for _, opts := range [][]avro.Opt{nil, {avro.TaggedUnions()}} {
+			t.Run(fmt.Sprintf("%s/options=%d", c.name, len(opts)), func(t *testing.T) {
+				s := avro.MustParse(c.union)
+				var out any = "caller"
+				err := s.DecodeJSON([]byte(c.doc), &out, opts...)
+				if c.want == nil {
+					if err == nil {
+						t.Fatalf("DecodeJSON(%s) = %#v, want an error", c.doc, out)
+					}
+					if out != "caller" {
+						t.Errorf("a failed DecodeJSON(%s) left %#v in the target, want the caller's value", c.doc, out)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("DecodeJSON(%s): %v", c.doc, err)
+				}
+				if m, tagged := out.(map[string]any); tagged {
+					out = m["long"]
+				}
+				if out != c.want {
+					t.Errorf("DecodeJSON(%s) = %#v, want %#v", c.doc, out, c.want)
+				}
+			})
+		}
+	}
+}
+
 // minAllocsPerRun returns the fewest allocations one call of f makes over
 // trials calls. Under -race, sync.Pool drops a quarter of the values put back
 // into it, so a call that takes a slab from the pool sometimes allocates a

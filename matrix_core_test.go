@@ -2790,7 +2790,7 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 								}
 								tagged := avrotest.MustAppendEncodeJSON(t, s, nil, ptr, avro.TaggedUnions())
 								logical := avrotest.MustAppendEncodeJSON(t, s, nil, ptr, avro.TaggedUnions(), avro.TagLogicalTypes())
-								decodeAllocs := func(doc []byte, opts ...avro.Opt) float64 {
+								decodeAllocs := func(s *avro.Schema, doc []byte, opts ...avro.Opt) float64 {
 									return minAllocsPerRun(20, func() {
 										var out any
 										if err := s.DecodeJSON(doc, &out, opts...); err != nil {
@@ -2798,8 +2798,16 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 										}
 									})
 								}
-								if n, want := decodeAllocs(logical, avro.TaggedUnions(), avro.TagLogicalTypes()), decodeAllocs(tagged, avro.TaggedUnions()); n != want {
+								if n, want := decodeAllocs(s, logical, avro.TaggedUnions(), avro.TagLogicalTypes()), decodeAllocs(s, tagged, avro.TaggedUnions()); n != want {
 									t.Errorf("DecodeJSON of a union value under TagLogicalTypes allocates %.0f times, and %.0f without it", n, want)
+								}
+								// Without an envelope, DecodeJSON puts a union
+								// value into an any with no allocation over the
+								// same value outside a union.
+								plain := avrotest.MustAppendEncodeJSON(t, s, nil, ptr)
+								barePlain := avrotest.MustAppendEncodeJSON(t, bare, nil, ptr)
+								if n, want := decodeAllocs(s, plain), decodeAllocs(bare, barePlain); n != want {
+									t.Errorf("DecodeJSON of a union value into an any allocates %.0f times, and %.0f outside a union", n, want)
 								}
 							}
 						}

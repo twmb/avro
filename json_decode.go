@@ -1379,7 +1379,23 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 			if branch := findUnionBranch(node, key); branch != nil {
 				if err := ctx.scanner.expect(':'); err == nil {
 					target, toAny := unionTarget(v, branch)
-					if toAny {
+					if ctx.decodesIntoAny(target, toAny) {
+						// The target has the caller's value again unless the
+						// close brace arrives: a malformed `{"long": 42,` puts
+						// the value back and backtracks to the bare fallback.
+						old := target.Interface()
+						target.SetZero()
+						err := ctx.decodeValue(target, branch)
+						if err == nil && ctx.scanner.peek() == '}' {
+							ctx.scanner.pos++
+							return nil
+						}
+						restoreAny(target, old)
+						if errors.Is(err, errTooDeep) || err != nil && unionBranchRecurses(branch.kind) {
+							return err
+						}
+						taggedErr = err
+					} else if toAny {
 						// We decode into a temporary so the target stays
 						// untouched until the close brace arrives; a malformed
 						// `{"long": 42,` would otherwise write it and then
@@ -1441,6 +1457,15 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 // writes the result into v.
 func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, union, branch *schemaNode) error {
 	v, toAny := unionTarget(rawV, branch)
+	if ctx.decodesIntoAny(v, toAny) {
+		old := v.Interface()
+		v.SetZero()
+		if err := ctx.decodeValue(v, branch); err != nil {
+			restoreAny(v, old)
+			return err
+		}
+		return nil
+	}
 	if toAny {
 		var val any
 		if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err != nil {
@@ -1451,6 +1476,23 @@ func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, union, branch *sche
 		return assignAny(v, ctx.wrapUnion(v, val, union, branch), branch.kind)
 	}
 	return ctx.decodeValue(v, branch)
+}
+
+// decodesIntoAny reports whether a union value goes straight into the
+// interface target, where a temporary would cost an allocation per value: v
+// takes any value, and no TaggedUnions envelope wraps the value first. The
+// caller saves v's value and puts it back if the decode fails.
+func (ctx *jsonDecoder) decodesIntoAny(v reflect.Value, toAny bool) bool {
+	return toAny && !ctx.slab.taggedUnions && v.Type().NumMethod() == 0 && v.CanInterface()
+}
+
+// restoreAny puts old back into the interface v.
+func restoreAny(v reflect.Value, old any) {
+	if old == nil {
+		v.SetZero()
+		return
+	}
+	v.Set(reflect.ValueOf(old))
 }
 
 // unionTarget selects the decode target and toAny flag for a matched union
