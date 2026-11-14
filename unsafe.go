@@ -252,20 +252,24 @@ func serRecordFastPtr(dst []byte, fast *fastRecordSer, base unsafe.Pointer, dept
 
 // deserRecordFastPtr deserializes a record whose fields all have unsafe
 // deser fns.
+//
+// We decrement inline rather than defer, as udNullUnionRecord does: every
+// array element of a record runs this. Every post-bump return decrements first.
 func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, sl *slab) ([]byte, error) {
 	if sl.depth >= maxDepth {
 		return nil, errTooDeep
 	}
 	sl.depth++
-	defer func() { sl.depth-- }()
 	var err error
 	for i := range fast.fields {
 		f := &fast.fields[i]
 		src, err = f.deser(src, unsafe.Add(base, f.offset), sl)
 		if err != nil {
+			sl.depth--
 			return nil, recordFieldError(fast.typ, f.name, err)
 		}
 	}
+	sl.depth--
 	return src, nil
 }
 
