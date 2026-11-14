@@ -303,22 +303,9 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 // concrete-target paths split the dispatch at the call site; see
 // deserFixedUUIDReflect for the pattern.
 //
-// Cold paths only. Do *not* use setIface on the hot primitive paths: passing rv
-// across a function boundary loses escape analysis and heap-allocates every
-// reflect.ValueOf(primitive), ~+2 allocs / +330 B per record decode in the
-// bench. Inline the check instead, fast path first so rv exists only on the
-// slow branch:
-//
-//	if v.Type().NumMethod() == 0 {        // empty interface (any), common
-//	    v.Set(reflect.ValueOf(b))
-//	    return nil
-//	}
-//	rv := reflect.ValueOf(b)              // slow path: typed interface
-//	if !rv.Type().AssignableTo(v.Type()) {
-//	    return &SemanticError{GoType: v.Type(), AvroType: "boolean"}
-//	}
-//	v.Set(rv)
-//	return nil
+// setIface allocates nothing on success. Boxing a value into rv may allocate,
+// as it would for an inlined v.Set, so a number decoder boxes its value with
+// boxNum first and hands reflect.ValueOf an any.
 func setIface(v, rv reflect.Value, avroType string) error {
 	if v.Kind() != reflect.Interface {
 		return &SemanticError{GoType: v.Type(), AvroType: avroType}

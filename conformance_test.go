@@ -23891,10 +23891,7 @@ func TestRegression_UnionNonCustomReuseInPlaceUnchanged(t *testing.T) {
 // ---------- slab_free_test.go ----------
 
 // Issue #41: Decode of a slab-free schema (scalar leaf, no custom wiring)
-// bypasses the internal slab pool entirely and runs on a nil *slab. These
-// tests pin the classifier and prove, two-sidedly against the matrix corpus,
-// that the classification exactly matches which compiled desers touch the
-// slab. We reach internal state through the export_test.go bridges.
+// bypasses the internal slab pool entirely and runs on a nil *slab.
 
 // TestScalarDecodeNoAllocAfterGC pins issue #41: Decode of a scalar schema must
 // not allocate even when GC has drained the slab pool. That is the steady

@@ -5247,18 +5247,6 @@ func TestCoverage_RatFromBytesHostileScale(t *testing.T) {
 // two comments agreeing with each other.
 func RaceRelaxedForTest(normal time.Duration) time.Duration { return raceRelaxed(normal) }
 
-// SlabFreeForTest reports the internal slab-free classification: whether
-// Decode bypasses the slab pool and runs this schema's deser on a nil slab.
-func (s *Schema) SlabFreeForTest() bool { return s.slabFree }
-
-// DeserNilSlabForTest drives the compiled deser directly with a nil slab,
-// exactly as Decode does for slab-free schemas, regardless of
-// classification. v must be a non-nil pointer. Used by the slab-free oracle
-// net to prove that classification matches actual slab usage.
-func (s *Schema) DeserNilSlabForTest(src []byte, v any) ([]byte, error) {
-	return s.deser(src, reflect.ValueOf(v).Elem(), nil)
-}
-
 // ---------- fuzz_test.go ----------
 
 // fuzzNamedString / fuzzNamedBytes / fuzzNamedFloat are named-type aliases
