@@ -1679,6 +1679,10 @@ type deserMap struct {
 	// loop. nil for non-primitive value types; the generic reflect path
 	// handles those.
 	fastIfaceVal deserIfaceFn
+	// rec is the values' record when deserItem is that record's own deser,
+	// with no custom type wrapped around it. A struct value then decodes
+	// through the record's compiled fields, which we look up once per block.
+	rec *deserRecord
 	// minEntryBytes is 1 (key length varint, >=1 byte for empty key)
 	// + schemaMinBytes(values). Used to bound block-count against
 	// remaining buffer length, preventing the same memory-amplification
@@ -1810,6 +1814,15 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			continue
 		}
 		keyType := mapTyp.Key()
+		// elemVal comes from reflect.New above, so its address stays the same
+		// for the whole decode.
+		var fast *fastRecordDeser
+		var elemP unsafe.Pointer
+		if s.rec != nil && elemTyp.Kind() == reflect.Struct {
+			if f := s.rec.fastFor(elemTyp, sl.skipUnknown); f != nil && f.allFast {
+				fast, elemP = f, unsafe.Pointer(elemVal.UnsafeAddr())
+			}
+		}
 		for range int(count) {
 			src, err = readMapKey(src, keyVal, sl)
 			if err != nil {
@@ -1818,7 +1831,11 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			if err := validateJSONNumberMapKey(keyVal.String(), keyType, "map"); err != nil {
 				return nil, err
 			}
-			src, err = s.deserItem(src, elemVal, sl)
+			if fast != nil {
+				src, err = deserRecordFastPtr(src, fast, elemP, sl)
+			} else {
+				src, err = s.deserItem(src, elemVal, sl)
+			}
 			if err != nil {
 				return nil, err
 			}

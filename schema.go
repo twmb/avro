@@ -2909,6 +2909,11 @@ func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) err
 	// block-count against remaining-buffer to prevent memory
 	// amplification on hostile input.
 	dm := &deserMap{deserItem: mf.deser, minEntryBytes: mapEntryMinBytes(b.minBytes.minBytesOf(mf.node))}
+	// The same gate as the unsafe []*record field (tryCompileFieldDeser): a
+	// forward reference is not wired yet, and a custom type wraps deserItem.
+	if !isFwdRef && !mf.meta.hasCustomType && mf.meta.deserRecord != nil {
+		dm.rec = mf.meta.deserRecord
+	}
 	// Same gate as the array case above: we skip specialization when
 	// values have a custom type, a logical type, or a forward
 	// reference (the fast-path closure can't capture an unresolved
