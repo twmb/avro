@@ -1377,29 +1377,20 @@ func unionStandardNames(branches []*schemaNode) []string {
 }
 
 // unionEmitTag returns the tag branch emits inside union, under tagLogical.
-// fillUnionTagTables builds every branch's logical tag at parse with the rule
-// below, into the union's tags and into deserUnion.logicalNames, so we read
-// it there and a value never builds "long.timestamp-millis". A union without
-// the table falls to the rule itself.
+// fillUnionTagTables builds every branch's logical tag at parse, into the
+// union's tags and into deserUnion.logicalNames, so we read it there and a
+// value never builds "long.timestamp-millis".
 func unionEmitTag(union, branch *schemaNode, tagLogical bool) string {
 	bn := unionBranchName(branch)
 	if !tagLogical || branch.logical == "" || bn != branch.kind {
-		return bn // no primitive logical qualifier to build or look up
+		return bn // no primitive logical qualifier to look up
 	}
-	if t := union.tags; t != nil && len(t.emit) == len(union.branches) {
-		for i, b := range union.branches {
-			if b == branch {
-				return t.emit[i]
-			}
+	for i, b := range union.branches {
+		if b == branch {
+			return union.tags.emit[i]
 		}
 	}
-	_, ln := unionBranchNames(branch)
-	for _, b := range union.branches {
-		if b != nil && b != branch && unionBranchName(b) == ln {
-			return bn
-		}
-	}
-	return ln
+	return bn
 }
 
 // unionTagTier is one tier of the union tag namespace: the rule by which a
