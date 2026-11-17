@@ -406,7 +406,7 @@ var censusRegistry = []censusQuestion{
 		id:       "Q15",
 		question: "Is this kind a NAMED type (occupies a fullname others can reference), and is it a RECORD?",
 		authority: "isNamedKind / isRecordKind (schema_node.go) are the shared predicates. The same " +
-			"classification is ALSO written as literal case sets in four other files, which is why the " +
+			"classification is ALSO written as literal case sets in three other files, which is why the " +
 			"question is here: those copies cannot call the predicates from inside a switch, so they can " +
 			"only be kept honest by driving the classification's observable consequence",
 		answerers: []censusAnswerer{
@@ -449,7 +449,7 @@ var censusRegistry = []censusQuestion{
 				"compat.go",
 			}},
 			{pattern: `"record", "error"`, files: []string{
-				"schema_node.go", "schema_parse.go", "schema.go",
+				"schema_parse.go", "schema.go",
 			}},
 			// Rejected tell: `== "record"` also matches the recursion question
 			// (json_decode.go's `kind == "record" || kind == "array" || kind
@@ -803,7 +803,7 @@ var censusRegistry = []censusQuestion{
 			"calibration-free and needs no reference: a tag must name exactly one branch, and a value's tagged " +
 			"round trip must land where it started",
 		answerers: []censusAnswerer{
-			{repr: "JSON encode envelope (EMIT)", site: "appendTaggedUnion", file: "json_codec.go"},
+			{repr: "JSON encode envelope (EMIT)", site: "appendUnionBranch", file: "json_codec.go"},
 			{repr: "JSON decode tagged-map wrap (EMIT)", site: "wrapUnion", file: "json_decode.go"},
 			{repr: "resolved union wrap tables (EMIT)", site: "resolveReaderUnion / resolveUnionUnion", file: "resolve.go"},
 			{
@@ -819,7 +819,7 @@ var censusRegistry = []censusQuestion{
 		tells: []censusTell{
 			{pattern: `unionEmitTag`, files: []string{
 				// Definition, its doc heading, and the one call in
-				// appendTaggedUnion.
+				// appendUnionBranch.
 				"json_codec.go",
 				// wrapUnion's call plus the comment naming why it is shared
 				// with the encode side.
@@ -5246,18 +5246,6 @@ func TestCoverage_RatFromBytesHostileScale(t *testing.T) {
 // why the rule was duplicated. The sharing is explicit here rather than left to
 // two comments agreeing with each other.
 func RaceRelaxedForTest(normal time.Duration) time.Duration { return raceRelaxed(normal) }
-
-// SlabFreeForTest reports the internal slab-free classification: whether
-// Decode bypasses the slab pool and runs this schema's deser on a nil slab.
-func (s *Schema) SlabFreeForTest() bool { return s.slabFree }
-
-// DeserNilSlabForTest drives the compiled deser directly with a nil slab,
-// exactly as Decode does for slab-free schemas, regardless of
-// classification. v must be a non-nil pointer. Used by the slab-free oracle
-// net to prove that classification matches actual slab usage.
-func (s *Schema) DeserNilSlabForTest(src []byte, v any) ([]byte, error) {
-	return s.deser(src, reflect.ValueOf(v).Elem(), nil)
-}
 
 // ---------- fuzz_test.go ----------
 

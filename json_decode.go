@@ -10,14 +10,14 @@ import (
 	"unsafe"
 )
 
-func decodeLogicalInt(val int32, node *schemaNode) any {
+func decodeLogicalInt(val int32, node *schemaNode, sl *slab) any {
 	switch node.logical {
 	case "date":
 		return dateToTime(val)
 	case "time-millis":
-		return timeMillisToDuration(val)
+		return boxNum(sl, timeMillisToDuration(val))
 	}
-	return val
+	return boxNum(sl, val)
 }
 
 // timestampToTimeConv returns the wire-int64 to time.Time converter for the
@@ -38,14 +38,18 @@ func timestampToTimeConv(logical string) (func(int64) time.Time, bool) {
 // decodeLogicalLong converts long-backed logicals for an *any target. It errors
 // only for time-micros, when val * time.Microsecond would wrap; the timestamp
 // conversions are total.
-func decodeLogicalLong(val int64, node *schemaNode) (any, error) {
+func decodeLogicalLong(val int64, node *schemaNode, sl *slab) (any, error) {
 	if conv, ok := timestampToTimeConv(node.logical); ok {
 		return conv(val), nil
 	}
 	if node.logical == "time-micros" {
-		return timeMicrosToDuration(val)
+		d, err := timeMicrosToDuration(val)
+		if err != nil {
+			return nil, err
+		}
+		return boxNum(sl, d), nil
 	}
-	return val, nil
+	return boxNum(sl, val), nil
 }
 
 // decodeLogicalBytes converts bytes-backed logicals for an *any target,
@@ -78,10 +82,10 @@ func jsonDecodeAppliesLogical(node *schemaNode) bool {
 	}
 	switch node.kind {
 	case "int":
-		_, raw := decodeLogicalInt(0, node).(int32)
+		_, raw := decodeLogicalInt(0, node, nil).(int32)
 		return !raw
 	case "long":
-		v, err := decodeLogicalLong(0, node)
+		v, err := decodeLogicalLong(0, node, nil)
 		if err != nil { // only a transforming arm (time-micros) can error
 			return true
 		}
@@ -165,7 +169,7 @@ func (ctx *jsonDecoder) consumeSlabString() (string, error) {
 
 // jsonDecoder is the state for schema-guided JSON decoding.
 type jsonDecoder struct {
-	scanner *jsonScanner
+	scanner jsonScanner
 	// slab carries the decode options as well as the string arena, since a
 	// field filled from its default routes through the binary deser fn, which
 	// reads the options off the slab.
@@ -352,9 +356,9 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny, raw 
 	}
 	if toAny {
 		if raw {
-			return setIface(v, reflect.ValueOf(val), "int")
+			return setIface(v, reflect.ValueOf(boxNum(ctx.slab, val)), "int")
 		}
-		return setIface(v, reflect.ValueOf(decodeLogicalInt(val, node)), "int")
+		return setIface(v, reflect.ValueOf(decodeLogicalInt(val, node, ctx.slab)), "int")
 	}
 	if raw {
 		// A matching no-Decode CustomType suppressed the logical: assign the
@@ -400,9 +404,9 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny, raw
 	}
 	if toAny {
 		if raw {
-			return setIface(v, reflect.ValueOf(val), "long")
+			return setIface(v, reflect.ValueOf(boxNum(ctx.slab, val)), "long")
 		}
-		logical, err := decodeLogicalLong(val, node)
+		logical, err := decodeLogicalLong(val, node, ctx.slab)
 		if err != nil {
 			return err
 		}
@@ -484,12 +488,12 @@ func (ctx *jsonDecoder) decodeJSONFloat(bitSize int, typ string) (float64, error
 			return 0, err
 		}
 		return parseSpecialFloat(s)
-	case isJSONNullStart(ctx.scanner, p):
+	case isJSONNullStart(&ctx.scanner, p):
 		if err := ctx.scanner.consumeNull(); err != nil {
 			return 0, err
 		}
 		return math.NaN(), nil
-	case isBareSpecialFloatStart(ctx.scanner, p):
+	case isBareSpecialFloatStart(&ctx.scanner, p):
 		tok, err := ctx.scanner.consumeBareSpecialFloat()
 		if err != nil {
 			return 0, err
@@ -516,7 +520,7 @@ func (ctx *jsonDecoder) decodeFloat(v reflect.Value) error {
 	if err != nil {
 		return err
 	}
-	return setFloatValue(v, f, "float", 32)
+	return setFloatValue(v, f, "float", 32, ctx.slab)
 }
 
 func (ctx *jsonDecoder) decodeDouble(v reflect.Value) error {
@@ -524,7 +528,7 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value) error {
 	if err != nil {
 		return err
 	}
-	return setFloatValue(v, f, "double", 64)
+	return setFloatValue(v, f, "double", 64, ctx.slab)
 }
 
 func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny, raw bool) error {
@@ -1077,10 +1081,14 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 	seen := make([]bool, len(node.fields))
 	// We track which JSON key claimed each field, so a name and its alias
 	// both appearing in one object error rather than silently overwrite.
-	seenKey := make([]string, len(node.fields))
+	// Most objects spell every field by its name, so we make seenKey only
+	// at the first key that is not its field's name. Until then, every seen
+	// field was claimed by its name.
+	var seenKey []string
 	if ctx.scanner.peek() != '}' {
 		for {
-			// The key is only looked up and quoted in errors, never stored.
+			// The key aliases src and stays out of the output: we look it
+			// up, quote it in errors, and keep it in seenKey until we return.
 			key, err := ctx.scanner.consumeStringZeroCopy()
 			if err != nil {
 				return err
@@ -1101,12 +1109,28 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 			} else {
 				// The same key appearing twice is last-wins, matching Java,
 				// fastavro, and encoding/json on duplicate keys.
-				if seen[idx] && seenKey[idx] != key {
-					return fmt.Errorf("avro json: record %q field %q resolved from both %q and %q in the same JSON object",
-						truncForError(node.name), truncForError(node.fields[idx].name), truncForError(seenKey[idx]), truncForError(key))
+				if seen[idx] {
+					prev := node.fields[idx].name
+					if seenKey != nil {
+						prev = seenKey[idx]
+					}
+					if prev != key {
+						return fmt.Errorf("avro json: record %q field %q resolved from both %q and %q in the same JSON object",
+							truncForError(node.name), truncForError(node.fields[idx].name), truncForError(prev), truncForError(key))
+					}
 				}
 				seen[idx] = true
-				seenKey[idx] = key
+				if seenKey == nil && key != node.fields[idx].name {
+					seenKey = make([]string, len(node.fields))
+					for i, s := range seen {
+						if s {
+							seenKey[i] = node.fields[i].name
+						}
+					}
+				}
+				if seenKey != nil {
+					seenKey[idx] = key
+				}
 				if err := handle(idx, key); err != nil {
 					return err
 				}
@@ -1308,7 +1332,7 @@ func (ctx *jsonDecoder) decodeUnion(v reflect.Value, node *schemaNode) error {
 	// indirectAlloc so a *T target stays nil. Java and fastavro both reject
 	// null when the union has no null branch. isJSONNullStart tells null
 	// from a bare special-float token.
-	if isJSONNullStart(ctx.scanner, p) {
+	if isJSONNullStart(&ctx.scanner, p) {
 		hasNull := false
 		for _, br := range node.branches {
 			if br.kind == "null" {
@@ -1355,7 +1379,23 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 			if branch := findUnionBranch(node, key); branch != nil {
 				if err := ctx.scanner.expect(':'); err == nil {
 					target, toAny := unionTarget(v, branch)
-					if toAny {
+					if ctx.decodesIntoAny(target, toAny) {
+						// The target has the caller's value again unless the
+						// close brace arrives: a malformed `{"long": 42,` puts
+						// the value back and backtracks to the bare fallback.
+						old := target.Interface()
+						target.SetZero()
+						err := ctx.decodeValue(target, branch)
+						if err == nil && ctx.scanner.peek() == '}' {
+							ctx.scanner.pos++
+							return nil
+						}
+						restoreAny(target, old)
+						if errors.Is(err, errTooDeep) || err != nil && unionBranchRecurses(branch.kind) {
+							return err
+						}
+						taggedErr = err
+					} else if toAny {
 						// We decode into a temporary so the target stays
 						// untouched until the close brace arrives; a malformed
 						// `{"long": 42,` would otherwise write it and then
@@ -1417,6 +1457,15 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 // writes the result into v.
 func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, union, branch *schemaNode) error {
 	v, toAny := unionTarget(rawV, branch)
+	if ctx.decodesIntoAny(v, toAny) {
+		old := v.Interface()
+		v.SetZero()
+		if err := ctx.decodeValue(v, branch); err != nil {
+			restoreAny(v, old)
+			return err
+		}
+		return nil
+	}
 	if toAny {
 		var val any
 		if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err != nil {
@@ -1427,6 +1476,23 @@ func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, union, branch *sche
 		return assignAny(v, ctx.wrapUnion(v, val, union, branch), branch.kind)
 	}
 	return ctx.decodeValue(v, branch)
+}
+
+// decodesIntoAny reports whether a union value goes straight into the
+// interface target, where a temporary would cost an allocation per value: v
+// takes any value, and no TaggedUnions envelope wraps the value first. The
+// caller saves v's value and puts it back if the decode fails.
+func (ctx *jsonDecoder) decodesIntoAny(v reflect.Value, toAny bool) bool {
+	return toAny && !ctx.slab.taggedUnions && v.Type().NumMethod() == 0 && v.CanInterface()
+}
+
+// restoreAny puts old back into the interface v.
+func restoreAny(v reflect.Value, old any) {
+	if old == nil {
+		v.SetZero()
+		return
+	}
+	v.Set(reflect.ValueOf(old))
 }
 
 // unionTarget selects the decode target and toAny flag for a matched union

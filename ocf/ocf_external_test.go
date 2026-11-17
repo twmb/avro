@@ -215,7 +215,7 @@ func (lenZeroReader) Len() int { return 0 }
 // within the default cap, and an incremental read above it. The source
 // axis is how the caller's reader can answer: a Len method, a regular file, a
 // stream that cannot say, and a Len that under-reports. What the reader says
-// picks how we read and never whether we accept.
+// picks how we read and never whether we accept, nor what the error says.
 func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 	// A valid header for "long", reused for its embedded 16-byte sync marker.
 	var hb bytes.Buffer
@@ -285,6 +285,7 @@ func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 		{"block 48 MiB, default cap", block(48 << 20), nil, false},
 		{"avro.schema 48 MiB", header("avro.schema", 48<<20), nil, false},
 	} {
+		texts := make(map[string]string)
 		for _, src := range sources {
 			t.Run("absent/"+tc.name+"/"+src.name, func(t *testing.T) {
 				in := src.open(t, tc.file)
@@ -300,6 +301,7 @@ func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 				if err == nil {
 					t.Fatal("expected an error for a declared size with no payload, got nil")
 				}
+				texts[src.name] = err.Error()
 				// A read that makes the declared size up front shows as a
 				// TotalAlloc delta near that size. Within the default cap,
 				// only a reader that says how much is left avoids it.
@@ -307,6 +309,11 @@ func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 					t.Errorf("a %d-byte file allocated %d bytes: the declared size was allocated before its bytes arrived", len(tc.file), alloc)
 				}
 			})
+		}
+		for name, text := range texts {
+			if want := texts[sources[0].name]; text != want {
+				t.Errorf("%s: the error depends on the reader:\n  %s: %s\n  %s: %s", tc.name, sources[0].name, want, name, text)
+			}
 		}
 	}
 

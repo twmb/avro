@@ -1372,10 +1372,11 @@ func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte
 }
 
 // udNullUnionEnter is the shared preamble for udNullUnionPtr and
-// udNullUnionRecord: read the union index, nil out *T on the null branch,
-// allocate inner storage on the value branch. On isNull you return src
-// directly, since we already zeroed the pointer field; otherwise pp points at
-// fresh inner storage for your branch decoder to fill.
+// udNullUnionRecord: read the union index, nil out *T on the null branch, and
+// on the value branch keep a non-nil *T or allocate one. On isNull you return
+// src directly, since we already zeroed the pointer field; otherwise pp points
+// at the T for your branch decoder to fill, which is the caller's own T when
+// the pointer was already set.
 func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valIdx int, nullByte, valByte byte) (pp unsafe.Pointer, rest []byte, isNull bool, err error) {
 	isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
 	if err != nil {
@@ -1394,8 +1395,9 @@ func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valI
 	return pp, src, false, nil
 }
 
-// udNullUnionPtr handles null-union deser for *T where T has a primitive
-// unsafe deserializer.
+// udNullUnionPtr handles null-union deser for *T where T has a compiled
+// field decoder, inner: a primitive, a string, bytes, a logical type, or an
+// array.
 //
 // The union is a schema node and bumps sl.depth once, like the reflect
 // deserNullUnionAt, the general deserUnion.deser, and the encode side
@@ -1765,8 +1767,10 @@ func udRecordBlock(src []byte, rec *deserRecord, t reflect.Type, data unsafe.Poi
 	return src, nil
 }
 
-// udArrayDirect handles array deser for []T where items are primitives. We
-// manage the slice with reflect and decode each element through unsafe.
+// udArrayDirect handles array deser for []T where T has a compiled field
+// decoder, inner: a primitive, a string, bytes, a logical type, a null union,
+// or another array. We manage the slice with reflect and decode each element
+// through inner.
 func udArrayDirect(inner udeserfn, elemSize uintptr, sliceType reflect.Type, minItemBytes int) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,

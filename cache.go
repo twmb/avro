@@ -218,13 +218,20 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 // unmarshalAnyPreservePrecision + json.Marshal, tracking namespace scope so
 // references resolve to the right fullname.
 
+// avroNamedRef reports whether typ, the "type" value of an object, names a
+// type rather than a kind: {"type":"Node"} references Node, and
+// {"type":"array"} declares an array. No object declares a union, so
+// {"type":"union"} references a type named "union", as in Java.
 func avroNamedRef(typ string) bool {
-	switch typ {
-	case "null", "boolean", "int", "long", "float", "double", "bytes", "string",
-		"record", "enum", "array", "map", "union", "fixed", "error":
-		return false
-	}
-	return typ != ""
+	return !isComplexKind(typ) && avroBareRef(typ)
+}
+
+// avroBareRef reports whether typ, a bare string schema, names a type. Every
+// string but a primitive's name does, a complex kind's name included, as the
+// parser reads it.
+func avroBareRef(typ string) bool {
+	_, prim := serPrimitive[typ]
+	return typ != "" && !prim
 }
 
 // treeScope resolves a raw named-type object's fullname and the namespace
@@ -293,7 +300,7 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[string]bool) any {
 	switch v := node.(type) {
 	case string:
-		if !avroNamedRef(v) {
+		if !avroBareRef(v) {
 			return v
 		}
 		var keys [2]string
@@ -378,7 +385,13 @@ func inlineNodeChildren(v map[string]any, ns string, defs map[string]any, seen, 
 		v[key] = inlineTreeDefs(v[key], scope, defs, seen, inlined)
 	}
 	walkNodeChildren(v, ns, nodeChildScope(v, ns), nodeChildVisitor{
-		typeValue: spliceAt,
+		// A string "type" here is the node's kind or a primitive, since
+		// inlineTreeDefs returned before this for a wrapped reference.
+		typeValue: func(key, scope string) {
+			if _, ok := v[key].(string); !ok {
+				spliceAt(key, scope)
+			}
+		},
 		field: func(_ int, fo map[string]any, typeKey, scope string) {
 			fo[typeKey] = inlineTreeDefs(fo[typeKey], scope, defs, seen, inlined)
 		},
@@ -412,7 +425,7 @@ func inlineNodeChildren(v map[string]any, ns string, defs map[string]any, seen, 
 // shares the limitation.
 func dupDefRef(fullname, ns string, seen map[string]bool) (string, bool) {
 	// The "" fullname (a keyless definition with no namespace in scope) has
-	// no reference spelling, since avroNamedRef rejects the empty string.
+	// no reference spelling, since avroBareRef rejects the empty string.
 	if fullname == "" || !seen[fullname] {
 		return "", false
 	}

@@ -144,9 +144,10 @@ var numSlabOK = func() bool {
 	return boxed == any(want)
 }()
 
-// numLike is a number type we decode into an any.
+// numLike is a number type we decode into an any. ~int64 takes in
+// time.Duration, the any value of a time-millis or time-micros.
 type numLike interface {
-	int32 | int64 | float32 | float64
+	int32 | ~int64 | float32 | float64
 }
 
 // boxNum returns v in an any, as any(v) does. any(v) allocates for each
@@ -556,7 +557,7 @@ func setFloat32WireValue(v reflect.Value, u uint32) error {
 		*(*uint32)(unsafe.Pointer(v.UnsafeAddr())) = u
 		return nil
 	}
-	return setFloatValue(v, float64(math.Float32frombits(u)), "float", 32)
+	return setFloatValue(v, float64(math.Float32frombits(u)), "float", 32, nil)
 }
 
 func deserFloat(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -578,7 +579,7 @@ func deserDouble(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if v = indirectAlloc(v); v.Kind() == reflect.Interface {
 		return src, setIface(v, reflect.ValueOf(boxNum(sl, math.Float64frombits(u))), "double")
 	}
-	return src, setFloatValue(v, math.Float64frombits(u), "double", 64)
+	return src, setFloatValue(v, math.Float64frombits(u), "double", 64, nil)
 }
 
 func deserBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -1899,16 +1900,14 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	// For interface targets with primitive avro values, use the
 	// iface-block fast path that operates directly on map[string]any.
 	useFastIface := iface && s.fastIfaceVal != nil
-	// We pre-allocate reusable key and elem containers to avoid per-entry
-	// reflect.ValueOf / reflect.New allocations. keyVal gets your actual map
-	// key type (e.g. `type UserID string`); reusing this Value for SetMapIndex
-	// avoids the panic that plain reflect.ValueOf(s) would fire when the map's
-	// key is a named string subtype.
+	// The reflect loops below reuse one key and one elem container to avoid
+	// per-entry reflect.ValueOf / reflect.New allocations. keyVal gets your
+	// actual map key type (e.g. `type UserID string`); reusing this Value for
+	// SetMapIndex avoids the panic that plain reflect.ValueOf(s) would fire
+	// when the map's key is a named string subtype. We allocate both on the
+	// first block that needs them, because an empty map and the native and
+	// iface loops never use them.
 	var keyVal, elemVal reflect.Value
-	if !useFastIface {
-		keyVal = reflect.New(mapTyp.Key()).Elem()
-		elemVal = reflect.New(elemTyp).Elem()
-	}
 	var err error
 	for {
 		count, _, rest, end, headerErr := readBlockHeader(src, "map", false)
@@ -1956,6 +1955,10 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			}
 			useFastNative = false // named map type: fall back to fastBlock henceforth
 		}
+		if !useFastIface && !keyVal.IsValid() {
+			keyVal = reflect.New(mapTyp.Key()).Elem()
+			elemVal = reflect.New(elemTyp).Elem()
+		}
 		if useFast {
 			src, err = s.fastBlock(src, mapVal, keyVal, elemVal, int(count), sl)
 			if err != nil {
@@ -1975,7 +1978,7 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			continue
 		}
 		keyType := mapTyp.Key()
-		// elemVal comes from reflect.New above, so its address stays the same
+		// elemVal comes from one reflect.New, so its address stays the same
 		// for the whole decode.
 		var fast *fastRecordDeser
 		var elemP unsafe.Pointer
@@ -2387,16 +2390,17 @@ func formatToStringKindTarget(v reflect.Value, content, avroType string) (wrote 
 // and json.Number targets. bits is the source width, 32 or 64. Every
 // float-emitting deserializer shares it, so the target set stays uniform. We
 // reject non-finite floats for integer and json.Number targets, neither of
-// which can hold them; decode into a typed float if you need them.
-func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error {
+// which can hold them; decode into a typed float if you need them. An
+// interface target gets the number boxed from sl, which may be nil.
+func setFloatValue(v reflect.Value, f float64, avroType string, bits int, sl *slab) error {
 	if v.Kind() == reflect.Interface {
-		var rv reflect.Value
+		var boxed any
 		if bits == 32 {
-			rv = reflect.ValueOf(float32(f))
+			boxed = boxNum(sl, float32(f))
 		} else {
-			rv = reflect.ValueOf(f)
+			boxed = boxNum(sl, f)
 		}
-		return setIface(v, rv, avroType)
+		return setIface(v, reflect.ValueOf(boxed), avroType)
 	}
 	if v.CanFloat() {
 		if bits == 64 && v.Kind() == reflect.Float32 && finiteFloat32Overflows(f) {
@@ -2643,10 +2647,11 @@ func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 // the documented target matrix: Interface->Duration; durationType->Duration;
 // timeType->time.Time at epoch UTC via timeOfDayToTime; integer fallback
 // -> setIntValue. Shared by binary deserTimeMillis and JSON decodeInt's
-// time-millis arm (and udTimeMillisTime for the time-target unsafe path).
-func setTimeMillisTarget(v reflect.Value, val int32) error {
+// time-millis arm (and udTimeMillisTime for the time-target unsafe path). An
+// interface target gets the Duration boxed from sl, which may be nil.
+func setTimeMillisTarget(v reflect.Value, val int32, sl *slab) error {
 	if v.Kind() == reflect.Interface {
-		return setIface(v, reflect.ValueOf(timeMillisToDuration(val)), "int")
+		return setIface(v, reflect.ValueOf(boxNum(sl, timeMillisToDuration(val))), "int")
 	}
 	if v.Type() == durationType {
 		v.Set(reflect.ValueOf(timeMillisToDuration(val)))
@@ -2662,7 +2667,7 @@ func setTimeMillisTarget(v reflect.Value, val int32) error {
 // setTimeMicrosTarget mirrors setTimeMillisTarget for int64 time-micros.
 // The overflow guard lives in timeMicrosToDuration so every caller
 // (binary, unsafe, JSON-any, JSON-typed) rejects out-of-range uniformly.
-func setTimeMicrosTarget(v reflect.Value, val int64) error {
+func setTimeMicrosTarget(v reflect.Value, val int64, sl *slab) error {
 	if v.Type() == durationType || v.Type() == timeType || v.Kind() == reflect.Interface {
 		d, err := timeMicrosToDuration(val)
 		if err != nil {
@@ -2674,7 +2679,7 @@ func setTimeMicrosTarget(v reflect.Value, val int64) error {
 		case v.Type() == timeType:
 			v.Set(reflect.ValueOf(timeOfDayToTime(d)))
 		default:
-			return setIface(v, reflect.ValueOf(d), "long")
+			return setIface(v, reflect.ValueOf(boxNum(sl, d)), "long")
 		}
 		return nil
 	}
@@ -2686,7 +2691,7 @@ func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return src, setTimeMillisTarget(indirectAlloc(v), val)
+	return src, setTimeMillisTarget(indirectAlloc(v), val, sl)
 }
 
 func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -2694,7 +2699,7 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return src, setTimeMicrosTarget(indirectAlloc(v), val)
+	return src, setTimeMicrosTarget(indirectAlloc(v), val, sl)
 }
 
 func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {

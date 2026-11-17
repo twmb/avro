@@ -6830,6 +6830,217 @@ func TestMatrix_EmptyNameComponentCompatResolveAgree(t *testing.T) {
 	t.Logf("cells: %d", cells)
 }
 
+// TestMatrix_NamelessKindObjectIgnoresStrayKeys crosses a nameless object
+// whose "type" is a complex kind over the keys its kind does not bind, with
+// and without the kind's own key, under the default validator and one that
+// accepts the empty name, with and without a type named after the kind in
+// scope. The object declares its kind whatever else it carries, as the spec,
+// Java, and fastavro read it, so a stray key is inert: the object and its
+// stray-free twin must parse to the same verdict and the same canonical form.
+// A type named after the kind must never turn the object into a reference to
+// that type.
+func TestMatrix_NamelessKindObjectIgnoresStrayKeys(t *testing.T) {
+	own := map[string]string{
+		"record": `"fields":[]`, "error": `"fields":[]`, "enum": `"symbols":[]`,
+		"fixed": `"size":0`, "array": `"items":"int"`, "map": `"values":"int"`,
+	}
+	strays := []struct{ key, body string }{
+		{"fields", `[{"name":"x","type":"int"}]`}, {"symbols", `["S"]`}, {"size", `4`},
+		{"items", `"long"`}, {"values", `"long"`},
+	}
+	var cells, accepted, refused int
+	for _, kind := range []string{"record", "error", "enum", "fixed", "array", "map"} {
+		named := fmt.Sprintf(`{"name":"a","type":{"type":"fixed","name":%q,"size":2}},`, kind)
+		if kind == "fixed" {
+			named = `{"name":"a","type":{"type":"enum","name":"fixed","symbols":["A"]}},`
+		}
+		for _, scope := range []string{"", named} {
+			for _, withOwn := range []bool{false, true} {
+				twin := fmt.Sprintf(`{"type":%q`, kind)
+				if withOwn {
+					twin += "," + own[kind]
+				}
+				for _, st := range strays {
+					if strings.HasPrefix(own[kind], `"`+st.key+`"`) {
+						continue
+					}
+					obj := twin + fmt.Sprintf(`,%q:%s}`, st.key, st.body)
+					wrap := func(b string) string {
+						return `{"type":"record","name":"R","fields":[` + scope + `{"name":"b","type":` + b + `}]}`
+					}
+					for _, opt := range []struct {
+						name string
+						opts []avro.SchemaOpt
+					}{{"strict", nil}, {"lax", []avro.SchemaOpt{laxAny}}} {
+						cells++
+						name := fmt.Sprintf("%s/scope=%v/own=%v/%s/%s", kind, scope != "", withOwn, st.key, opt.name)
+						s, err := avro.Parse(wrap(obj), opt.opts...)
+						tw, twErr := avro.Parse(wrap(twin+"}"), opt.opts...)
+						if (err == nil) != (twErr == nil) {
+							t.Errorf("%s: the stray key changed the verdict\n  with:    %v\n  without: %v", name, err, twErr)
+							continue
+						}
+						if err != nil {
+							refused++
+							continue
+						}
+						accepted++
+						if !bytes.Equal(s.Canonical(), tw.Canonical()) {
+							t.Errorf("%s: the stray key changed the schema\n  with:    %s\n  without: %s", name, s.Canonical(), tw.Canonical())
+						}
+						if scope != "" && strings.Contains(string(tw.Canonical()), fmt.Sprintf(`{"name":"b","type":%q}`, kind)) {
+							t.Errorf("%s: the nameless object became a reference to the type named %q: %s", name, kind, tw.Canonical())
+						}
+					}
+				}
+			}
+		}
+	}
+	// The net must see both verdicts, or its axes collapsed: the default
+	// validator refuses every nameless named kind, and the lax one accepts
+	// them.
+	if accepted < 40 || refused < 40 {
+		t.Fatalf("the net collapsed: %d cells, %d accepted, %d refused", cells, accepted, refused)
+	}
+}
+
+// TestMatrix_KindNamedTypeReferences takes every kindNamedCell, a type named
+// after a complex kind or "union" and referenced by its bare name, and holds
+// the reference to Root().Schema(), to a field type extracted from Root() and
+// converted on its own, and to ExpandReferences. A recursive cell also
+// extracts the type's reference to itself. The type named "union" is also
+// referenced wrapped, alone or with a doc or a custom property, since no
+// object declares a union. fastavro rejects a wrapped reference, so the
+// acceptance cells leave these spellings out. The oracle is the same cell
+// with the type renamed, so that no kind name is involved, and the rebuilt
+// schema must also keep the parsed canonical form and fingerprint.
+func TestMatrix_KindNamedTypeReferences(t *testing.T) {
+	cells := kindNamedCells()
+	for _, c := range kindNamedCells() {
+		if c.kind != "union" {
+			continue
+		}
+		for _, wrapped := range []string{`{"type":"%s"}`, `{"type":"%s","doc":"x"}`, `{"type":"%s","foo":"bar"}`} {
+			w := c
+			w.use = strings.Replace(c.use, `"%s"`, wrapped, 1)
+			cells = append(cells, w)
+		}
+	}
+	for _, c := range cells {
+		twinName := "Z" + c.kind
+		// back renames the twin's type in its text, so the two texts compare.
+		back := func(s string) string { return strings.ReplaceAll(s, twinName, c.kind) }
+		name := fmt.Sprintf("%s/ns=%q/recursive=%v/%s", c.kind, c.ns, c.recursive, fmt.Sprintf(c.use, "T"))
+		s, tw := avro.MustParse(c.schema(c.kind)), avro.MustParse(c.schema(twinName))
+		surfaces := map[string]func(root *avro.SchemaNode) (*avro.Schema, error){
+			"rebuild": func(root *avro.SchemaNode) (*avro.Schema, error) { return root.Schema() },
+			"extract": func(root *avro.SchemaNode) (*avro.Schema, error) { return (&root.Fields[1].Type).Schema() },
+			"expand": func(root *avro.SchemaNode) (*avro.Schema, error) {
+				return root.ExpandReferences().Fields[1].Type.Schema()
+			},
+		}
+		if c.recursive {
+			surfaces["extract self-reference"] = func(root *avro.SchemaNode) (*avro.Schema, error) {
+				return (&root.Fields[0].Type.Fields[0].Type).Schema()
+			}
+		}
+		for label, surface := range surfaces {
+			got, err := surface(s.Root())
+			if err != nil {
+				t.Errorf("%s: %s: %v", name, label, err)
+				continue
+			}
+			want, err := surface(tw.Root())
+			if err != nil {
+				t.Fatalf("%s: %s of the renamed twin: %v", name, label, err)
+			}
+			if g, w := got.String(), back(want.String()); g != w {
+				t.Errorf("%s: %s gave a different schema than the renamed twin:\n  got  %s\n  want %s", name, label, g, w)
+			}
+			if label == "rebuild" && (!bytes.Equal(got.Canonical(), s.Canonical()) || !bytes.Equal(got.Fingerprint(avro.NewRabin()), s.Fingerprint(avro.NewRabin()))) {
+				t.Errorf("%s: rebuild changed the canonical form:\n  got  %s\n  want %s", name, got.Canonical(), s.Canonical())
+			}
+		}
+	}
+
+	// A node extracted from Root() converts in the null namespace. A field
+	// type that is not a named record can hold both a definition and a
+	// reference to it by short name, which then binds nothing in a namespaced
+	// parent, or binds a decoy: a type with the same short name in the null
+	// namespace. The decoy sits in "other" for a parent in the null namespace,
+	// where the short name binds the definition either way. The extracted node,
+	// converted and expanded, must keep the schema it has inside its parent, as
+	// Java and fastavro keep it. We cut that schema out of the parent's
+	// canonical form, since a renamed twin is an ordinary name in the same
+	// position. "Z" is that ordinary name. Where the definition is outside the
+	// field, the oracle is the field with the definition written at the
+	// reference. The reference sits in a map where the type is named "array",
+	// since a union cannot hold both a type named "array" and an array.
+	field := func(s *avro.Schema, name string) *avro.Schema {
+		var parent struct {
+			Fields []struct{ Type json.RawMessage }
+		}
+		if err := json.Unmarshal(s.Canonical(), &parent); err != nil || len(parent.Fields) == 0 {
+			t.Fatalf("%s: cannot read the field out of the parent's canonical form: %v", name, err)
+		}
+		return avro.MustParse(string(parent.Fields[len(parent.Fields)-1].Type))
+	}
+	for _, kind := range []string{"record", "error", "enum", "fixed", "array", "map", "union", "Z"} {
+		refTo := func(items string) string {
+			if kind == "array" {
+				return `{"type":"map","values":` + items + `}`
+			}
+			return `{"type":"array","items":` + items + `}`
+		}
+		ref := refTo(fmt.Sprintf("%q", kind))
+		for _, ns := range []string{"", "ns"} {
+			nsAttr, decoyNS := "", "other"
+			if ns != "" {
+				nsAttr, decoyNS = fmt.Sprintf(`"namespace":%q,`, ns), ""
+			}
+			decoy := fmt.Sprintf(`{"type":"fixed","name":%q,"namespace":%q,"size":3}`, kind, decoyNS)
+			for _, recursive := range []bool{false, true} {
+				def := kindNamedCell{kind: kind, ns: ns, recursive: recursive}.def(kind)
+				for _, place := range []string{"alone", "decoy", "decoy, definition outside"} {
+					for _, holder := range []string{`[%s]`, `{"type":"array","items":[%s]}`, `{"type":"map","values":[%s]}`} {
+						record := func(fields string) *avro.Schema {
+							return avro.MustParse(fmt.Sprintf(`{"type":"record","name":"R",%s"fields":[%s]}`, nsAttr, fields))
+						}
+						var s, want *avro.Schema
+						name := fmt.Sprintf("contained %s/ns=%q/recursive=%v/%s/%s", kind, ns, recursive, place, fmt.Sprintf(holder, `"null",DEF,`+ref))
+						switch place {
+						case "alone":
+							s = record(`{"name":"f","type":` + fmt.Sprintf(holder, `"null",`+def+`,`+ref) + `}`)
+							want = field(s, name)
+						case "decoy":
+							s = record(`{"name":"f","type":` + fmt.Sprintf(holder, `"null",`+decoy+`,`+def+`,`+ref) + `}`)
+							want = field(s, name)
+						default:
+							s = record(`{"name":"a","type":` + def + `},{"name":"f","type":` + fmt.Sprintf(holder, `"null",`+decoy+`,`+ref) + `}`)
+							want = field(record(`{"name":"f","type":`+fmt.Sprintf(holder, `"null",`+decoy+`,`+refTo(def))+`}`), name)
+						}
+						last := len(s.Root().Fields) - 1
+						surfaces := map[string]func() (*avro.Schema, error){
+							"extract": func() (*avro.Schema, error) { return (&s.Root().Fields[last].Type).Schema() },
+							"expand":  func() (*avro.Schema, error) { return (&s.Root().Fields[last].Type).ExpandReferences().Schema() },
+						}
+						for label, surface := range surfaces {
+							got, err := surface()
+							if err != nil {
+								t.Errorf("%s: %s: %v", name, label, err)
+								continue
+							}
+							if !bytes.Equal(got.Canonical(), want.Canonical()) || !bytes.Equal(got.Fingerprint(avro.NewRabin()), want.Fingerprint(avro.NewRabin())) {
+								t.Errorf("%s: %s gave a different schema than the field inside its parent:\n  got  %s\n  want %s", name, label, got.Canonical(), want.Canonical())
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 // TestMatrix_EmptyFieldNameAliasClaimAgreement is the shape that a name-valued
 // absence sentinel hides. Two writer fields resolve to one reader slot, one
 // by the reader field's name and one by its alias, which both the resolver and

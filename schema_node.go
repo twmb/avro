@@ -30,7 +30,9 @@ import (
 //   - map: Values required.
 //   - fixed: Name, Size required; LogicalType, Precision, Scale, Namespace,
 //     Props optional.
-//   - union: Branches lists the member schemas.
+//   - union: Branches lists the member schemas. An empty union has an
+//     empty, non-nil Branches. When the tree defines a type named "union", a
+//     node with Type "union" and nil Branches is a reference to that type.
 //
 // To reference a named type (record, enum, fixed) defined elsewhere in the
 // schema, set Type to its full name (e.g. com.example.Address) and nothing
@@ -275,20 +277,25 @@ type expander struct {
 }
 
 // resolve returns the definition n names and the fullname to key it by, or nil
-// when n is not a bare reference to anything. n's own tree wins, then the
-// [Schema.Root] stamp, the order [SchemaNode.Schema] splices in, so the two
-// paths cannot bind one reference to different definitions. A stamped target
-// from outside the tree joins the table, so every later pass sees it.
+// when n is not a bare reference to anything. The [Schema.Root] stamp wins,
+// since it is the target the name bound where it was written, as in Java and
+// fastavro, and the tree's own definition of that fullname stands in for it.
+// Without a stamp, n's own tree binds the name. [SchemaNode.Schema] binds in
+// the same order, so the two paths cannot bind one reference to different
+// definitions. A stamped target from outside the tree joins the table, so
+// every later pass sees it.
 func (x *expander) resolve(n *SchemaNode, ns string) (*SchemaNode, string) {
 	if !nodeCarriesOnlyType(n) {
 		return nil, ""
 	}
-	t := lookupNameRef(n, x.table, ns)
-	if t == nil {
-		if !nodeRefTargetAgrees(n) {
-			return nil, ""
-		}
+	var t *SchemaNode
+	if nodeRefTargetAgrees(n) {
 		t = n.refTarget
+		if def, ok := x.table[nodeFullname(t)]; ok {
+			t = def
+		}
+	} else if t = lookupNameRef(n, x.table, ns); t == nil {
+		return nil, ""
 	}
 	fn := nodeFullname(t)
 	if fn == "" {
@@ -445,6 +452,11 @@ type deduper struct {
 	// binds locally on re-parse. Only a reference to a name the tree nowhere
 	// defines splices the stamped target in.
 	localNames map[string]bool
+
+	// snapshot marks the walk behind toJSONShared. It reads localNames, so a
+	// node renders as a reference to a kind-named type wherever the dedup walk
+	// renders one, and it registers, splices, and compares no definition.
+	snapshot bool
 }
 
 // Root returns a SchemaNode tree describing the parsed schema. We preserve all
@@ -1299,13 +1311,15 @@ func boundedSerializableValue(d *deduper, depth int, b *walkBudget, v any) any {
 // of a w-node body costing k*w in comparison work. On exhaustion the caller
 // reports over-budget rather than a spurious conflict, since asymmetric
 // truncation could make identical bodies compare unequal.
-func (n *SchemaNode) toJSONShared(b *walkBudget) any {
-	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0, b, false)
+func (n *SchemaNode) toJSONShared(d *deduper, b *walkBudget) any {
+	snap := &deduper{localNames: d.localNames, snapshot: true}
+	return n.toJSONWalk(make(map[*SchemaNode]struct{}), snap, "", 0, b, false)
 }
 
 // toJSONWalk is the cycle-aware walker behind both the dedup walk and the
-// bare one. visited terminates Items/Values pointer cycles. A non-nil d
-// tracks named-type definitions and reports conflicting redefinitions.
+// snapshot. visited terminates Items/Values pointer cycles. d tracks
+// named-type definitions and reports conflicting redefinitions, unless
+// d.snapshot is set.
 // enclosingNS is the scope at this node's position; named types emit their
 // namespace relative to it and name references emit the fullname. depth
 // bounds a distinct-node-per-level chain, which visited cannot see, at the
@@ -1341,7 +1355,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	if _, cycle := visited[n]; cycle {
 		// A cycle through Items/Values back to n. Named types emit the
 		// fullname as a reference; unnamed cycles are an error in the dedup
-		// walker and nil-stable JSON in the bare one. Keyed on the fullname
+		// walker and nil-stable JSON in the snapshot. Keyed on the fullname
 		// being expressible: "ns." is a valid reference target while "" has
 		// no spelling.
 		if isNamedKind(n.Type) && nodeFullname(n) != "" && !stray {
@@ -1360,7 +1374,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// as the spec defines name equality. A bare reference from inside a
 	// namespaced scope that collides with an in-scope short name re-binds
 	// in-scope, the same ambiguity Java has.
-	if d != nil && !stray && isNamedKind(n.Type) && nodeFullname(n) != "" {
+	if d != nil && !d.snapshot && !stray && isNamedKind(n.Type) && nodeFullname(n) != "" {
 		if prev, exists := d.defined[nodeFullname(n)]; exists {
 			// We marshal-compare bodies only for *distinct* nodes: a named
 			// type referenced repeatedly resolves to the same *SchemaNode and
@@ -1369,8 +1383,8 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			// type's subtree. The comparison uses toJSONShared, so many
 			// identical-bodied duplicates stay inside the budget.
 			if prev != n && d.err == nil {
-				cur, _ := json.Marshal(n.toJSONShared(b))
-				prevB, _ := json.Marshal(prev.toJSONShared(b))
+				cur, _ := json.Marshal(n.toJSONShared(d, b))
+				prevB, _ := json.Marshal(prev.toJSONShared(d, b))
 				switch {
 				case b.nodes <= 0:
 					// Budget exhausted mid-comparison: the bodies are
@@ -1393,13 +1407,14 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 
 	// A reference to a name this tree does not define emits the stamped
 	// definition at its first occurrence through this same recursion, so an
-	// extracted subtree is self-contained. Gated on d != nil so conflict
-	// snapshots stay splice-free, and on !stray. A reference the tree defines
-	// locally stays as written.
+	// extracted subtree is self-contained. Gated on !stray, and a snapshot
+	// splices nothing. A reference the tree defines locally stays as written
+	// when the written name binds the stamped target at this position.
 	refType := n.Type
+	stampedRef := false // the stamp, not the written name, binds n here
 	if d != nil && !stray && nodeRefTargetAgrees(n) && nodeIsNameRefShape(n) {
 		if fn := nodeFullname(n.refTarget); fn != "" && !d.localNames[fn] {
-			if _, emitted := d.defined[fn]; !emitted {
+			if _, emitted := d.defined[fn]; !emitted && !d.snapshot {
 				// A fresh visited map: a recursive definition reaches back
 				// through the extraction point, which the shared map would
 				// misread as an unnamed cycle. The revisit is finite because
@@ -1432,9 +1447,35 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			// Already emitted (an earlier splice, or the walk passed the
 			// definition): reference it by fullname, the spelling that
 			// re-binds regardless of the standalone parse's
-			// namespace scope at this position.
-			refType = fn
+			// namespace scope at this position. A snapshot compares the name
+			// as written.
+			stampedRef = true
+			if !d.snapshot {
+				refType = fn
+			}
+		} else if k, _, _ := lookupScoped(d.localNames, n.Type, enclosingNS); k != fn {
+			// The tree defines the target, but the written name binds another
+			// type or none here, as a short name can in an extracted subtree,
+			// which converts in the null namespace. We emit the fullname, so
+			// the reference keeps the target it had where it was written, as
+			// in Java and fastavro.
+			refType, stampedRef = fn, true
 		}
+	}
+
+	// A complex kind or "union" node of kindRefShape is a reference to a type
+	// of that name when the tree defines the name in scope or the stamp binds
+	// the node. A reference carrying nothing but its Type emits the bare name,
+	// since the object {"type":"array"} declares an array with no items. A
+	// reference to a type named "union" with a doc or props skips the union
+	// arm below and renders as its object.
+	kindRef := false
+	if d != nil && !stray && reusedKindName(n.Type) && kindRefShape(n) {
+		_, _, ok := lookupScoped(d.localNames, n.Type, enclosingNS)
+		kindRef = ok || stampedRef
+	}
+	if kindRef && nodeCarriesOnlyType(n) {
+		return refType
 	}
 
 	switch n.Type {
@@ -1446,11 +1487,13 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			return n.Type
 		}
 	case "union":
-		branches := make([]any, len(n.Branches))
-		for i := range n.Branches {
-			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1, b, stray)
+		if !kindRef {
+			branches := make([]any, len(n.Branches))
+			for i := range n.Branches {
+				branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1, b, stray)
+			}
+			return branches
 		}
-		return branches
 	}
 
 	// The same losslessness question as the primitive arm above, for a name
@@ -1466,7 +1509,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// We remember this named type's node for the next occurrence's conflict
 	// check, storing the node rather than its marshaled body: eager marshaling
 	// is O(depth*subtree), and we need the body only if a duplicate appears.
-	if d != nil && !stray {
+	if d != nil && !d.snapshot && !stray {
 		// Fullname-keyed like the duplicate check above. Fullname "" has no
 		// reference spelling so it stays un-deduped, and stray-reached names
 		// register nothing; the wire parser binds neither.
@@ -1742,6 +1785,32 @@ func isNamedKind(typ string) bool {
 	return typ == "record" || typ == "error" || typ == "enum" || typ == "fixed"
 }
 
+// isComplexKind reports whether typ is a kind that an object declares with
+// keys of its own: a named kind, an array, or a map.
+func isComplexKind(typ string) bool {
+	return isNamedKind(typ) || typ == "array" || typ == "map"
+}
+
+// reusedKindName reports whether typ names a kind that the spec lets a named
+// type reuse as its name: a complex kind or "union".
+func reusedKindName(typ string) bool {
+	return isComplexKind(typ) || typ == "union"
+}
+
+// kindRefShape reports whether n, whose Type is a reusedKindName, has the
+// shape of a reference to a type of that name. A complex kind's name is a
+// reference only as the bare string "array", which Root() builds as a node
+// carrying nothing but its Type. No object declares a union, so an object
+// such as {"type":"union","doc":"x"} also references a type named "union",
+// and a union node with nil Branches has the shape when it carries only what
+// such an object may carry.
+func kindRefShape(n *SchemaNode) bool {
+	if n.Type == "union" {
+		return nodeIsNameRefShape(n)
+	}
+	return nodeCarriesOnlyType(n)
+}
+
 // nodeFullname returns n's fullname by resolveScope over the node's own
 // Name and Namespace. Namespace is already resolved, so it stands in for a
 // written attribute and "" means the null namespace; a dotted Name takes
@@ -1774,15 +1843,10 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *Sche
 	if t == nil {
 		return nil
 	}
-	// Structural kinds (primitives, "record"/"error", "enum", "fixed",
-	// "array", "map", "union") are schema definitions, not name-ref
-	// targets. "error" is in this list per [isRecordKind]: without it,
-	// a SchemaNode with t.Type=="error" would fall through to
-	// table["error"] and wrongly resolve to any record literally named
-	// "error" in the schema.
-	switch t.Type {
-	case "null", "boolean", "int", "long", "float", "double",
-		"bytes", "string", "record", "error", "enum", "fixed", "array", "map", "union":
+	// A primitive is never a reference. A complex kind, "error" included per
+	// [isRecordKind], or "union" is a definition, unless the node has the
+	// shape of a reference to a type named after the kind.
+	if _, prim := serPrimitive[t.Type]; prim || reusedKindName(t.Type) && !kindRefShape(t) {
 		return nil
 	}
 	_, r, _ := lookupScoped(table, t.Type, ns)

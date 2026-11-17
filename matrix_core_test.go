@@ -2773,6 +2773,43 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 							if !bytes.Equal(jsonW, cjson) {
 								t.Fatalf("deep JSON wire differs from bare base:\n got=%s\nwant=%s", jsonW, cjson)
 							}
+							// A union encodes its branch into the output, so a
+							// union value costs no JSON allocation over the
+							// same value outside a union. A tag naming a
+							// logical type costs no allocation either, on
+							// encode and when DecodeJSON wraps the value.
+							if strings.HasPrefix(pc.label, "union") && depth == 1 {
+								ptr := pc.input(b, depth).Interface()
+								bare := avro.MustParse(b.avro)
+								buf := make([]byte, 0, 64)
+								for _, opts := range [][]avro.Opt{nil, {avro.TaggedUnions()}, {avro.TaggedUnions(), avro.TagLogicalTypes()}} {
+									want := minAllocsPerRun(20, func() { buf, _ = bare.AppendEncodeJSON(buf[:0], ptr, opts...) })
+									if n := minAllocsPerRun(20, func() { buf, _ = s.AppendEncodeJSON(buf[:0], ptr, opts...) }); n != want {
+										t.Errorf("JSON encoding a union value (%d options) allocates %.0f times, and %.0f outside a union", len(opts), n, want)
+									}
+								}
+								tagged := avrotest.MustAppendEncodeJSON(t, s, nil, ptr, avro.TaggedUnions())
+								logical := avrotest.MustAppendEncodeJSON(t, s, nil, ptr, avro.TaggedUnions(), avro.TagLogicalTypes())
+								decodeAllocs := func(s *avro.Schema, doc []byte, opts ...avro.Opt) float64 {
+									return minAllocsPerRun(20, func() {
+										var out any
+										if err := s.DecodeJSON(doc, &out, opts...); err != nil {
+											t.Fatal(err)
+										}
+									})
+								}
+								if n, want := decodeAllocs(s, logical, avro.TaggedUnions(), avro.TagLogicalTypes()), decodeAllocs(s, tagged, avro.TaggedUnions()); n != want {
+									t.Errorf("DecodeJSON of a union value under TagLogicalTypes allocates %.0f times, and %.0f without it", n, want)
+								}
+								// Without an envelope, DecodeJSON puts a union
+								// value into an any with no allocation over the
+								// same value outside a union.
+								plain := avrotest.MustAppendEncodeJSON(t, s, nil, ptr)
+								barePlain := avrotest.MustAppendEncodeJSON(t, bare, nil, ptr)
+								if n, want := decodeAllocs(s, plain), decodeAllocs(bare, barePlain); n != want {
+									t.Errorf("DecodeJSON of a union value into an any allocates %.0f times, and %.0f outside a union", n, want)
+								}
+							}
 						}
 
 						// --- decode parity: every {wire}×{natural,resolved} path
@@ -3813,23 +3850,29 @@ func schemaMutants(schemaJSON string) []schemaMutant {
 		s, _ := obj["type"].(string)
 		return s == t
 	}
+	// defines reports whether obj is a definition of kind t that carries key.
+	// A field whose type is a bare reference to a type named t is not one.
+	defines := func(obj map[string]any, t, key string) bool {
+		_, ok := obj[key]
+		return ok && isType(obj, t)
+	}
 
 	add("fixed-missing-size", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "fixed") {
+		if defines(o, "fixed", "size") {
 			delete(o, "size")
 			return true
 		}
 		return false
 	}))
 	add("fixed-negative-size", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "fixed") {
+		if defines(o, "fixed", "size") {
 			o["size"] = -1
 			return true
 		}
 		return false
 	}))
 	add("enum-missing-symbols", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "enum") {
+		if defines(o, "enum", "symbols") {
 			delete(o, "symbols")
 			return true
 		}
@@ -3864,7 +3907,7 @@ func schemaMutants(schemaJSON string) []schemaMutant {
 		return false
 	}))
 	add("record-missing-fields", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "record") {
+		if defines(o, "record", "fields") {
 			delete(o, "fields")
 			return true
 		}
@@ -3891,14 +3934,14 @@ func schemaMutants(schemaJSON string) []schemaMutant {
 		return false
 	}))
 	add("array-missing-items", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "array") {
+		if defines(o, "array", "items") {
 			delete(o, "items")
 			return true
 		}
 		return false
 	}))
 	add("map-missing-values", mutateOnce(schemaJSON, func(o map[string]any) bool {
-		if isType(o, "map") {
+		if defines(o, "map", "values") {
 			delete(o, "values")
 			return true
 		}
@@ -3908,6 +3951,30 @@ func schemaMutants(schemaJSON string) []schemaMutant {
 		if _, ok := o["type"]; ok {
 			delete(o, "type")
 			return true
+		}
+		return false
+	}))
+	// A bare reference to a type named after a kind, written as an object:
+	// {"type":"array"} declares an array, which needs items, and never names
+	// the type called "array".
+	add("kind-name-object", mutateOnce(schemaJSON, func(o map[string]any) bool {
+		binds := map[string]string{"record": "fields", "error": "fields", "enum": "symbols", "fixed": "size", "array": "items", "map": "values"}
+		for _, key := range []string{"type", "items", "values"} {
+			switch v := o[key].(type) {
+			case string:
+				// A definition's own "type" carries the key its kind binds.
+				if _, defines := o[binds[v]]; binds[v] != "" && (key != "type" || !defines) {
+					o[key] = map[string]any{"type": v}
+					return true
+				}
+			case []any:
+				for i, b := range v {
+					if k, _ := b.(string); binds[k] != "" {
+						v[i] = map[string]any{"type": k}
+						return true
+					}
+				}
+			}
 		}
 		return false
 	}))
@@ -3932,7 +3999,8 @@ func schemaMutants(schemaJSON string) []schemaMutant {
 }
 
 // acceptanceCells samples the composed schemas the acceptance axis sweeps:
-// every fragment × three structural contexts.
+// every fragment in each of three structural contexts, then the
+// kindNamedCells.
 func acceptanceCells() []string {
 	var cells []string
 	for _, fr := range matFrags() {
@@ -3949,16 +4017,74 @@ func acceptanceCells() []string {
 			cells = append(cells, cx.schema(fr.schema(u), fr.kind, u))
 		}
 	}
+	for _, c := range kindNamedCells() {
+		cells = append(cells, c.schema(c.kind))
+	}
+	return cells
+}
+
+// kindNamedCell is a schema that defines a type named after a complex kind or
+// "union", which the spec permits, as field a, and references it by its bare
+// name in field b. use places the reference in b's schema.
+type kindNamedCell struct {
+	kind, ns, use string
+	recursive     bool // the type is a record that references itself
+}
+
+// def writes the cell's definition of the type named name.
+func (c kindNamedCell) def(name string) string {
+	switch {
+	case c.recursive:
+		return fmt.Sprintf(`{"type":"record","name":%q,"fields":[{"name":"n","type":["null",%q]}]}`, name, name)
+	case c.kind == "fixed":
+		return fmt.Sprintf(`{"type":"enum","name":%q,"symbols":["A"]}`, name)
+	}
+	return fmt.Sprintf(`{"type":"fixed","name":%q,"size":2}`, name)
+}
+
+// schema writes the cell with the type named name.
+func (c kindNamedCell) schema(name string) string {
+	def := c.def(name)
+	nsAttr := ""
+	if c.ns != "" {
+		nsAttr = fmt.Sprintf(`"namespace":%q,`, c.ns)
+	}
+	return fmt.Sprintf(`{"type":"record","name":"R",%s"fields":[{"name":"a","type":%s},{"name":"b","type":%s}]}`,
+		nsAttr, def, fmt.Sprintf(c.use, name))
+}
+
+// kindNamedCells crosses the kinds over the null namespace and a named one,
+// a plain and a recursive type, and the field, array items, map values, and
+// union branch positions.
+func kindNamedCells() []kindNamedCell {
+	var cells []kindNamedCell
+	for _, kind := range []string{"record", "error", "enum", "fixed", "array", "map", "union"} {
+		for _, ns := range []string{"", "ns"} {
+			for _, recursive := range []bool{false, true} {
+				for _, use := range []string{`"%s"`, `{"type":"array","items":"%s"}`, `{"type":"map","values":"%s"}`, `["null","%s"]`} {
+					cells = append(cells, kindNamedCell{kind, ns, use, recursive})
+				}
+			}
+		}
+	}
 	return cells
 }
 
 // TestMatrix_AcceptanceMutantsRejectLocally: every mutant must fail twmb's
 // Parse, the local half of the parity. The oracle halves assert fastavro
-// and Java agree.
+// and Java agree. Every unmutated cell must also rebuild from Root() to the
+// same canonical form and fingerprint.
 func TestMatrix_AcceptanceMutantsRejectLocally(t *testing.T) {
 	for _, cell := range acceptanceCells() {
-		if _, err := avro.Parse(cell); err != nil {
+		s, err := avro.Parse(cell)
+		if err != nil {
 			t.Fatalf("unmutated cell must parse: %v\n%s", err, cell)
+		}
+		root := s.Root()
+		if rb, err := root.Schema(); err != nil {
+			t.Errorf("Root().Schema() cannot rebuild the cell: %v\n%s", err, cell)
+		} else if !bytes.Equal(rb.Canonical(), s.Canonical()) || !bytes.Equal(rb.Fingerprint(avro.NewRabin()), s.Fingerprint(avro.NewRabin())) {
+			t.Errorf("Root().Schema() rebuilt a different schema:\n  cell    %s\n  rebuilt %s", s.Canonical(), rb.Canonical())
 		}
 		for _, m := range schemaMutants(cell) {
 			if _, err := avro.Parse(m.schema); err == nil {
@@ -4080,30 +4206,46 @@ func TestMatrix_CacheSelfContainedNamespaces(t *testing.T) {
 
 	defNSs := []string{"null", "explicit", "inherited", "dotted"}
 	refNSs := []string{"null", "same", "diff"}
-	poss := []string{"field", "array", "map", "union"}
+	// The name axis: a type may take a complex kind's name or "union", and
+	// the bare name then references it. Only "union" also references it
+	// wrapped, alone or with a doc or a custom property, since
+	// {"type":"array"} declares an array.
+	var poss []struct{ pos, n string }
+	for _, n := range []string{"T", "record", "error", "enum", "fixed", "array", "map", "union"} {
+		for _, pos := range []string{"field", "array", "map", "union"} {
+			poss = append(poss, struct{ pos, n string }{pos, n})
+		}
+	}
+	wraps := map[string]string{"wrapped": "", "wrapped-doc": `,"doc":"x"`, "wrapped-prop": `,"foo":"bar"`}
+	for _, n := range []string{"T", "union"} {
+		for _, pos := range []string{"wrapped", "wrapped-doc", "wrapped-prop"} {
+			poss = append(poss, struct{ pos, n string }{pos, n})
+		}
+	}
 
 	for _, k := range kinds {
 		for _, dns := range defNSs {
 			for _, rns := range refNSs {
-				for _, pos := range poss {
-					t.Run(fmt.Sprintf("%s/%s/%s/%s", k.name, dns, rns, pos), func(t *testing.T) {
+				for _, pn := range poss {
+					pos, n := pn.pos, pn.n
+					t.Run(fmt.Sprintf("%s/%s/%s/%s/%s", k.name, dns, rns, pos, n), func(t *testing.T) {
 						// Resolve the definition into (fullname, resolved namespace,
 						// registration schemas).
 						var fullname, defns string
 						var regs []string
 						switch dns {
 						case "null":
-							fullname, defns = "T", ""
-							regs = []string{k.def("T", "")}
+							fullname, defns = n, ""
+							regs = []string{k.def(n, "")}
 						case "explicit":
-							fullname, defns = "a.b.T", "a.b"
-							regs = []string{k.def("T", `,"namespace":"a.b"`)}
+							fullname, defns = "a.b."+n, "a.b"
+							regs = []string{k.def(n, `,"namespace":"a.b"`)}
 						case "inherited":
-							fullname, defns = "a.b.T", "a.b"
-							regs = []string{fmt.Sprintf(`{"type":"record","name":"Wrap","namespace":"a.b","fields":[{"name":"w","type":%s}]}`, k.def("T", ""))}
+							fullname, defns = "a.b."+n, "a.b"
+							regs = []string{fmt.Sprintf(`{"type":"record","name":"Wrap","namespace":"a.b","fields":[{"name":"w","type":%s}]}`, k.def(n, ""))}
 						case "dotted":
-							fullname, defns = "a.b.T", "a.b"
-							regs = []string{k.def("a.b.T", "")}
+							fullname, defns = "a.b."+n, "a.b"
+							regs = []string{k.def("a.b."+n, "")}
 						}
 						// The self-contained oracle definition always carries an
 						// explicit namespace. That includes "" to force null
@@ -4111,8 +4253,12 @@ func TestMatrix_CacheSelfContainedNamespaces(t *testing.T) {
 						selfDef := k.def(short(fullname), fmt.Sprintf(`,"namespace":%q`, defns))
 
 						refNSval := map[string]string{"null": "", "same": defns, "diff": "z.z"}[rns]
+						ref := fmt.Sprintf("%q", fullname)
+						if extra, ok := wraps[pos]; ok {
+							pos, ref = "field", `{"type":`+ref+extra+`}`
+						}
 						refSchema := fmt.Sprintf(`{"type":"record","name":"Ref"%s,"fields":[{"name":"f","type":%s}]}`,
-							nsAttr(refNSval), posWrap(pos, fmt.Sprintf("%q", fullname)))
+							nsAttr(refNSval), posWrap(pos, ref))
 						inlineSchema := fmt.Sprintf(`{"type":"record","name":"Ref"%s,"fields":[{"name":"f","type":%s}]}`,
 							nsAttr(refNSval), posWrap(pos, selfDef))
 
