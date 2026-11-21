@@ -50,12 +50,31 @@ func (e *SemanticError) Error() string {
 		s = "avro: semantic error"
 	}
 	if e.Err != nil {
-		// The cause is often one of our own errors, which starts with
-		// "avro: " as well.
-		s += ": " + strings.TrimPrefix(e.Err.Error(), "avro: ")
+		s += ": " + causeText(e.Err)
 	}
 	return s
 }
+
+// causeText returns the text of err for the end of one of our messages. When
+// err is one of our own errors, we drop the "avro: " or "avro json: " that
+// starts it, so that a chain of our errors names the package once.
+func causeText(err error) string {
+	s := err.Error()
+	if t, ok := strings.CutPrefix(s, "avro: "); ok {
+		return t
+	}
+	return strings.TrimPrefix(s, "avro json: ")
+}
+
+// causeError is an error that reads "msg: cause", where the cause's text is
+// as causeText returns it, and that unwraps to the cause.
+type causeError struct {
+	msg   string
+	cause error
+}
+
+func (e *causeError) Error() string { return e.msg + ": " + causeText(e.cause) }
+func (e *causeError) Unwrap() error { return e.cause }
 
 func formatGoType(t reflect.Type) string {
 	if t == nil {

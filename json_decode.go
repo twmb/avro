@@ -1549,7 +1549,7 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 	ctx.scanner.pos = savedPos
 	if err := ctx.decodeUnionBare(v, node, '{'); err != nil {
 		if taggedErr != nil {
-			return fmt.Errorf("%w (tagged-form: %v)", err, taggedErr)
+			return fmt.Errorf("%w (tagged-form: %s)", err, causeText(taggedErr))
 		}
 		return err
 	}
@@ -1709,7 +1709,7 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, p byt
 		}
 	}
 	if lastErr != nil {
-		return fmt.Errorf("avro json: no union branch matched at offset %d: %w", ctx.scanner.pos, lastErr)
+		return &causeError{fmt.Sprintf("avro json: no union branch matched at offset %d", ctx.scanner.pos), lastErr}
 	}
 	return fmt.Errorf("avro json: no union branch matched at offset %d", ctx.scanner.pos)
 }

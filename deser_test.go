@@ -3087,6 +3087,11 @@ func TestSemanticErrorFormat(t *testing.T) {
 			"avro: field f: short buffer for uvarlong",
 		},
 		{
+			"field with one of our JSON errors as the cause",
+			&SemanticError{Field: "f", Err: fmt.Errorf("avro json: expected number at offset 5")},
+			"avro: field f: expected number at offset 5",
+		},
+		{
 			"type mismatch with one of our errors as the cause",
 			&SemanticError{GoType: reflect.TypeFor[int](), AvroType: "string", Err: &ShortBufferError{Type: "string", Need: 10, Have: 3}},
 			"avro: cannot use int with Avro type string: short buffer for string: need 10, have 3",

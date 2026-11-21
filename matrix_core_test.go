@@ -12534,7 +12534,12 @@ func TestMatrix_UsedTargetParity(t *testing.T) {
 				// DecodeJSON) into ptr, and returns the error and what a
 				// panic recovered.
 				decode := func(w int, in input, ptr any) (err error, panicked any) {
-					defer func() { panicked = recover() }()
+					defer func() {
+						panicked = recover()
+						if parityNamesAvroTwice(err) {
+							fail("%s | %s: an error names the package twice: %v", option.name, sc.name, err)
+						}
+					}()
 					if w == 0 {
 						_, err = s.Decode(in.bin, ptr, opts...)
 						return err, nil
@@ -13027,6 +13032,17 @@ func parityID(x any) uintptr {
 	return 0
 }
 
+// parityNamesAvroTwice reports whether the text of err names the package more
+// than once, as a chain of our errors does when each repeats "avro: ". The
+// parity matrices check every error they see with it.
+func parityNamesAvroTwice(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Count(s, "avro: ")+strings.Count(s, "avro json: ") > 1
+}
+
 // parityInside returns the value in a TaggedUnions envelope, and x otherwise.
 func parityInside(x any) any {
 	if w, ok := x.(map[string]any); ok && len(w) == 1 {
@@ -13117,19 +13133,22 @@ func TestMatrix_RoundTripParity(t *testing.T) {
 			return m
 		})},
 	}
+	var failures []string
+	fail := func(format string, args ...any) { failures = append(failures, fmt.Sprintf(format, args...)) }
 	// try runs f and returns its error, or the panic it recovered as one.
 	try := func(f func() error) (err error) {
 		defer func() {
 			if r := recover(); r != nil {
 				err = fmt.Errorf("panic: %v", r)
 			}
+			if parityNamesAvroTwice(err) {
+				fail("an error names the package twice: %v", err)
+			}
 		}()
 		return f()
 	}
 	isPanic := func(err error) bool { return err != nil && strings.HasPrefix(err.Error(), "panic: ") }
 	snap := func(x any) string { return paritySnap(reflect.ValueOf(x), 0) }
-	var failures []string
-	fail := func(format string, args ...any) { failures = append(failures, fmt.Sprintf(format, args...)) }
 	cases := parityCases()
 	for _, option := range []struct {
 		name string
@@ -13316,6 +13335,9 @@ func TestMatrix_ResolvedTargetParity(t *testing.T) {
 		defer func() {
 			if r := recover(); r != nil {
 				err = fmt.Errorf("panic: %v", r)
+			}
+			if parityNamesAvroTwice(err) {
+				fail("an error names the package twice: %v", err)
 			}
 		}()
 		return f()

@@ -1327,7 +1327,7 @@ tryAll:
 	}
 	e := &SemanticError{GoType: v.Type(), AvroType: "union"}
 	if lastErr != nil {
-		e.Err = fmt.Errorf("avro json: no union branch matched: %w", lastErr)
+		e.Err = &causeError{"avro json: no union branch matched", lastErr}
 	} else {
 		e.Err = errors.New("avro json: no union branch matched")
 	}

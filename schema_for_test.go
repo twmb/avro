@@ -402,6 +402,36 @@ func TestSchemaForErrors(t *testing.T) {
 		}
 	})
 
+	// An error under a field names the package once.
+	t.Run("nested errors name avro once", func(t *testing.T) {
+		type inner struct {
+			G chan int `avro:"g"`
+		}
+		type outer struct {
+			F inner `avro:"f"`
+		}
+		type money struct{ V int64 }
+		type holder struct {
+			M money `avro:"m"`
+		}
+		cyclic := &SchemaNode{Type: "array"}
+		cyclic.Items = cyclic
+		identity := func(v any, _ *SchemaNode) (any, error) { return v, nil }
+		_, nested := SchemaFor[outer]()
+		_, custom := SchemaFor[holder](WithCustomType(CustomType{GoType: reflect.TypeFor[money](), Schema: cyclic, Encode: identity, Decode: identity}))
+		for _, c := range []struct {
+			err  error
+			want string
+		}{
+			{nested, `avro: field "f": field "g": unsupported Go type chan int`},
+			{custom, `avro: field "m": SchemaFor: CustomType.Schema: cyclic SchemaNode detected`},
+		} {
+			if c.err == nil || c.err.Error() != c.want {
+				t.Errorf("got %v, want %s", c.err, c.want)
+			}
+		}
+	})
+
 	t.Run("unsupported in slice", func(t *testing.T) {
 		type R struct {
 			C []chan int `avro:"c"`
