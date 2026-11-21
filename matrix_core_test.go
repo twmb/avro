@@ -13994,18 +13994,20 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 		}
 		// The custom types of one parse on a SchemaCache do not change the
 		// unions of another parse: a union that resolves to the cached fixed,
-		// and a later union of it, decode into your *[]byte.
+		// and a later union of it, decode into your *[]byte, which only the
+		// other parse's custom type declares.
 		var cache avro.SchemaCache
-		reader, err := cache.Parse(`["null",{"type":"fixed","name":"N","size":2}]`)
+		skip := func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }
+		mine := avro.CustomType{AvroType: "fixed", GoType: reflect.TypeFor[*int](), Decode: skip}
+		reader, err := cache.Parse(`["null",{"type":"fixed","name":"N","size":2}]`, mine)
 		if err != nil {
 			t.Fatal(err)
 		}
-		skip := func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }
 		if _, err := cache.Parse(`{"type":"record","name":"W","fields":[{"name":"n","type":"N"}]}`,
-			avro.CustomType{GoType: reflect.TypeFor[*[]byte](), Decode: skip}); err != nil {
+			avro.CustomType{AvroType: "fixed", GoType: reflect.TypeFor[*[]byte](), Decode: skip}); err != nil {
 			t.Fatal(err)
 		}
-		later, err := cache.Parse(`["null","N"]`)
+		later, err := cache.Parse(`["null","N"]`, mine)
 		if err != nil {
 			t.Fatal(err)
 		}

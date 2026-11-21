@@ -1367,7 +1367,7 @@ func (b *builder) finalize() error {
 			// union-default-validation paths walk node.branches directly
 			// and would dereference the nil node.
 			if m.branches != nil {
-				m.branches[idx] = nt.node
+				m.branches[idx] = b.siteNode(nt.node)
 			}
 		}
 		// With every branch node wired, re-derive the union's
@@ -1413,7 +1413,7 @@ func (b *builder) finalize() error {
 		// We mark a custom type, as applyCustomTypes does for an in-order
 		// reference, so the unsafe paths keep the wrap on fn.
 		m.nd.serRecord.fields[m.idx].meta.hasCustomType = b.custom[nt.node] != nil
-		m.nd.fields[m.idx].node = nt.node
+		m.nd.fields[m.idx].node = b.siteNode(nt.node)
 	}
 	// Phase 1b: wire every forward-referenced array/map container child.
 	// One walk is shared across the loop: a schema can point any number of
@@ -1429,7 +1429,7 @@ func (b *builder) finalize() error {
 		*m.serItem = b.customWrappedSer(nt.node, nt.node.ser)
 		*m.deserItem = b.customWrappedDeser(nt.node, nt.node.deser)
 		m.setMinBytes(mbw.minBytesOf(nt.node))
-		*m.nodeChild = nt.node
+		*m.nodeChild = b.siteNode(nt.node)
 	}
 	// Phase 2: deferred field defaults, in two passes. encodeDefault fills
 	// an absent nested record field from its resolved f.defaultVal, so we
@@ -1663,28 +1663,50 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		b.ser = makeCustomSer(wiring.encode, node.ser)
 	}
 
-	// See buildCustomWiring for what this narrowing buys and the
-	// suppression contract behind it.
-	jsonAppliesLogical := wiring.suppressLogical && jsonDecodeAppliesLogical(node)
 	if len(wiring.decoders) > 0 {
 		b.deser = wrapDeserWithCustomDecoders(node.deser, wiring.decoders, wiring.sn)
-		// JSON-side: wrap the node's per-decode dispatch with a
-		// closure that captures the decoder chain. The JSON runtime
-		// (decodeValue) checks node.decodeJSON first and falls back
-		// to decodeKind otherwise: no per-call map lookup, no
-		// recursion guard, no shared mutable state.
-		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(wiring.decoders, wiring.sn, wiring.suppressLogical)
-	} else if jsonAppliesLogical {
-		// No Decode callback on a logical node the binary path suppresses: you
-		// receive the raw Avro-native value, so we install the raw-decode
-		// wrapper with an empty chain to produce the same raw value through
-		// DecodeJSON. A wildcard keeps the logical transform on both paths.
-		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(nil, wiring.sn, wiring.suppressLogical)
 	}
-
 	b.putCustomWiring(node, wiring)
+	b.node = b.siteNode(node)
 	b.meta.hasCustomType = true
 	return nil
+}
+
+// siteNode returns the node a reference to node uses: node, or a node with
+// this parse's custom JSON decoder when a custom type matches node. The JSON
+// runtime (decodeValue) checks node.decodeJSON first and falls back to
+// decodeKind otherwise. A named type's node is shared by every reference to
+// it, in this parse and, through a SchemaCache, in others, so a reference to
+// one gets a copy with the decoder, as the binary decoder wraps the
+// reference and not the node. Any other node has one reference and gets the
+// decoder itself.
+func (b *builder) siteNode(node *schemaNode) *schemaNode {
+	w := b.custom[node]
+	if w == nil {
+		return node
+	}
+	var fn jsonDecodeFn
+	switch {
+	case len(w.decoders) > 0:
+		fn = wrapDecodeJSONWithCustomDecoders(w.decoders, w.sn, w.suppressLogical)
+	case w.suppressLogical && jsonDecodeAppliesLogical(node):
+		// No Decode callback on a logical node the binary path suppresses:
+		// you receive the raw Avro-native value, so the decoder has an
+		// empty chain and gives the same raw value through DecodeJSON. A
+		// wildcard keeps the logical transform on both paths. See
+		// buildCustomWiring for the suppression contract.
+		fn = wrapDecodeJSONWithCustomDecoders(nil, w.sn, w.suppressLogical)
+	default:
+		return node
+	}
+	if node.name == "" {
+		node.decodeJSON = fn
+		return node
+	}
+	site := *node
+	site.decodeJSON = fn
+	b.putCustomWiring(&site, w)
+	return &site
 }
 
 // buildCustomWiring collects the per-node custom-type wiring from this parse's
@@ -1985,13 +2007,18 @@ func (b *builder) findCustomTypeMatchInSubtreeWalk(node *schemaNode, visited map
 		effLogical = node.unknownLogical
 	}
 	for _, ct := range b.customTypes {
-		// Wildcard CTs (both empty) opt into runtime ErrSkipCustomType
-		// dispatch: they don't reliably suppress built-ins at parse
-		// time, so they don't cause silent-drop on cached subtrees.
-		// Skip them in this check; only explicitly-typed CTs would
-		// silently fail to fire.
+		// A wildcard (both empty) with a callback runs on every node,
+		// and its callback converts values there, which a cached
+		// subtree bakes in as it bakes in any other custom type's. A
+		// wildcard with no callback changes nothing.
 		if ct.LogicalType == "" && ct.AvroType == "" {
-			continue
+			if ct.Decode == nil && ct.Encode == nil {
+				continue
+			}
+			if node.name != "" {
+				return node.name
+			}
+			return node.kind
 		}
 		ltMatch := ct.LogicalType == "" || ct.LogicalType == effLogical
 		atMatch := ct.AvroType == "" || ct.AvroType == node.kind

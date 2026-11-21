@@ -12079,6 +12079,61 @@ func TestMatrix_SchemaCacheCustomBoundaryGuard(t *testing.T) {
 			t.Errorf("clean reference should resolve, got: %v", err)
 		}
 	})
+	// A custom type's JSON decoder for a named type goes on the reference,
+	// as the binary decoder's wrap does, so one parse's custom types change
+	// nothing another parse decodes, and each schema decodes the same on both
+	// wires. A pair the guard above refuses is skipped.
+	t.Run("custom-decoders-stay-with-their-parse", func(t *testing.T) {
+		dec := func(avroType, out string) avro.CustomType {
+			return avro.CustomType{AvroType: avroType, Decode: func(v any, sn *avro.SchemaNode) (any, error) {
+				if sn.Type != "fixed" {
+					return nil, avro.ErrSkipCustomType
+				}
+				return out, nil
+			}}
+		}
+		regs := map[string][]avro.SchemaOpt{
+			"none":       nil,
+			"wildcard A": {dec("", "A")},
+			"wildcard B": {dec("", "B")},
+			"fixed A":    {dec("fixed", "A")},
+			"fixed B":    {dec("fixed", "B")},
+		}
+		both := func(t *testing.T, s *avro.Schema, bin []byte, js string) string {
+			t.Helper()
+			var b, j any
+			if _, err := s.Decode(bin, &b); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.DecodeJSON([]byte(js), &j); err != nil {
+				t.Fatal(err)
+			}
+			if fmt.Sprint(b) != fmt.Sprint(j) {
+				t.Errorf("Decode gives %v and DecodeJSON %v", b, j)
+			}
+			return fmt.Sprint(b)
+		}
+		for n1, r1 := range regs {
+			for n2, r2 := range regs {
+				t.Run(n1+" then "+n2, func(t *testing.T) {
+					var cache avro.SchemaCache
+					s1, err := cache.Parse(`{"type":"fixed","name":"N","size":2}`, r1...)
+					if err != nil {
+						t.Fatal(err)
+					}
+					before := both(t, s1, []byte("ab"), `"ab"`)
+					s2, err := cache.Parse(`{"type":"record","name":"W","fields":[{"name":"n","type":"N"}]}`, r2...)
+					if err != nil {
+						return
+					}
+					both(t, s2, []byte("ab"), `{"n":"ab"}`)
+					if after := both(t, s1, []byte("ab"), `"ab"`); after != before {
+						t.Errorf("the first schema decoded %v, and %v after the second parse", before, after)
+					}
+				})
+			}
+		}
+	})
 }
 
 // A self-referential schema cached without a CustomType and re-parsed (the

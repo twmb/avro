@@ -36,6 +36,13 @@ import (
 // [Schema.Canonical] output also needs WithLaxNames. [Schema.Encode] and
 // [Schema.Decode] are unaffected.
 //
+// Note that a cached type keeps the custom types of the Parse that defined
+// it: inside the type, values encode and decode with those custom types,
+// whatever custom types a later Parse that references the type registers.
+// Parse returns an error when only one of the two Parses registers a custom
+// type that matches inside the type. Register the same custom types on every
+// Parse that shares types.
+//
 // The zero value is ready to use. A SchemaCache is safe for concurrent use.
 type SchemaCache struct {
 	mu    sync.Mutex

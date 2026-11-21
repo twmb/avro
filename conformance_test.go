@@ -9639,10 +9639,11 @@ func TestMatrix_SchemaCacheCustomTypeRefRejected(t *testing.T) {
 		}
 	})
 
-	t.Run("wildcard CT (both empty) does NOT trigger rejection", func(t *testing.T) {
-		// Wildcard CTs use ErrSkipCustomType at runtime to opt out;
-		// they don't suppress built-ins at parse time, so they don't
-		// cause the silent-drop pattern this guard rejects.
+	t.Run("wildcard CT (both empty) with a callback triggers rejection", func(t *testing.T) {
+		// A wildcard's callback runs on every node and converts values
+		// there, which a cached subtree bakes in as it does any other
+		// custom type's, in both directions. A wildcard with no callback
+		// changes nothing and is not checked.
 		wildcard := avro.CustomType{
 			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
 				return nil, avro.ErrSkipCustomType
@@ -9652,8 +9653,25 @@ func TestMatrix_SchemaCacheCustomTypeRefRejected(t *testing.T) {
 		if _, err := cache.Parse(innerSchema); err != nil {
 			t.Fatalf("cache.Parse(Inner): %v", err)
 		}
-		if _, err := cache.Parse(outerSchema, avro.WithCustomType(wildcard)); err != nil {
-			t.Errorf("wildcard CT shouldn't trigger rejection: %v", err)
+		if _, err := cache.Parse(outerSchema, avro.WithCustomType(wildcard)); err == nil {
+			t.Error("a wildcard CT with a Decode referencing a clean cached type parsed, want a rejection")
+		}
+		withWildcard := &avro.SchemaCache{}
+		if _, err := withWildcard.Parse(innerSchema, avro.WithCustomType(wildcard)); err != nil {
+			t.Fatalf("cache.Parse(Inner, wildcard): %v", err)
+		}
+		if _, err := withWildcard.Parse(outerSchema); err == nil {
+			t.Error("a clean parse referencing a type cached with a wildcard CT parsed, want a rejection")
+		}
+		if _, err := withWildcard.Parse(outerSchema, avro.WithCustomType(wildcard)); err != nil {
+			t.Errorf("the same wildcard CT on both parses: %v", err)
+		}
+		noCallback := &avro.SchemaCache{}
+		if _, err := noCallback.Parse(innerSchema); err != nil {
+			t.Fatalf("cache.Parse(Inner): %v", err)
+		}
+		if _, err := noCallback.Parse(outerSchema, avro.WithCustomType(avro.CustomType{})); err != nil {
+			t.Errorf("a wildcard CT with no callback: %v", err)
 		}
 	})
 
