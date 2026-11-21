@@ -1569,14 +1569,22 @@ func (b *builder) build(parentName string, s *aschema) error {
 	if err != nil {
 		return err
 	}
-	// Propagate extra schema properties to the node (for CustomType callbacks).
+	// Propagate extra schema properties to the node (for CustomType
+	// callbacks). A wrapped reference ({"type":"S","foo":1}) resolves to the
+	// named type's node, which every reference shares, so its props go only
+	// to this reference's custom types.
+	var refProps map[string]any
 	if b.node != nil && s.object != nil && len(s.object.extra) > 0 {
-		b.node.props = s.object.extra
+		if s.object.Name == "" && isNamedKind(b.node.kind) {
+			refProps = s.object.extra
+		} else {
+			b.node.props = s.object.extra
+		}
 	}
 	// Apply custom types to newly built nodes (not unions: custom
 	// types fire on individual branches, not the union container).
 	if len(b.customTypes) > 0 && b.node != nil && b.node.kind != "union" {
-		if err := b.applyCustomTypes(b.node); err != nil {
+		if err := b.applyCustomTypes(b.node, refProps); err != nil {
 			return err
 		}
 	}
@@ -1646,7 +1654,7 @@ func (b *builder) hasMatchingCustomTypeCond(kind, logical string, requireEncode 
 	return false
 }
 
-func (b *builder) applyCustomTypes(node *schemaNode) error {
+func (b *builder) applyCustomTypes(node *schemaNode, refProps map[string]any) error {
 	// Validate NewCustomType-created types with unsupported A type.
 	for _, ct := range b.customTypes {
 		if ct.needsAvroType && ct.AvroType == "" {
@@ -1654,7 +1662,13 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		}
 	}
 
-	wiring := b.buildCustomWiring(node)
+	src := node
+	if refProps != nil {
+		ref := *node
+		ref.props = refProps
+		src = &ref
+	}
+	wiring := b.buildCustomWiring(src)
 	if wiring == nil {
 		return nil
 	}
@@ -1672,8 +1686,12 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 	if len(wiring.decoders) > 0 {
 		b.deser = wrapDeserWithCustomDecoders(node.deser, wiring.decoders, wiring.sn)
 	}
-	b.putCustomWiring(node, wiring)
-	b.node = b.siteNode(node)
+	// The shared node keeps the wiring of the type's own props, and a
+	// wrapped reference's wiring goes only on its copy.
+	if refProps == nil {
+		b.putCustomWiring(node, wiring)
+	}
+	b.node = b.siteNodeWith(node, wiring)
 	b.meta.hasCustomType = true
 	return nil
 }
@@ -1687,7 +1705,11 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 // reference and not the node. Any other node has one reference and gets the
 // decoder itself.
 func (b *builder) siteNode(node *schemaNode) *schemaNode {
-	w := b.custom[node]
+	return b.siteNodeWith(node, b.custom[node])
+}
+
+// siteNodeWith is siteNode with the wiring w for the reference.
+func (b *builder) siteNodeWith(node *schemaNode, w *customWiring) *schemaNode {
 	if w == nil {
 		return node
 	}

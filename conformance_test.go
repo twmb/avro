@@ -22276,26 +22276,41 @@ func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
 			}
 		})
 	}
-	// A custom type's callback gets the record's props at a reference
-	// inside the record, as at the record itself.
+	// A custom type's callback gets a record's props at a reference inside
+	// the record, as at the record itself, and a wrapped reference's own
+	// props only at that reference, as Root gives them.
 	t.Run("props", func(t *testing.T) {
 		var seen []any
 		ct := avro.CustomType{AvroType: "record", Decode: func(v any, sn *avro.SchemaNode) (any, error) {
 			seen = append(seen, sn.Props["foo"])
 			return v, nil
 		}}
-		s := avro.MustParse(`{"type":"record","name":"R","foo":"bar","fields":[{"name":"a","type":"long"},{"name":"next","type":["null","R"]}]}`, ct)
-		v := map[string]any{"a": int64(1), "next": map[string]any{"a": int64(2), "next": nil}}
-		for name, decode := range map[string]func() error{
-			"Decode":     func() error { var out any; _, err := s.Decode(avrotest.MustEncode(t, s, v), &out); return err },
-			"DecodeJSON": func() error { var out any; return s.DecodeJSON(avrotest.MustEncodeJSON(t, s, v), &out) },
+		for _, c := range []struct {
+			name, schema string
+			v            any
+			want         []any // in the order the records finish decoding
+		}{
+			{"inner reference", `{"type":"record","name":"R","foo":"bar","fields":[{"name":"a","type":"long"},{"name":"next","type":["null","R"]}]}`,
+				map[string]any{"a": int64(1), "next": map[string]any{"a": int64(2), "next": nil}}, []any{"bar", "bar"}},
+			{"wrapped reference", `{"type":"record","name":"T","fields":[
+				{"name":"x","type":{"type":"record","name":"S","foo":"def","fields":[{"name":"a","type":"long"}]}},
+				{"name":"y","type":{"type":"S","foo":"ref"}},
+				{"name":"z","type":"S"}]}`,
+				map[string]any{"x": map[string]any{"a": int64(1)}, "y": map[string]any{"a": int64(2)}, "z": map[string]any{"a": int64(3)}},
+				[]any{"def", "ref", "def", nil}},
 		} {
-			seen = nil
-			if err := decode(); err != nil {
-				t.Fatalf("%s: %v", name, err)
-			}
-			if len(seen) != 2 || seen[0] != "bar" || seen[1] != "bar" {
-				t.Errorf("%s: the callback saw props %v, want bar at both records", name, seen)
+			s := avro.MustParse(c.schema, ct)
+			for name, decode := range map[string]func() error{
+				"Decode":     func() error { var out any; _, err := s.Decode(avrotest.MustEncode(t, s, c.v), &out); return err },
+				"DecodeJSON": func() error { var out any; return s.DecodeJSON(avrotest.MustEncodeJSON(t, s, c.v), &out) },
+			} {
+				seen = nil
+				if err := decode(); err != nil {
+					t.Fatalf("%s/%s: %v", c.name, name, err)
+				}
+				if !reflect.DeepEqual(seen, c.want) {
+					t.Errorf("%s/%s: the callbacks saw props %v, want %v", c.name, name, seen, c.want)
+				}
 			}
 		}
 	})
