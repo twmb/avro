@@ -358,6 +358,30 @@ func sliceOf[T any](v reflect.Value) ([]T, bool) {
 	return v.Interface().([]T), true
 }
 
+// nilPointerOnPath returns the nil pointer that indirectAlloc would allocate
+// at the pointer v, or the zero Value when v is not a pointer or none is nil.
+// It inlines, so that a slot that is not a pointer costs one comparison.
+func nilPointerOnPath(v reflect.Value) reflect.Value {
+	if v.Kind() != reflect.Pointer {
+		return reflect.Value{}
+	}
+	return nilPointerBelow(v)
+}
+
+// nilPointerBelow follows the non-nil pointers from v to the first nil one.
+func nilPointerBelow(v reflect.Value) reflect.Value {
+	for range maxIndirectDepth {
+		if v.Kind() != reflect.Pointer {
+			return reflect.Value{}
+		}
+		if v.IsNil() {
+			return v
+		}
+		v = v.Elem()
+	}
+	return reflect.Value{}
+}
+
 func indirectAlloc(v reflect.Value) reflect.Value {
 	for range maxIndirectDepth {
 		switch v.Kind() {

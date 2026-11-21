@@ -251,7 +251,13 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 		scanner: jsonScanner{data: src},
 		slab:    sl,
 	}
+	// A nil pointer that v points at, and that the decode allocates before
+	// its value fails, stays nil.
+	fresh := nilPointerOnPath(rv.Elem())
 	err := ctx.decodeValue(rv.Elem(), s.node)
+	if err != nil && fresh.IsValid() {
+		fresh.SetZero()
+	}
 	if err == nil {
 		// One DecodeJSON call decodes exactly one value and returns no
 		// offset, so we reject any trailing non-whitespace content,

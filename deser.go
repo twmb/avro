@@ -346,8 +346,15 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	// slab state, and they are inert outside union and record paths, which are
 	// never slab-free. So their mere presence takes the pooled path, keeping
 	// the nil-slab proof trivial.
+	// A nil pointer that v points at, and that the decode allocates before
+	// its value fails, stays nil.
+	fresh := nilPointerOnPath(rv.Elem())
 	if s.slabFree && len(opts) == 0 {
-		return s.deser(src, rv.Elem(), nil)
+		rest, err := s.deser(src, rv.Elem(), nil)
+		if err != nil && fresh.IsValid() {
+			fresh.SetZero()
+		}
+		return rest, err
 	}
 	sl := slabPool.Get().(*slab)
 	if len(opts) > 0 {
@@ -359,6 +366,9 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	}
 	rest, err := s.deser(src, rv.Elem(), sl)
 	sl.put()
+	if err != nil && fresh.IsValid() {
+		fresh.SetZero()
+	}
 	return rest, err
 }
 
@@ -2045,7 +2055,12 @@ func (s *deserArray) deserFixedArray(src []byte, v reflect.Value, sl *slab) ([]b
 		}
 		n := int(count)
 		for range n {
-			src, err = s.deserItem(src, v.Index(idx), sl)
+			// A nil pointer element whose item fails stays nil.
+			ev := v.Index(idx)
+			fresh := nilPointerOnPath(ev)
+			if src, err = s.deserItem(src, ev, sl); err != nil && fresh.IsValid() {
+				fresh.SetZero()
+			}
 			if err != nil {
 				return nil, err
 			}

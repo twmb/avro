@@ -814,7 +814,13 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 				if idx >= arrLen {
 					return &SemanticError{GoType: v.Type(), AvroType: "array", Err: fmt.Errorf("expected %d elements, got more", arrLen)}
 				}
-				if err := ctx.decodeValue(v.Index(idx), node.items); err != nil {
+				// A nil pointer element whose item fails stays nil.
+				ev := v.Index(idx)
+				fresh := nilPointerOnPath(ev)
+				if err := ctx.decodeValue(ev, node.items); err != nil {
+					if fresh.IsValid() {
+						fresh.SetZero()
+					}
 					return err
 				}
 				idx++
@@ -1406,7 +1412,12 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 			if err != nil {
 				return recordFieldError(v.Type(), f.name, err)
 			}
+			// A nil pointer field whose value fails stays nil.
+			fresh := nilPointerOnPath(fv)
 			if err := ctx.decodeValue(fv, f.node); err != nil {
+				if fresh.IsValid() {
+					fresh.SetZero()
+				}
 				return recordFieldError(v.Type(), f.name, err)
 			}
 			return nil
@@ -1420,7 +1431,11 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 			if err != nil {
 				return defaultFieldError(v.Type(), f.name, err)
 			}
+			fresh := nilPointerOnPath(fv)
 			if err := ctx.applyFieldDefault(fv, node, idx); err != nil {
+				if fresh.IsValid() {
+					fresh.SetZero()
+				}
 				return defaultFieldError(v.Type(), f.name, err)
 			}
 			return nil

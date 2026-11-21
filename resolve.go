@@ -615,7 +615,12 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 		if ferr != nil {
 			return nil, recordFieldError(t, rr.readerNames[op.readerIdx], ferr)
 		}
+		// A nil pointer field whose value fails stays nil.
+		fresh := nilPointerOnPath(fv)
 		if src, err = op.read(src, fv, sl); err != nil {
+			if fresh.IsValid() {
+				fresh.SetZero()
+			}
 			return nil, recordFieldError(t, rr.readerNames[op.readerIdx], err)
 		}
 	}
@@ -629,7 +634,11 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 		if ferr != nil {
 			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], ferr)
 		}
+		fresh := nilPointerOnPath(fv)
 		if _, err = d.deser(d.encodedDefault, fv, sl); err != nil {
+			if fresh.IsValid() {
+				fresh.SetZero()
+			}
 			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], err)
 		}
 	}

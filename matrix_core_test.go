@@ -13709,6 +13709,121 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 			}
 		}
 	})
+	t.Run("nil-pointer-stays-nil-after-a-failure", func(t *testing.T) {
+		// A nil pointer whose value fails stays nil, on both decoders.
+		const long, nl = `"long"`, `["null","long"]`
+		rec := func(s string) string { return `{"type":"record","name":"R","fields":[{"name":"f","type":` + s + `}]}` }
+		arr := func(s string) string { return `{"type":"array","items":` + s + `}` }
+		for _, c := range []struct {
+			name, schema string
+			bin, js      []byte
+			target       func() (ptr any, isNil func() bool)
+		}{
+			{"top, long", long, []byte{0x80}, []byte(`"x"`), func() (any, func() bool) {
+				var p *int64
+				return &p, func() bool { return p == nil }
+			}},
+			{"top, null union", nl, []byte{2, 0x80}, []byte(`{"long":"x"}`), func() (any, func() bool) {
+				var p *int64
+				return &p, func() bool { return p == nil }
+			}},
+			{"field, long", rec(long), []byte{0x80}, []byte(`{"f":"x"}`), func() (any, func() bool) {
+				var x struct {
+					F *int64 `avro:"f"`
+				}
+				return &x, func() bool { return x.F == nil }
+			}},
+			{"field, null union", rec(nl), []byte{2, 0x80}, []byte(`{"f":{"long":"x"}}`), func() (any, func() bool) {
+				var x struct {
+					F *int64 `avro:"f"`
+				}
+				return &x, func() bool { return x.F == nil }
+			}},
+			{"Go array", arr(long), []byte{2, 0x80}, []byte(`["x"]`), func() (any, func() bool) {
+				var x [1]*int64
+				return &x, func() bool { return x[0] == nil }
+			}},
+			{"Go array field", rec(arr(long)), []byte{2, 0x80}, []byte(`{"f":["x"]}`), func() (any, func() bool) {
+				var x struct {
+					F [1]*int64 `avro:"f"`
+				}
+				return &x, func() bool { return x.F[0] == nil }
+			}},
+			{"top record", rec(long), []byte{0x80}, []byte(`{"f":"x"}`), func() (any, func() bool) {
+				var p *struct {
+					F int64 `avro:"f"`
+				}
+				return &p, func() bool { return p == nil }
+			}},
+			// A value of the wrong type fails after the pointer would be
+			// allocated.
+			{"top, wrong type", `"boolean"`, []byte{1}, []byte(`true`), func() (any, func() bool) {
+				var p *int64
+				return &p, func() bool { return p == nil }
+			}},
+			{"field, wrong type", rec(`"boolean"`), []byte{1}, []byte(`{"f":true}`), func() (any, func() bool) {
+				var x struct {
+					F *int64 `avro:"f"`
+				}
+				return &x, func() bool { return x.F == nil }
+			}},
+			{"Go array, wrong type", arr(`"boolean"`), []byte{2, 1, 0}, []byte(`[true]`), func() (any, func() bool) {
+				var x [1]*int64
+				return &x, func() bool { return x[0] == nil }
+			}},
+			{"field, null union of a record", rec(`["null",{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}]`),
+				[]byte{2, 0x80}, []byte(`{"f":{"P":{"a":"x"}}}`), func() (any, func() bool) {
+					var x struct {
+						F *struct {
+							A int64 `avro:"a"`
+						} `avro:"f"`
+					}
+					return &x, func() bool { return x.F == nil }
+				}},
+		} {
+			s := avro.MustParse(c.schema)
+			for name, decode := range map[string]func(v any) error{
+				"binary": func(v any) error { _, err := s.Decode(c.bin, v); return err },
+				"json":   func(v any) error { return s.DecodeJSON(c.js, v) },
+			} {
+				ptr, isNil := c.target()
+				if err := decode(ptr); err == nil || !isNil() {
+					t.Errorf("%s/%s: err %v, pointer nil %v; want an error and nil", c.name, name, err, isNil())
+				}
+			}
+		}
+		// A default that DecodeJSON fills, and that the field cannot take,
+		// leaves the field's nil pointer nil.
+		dj := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"d","type":"int","default":42}]}`)
+		var dflt struct {
+			D *string `avro:"d"`
+		}
+		if err := dj.DecodeJSON([]byte(`{}`), &dflt); err == nil || dflt.D != nil {
+			t.Errorf("JSON default: err %v, pointer %v; want an error and nil", err, dflt.D)
+		}
+		// Through Resolve, a record field that fails, or a reader field's
+		// default that the Go field cannot take, leaves the nil pointer nil.
+		w := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+		r := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"d","type":"int","default":42}]}`)
+		res := avrotest.MustResolve(t, w, r)
+		pw := avro.MustParse(`{"type":"record","name":"O","fields":[{"name":"p","type":{"type":"record","name":"P","fields":[{"name":"x","type":"int"}]}}]}`)
+		pr := avro.MustParse(`{"type":"record","name":"O","fields":[{"name":"p","type":{"type":"record","name":"P","fields":[{"name":"x","type":"long"}]}}]}`)
+		var outer struct {
+			P *struct {
+				X int64 `avro:"x"`
+			} `avro:"p"`
+		}
+		if _, err := avrotest.MustResolve(t, pw, pr).Decode(nil, &outer); err == nil || outer.P != nil {
+			t.Errorf("resolved record field: err %v, pointer %v; want an error and nil", err, outer.P)
+		}
+		var def struct {
+			A int64   `avro:"a"`
+			D *string `avro:"d"`
+		}
+		if _, err := res.Decode([]byte{2}, &def); err == nil || def.D != nil {
+			t.Errorf("resolved default: err %v, pointer %v; want an error and nil", err, def.D)
+		}
+	})
 	t.Run("slice-of-pointers", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"array","items":["null","int"]}`)
 		for _, w := range reuseWires {

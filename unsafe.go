@@ -224,7 +224,11 @@ func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *sla
 			if ferr != nil {
 				return nil, recordFieldError(fast.typ, f.name, ferr)
 			}
-			src, err = f.slowFn(src, fv, sl)
+			// A nil pointer field whose value fails stays nil.
+			fresh := nilPointerOnPath(fv)
+			if src, err = f.slowFn(src, fv, sl); err != nil && fresh.IsValid() {
+				fresh.SetZero()
+			}
 		}
 		if err != nil {
 			return nil, recordFieldError(fast.typ, f.name, err)
@@ -1382,22 +1386,23 @@ func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte
 // src directly, since we already zeroed the pointer field; otherwise pp points
 // at the T for your branch decoder to fill, which is the caller's own T when
 // the pointer was already set.
-func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valIdx int, nullByte, valByte byte) (pp unsafe.Pointer, rest []byte, isNull bool, err error) {
+func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valIdx int, nullByte, valByte byte) (pp unsafe.Pointer, rest []byte, isNull, fresh bool, err error) {
 	isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, false, false, err
 	}
 	if !isVal {
 		*(*unsafe.Pointer)(p) = nil
-		return nil, src, true, nil
+		return nil, src, true, false, nil
 	}
 	pp = *(*unsafe.Pointer)(p)
 	if pp == nil {
 		v := reflect.New(innerType)
 		pp = v.UnsafePointer()
 		*(*unsafe.Pointer)(p) = pp
+		fresh = true
 	}
-	return pp, src, false, nil
+	return pp, src, false, fresh, nil
 }
 
 // udNullUnionPtr handles null-union deser for *T where T has a compiled
@@ -1415,13 +1420,17 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type, valIdx int, nullByte
 			return nil, errTooDeep
 		}
 		sl.depth++
-		pp, src, isNull, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
+		pp, src, isNull, fresh, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
 		if err != nil || isNull {
 			sl.depth--
 			return src, err
 		}
 		src, err = inner(src, pp, sl)
 		sl.depth--
+		if err != nil && fresh {
+			// A nil pointer whose value fails stays nil.
+			*(*unsafe.Pointer)(p) = nil
+		}
 		return src, err
 	}
 }
@@ -1443,13 +1452,17 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nul
 			return nil, errTooDeep
 		}
 		sl.depth++
-		pp, src, isNull, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
+		pp, src, isNull, fresh, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
 		if err != nil || isNull {
 			sl.depth--
 			return src, err
 		}
 		src, err = deserRecordVia(src, rec.fastFor(innerType, sl.skipUnknown), rec, innerType, pp, sl)
 		sl.depth--
+		if err != nil && fresh {
+			// A nil pointer whose record fails stays nil.
+			*(*unsafe.Pointer)(p) = nil
+		}
 		return src, err
 	}
 }
