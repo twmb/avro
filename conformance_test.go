@@ -22298,6 +22298,19 @@ func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
 				{"name":"z","type":"S"}]}`,
 				map[string]any{"x": map[string]any{"a": int64(1)}, "y": map[string]any{"a": int64(2)}, "z": map[string]any{"a": int64(3)}},
 				[]any{"def", "ref", "def", nil}},
+			{"wrapped references before the definition", `{"type":"record","name":"T","fields":[
+				{"name":"u","type":["null",{"type":"S","foo":"u"}]},
+				{"name":"f","type":{"type":"S","foo":"f"}},
+				{"name":"a","type":{"type":"array","items":{"type":"S","foo":"a"}}},
+				{"name":"m","type":{"type":"map","values":{"type":"S","foo":"m"}}},
+				{"name":"x","type":{"type":"record","name":"S","foo":"def","fields":[{"name":"a","type":"long"}]}},
+				{"name":"z","type":"S"}]}`,
+				map[string]any{
+					"u": map[string]any{"a": int64(1)}, "f": map[string]any{"a": int64(2)},
+					"a": []any{map[string]any{"a": int64(3)}}, "m": map[string]any{"k": map[string]any{"a": int64(4)}},
+					"x": map[string]any{"a": int64(5)}, "z": map[string]any{"a": int64(6)},
+				},
+				[]any{"u", "f", "a", "m", "def", "def", nil}},
 		} {
 			s := avro.MustParse(c.schema, ct)
 			for name, decode := range map[string]func() error{

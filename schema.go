@@ -857,6 +857,9 @@ type unionMissing struct {
 	branches   []*schemaNode  // union node's branch slice; fwd-ref branch nodes are patched in finalize
 	missing    map[int]string // branch index to type name
 	parentName string         // enclosing scope, for the finalize namespace-qualified retry
+	// props are the extra keys of a wrapped forward-referenced branch, by
+	// branch index, which only that branch's custom types get.
+	props map[int]map[string]any
 }
 
 // fieldMeta carries Avro-level type info for a record field, used by the
@@ -904,6 +907,9 @@ type recordFieldFixup struct {
 	parentName string // enclosing record fullname, for the namespace-qualified retry
 	defaultVal any    // parsed JSON default; valid only when hasDefault is true
 	hasDefault bool   // whether the field had a "default" in the schema
+	// props are the extra keys of a wrapped reference, which only this
+	// field's custom types get.
+	props map[string]any
 }
 
 // containerFixup patches an array or map container whose element type
@@ -919,6 +925,9 @@ type containerFixup struct {
 	name        string       // referenced named-type name
 	parentName  string       // enclosing scope, for the namespace-qualified retry
 	ctxLabel    string       // "array" or "map" for error messages
+	// props are the extra keys of a wrapped reference, which only this
+	// element's custom types get.
+	props map[string]any
 }
 
 // defaultFixup defers a record field's default-value encoding to finalize,
@@ -1132,8 +1141,8 @@ func makeCustomSer(ce func(reflect.Value) (reflect.Value, error), base serfn) se
 // on the binary path. Using the unwrapped namedType.ser instead silently
 // diverges binary from JSON: the forward-referenced field encodes raw on
 // binary but converted on JSON.
-func (b *builder) customWrappedSer(node *schemaNode, base serfn) serfn {
-	if w := b.custom[node]; w != nil && w.encode != nil {
+func customWrappedSer(w *customWiring, base serfn) serfn {
+	if w != nil && w.encode != nil {
 		return makeCustomSer(w.encode, base)
 	}
 	return base
@@ -1145,8 +1154,8 @@ func (b *builder) customWrappedSer(node *schemaNode, base serfn) serfn {
 // custom-decoded named type applies the CustomType on the binary path as the
 // JSON path already does. Logical suppression with no Decode callback needs
 // no wrap, since the raw deser is baked onto the shared leaf node.
-func (b *builder) customWrappedDeser(node *schemaNode, base deserfn) deserfn {
-	if w := b.custom[node]; w != nil && len(w.decoders) > 0 {
+func customWrappedDeser(w *customWiring, base deserfn) deserfn {
+	if w != nil && len(w.decoders) > 0 {
 		return wrapDeserWithCustomDecoders(base, w.decoders, w.sn)
 	}
 	return base
@@ -1364,8 +1373,9 @@ func (b *builder) finalize() error {
 			if nt == nil {
 				return fmt.Errorf("unknown type %q", truncForError(name))
 			}
-			m.ser.fns[idx] = b.customWrappedSer(nt.node, nt.node.ser)
-			m.deser.fns[idx] = b.customWrappedDeser(nt.node, nt.node.deser)
+			w := b.refWiring(nt.node, m.props[idx])
+			m.ser.fns[idx] = customWrappedSer(w, nt.node.ser)
+			m.deser.fns[idx] = customWrappedDeser(w, nt.node.deser)
 			// The builder left branches[idx] nil for this forward-ref
 			// branch (the named type wasn't built yet). The binary path
 			// dispatches through the ser/deser fn tables (patched above),
@@ -1373,7 +1383,7 @@ func (b *builder) finalize() error {
 			// union-default-validation paths walk node.branches directly
 			// and would dereference the nil node.
 			if m.branches != nil {
-				m.branches[idx] = b.siteNode(nt.node)
+				m.branches[idx] = b.siteNodeWith(nt.node, w)
 			}
 		}
 		// With every branch node wired, re-derive the union's
@@ -1406,8 +1416,9 @@ func (b *builder) finalize() error {
 		if nt == nil {
 			return fmt.Errorf("unknown type %q", truncForError(m.name))
 		}
-		m.nd.serRecord.fields[m.idx].fn = b.customWrappedSer(nt.node, nt.node.ser)
-		m.nd.deserRecord.fields[m.idx].fn = b.customWrappedDeser(nt.node, nt.node.deser)
+		w := b.refWiring(nt.node, m.props)
+		m.nd.serRecord.fields[m.idx].fn = customWrappedSer(w, nt.node.ser)
+		m.nd.deserRecord.fields[m.idx].fn = customWrappedDeser(w, nt.node.deser)
 		if nt.node.serRecord != nil {
 			// The encode and decode entries for one field were handed the
 			// same *fieldMeta when the field was built, so naming the type
@@ -1418,8 +1429,8 @@ func (b *builder) finalize() error {
 		}
 		// We mark a custom type, as applyCustomTypes does for an in-order
 		// reference, so the unsafe paths keep the wrap on fn.
-		m.nd.serRecord.fields[m.idx].meta.hasCustomType = b.custom[nt.node] != nil
-		m.nd.fields[m.idx].node = b.siteNode(nt.node)
+		m.nd.serRecord.fields[m.idx].meta.hasCustomType = w != nil
+		m.nd.fields[m.idx].node = b.siteNodeWith(nt.node, w)
 	}
 	// Phase 1b: wire every forward-referenced array/map container child.
 	// One walk is shared across the loop: a schema can point any number of
@@ -1432,10 +1443,11 @@ func (b *builder) finalize() error {
 		if nt == nil {
 			return fmt.Errorf("%s references unknown named type %q", m.ctxLabel, truncForError(m.name))
 		}
-		*m.serItem = b.customWrappedSer(nt.node, nt.node.ser)
-		*m.deserItem = b.customWrappedDeser(nt.node, nt.node.deser)
+		w := b.refWiring(nt.node, m.props)
+		*m.serItem = customWrappedSer(w, nt.node.ser)
+		*m.deserItem = customWrappedDeser(w, nt.node.deser)
 		m.setMinBytes(mbw.minBytesOf(nt.node))
-		*m.nodeChild = b.siteNode(nt.node)
+		*m.nodeChild = b.siteNodeWith(nt.node, w)
 	}
 	// Phase 2: deferred field defaults, in two passes. encodeDefault fills
 	// an absent nested record field from its resolved f.defaultVal, so we
@@ -1706,6 +1718,27 @@ func (b *builder) applyCustomTypes(node *schemaNode, refProps map[string]any) er
 // decoder itself.
 func (b *builder) siteNode(node *schemaNode) *schemaNode {
 	return b.siteNodeWith(node, b.custom[node])
+}
+
+// refProps returns the extra keys of a wrapped reference such as
+// {"type":"S","foo":1}, or nil.
+func refProps(s *aschema) map[string]any {
+	if s == nil || s.object == nil || len(s.object.extra) == 0 {
+		return nil
+	}
+	return s.object.extra
+}
+
+// refWiring returns the custom wiring of a reference to node: node's own, or
+// for a wrapped reference with props, wiring built with those props, which
+// only that reference's custom types get.
+func (b *builder) refWiring(node *schemaNode, props map[string]any) *customWiring {
+	if props == nil {
+		return b.custom[node]
+	}
+	ref := *node
+	ref.props = props
+	return b.buildCustomWiring(&ref)
 }
 
 // siteNodeWith is siteNode with the wiring w for the reference.
@@ -2102,6 +2135,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		ser         = &serUnion{tags: tags}
 		deser       = new(deserUnion)
 		missing     = make(map[int]string)
+		props       map[int]map[string]any // a wrapped forward branch's extra keys
 		sawTypes    = make(map[string]bool)
 		branchMetas = make([]fieldMeta, len(s.union))
 		branchNodes = make([]*schemaNode, len(s.union))
@@ -2124,12 +2158,19 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		// The name captureFwdRef hands back comes from either the
 		// bare-string form (where us.primitive is set) or the wrapped form
 		// {"type":"FwdName"} (where us.object.Type is set).
+		branchProps := refProps(&us) // before the build, which can rewrite us
 		isFwdRef, fwdName, err := captureFwdRef(u.build(parentName, &us), "union")
 		if err != nil {
 			return err
 		}
 		if isFwdRef {
 			missing[i] = fwdName
+			if p := branchProps; p != nil {
+				if props == nil {
+					props = make(map[int]map[string]any)
+				}
+				props[i] = p
+			}
 		}
 		b.unnest(u)
 		branchMetas[i] = u.meta
@@ -2219,6 +2260,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 			branches:   branchNodes,
 			missing:    missing,
 			parentName: parentName,
+			props:      props,
 		})
 	}
 	b.node = &schemaNode{
@@ -2741,6 +2783,7 @@ func (b *builder) buildRecord(o *aobject) error {
 		if of.orderSet && of.Order != "ascending" && of.Order != "descending" && of.Order != "ignore" {
 			return fmt.Errorf("invalid field order %q for field %q", truncForError(of.Order), truncForError(of.Name))
 		}
+		fieldProps := refProps(of.Type) // before the build, which can rewrite of.Type
 		bf, isFwdRef, fwdRefName, err := b.buildChild(o.Name, of.Type, "record field")
 		if err != nil {
 			return err
@@ -2778,6 +2821,7 @@ func (b *builder) buildRecord(o *aobject) error {
 				idx:        fieldIdx,
 				name:       fwdRefName,
 				parentName: o.Name, // fields build under the record's fullname
+				props:      fieldProps,
 			}
 			if len(of.Default) > 0 {
 				fix.defaultVal = unmarshalDefault(of.Default)
@@ -2928,6 +2972,7 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 	if o.Items == nil {
 		return errors.New("array is missing items schema")
 	}
+	itemProps := refProps(o.Items) // before the build, which can rewrite o.Items
 	af, isFwdRef, fwdRefName, err := b.buildChild(parentName, o.Items, "array")
 	if err != nil {
 		return err
@@ -3004,6 +3049,7 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 			nodeChild:   &arrayNode.items,
 			name:        fwdRefName,
 			parentName:  parentName,
+			props:       itemProps,
 			ctxLabel:    "array",
 		})
 	}
@@ -3014,6 +3060,7 @@ func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) err
 	if o.Values == nil {
 		return errors.New("map is missing values schema")
 	}
+	valueProps := refProps(o.Values) // before the build, which can rewrite o.Values
 	mf, isFwdRef, fwdRefName, err := b.buildChild(parentName, o.Values, "map")
 	if err != nil {
 		return err
@@ -3072,6 +3119,7 @@ func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) err
 			name:        fwdRefName,
 			parentName:  parentName,
 			ctxLabel:    "map",
+			props:       valueProps,
 		})
 	}
 	return nil
