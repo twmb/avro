@@ -1279,7 +1279,7 @@ func (ctx *jsonDecoder) decodeArrayRecord(row ArrayRecord, node *schemaNode) err
 		func(idx int) error {
 			f := &node.fields[idx]
 			if err := ctx.applyFieldDefault(reflect.ValueOf(&row[idx]).Elem(), node, idx); err != nil {
-				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
+				return defaultFieldError(arrayRecordType, f.name, err)
 			}
 			return nil
 		},
@@ -1323,7 +1323,7 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 			}
 			defValV := reflect.ValueOf(&defVal).Elem()
 			if err := ctx.applyFieldDefault(defValV, node, idx); err != nil {
-				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
+				return defaultFieldError(nil, f.name, err)
 			}
 			m[f.name] = defVal
 			return nil
@@ -1374,7 +1374,7 @@ func (ctx *jsonDecoder) decodeRecordMap(target reflect.Value, node *schemaNode) 
 				mapValueInto(v, key, elem)
 			}
 			if err := ctx.applyFieldDefault(elem, node, idx); err != nil {
-				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
+				return defaultFieldError(nil, f.name, err)
 			}
 			v.SetMapIndex(key, elem)
 			elem.SetZero()
@@ -1418,10 +1418,10 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 			}
 			fv, err := fieldByIndex(v, mapping.indices[idx])
 			if err != nil {
-				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
+				return defaultFieldError(v.Type(), f.name, err)
 			}
 			if err := ctx.applyFieldDefault(fv, node, idx); err != nil {
-				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
+				return defaultFieldError(v.Type(), f.name, err)
 			}
 			return nil
 		},

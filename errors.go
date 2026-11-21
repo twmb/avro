@@ -115,6 +115,13 @@ func recordFieldError(goType reflect.Type, fieldName string, err error) error {
 	return &SemanticError{GoType: goType, Field: fieldName, Err: err}
 }
 
+// defaultFieldError reports a field whose default could not go into the
+// target. Unlike recordFieldError, it keeps the cause behind "default", so the
+// text says the value came from the default and not from the document.
+func defaultFieldError(goType reflect.Type, fieldName string, err error) error {
+	return &SemanticError{GoType: goType, Field: fieldName, Err: &causeError{"default", err}}
+}
+
 // ShortBufferError indicates the input buffer is too short for the value
 // being decoded.
 type ShortBufferError struct {

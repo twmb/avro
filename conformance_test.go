@@ -4376,6 +4376,38 @@ func TestSpecJSONDecodeFillsDefaultForMissingField(t *testing.T) {
 			t.Fatalf("defaulted: %v", got["defaulted"])
 		}
 	})
+	t.Run("default_the_target_cannot_hold", func(t *testing.T) {
+		// The error names the field and that the default failed, with the
+		// package named once, into every target and nested in a record.
+		inner := `{"type":"record","name":"R","fields":[{"name":"d","type":"int","default":42}]}`
+		r := avrotest.MustParse(t, inner)
+		o := avrotest.MustParse(t, `{"type":"record","name":"O","fields":[{"name":"r","type":`+inner+`}]}`)
+		var anyMap any = map[string]any{"d": new(string)}
+		for _, c := range []struct {
+			name   string
+			s      *avro.Schema
+			doc    string
+			target any
+			want   string
+		}{
+			{"struct", r, `{}`, &struct {
+				D string `avro:"d"`
+			}{}, "avro: field d: default: "},
+			{"typed map", r, `{}`, &map[string]string{}, "avro: field d: default: "},
+			{"ArrayRecord", r, `{}`, &avro.ArrayRecord{new(string)}, "avro: field d: default: "},
+			{"any map", r, `{}`, &anyMap, "avro: field d: default: "},
+			{"nested struct", o, `{"r":{}}`, &struct {
+				R struct {
+					D string `avro:"d"`
+				} `avro:"r"`
+			}{}, "avro: field r.d: default: "},
+		} {
+			err := c.s.DecodeJSON([]byte(c.doc), c.target)
+			if err == nil || !strings.HasPrefix(err.Error(), c.want) || strings.Count(err.Error(), "avro") != 1 {
+				t.Errorf("%s: %v, want an error starting %q that names avro once", c.name, err, c.want)
+			}
+		}
+	})
 }
 
 // TestRegression_DecodeJSONIntoAnyDefaultFillTypeConsistency locks parity
@@ -9595,6 +9627,9 @@ func TestMatrix_SchemaCacheCustomTypeRefRejected(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "re-parse") {
 			t.Errorf("error should suggest re-parsing: %v", err)
+		}
+		if strings.Contains(err.Error(), ": avro: ") {
+			t.Errorf("error names the package in the middle: %v", err)
 		}
 	})
 

@@ -946,7 +946,7 @@ func captureFwdRef(err error, ctxLabel string) (isFwdRef bool, fwdName string, w
 	if pe := (*unknownPrimitiveError)(nil); errors.As(err, &pe) {
 		return true, pe.p, nil
 	}
-	return false, "", fmt.Errorf("invalid %s: %v", ctxLabel, err)
+	return false, "", fmt.Errorf("invalid %s: %s", ctxLabel, causeText(err))
 }
 
 // namedType holds the compiled artifacts for a named Avro type (record,
