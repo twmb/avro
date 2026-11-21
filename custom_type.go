@@ -59,6 +59,11 @@ type CustomType struct {
 	// here instead. If nil, the custom type does not affect schema
 	// generation, but we still use it in the returned [*Schema] for
 	// encode/decode.
+	//
+	// A union with this custom type on a branch knows from GoType which
+	// values in an any your Decode returned, so it replaces such a value
+	// when another branch arrives. If nil, a value your Decode returned is
+	// decoded into like any other pointer, map, or slice in an any.
 	GoType reflect.Type
 
 	// Schema is the full schema to emit in SchemaFor. You only need it
