@@ -28,10 +28,11 @@ func (taggedUnions) opt() {}
 //
 // [Schema.EncodeJSON] emits the tagged form. [Schema.Decode] and
 // [Schema.DecodeJSON] wrap union values as map[string]any{branchName: value},
-// but only when the value decodes into an any: your *any target, an any
-// field, or an any that a pointer points at. A typed target (a struct field
-// of a concrete type, a pointer to a concrete type, or a non-empty interface)
-// cannot hold the wrapper, so a typed target gets the bare branch value.
+// but only when the value decodes into an any, such as your *any target, an
+// any field, element, or map value, or an any that a pointer points at. A
+// typed target (a struct field of a concrete type, a pointer to a concrete
+// type, or a non-empty interface) cannot hold the wrapper, so a typed target
+// gets the bare branch value.
 //
 // [Schema.DecodeJSON] and [Schema.Encode] take both tagged and bare union
 // input either way.

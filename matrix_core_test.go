@@ -13203,7 +13203,7 @@ func TestMatrix_RoundTripParity(t *testing.T) {
 				}
 				for _, in := range append(vals, inputs...) {
 					// The encoded value is the target a position builds around the
-					// input. A slot of the input.s own type needs the input.s type.
+					// input. A slot of the input's own type needs the input's type.
 					ptr, _ := pos.target(in.v)
 					if ptr == nil {
 						continue

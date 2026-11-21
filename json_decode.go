@@ -1594,9 +1594,9 @@ func (ctx *jsonDecoder) wrapBranch(v reflect.Value, union, branch *schemaNode) {
 // target has, after the form decoded and its object did not close, so that
 // the bare form does not decode into it.
 //
-// We decode the tagged form into your value and not into a copy, because the
-// tagged form's object closes in every document but these, and a copy would
-// give up the reuse.
+// We decode the tagged form into the map or pointer you have, not into a copy
+// of it, because the tagged form's object closes in every document but these,
+// and a copy would give up the reuse.
 func (ctx *jsonDecoder) undoTagged(target reflect.Value, branch *schemaNode, valuePos int) {
 	if branch.kind != "record" && branch.kind != "map" {
 		return

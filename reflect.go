@@ -113,7 +113,7 @@ func anySlice(v reflect.Value, s *[]any) (typed reflect.Value, err error) {
 }
 
 // isTarget reports whether x, the value an any has, is something we decode
-// into: a non-nil pointer, a map, or a slice other than []byte. Every other
+// into: a non-nil pointer, map, or slice other than []byte. Every other
 // value is replaced. A decoder that stores into an any without reading it
 // first asks this before it stores.
 func isTarget(x any) bool {

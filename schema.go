@@ -957,13 +957,12 @@ type namedType struct {
 	// custom-typed reference wraps b.ser while leaving node.ser bare, and a
 	// copy could not be re-pointed.
 	node *schemaNode
-	// hadCustomType is true when this named type was defined by a parse that
-	// wired at least one CustomType anywhere (coarse: every
-	// definition of a custom-wired parse counts; stamped at finalize, see
-	// registerNamed). The cache-reference boundary guard compares it against
-	// the referencing parse's registrations to allow consistent reuse and
-	// reject mismatches; the documented remediation path "re-parse Inner with
-	// the CT first" depends on this signal.
+	// hadCustomType is true when a CustomType of the parse that defined this
+	// named type matches somewhere in the type's subtree, as finalize stamps
+	// it. The cache-reference boundary guard compares it against the
+	// referencing parse's registrations to allow consistent reuse and reject
+	// mismatches; the documented remediation path "re-parse Inner with the CT
+	// first" depends on this signal.
 	hadCustomType bool
 }
 
@@ -1492,8 +1491,8 @@ func (b *builder) finalize() error {
 		}
 	}
 	// We stamp each named type this parse defined as custom-affected iff a
-	// non-wildcard registration matches somewhere in its own subtree,
-	// which is when baked effects live inside the type. The predicate is
+	// registration matches somewhere in its own subtree, a wildcard only
+	// with a callback, which is when baked effects live inside the type. The predicate is
 	// the same one the cache-boundary guard applies on the reference side,
 	// so stamp and guard cannot disagree. Asking about the type's own
 	// subtree crosses into inherited subtrees, so a wrapper around an
@@ -1949,8 +1948,8 @@ func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *name
 		// Reverse: the cached node was built with a CustomType (its raw
 		// ser/deser, and the JSON decoders of the references inside it,
 		// convert values), but this Parse registers no matching
-		// CustomType. Reusing it would silently apply the original
-		// conversion to a Schema that never opted in, giving suppressed/raw
+		// CustomType. Reusing it would apply the original conversion, with
+		// no error, to a Schema that never opted in, giving suppressed/raw
 		// values on both wire formats. Register the same CustomType in this
 		// Parse, or parse the inner type without one.
 		return fmt.Errorf("avro: cached type %q was parsed with a CustomType affecting its subtree, but this Parse registers no matching CustomType; reusing it would apply that conversion here: register the CustomType in this Parse, or parse %q without one", truncForError(refName), truncForError(refName))
