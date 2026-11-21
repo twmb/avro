@@ -306,27 +306,22 @@ func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, er
 			return ctx.decodeKind(v, node)
 		}
 		// A nil interface target takes decodeKind's output as the chain input
-		// directly, keeping a parent probe to a single pass. A non-nil
-		// interface would reuse the held value in place, so it takes the
-		// probe and re-decode path below.
+		// directly, keeping a parent probe to a single pass. v is nil again
+		// while the chain runs, so that a decoder that fails or panics
+		// leaves it nil. A non-nil interface would reuse the held value in
+		// place, so it takes the probe and re-decode path below.
 		if v.Kind() == reflect.Interface && v.IsNil() {
 			ctx.suppressLogical = suppressLogical
 			if err := ctx.decodeKind(v, node); err != nil {
 				return err
 			}
 			chainVal := v.Interface()
-			for _, dec := range decoders {
-				out, err := dec(chainVal, sn)
-				if err != nil {
-					if errors.Is(err, ErrSkipCustomType) {
-						continue
-					}
-					return err
-				}
-				ctx.slab.customMatches++
-				return setCustomResult(v, out, node.kind)
+			v.SetZero()
+			if took, err := runDecoders(v, chainVal, decoders, sn, ctx.slab); took || err != nil {
+				return err
 			}
-			return nil // all-skip: v already holds the no-custom value
+			setAny(v, chainVal) // all-skip: the no-custom value
+			return nil
 		}
 		// Typed target: we probe into a throwaway any for the chain, and if
 		// every decoder skips we rewind and re-decode into v, the same decode
@@ -339,17 +334,9 @@ func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, er
 		if err := ctx.decodeKind(tmpV, node); err != nil {
 			return err
 		}
-		for _, dec := range decoders {
-			out, err := dec(tmp, sn)
-			if err != nil {
-				if errors.Is(err, ErrSkipCustomType) {
-					continue
-				}
-				return err
-			}
-			// The un-indirected v lets a *T result go into a *T target.
-			ctx.slab.customMatches++
-			return setCustomResult(v, out, node.kind)
+		// The un-indirected v lets a *T result go into a *T target.
+		if took, err := runDecoders(v, tmp, decoders, sn, ctx.slab); took || err != nil {
+			return err
 		}
 		// Every decoder skipped. If no nested custom matched we bypass customs
 		// for the re-decode, otherwise we re-decode with them active to

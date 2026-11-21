@@ -7697,16 +7697,22 @@ func parseMoney(t *testing.T, schema string) *Schema {
 
 func TestCustomTypeErrors(t *testing.T) {
 	t.Run("decode_fatal", func(t *testing.T) {
+		// The error from Decode comes back, and a nil any stays nil.
 		myErr := errors.New("boom")
-		s, _ := Parse(`{"type":"long","logicalType":"money"}`, CustomType{
-			LogicalType: "money",
-			Decode:      func(any, *SchemaNode) (any, error) { return nil, myErr },
-		})
-		data, _ := s.Encode(int64(1))
-		var v any
-		_, err := s.Decode(data, &v)
-		if !errors.Is(err, myErr) {
-			t.Fatalf("got %v", err)
+		money := `{"type":"long","logicalType":"money"}`
+		for _, schema := range []string{money, `["null",` + money + `]`, `["null","string",` + money + `]`} {
+			s, _ := Parse(schema, CustomType{
+				LogicalType: "money",
+				Decode:      func(any, *SchemaNode) (any, error) { return nil, myErr },
+			})
+			bin, _ := s.Encode(int64(1))
+			js, _ := s.EncodeJSON(int64(1))
+			var v, vj any
+			_, err := s.Decode(bin, &v)
+			errj := s.DecodeJSON(js, &vj)
+			if !errors.Is(err, myErr) || !errors.Is(errj, myErr) || v != nil || vj != nil {
+				t.Errorf("%s: Decode %v and %#v, DecodeJSON %v and %#v; want the error and a nil any", schema, err, v, errj, vj)
+			}
 		}
 	})
 
@@ -7720,6 +7726,7 @@ func TestCustomTypeErrors(t *testing.T) {
 			opts         []Opt
 		}{
 			{"record", `{"type":"record","name":"R","fields":[{"name":"m","type":` + money + `}]}`, map[string]any{"m": int64(1)}, "caller", nil},
+			{"nil any", money, int64(1), nil, nil},
 			{"union envelope", `["string",` + money + `]`, int64(1), map[string]any{"string": "x"}, []Opt{TaggedUnions()}},
 			{"union replaces", `[{"type":"array","items":"long"},` + money + `]`, int64(1), []any{int64(1)}, nil},
 		} {
