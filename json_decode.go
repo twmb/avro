@@ -1069,6 +1069,11 @@ func decodeJSONNativeSlice[V any](ctx *jsonDecoder, v reflect.Value, readOne fun
 			ctx.scanner.pos++
 		}
 	}
+	// The array must end before v gets s, so that a decode that fails leaves
+	// v's length.
+	if err := ctx.scanner.expect(']'); err != nil {
+		return err
+	}
 	if s == nil {
 		s = []V{}
 	}
@@ -1079,7 +1084,7 @@ func decodeJSONNativeSlice[V any](ctx *jsonDecoder, v reflect.Value, readOne fun
 	} else {
 		v.Set(reflect.ValueOf(s))
 	}
-	return ctx.scanner.expect(']')
+	return nil
 }
 
 // decodeJSONNativeMap routes an unnamed map[string]V of a plain primitive to

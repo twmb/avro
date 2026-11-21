@@ -1800,6 +1800,9 @@ func udRecordBlock(src []byte, rec *deserRecord, t reflect.Type, data unsafe.Poi
 // or another array. We manage the slice with reflect and decode each element
 // through inner.
 func udArrayDirect(inner udeserfn, elemSize uintptr, sliceType reflect.Type, minItemBytes int) udeserfn {
+	if sliceType.Elem().Kind() == reflect.Pointer {
+		return udArrayDirectPtr(inner, sliceType, minItemBytes)
+	}
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,
 			func(src []byte, v reflect.Value, _ unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
@@ -1809,6 +1812,29 @@ func udArrayDirect(inner udeserfn, elemSize uintptr, sliceType reflect.Type, min
 				for i := start; i < start+n; i++ {
 					src, err = inner(src, unsafe.Add(data, uintptr(i)*elemSize), sl)
 					if err != nil {
+						return nil, err
+					}
+				}
+				return src, nil
+			})
+	}
+}
+
+// udArrayDirectPtr is udArrayDirect for a slice of pointers, where a nil
+// element whose item fails stays nil, as it does on the reflect path. A
+// separate function keeps the check out of every other slice's loop.
+func udArrayDirectPtr(inner udeserfn, sliceType reflect.Type, minItemBytes int) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,
+			func(src []byte, v reflect.Value, _ unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
+				elems := unsafe.Slice((*unsafe.Pointer)(v.UnsafePointer()), v.Len())
+				var err error
+				for i := start; i < start+n; i++ {
+					wasNil := elems[i] == nil
+					if src, err = inner(src, unsafe.Pointer(&elems[i]), sl); err != nil {
+						if wasNil {
+							elems[i] = nil
+						}
 						return nil, err
 					}
 				}

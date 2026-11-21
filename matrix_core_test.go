@@ -13672,24 +13672,40 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 	})
 	t.Run("slice-field-fails-partway", func(t *testing.T) {
 		// A struct field's slice fills the room it has before it grows, as
-		// DecodeJSON does, so an array whose second item fails has written
-		// its first item into your backing array on both decoders, and the
-		// field keeps its length.
+		// DecodeJSON does, so an array whose second item fails, or that does
+		// not end, has written its first item into your backing array on
+		// both decoders, and the field keeps its length.
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":"string"}}]}`)
 		for name, decode := range map[string]func(v any) error{
 			// Two items: "x", and then a string longer than the input.
 			"binary": func(v any) error { _, err := s.Decode([]byte{4, 2, 'x', 0xc8, 0x01}, v); return err },
 			"json":   func(v any) error { return s.DecodeJSON([]byte(`{"f":["x",1]}`), v) },
+			// Two items, and then no end of the array.
+			"binary, no end": func(v any) error { _, err := s.Decode([]byte{4, 2, 'x', 2, 'y'}, v); return err },
+			"json, no end":   func(v any) error { return s.DecodeJSON([]byte(`{"f":["x","y"}`), v) },
 		} {
 			target := struct {
 				F []string `avro:"f"`
 			}{F: []string{"old"}}
 			kept := target.F
 			if err := decode(&target); err == nil {
-				t.Fatalf("%s: the decode worked, want an error at the second item", name)
+				t.Fatalf("%s: the decode worked, want an error at the second item or the end", name)
 			}
 			if len(target.F) != 1 || kept[0] != "x" {
 				t.Errorf("%s: the field is %q and your backing array has %q, want length 1 and the first item written", name, target.F, kept)
+			}
+		}
+		// A nil pointer element whose item fails stays nil.
+		ps := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":["null","long"]}}]}`)
+		for name, decode := range map[string]func(v any) error{
+			"binary": func(v any) error { _, err := ps.Decode([]byte{2, 2, 0x80}, v); return err },
+			"json":   func(v any) error { return ps.DecodeJSON([]byte(`{"f":[{"long":"x"}]}`), v) },
+		} {
+			target := struct {
+				F []*int64 `avro:"f"`
+			}{F: make([]*int64, 1)}
+			if err := decode(&target); err == nil || target.F[0] != nil {
+				t.Errorf("%s: a nil element whose item fails: err %v, element %v; want an error and nil", name, err, target.F[0])
 			}
 		}
 	})
