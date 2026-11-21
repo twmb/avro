@@ -13755,6 +13755,16 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 				}
 				return &p, func() bool { return p == nil }
 			}},
+			{"any with a pointer to a nil pointer", long, []byte{0x80}, []byte(`"x"`), func() (any, func() bool) {
+				pp := new(*int64)
+				var x any = pp
+				return &x, func() bool { return *pp == nil }
+			}},
+			{"any with a pointer to a nil pointer, wrong type", `"boolean"`, []byte{1}, []byte(`true`), func() (any, func() bool) {
+				pp := new(*int64)
+				var x any = pp
+				return &x, func() bool { return *pp == nil }
+			}},
 			// A value of the wrong type fails after the pointer would be
 			// allocated.
 			{"top, wrong type", `"boolean"`, []byte{1}, []byte(`true`), func() (any, func() bool) {
