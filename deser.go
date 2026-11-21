@@ -480,8 +480,9 @@ func (u *unionShape) replaces(x any, c byte) bool {
 	case *big.Rat:
 		return c != 'r' && u.rats > 0
 	}
-	// A map of your own type is still a Go map.
-	return c == 'm' && u.maps > 1 && reflect.ValueOf(x).Kind() == reflect.Map
+	// A map of your own type is still a Go map, and an ArrayRecord gets new
+	// slots as a map gets a new map.
+	return c == 'm' && u.maps > 1 && (reflect.ValueOf(x).Kind() == reflect.Map || reflect.TypeOf(x) == arrayRecordType)
 }
 
 // unionTarget says where the value of one branch of a union goes in a
@@ -539,12 +540,15 @@ func (u *unionShape) target(t *unionTarget, v reflect.Value, c byte, tagged bool
 		t.slot, t.seed = v, x
 		if replace {
 			t.seed, direct = nil, false
+			if _, ok := x.(ArrayRecord); ok {
+				t.seed = ArrayRecord{}
+			}
 		}
 		return direct
 	}
 	switch {
-	case v.Kind() == reflect.Map && c == 'm' && u.maps > 1 && !v.IsNil() && v.CanSet():
-		// The cell starts as a nil map.
+	case (v.Kind() == reflect.Map || v.Type() == arrayRecordType) && c == 'm' && u.maps > 1 && !v.IsNil() && v.CanSet():
+		// The cell starts as a nil map or a nil ArrayRecord.
 		t.slot, direct = v, false
 	case t.env.IsValid():
 		// A value behind the pointer in the envelope that is not an any

@@ -14081,8 +14081,12 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 		const (
 			recA = `{"type":"record","name":"A","fields":[{"name":"a","type":"long"}]}`
 			recB = `{"type":"record","name":"B","fields":[{"name":"b","type":"long"}]}`
-			arrL = `{"type":"array","items":"long"}`
-			mapL = `{"type":"map","values":"long"}`
+			// Records whose one field is a map, which a reused slot would
+			// merge into.
+			recMA = `{"type":"record","name":"MA","fields":[{"name":"a","type":{"type":"map","values":"long"}}]}`
+			recMB = `{"type":"record","name":"MB","fields":[{"name":"b","type":{"type":"map","values":"long"}}]}`
+			arrL  = `{"type":"array","items":"long"}`
+			mapL  = `{"type":"map","values":"long"}`
 		)
 		a := func(n int64) map[string]any { return map[string]any{"a": n} }
 		b := func(n int64) map[string]any { return map[string]any{"b": n} }
@@ -14163,6 +14167,9 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 				[]any{[]any{int64(7)}}, nil, []any{int64(7)}, "", same},
 			{"union of two records: a map of your own type is replaced", `[` + recA + `,` + recB + `]`, func() any { return map[string]int64{"own": 1} },
 				[]any{a(1)}, nil, a(1), "", fresh},
+			{"union of two records: an ArrayRecord gets new slots", `[` + recMA + `,` + recMB + `]`, func() any { return avro.ArrayRecord{} },
+				[]any{map[string]any{"a": map[string]any{"ka": int64(1)}}, map[string]any{"b": map[string]any{"kb": int64(2)}}}, nil,
+				avro.ArrayRecord{map[string]any{"kb": int64(2)}}, "", fresh},
 			// The kept key shows the map was decoded into.
 			{"TaggedUnions: a one-key map whose key names no branch is not an envelope", `["null",` + mapL + `]`,
 				func() any { return map[string]any{"k": int64(1)} },
@@ -14240,6 +14247,16 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 			rows = []any{mine}
 			if err := w.decode(cu, w.encode(t, cu, []any{"y"}, avro.TaggedUnions()), &rows); err != nil || rows[0] != any(mine) || *mine != "y" {
 				t.Errorf("%s: your own pointer in a union with a custom type: %#v, err %v; want it decoded into", w.name, rows, err)
+			}
+		}
+		// A typed ArrayRecord target gets new slots the same way.
+		twoMaps := avro.MustParse(`[` + recMA + `,` + recMB + `]`)
+		for _, w := range reuseWires {
+			var row avro.ArrayRecord
+			w.mustDecode(t, twoMaps, w.encode(t, twoMaps, map[string]any{"a": map[string]any{"ka": int64(1)}}, avro.TaggedUnions()), &row)
+			w.mustDecode(t, twoMaps, w.encode(t, twoMaps, map[string]any{"b": map[string]any{"kb": int64(2)}}, avro.TaggedUnions()), &row)
+			if !matEqual(row, avro.ArrayRecord{map[string]any{"kb": int64(2)}}) {
+				t.Errorf("%s: an ArrayRecord after the other record: %#v, want new slots", w.name, row)
 			}
 		}
 		// The same holds for a branch that names a type defined after the
