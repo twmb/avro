@@ -211,6 +211,7 @@ func Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	b := &builder{
 		named:      make(map[string]*namedType),
 		building:   make(map[*schemaNode]struct{}),
+		sites:      make(map[*schemaNode][]*schemaNode),
 		definedSet: make(map[*namedType]bool),
 		minBytes:   newMinBytesWalk(),
 	}
@@ -970,9 +971,14 @@ type builder struct {
 	ser   serfn
 	deser deserfn
 
-	named        map[string]*namedType
-	building     map[*schemaNode]struct{} // record/error nodes whose field loop is in progress (shared across nest, like named)
-	definedNamed []*namedType             // named types defined by this parse (vs inherited); stamped custom-affected at finalize
+	named    map[string]*namedType
+	building map[*schemaNode]struct{} // record/error nodes whose field loop is in progress (shared across nest, like named)
+	// sites has, for a record in building, the copies siteNode made of it
+	// for references inside its own fields. buildRecord copies the record
+	// into them again once its fields are done. Shared across nest, like
+	// building.
+	sites        map[*schemaNode][]*schemaNode
+	definedNamed []*namedType // named types defined by this parse (vs inherited); stamped custom-affected at finalize
 	// definedSet is the membership form of this-parse definitions. Unlike
 	// definedNamed, which merges up only at unnest, it is shared by reference
 	// across nest(), so a guard running in a nested builder can test whether
@@ -1060,6 +1066,7 @@ func (b *builder) nest() *builder {
 	return &builder{
 		named:           b.named,
 		building:        b.building,
+		sites:           b.sites,
 		checkName:       b.checkName,
 		customTypes:     b.customTypes,
 		custom:          b.custom,
@@ -1706,6 +1713,14 @@ func (b *builder) siteNode(node *schemaNode) *schemaNode {
 	site := *node
 	site.decodeJSON = fn
 	b.putCustomWiring(&site, w)
+	// A record that is still being built has only the fields declared so
+	// far, so the copy counts as building, and a default through it waits
+	// for finalize. buildRecord copies the record into it again when the
+	// fields are done.
+	if _, ok := b.building[node]; ok {
+		b.building[&site] = struct{}{}
+		b.sites[node] = append(b.sites[node], &site)
+	}
 	return &site
 }
 
@@ -2672,6 +2687,7 @@ func (b *builder) buildRecord(o *aobject) error {
 	// is shared through nest so a nested record sees it.
 	if b.building == nil {
 		b.building = make(map[*schemaNode]struct{})
+		b.sites = make(map[*schemaNode][]*schemaNode)
 	}
 	b.building[nd] = struct{}{}
 	defer delete(b.building, nd)
@@ -2813,6 +2829,13 @@ func (b *builder) buildRecord(o *aobject) error {
 			nd.fieldIdx[a] = i
 		}
 	}
+	for _, site := range b.sites[nd] {
+		fn := site.decodeJSON
+		*site = *nd
+		site.decodeJSON = fn
+		delete(b.building, site)
+	}
+	delete(b.sites, nd)
 	return nil
 }
 

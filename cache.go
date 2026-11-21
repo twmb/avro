@@ -97,6 +97,7 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	b := &builder{
 		named:      cloned,
 		building:   make(map[*schemaNode]struct{}),
+		sites:      make(map[*schemaNode][]*schemaNode),
 		definedSet: make(map[*namedType]bool),
 		minBytes:   newMinBytesWalk(),
 	}

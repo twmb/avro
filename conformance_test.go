@@ -22112,67 +22112,88 @@ func TestMatrix_ResolvedDecodeJSONWriterCustomDecodeRawRoundTrip(t *testing.T) {
 }
 
 // A self-/mutually-recursive or forward-referenced named type whose subtree
-// contains a logical a registered CustomType matches must Parse, and both
-// wires must then agree. The cached-named-ref guard is for types inherited
-// from a SchemaCache across Parses. A self-reference resolves mid-build,
-// before the record's fields finish wiring their CTs, so hadCustomType is
-// still false there. Gating on cachedNames is what keeps the guard from
-// rejecting valid recursive schemas.
+// contains a node a registered CustomType matches must Parse, and both wires
+// must then agree, for a custom type on a leaf, on the record itself, and on
+// every node. The cached-named-ref guard is for types inherited from a
+// SchemaCache across Parses. A self-reference resolves mid-build, before the
+// record's fields finish wiring their CTs, so hadCustomType is still false
+// there. Gating on cachedNames is what keeps the guard from rejecting valid
+// recursive schemas. A reference to the record from inside its own fields
+// must see every field, including in a default Parse encodes.
 func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
-	ct := avro.CustomType{LogicalType: "timestamp-millis"}
-	schemas := []struct{ name, schema string }{
+	skip := func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }
+	cts := []struct {
+		name string
+		ct   avro.CustomType
+		// plain says the custom type decodes as the schema without it does.
+		plain bool
+	}{
+		{"timestamp leaf", avro.CustomType{LogicalType: "timestamp-millis"}, false},
+		{"record", avro.CustomType{AvroType: "record", Decode: skip}, true},
+		{"wildcard", avro.CustomType{Decode: skip}, true},
+	}
+	ts := func(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
+	schemas := []struct {
+		name, schema string
+		vals         []any
+	}{
 		{"self-nested", `{"type":"record","name":"Node","fields":[
 			{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
-			{"name":"next","type":["null","Node"]}]}`},
+			{"name":"next","type":["null","Node"]}]}`,
+			[]any{map[string]any{"ts": ts(1), "next": map[string]any{"ts": ts(2), "next": nil}}}},
 		{"self-wrapped", `{"type":"record","name":"Node","fields":[
 			{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
-			{"name":"next","type":["null",{"type":"Node"}]}]}`},
+			{"name":"next","type":["null",{"type":"Node"}]}]}`,
+			[]any{map[string]any{"ts": ts(1), "next": map[string]any{"ts": ts(2), "next": nil}}}},
+		{"self-defaulted", `{"type":"record","name":"Node","fields":[
+			{"name":"v","type":"long"},
+			{"name":"next","type":["Node","null"],"default":{"v":7,"next":null}},
+			{"name":"w","type":"long","default":3}]}`,
+			[]any{
+				map[string]any{"v": int64(1), "next": map[string]any{"v": int64(2), "next": nil, "w": int64(5)}, "w": int64(4)},
+				map[string]any{"v": int64(1), "w": int64(4)}, // next takes its default
+			}},
 		{"mutual", `{"type":"record","name":"A","fields":[
 			{"name":"b","type":["null",{"type":"record","name":"B","fields":[
 				{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
-				{"name":"a","type":["null","A"]}]}]}]}`},
+				{"name":"a","type":["null","A"]}]}]}]}`,
+			[]any{map[string]any{"b": map[string]any{"ts": ts(1), "a": map[string]any{"b": nil}}}}},
 		{"shared-multiref", `{"type":"record","name":"R","fields":[
 			{"name":"x","type":{"type":"record","name":"Pair","fields":[
 				{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}},
-			{"name":"y","type":"Pair"}]}`},
+			{"name":"y","type":"Pair"}]}`,
+			[]any{map[string]any{"x": map[string]any{"ts": ts(1)}, "y": map[string]any{"ts": ts(2)}}}},
 	}
-	for _, sc := range schemas {
-		t.Run(sc.name, func(t *testing.T) {
-			s, err := avro.Parse(sc.schema, ct)
-			if err != nil {
-				t.Fatalf("Parse(recursive + CustomType) failed: %v", err)
-			}
-			// Decode a minimal leaf both ways; suppression -> raw int64 on both.
-			plain := avro.MustParse(sc.schema)
-			// Build a minimal value: just the ts (and nil recursion / required
-			// subrecords).
-			var val any
-			switch sc.name {
-			case "self-nested", "self-wrapped":
-				val = map[string]any{"ts": time.UnixMilli(1700000000000).UTC(), "next": nil}
-			case "mutual":
-				val = map[string]any{"b": nil}
-			case "shared-multiref":
-				val = map[string]any{
-					"x": map[string]any{"ts": time.UnixMilli(1700000000000).UTC()},
-					"y": map[string]any{"ts": time.UnixMilli(1700000001000).UTC()},
+	for _, c := range cts {
+		for _, sc := range schemas {
+			t.Run(c.name+"/"+sc.name, func(t *testing.T) {
+				s, err := avro.Parse(sc.schema, c.ct)
+				if err != nil {
+					t.Fatalf("Parse(recursive + CustomType) failed: %v", err)
 				}
-			}
-			bin, err := plain.Encode(val)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			jsn, err := plain.EncodeJSON(val)
-			if err != nil {
-				t.Fatalf("encodeJSON: %v", err)
-			}
-			var bv, jv any
-			avrotest.MustDecode(t, s, bin, &bv)
-			avrotest.MustDecodeJSON(t, s, jsn, &jv)
-			if !reflect.DeepEqual(bv, jv) {
-				t.Errorf("recursive custom binary<->JSON divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
-			}
-		})
+				plain := avro.MustParse(sc.schema)
+				for i, val := range sc.vals {
+					bin := avrotest.MustEncode(t, plain, val)
+					jsn := avrotest.MustEncodeJSON(t, plain, val)
+					if got := avrotest.MustEncode(t, s, val); !bytes.Equal(got, bin) {
+						t.Errorf("value %d: Encode %x, want %x as without the custom type", i, got, bin)
+					}
+					if got := avrotest.MustEncodeJSON(t, s, val); !bytes.Equal(got, jsn) {
+						t.Errorf("value %d: EncodeJSON %s, want %s as without the custom type", i, got, jsn)
+					}
+					var bv, jv, pv any
+					avrotest.MustDecode(t, s, bin, &bv)
+					avrotest.MustDecodeJSON(t, s, jsn, &jv)
+					avrotest.MustDecode(t, plain, bin, &pv)
+					if !reflect.DeepEqual(bv, jv) {
+						t.Errorf("value %d: recursive custom binary<->JSON divergence:\n  binary=%#v\n  json  =%#v", i, bv, jv)
+					}
+					if c.plain && !reflect.DeepEqual(bv, pv) {
+						t.Errorf("value %d: decoded %#v, want %#v as without the custom type", i, bv, pv)
+					}
+				}
+			})
+		}
 	}
 }
 
