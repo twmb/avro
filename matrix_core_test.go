@@ -12417,7 +12417,7 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 						wire   func([]byte) []byte
 					}{
 						"slice":        {arr, &top, &top, func(b []byte) []byte { return b }},
-						"struct field": {holder, &field, &field.F, w.wrapField},
+						"struct field": {holder, &field, &field.F, func(b []byte) []byte { return w.wrapField(holder, b) }},
 					} {
 						name := w.name + "/" + name
 						w.mustDecode(t, target.schema, target.wire(first), target.ptr)
@@ -13610,12 +13610,14 @@ func checkTakenOut(t *testing.T, what string, kept, got, want []any) {
 }
 
 // reuseWire decodes a wire's own encoding of a value. wrapField turns an
-// encoded value into the encoding of a record whose one field "f" has it.
+// encoded value into the encoding of the record rec, whose one field "f" has
+// it. The single-object wire asserts the DecodeSingleObject doc: it decodes by
+// the rules of Decode.
 type reuseWire struct {
 	name      string
 	encode    func(t testing.TB, s *avro.Schema, v any, opts ...avro.Opt) []byte
 	decode    func(s *avro.Schema, src []byte, v any, opts ...avro.Opt) error
-	wrapField func([]byte) []byte
+	wrapField func(rec *avro.Schema, b []byte) []byte
 }
 
 func (w reuseWire) mustDecode(t *testing.T, s *avro.Schema, src []byte, v any, opts ...avro.Opt) {
@@ -13634,7 +13636,7 @@ var reuseWires = []reuseWire{
 			_, err := s.Decode(src, v, opts...)
 			return err
 		},
-		func(b []byte) []byte { return b }},
+		func(_ *avro.Schema, b []byte) []byte { return b }},
 	{"json",
 		func(t testing.TB, s *avro.Schema, v any, opts ...avro.Opt) []byte {
 			return avrotest.MustEncodeJSON(t, s, v, opts...)
@@ -13642,7 +13644,29 @@ var reuseWires = []reuseWire{
 		func(s *avro.Schema, src []byte, v any, opts ...avro.Opt) error {
 			return s.DecodeJSON(src, v, opts...)
 		},
-		func(b []byte) []byte { return append(append([]byte(`{"f":`), b...), '}') }},
+		func(_ *avro.Schema, b []byte) []byte { return append(append([]byte(`{"f":`), b...), '}') }},
+	{"single object",
+		func(t testing.TB, s *avro.Schema, v any, opts ...avro.Opt) []byte {
+			t.Helper()
+			b, err := s.AppendSingleObject(nil, v, opts...)
+			if err != nil {
+				t.Fatalf("AppendSingleObject: %v", err)
+			}
+			return b
+		},
+		func(s *avro.Schema, src []byte, v any, opts ...avro.Opt) error {
+			_, err := s.DecodeSingleObject(src, v, opts...)
+			return err
+		},
+		// The record's header, which no value changes, then the value's
+		// body, which is the record's body.
+		func(rec *avro.Schema, b []byte) []byte {
+			hdr, err := rec.AppendSingleObject(nil, map[string]any{"f": []any{}})
+			if err != nil {
+				panic(err)
+			}
+			return append(hdr[:10:10], b[10:]...)
+		}},
 }
 
 // Typed-container reuse: slices shrink and grow to exactly the decoded

@@ -1504,14 +1504,14 @@ func (b *builder) finalize() error {
 	}
 	// We stamp each named type this parse defined as custom-affected iff a
 	// registration matches somewhere in its own subtree, a wildcard only
-	// with a callback, which is when baked effects live inside the type. The predicate is
-	// the same one the cache-boundary guard applies on the reference side,
-	// so stamp and guard cannot disagree. Asking about the type's own
-	// subtree crosses into inherited subtrees, so a wrapper around an
-	// inherited custom-baked reference is stampable, and a sibling with
-	// no match is not stamped merely because the parse wired something
-	// elsewhere. Taken at finalize, after the tree is built, because
-	// registration happens early to support self-references.
+	// with a callback, which is when custom conversions live inside the
+	// type. The predicate is the same one the cache-boundary guard applies
+	// on the reference side, so stamp and guard cannot disagree. Asking
+	// about the type's own subtree crosses into inherited subtrees, so a
+	// wrapper around an inherited custom-wired reference is stampable, and
+	// a sibling with no match is not stamped merely because the parse wired
+	// something elsewhere. Taken at finalize, after the tree is built,
+	// because registration happens early to support self-references.
 	if len(b.customTypes) > 0 {
 		for _, nt := range b.definedNamed {
 			if b.customMatchInSubtree(nt.node) != "" {
