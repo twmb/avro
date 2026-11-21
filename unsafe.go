@@ -515,7 +515,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type, skipUnknown 
 		if innerGoType.Kind() == reflect.Pointer {
 			return nil
 		}
-		// A *any declines to reflect, whose union wraps the any with
+		// A *any takes the reflection path, which wraps the any with
 		// TaggedUnions.
 		if innerGoType.Kind() == reflect.Interface {
 			return nil

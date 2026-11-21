@@ -383,16 +383,17 @@ type deserUnion struct {
 	// resolveUnionUnion behavior: wrap when TaggedUnions is active
 	// and the target is *any (or compatible interface).
 	noWrap bool
-	// shape is what each branch decodes to in an any, for branch.
+	// shape is what each branch decodes to in an any, which the `branch`
+	// method reads to apply the union rules.
 	shape unionShape
 }
 
 // unionShape says what each branch of a union decodes to in an any: a
 // map[string]any for a record or a map, a []any for an array, a *big.Rat for
-// a decimal, or a value with nothing to decode into. Two rules about the
-// value a target already has need it: a value with another branch's type is
-// replaced, and a union with two or more records or maps always decodes one
-// of them into a new map.
+// a decimal, or a value with nothing to decode into. The shape serves two
+// rules about the value a target already has: a value with another branch's
+// type is replaced, and a union with two or more records or maps always
+// decodes one of them into a new map.
 type unionShape struct {
 	class              []byte // per branch: 'm', 'a', 'r', 'n' for null, or 0
 	maps, arrays, rats int    // how many branches have each class
@@ -427,8 +428,8 @@ func newUnionShape(branches []*schemaNode, custom map[*schemaNode]*customWiring)
 	for i, b := range branches {
 		u.class[i] = unionClass(b)
 		if w := custom[b]; w != nil {
-			// Each type once, so the list is as long as the custom types
-			// you registered and not as wide as the union.
+			// We add each type once, so the list is as long as the custom
+			// types you registered and not as wide as the union.
 			for _, t := range w.goTypes {
 				if !slices.Contains(u.customGo, t) {
 					u.customGo = append(u.customGo, t)
@@ -3123,10 +3124,10 @@ func setDecimalValue(v reflect.Value, b []byte, scale int) (bool, error) {
 	return setDecimalRat(v, bytesToRat(b, scale), scale)
 }
 
-// ratTarget returns the *big.Rat that a decimal decodes into in place: one we
-// reach through a pointer, such as a *big.Rat field or element, or the one an
-// any has. v is the target before indirectAlloc. A big.Rat we reach by value
-// is not one, although we can address it: a copy of its struct shares its
+// ratTarget returns the *big.Rat that a decimal decodes into in place: one
+// behind a pointer, such as a *big.Rat field or element, or the one an any
+// has. v is the target before indirectAlloc. A big.Rat stored by value is
+// not one, although we can address it: a copy of its struct shares its
 // storage, and a decode in place would change every copy you kept. That
 // includes the big.Rat of Decode(src, r) for an r of type *big.Rat, which we
 // cannot tell from the address of a field.

@@ -2008,8 +2008,8 @@ func (b *builder) findCustomTypeMatchInSubtreeWalk(node *schemaNode, visited map
 	}
 	for _, ct := range b.customTypes {
 		// A wildcard (both empty) with a callback runs on every node,
-		// and its callback converts values there, which a cached
-		// subtree bakes in as it bakes in any other custom type's. A
+		// and its callback converts values there. A cached subtree keeps
+		// those conversions, as it keeps any other custom type's. A
 		// wildcard with no callback changes nothing.
 		if ct.LogicalType == "" && ct.AvroType == "" {
 			if ct.Decode == nil && ct.Encode == nil {

@@ -12288,7 +12288,7 @@ func TestDifferentialFastavroResolvedJSONUnion(t *testing.T) {
 // matrix core always decodes into fresh targets. The reuse semantics have
 // their own documented contracts, and historically their own bugs. Map targets
 // retain non-schema keys while schema fields overwrite, slices are rewritten
-// to exactly the new length in their own backing array, and pointers are
+// to the new length in their own backing array, and pointers are
 // reused. A map, a []any, or a *big.Rat in an any is decoded into as well, so
 // a value you took out of a target can change on the next decode. Every
 // fragment kind drives a decode-twice cycle on the same target, on both wire
@@ -12380,12 +12380,12 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 			}
 
 			// The next decode into a []any decodes into each element the
-			// array reaches, whether the next array fits the slice or
-			// outgrows it, so a map or a *big.Rat you took out of the slice
-			// changes; see checkTakenOut. The second value of every fragment
-			// has the keys of the first, so the used slice decodes to what a
-			// new slice decodes to. A record with one array field has the
-			// array's own wire.
+			// array has an item for, whether the next array fits the slice
+			// or outgrows it, so a map or a *big.Rat you took out of the
+			// slice changes; see checkTakenOut. The second value of every
+			// fragment has the keys of the first, so the used slice decodes
+			// to what a new slice decodes to. A record with one array field
+			// has the array's own wire.
 			arr := avro.MustParse(fmt.Sprintf(`{"type":"array","items":%s}`, fr.schema(&uniq{})))
 			holder := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"ReuseHolder","fields":[{"name":"f","type":%s}]}`, arr.String()))
 			item, err := avro.MustParse(fr.schema(&uniq{})).AppendEncode(nil, fr.values[1])
@@ -13278,10 +13278,10 @@ func TestMatrix_RoundTripParity(t *testing.T) {
 // both wires, with and without TaggedUnions. The two decodes must fail the
 // same, leave the same value, and reuse the same containers, after one decode
 // and after two in a row, and a resolved decode that fails at its first byte
-// leaves the target as it was. The pairs are a reader union around the
-// writer's type and a reader record with a field the writer lacks, which
-// reach the record, map, and union decoders of resolve.go; a schema resolved
-// against itself is the reader. TestMatrix_UsedTargetParity covers the plain decoders, and
+// leaves the target as it was. The pairs are a schema resolved against
+// itself, a reader union around the writer's type, and a reader record with a
+// field the writer lacks, which run the record, map, and union decoders of
+// resolve.go. TestMatrix_UsedTargetParity covers the plain decoders, and
 // TestParity_ResolveMatrix checks resolution into new targets.
 func TestMatrix_ResolvedTargetParity(t *testing.T) {
 	ct := parityCustom()
@@ -13543,7 +13543,7 @@ func parityBareAmbiguous(s *avro.Schema, js []byte) bool {
 }
 
 // checkTakenOut checks the values you took out of a used []any before the next
-// decode into it: a map or a *big.Rat at an element the next decode reaches is
+// decode into it: a map or a *big.Rat at an element the next decode writes is
 // the one the element now has, and any other value still equals want, its
 // fresh decode.
 func checkTakenOut(t *testing.T, what string, kept, got, want []any) {

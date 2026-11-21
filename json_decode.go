@@ -308,7 +308,7 @@ func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, er
 		// A nil interface target takes decodeKind's output as the chain input
 		// directly, keeping a parent probe to a single pass. v is nil again
 		// while the chain runs, so that a decoder that fails or panics
-		// leaves it nil. A non-nil interface would reuse the held value in
+		// leaves it nil. A non-nil interface would reuse the value it has in
 		// place, so it takes the probe and re-decode path below.
 		if v.Kind() == reflect.Interface && v.IsNil() {
 			ctx.suppressLogical = suppressLogical
@@ -1259,8 +1259,8 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 }
 
 // decodeArrayRecord decodes a JSON object's fields into row by the schema's
-// field positions, whatever order the keys arrive in. row has one slot per
-// field, and a field decodes into the value its slot has.
+// field positions, in any order of the keys. row has one slot per field, and
+// a field decodes into the value its slot has.
 func (ctx *jsonDecoder) decodeArrayRecord(row ArrayRecord, node *schemaNode) error {
 	return ctx.iterateRecordFields(node,
 		func(idx int, key string) error {
@@ -1593,8 +1593,8 @@ func (ctx *jsonDecoder) wrapBranch(v reflect.Value, union, branch *schemaNode) {
 // form fills in would keep the keys the tagged form wrote.
 //
 // We decode the tagged form into your value and not into a copy, because the
-// tagged form is the one that closes in every document but these, and a copy
-// would give up the reuse.
+// tagged form's object closes in every document but these, and a copy would
+// give up the reuse.
 func (ctx *jsonDecoder) undoTagged(target reflect.Value, branch *schemaNode, valuePos int) {
 	if branch.kind != "record" && branch.kind != "map" {
 		return

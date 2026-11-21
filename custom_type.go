@@ -315,7 +315,7 @@ func wrapDeserWithCustomDecoders(inner deserfn, decoders []func(any, *SchemaNode
 		// A nil interface target decodes straight into v and reads it back
 		// for the chain. v is nil again while the chain runs, so that a
 		// decoder that fails or panics leaves it nil. A non-nil interface
-		// would reuse the held value in place, so it takes the probe and
+		// would reuse the value it has in place, so it takes the probe and
 		// re-decode path.
 		if v.Kind() == reflect.Interface && v.IsNil() {
 			rest, err := inner(src, v, sl)
