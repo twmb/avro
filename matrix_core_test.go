@@ -12704,9 +12704,9 @@ func TestMatrix_UsedTargetParity(t *testing.T) {
 			}
 		}
 	}
-	// The bare form runs about 730,000 times; an ambiguity check that
+	// The bare form runs about 760,000 times; an ambiguity check that
 	// grew too wide would skip it.
-	if bareRuns < 100000 {
+	if bareRuns < 500000 {
 		t.Errorf("the bare JSON form decoded %d times, want it on most cells", bareRuns)
 	}
 	parityReport(t, failures)
@@ -13536,7 +13536,7 @@ func parityMultiKey(x any) bool {
 // alike, or js has an object key that names a branch of a union in s.
 func parityBareAmbiguous(s *avro.Schema, js []byte) bool {
 	var names []string
-	ambiguous := false
+	ambiguous, quotedFloat := false, false
 	var walk func(n *avro.SchemaNode, depth int)
 	walk = func(n *avro.SchemaNode, depth int) {
 		if n == nil || depth > 16 {
@@ -13549,10 +13549,17 @@ func parityBareAmbiguous(s *avro.Schema, js []byte) bool {
 				c := tokenClass(b.Type)
 				ambiguous = ambiguous || seen[c]
 				seen[c] = true
-				// DecodeJSON also reads a bare number as a decimal.
+				// DecodeJSON also reads a bare number as a decimal, and a
+				// quoted NaN or Infinity as a float or a double.
 				if b.LogicalType == "decimal" || b.LogicalType == "big-decimal" {
 					ambiguous = ambiguous || seen["digit"]
 					seen["digit"] = true
+				}
+				if b.Type == "float" || b.Type == "double" {
+					quotedFloat = quotedFloat || seen["string"]
+					seen["quoted float"] = true
+				} else if c == "string" {
+					quotedFloat = quotedFloat || seen["quoted float"]
 				}
 				names = append(names, b.Type, b.Name)
 				if b.LogicalType != "" {
@@ -13568,7 +13575,7 @@ func parityBareAmbiguous(s *avro.Schema, js []byte) bool {
 		walk(n.Values, depth+1)
 	}
 	walk(s.Root(), 0)
-	if ambiguous {
+	if ambiguous || quotedFloat && (bytes.Contains(js, []byte(`"NaN"`)) || bytes.Contains(js, []byte(`Infinity"`))) {
 		return true
 	}
 	for _, name := range names {
