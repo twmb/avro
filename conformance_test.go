@@ -22163,6 +22163,49 @@ func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
 				{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}},
 			{"name":"y","type":"Pair"}]}`,
 			[]any{map[string]any{"x": map[string]any{"ts": ts(1)}, "y": map[string]any{"ts": ts(2)}}}},
+		{"self-array", `{"type":"record","name":"Node","fields":[
+			{"name":"v","type":"long"},
+			{"name":"kids","type":{"type":"array","items":"Node"},"default":[{"v":7,"kids":[]}]}]}`,
+			[]any{
+				map[string]any{"v": int64(1), "kids": []any{map[string]any{"v": int64(2), "kids": []any{}}}},
+				map[string]any{"v": int64(1)}, // kids takes its default
+			}},
+		{"self-map", `{"type":"record","name":"Node","fields":[
+			{"name":"v","type":"long"},
+			{"name":"kids","type":{"type":"map","values":"Node"},"default":{"k":{"v":7,"kids":{}}}}]}`,
+			[]any{
+				map[string]any{"v": int64(1), "kids": map[string]any{"j": map[string]any{"v": int64(2), "kids": map[string]any{}}}},
+				map[string]any{"v": int64(1)}, // kids takes its default
+			}},
+		{"forward", `{"type":"record","name":"R","fields":[
+			{"name":"a","type":["null","N"]},
+			{"name":"n","type":{"type":"record","name":"N","fields":[
+				{"name":"v","type":"long"},
+				{"name":"next","type":["null","N"]}]}}]}`,
+			[]any{map[string]any{"a": map[string]any{"v": int64(1), "next": map[string]any{"v": int64(2), "next": nil}}, "n": map[string]any{"v": int64(3), "next": nil}}}},
+	}
+	// check encodes val with the schema without the custom type, plain, and
+	// with s, and decodes it both ways.
+	check := func(t *testing.T, s, plain *avro.Schema, decodesPlain bool, i int, val any) {
+		t.Helper()
+		bin := avrotest.MustEncode(t, plain, val)
+		jsn := avrotest.MustEncodeJSON(t, plain, val)
+		if got := avrotest.MustEncode(t, s, val); !bytes.Equal(got, bin) {
+			t.Errorf("value %d: Encode %x, want %x as without the custom type", i, got, bin)
+		}
+		if got := avrotest.MustEncodeJSON(t, s, val); !bytes.Equal(got, jsn) {
+			t.Errorf("value %d: EncodeJSON %s, want %s as without the custom type", i, got, jsn)
+		}
+		var bv, jv, pv any
+		avrotest.MustDecode(t, s, bin, &bv)
+		avrotest.MustDecodeJSON(t, s, jsn, &jv)
+		avrotest.MustDecode(t, plain, bin, &pv)
+		if !reflect.DeepEqual(bv, jv) {
+			t.Errorf("value %d: recursive custom binary<->JSON divergence:\n  binary=%#v\n  json  =%#v", i, bv, jv)
+		}
+		if decodesPlain && !reflect.DeepEqual(bv, pv) {
+			t.Errorf("value %d: decoded %#v, want %#v as without the custom type", i, bv, pv)
+		}
 	}
 	for _, c := range cts {
 		for _, sc := range schemas {
@@ -22173,27 +22216,30 @@ func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
 				}
 				plain := avro.MustParse(sc.schema)
 				for i, val := range sc.vals {
-					bin := avrotest.MustEncode(t, plain, val)
-					jsn := avrotest.MustEncodeJSON(t, plain, val)
-					if got := avrotest.MustEncode(t, s, val); !bytes.Equal(got, bin) {
-						t.Errorf("value %d: Encode %x, want %x as without the custom type", i, got, bin)
-					}
-					if got := avrotest.MustEncodeJSON(t, s, val); !bytes.Equal(got, jsn) {
-						t.Errorf("value %d: EncodeJSON %s, want %s as without the custom type", i, got, jsn)
-					}
-					var bv, jv, pv any
-					avrotest.MustDecode(t, s, bin, &bv)
-					avrotest.MustDecodeJSON(t, s, jsn, &jv)
-					avrotest.MustDecode(t, plain, bin, &pv)
-					if !reflect.DeepEqual(bv, jv) {
-						t.Errorf("value %d: recursive custom binary<->JSON divergence:\n  binary=%#v\n  json  =%#v", i, bv, jv)
-					}
-					if c.plain && !reflect.DeepEqual(bv, pv) {
-						t.Errorf("value %d: decoded %#v, want %#v as without the custom type", i, bv, pv)
-					}
+					check(t, s, plain, c.plain, i, val)
 				}
 			})
 		}
+		// A SchemaCache Parse that references the recursive type gets every
+		// field as well.
+		t.Run(c.name+"/cache", func(t *testing.T) {
+			const node = `{"type":"record","name":"Node","fields":[{"name":"v","type":"long"},{"name":"next","type":["Node","null"],"default":{"v":7,"next":null}}]}`
+			var cache avro.SchemaCache
+			if _, err := cache.Parse(node, c.ct); err != nil {
+				t.Fatal(err)
+			}
+			s, err := cache.Parse(`{"type":"record","name":"Outer","fields":[{"name":"o","type":"Node"}]}`, c.ct)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plain := avro.MustParse(`{"type":"record","name":"Outer","fields":[{"name":"o","type":` + node + `}]}`)
+			for i, val := range []any{
+				map[string]any{"o": map[string]any{"v": int64(1), "next": map[string]any{"v": int64(2), "next": nil}}},
+				map[string]any{"o": map[string]any{"v": int64(1)}}, // next takes its default
+			} {
+				check(t, s, plain, c.plain, i, val)
+			}
+		})
 	}
 }
 
