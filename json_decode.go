@@ -1482,7 +1482,11 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 		key, err := ctx.scanner.consumeStringZeroCopy()
 		if err == nil {
 			if branch := findUnionBranch(node, key); branch != nil {
-				if err := ctx.scanner.expect(':'); err == nil {
+				// A key that names a container branch is the tagged form only
+				// when its value can start that branch. Otherwise it is a
+				// bare record or map with that key, such as a map with the
+				// key "map".
+				if err := ctx.scanner.expect(':'); err == nil && (!unionBranchRecurses(branch.kind) || jsonTokenMatchesBranch(ctx.scanner.peek(), branch)) {
 					// start applies the union rules to the value the target
 					// has. A malformed `{"long": 42,` backtracks to the
 					// bare fallback. Before it does, what the tagged form

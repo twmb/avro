@@ -24073,6 +24073,11 @@ func TestMatrix_JSONUnionFailureKeepsTarget(t *testing.T) {
 		{"tagged record into a map of your type then bare decodes", `[{"type":"record","name":"K","fields":[{"name":"m","type":{"type":"map","values":"long"}}]},"string"]`,
 			`{"K":{"m":{"x":1}},"m":{"y":2}}`,
 			map[string]map[string]int64{"m": {"y": 2}}, func() any { return map[string]map[string]int64{} }},
+		// A key that names a container branch is the tagged form only when
+		// its value can start that branch: this is EncodeJSON's own output
+		// for a map with the key "map".
+		{"a map with the key map", `["null",{"type":"map","values":"string"}]`, `{"map":"x","other":"y"}`,
+			map[string]any{"map": "x", "other": "y"}, func() any { return nil }},
 		// The int branch replaces the array branch's []any before it
 		// decodes, and the []any is back after the int overflows.
 		{"a failed branch gives the value back", `[{"type":"array","items":"long"},"int"]`, `9999999999`, nil, func() any { return []any{int64(1)} }},
