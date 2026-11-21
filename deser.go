@@ -3165,40 +3165,8 @@ func decimalInPlace(v reflect.Value, b []byte, scale int) (bool, error) {
 	if err := checkDecimalUnscaledLen(b); err != nil {
 		return true, err
 	}
-	ratInto(r, b, scale)
+	r.SetFrac(setSigned(r.Num(), b), pow10(scale))
 	return true, nil
-}
-
-// ratInto sets dst to the two's complement big-endian integer b times
-// 10^-scale, as bytesToRat returns it, in dst's own storage. scale is not
-// negative.
-func ratInto(dst *big.Rat, b []byte, scale int) {
-	n := dst.Num() // a reference to dst's numerator
-	switch {
-	case len(b) == 0:
-		n.SetInt64(0)
-	case b[0]&0x80 == 0:
-		n.SetBytes(b)
-	default:
-		// A negative value: its magnitude is the two's complement of b.
-		var stack [64]byte
-		mag := stack[:0]
-		if len(b) > len(stack) {
-			mag = make([]byte, 0, len(b))
-		}
-		mag = mag[:len(b)]
-		carry := byte(1)
-		for i := len(b) - 1; i >= 0; i-- {
-			x := ^b[i] + carry
-			if x != 0 {
-				carry = 0
-			}
-			mag[i] = x
-		}
-		n.SetBytes(mag)
-		n.Neg(n)
-	}
-	dst.SetFrac(n, pow10(scale))
 }
 
 // setDecimalRat is the rat-input variant of setDecimalValue; the JSON
@@ -3399,19 +3367,25 @@ func bytesToRat(b []byte, scale int) *big.Rat {
 	return scaledRat(bytesToBigInt(b), scale)
 }
 
-func bytesToBigInt(b []byte) *big.Int {
-	if len(b) == 0 {
-		return new(big.Int)
+func bytesToBigInt(b []byte) *big.Int { return setSigned(new(big.Int), b) }
+
+// setSigned sets z to the two's complement big-endian integer b, in z's own
+// storage, and returns z.
+func setSigned(z *big.Int, b []byte) *big.Int {
+	if len(b) == 0 || b[0]&0x80 == 0 {
+		return z.SetBytes(b)
 	}
-	i := new(big.Int).SetBytes(b) // unsigned big-endian
-	if b[0]&0x80 != 0 {
-		// High bit set means negative in two's complement.
-		// SetBytes treated it as unsigned, so subtract 2^(8*len)
-		// to recover the signed value.
-		modulus := new(big.Int).Lsh(big.NewInt(1), uint(8*len(b)))
-		i.Sub(i, modulus)
+	// A negative value: its magnitude is the two's complement of b.
+	var stack [64]byte
+	mag := append(stack[:0], b...)
+	carry := byte(1)
+	for i := len(mag) - 1; i >= 0; i-- {
+		mag[i] = ^mag[i] + carry
+		if mag[i] != 0 {
+			carry = 0
+		}
 	}
-	return i
+	return z.Neg(z.SetBytes(mag))
 }
 
 // parseUUID parses an RFC 4122 hex-dash UUID string into a [16]byte. It is
