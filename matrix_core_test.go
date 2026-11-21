@@ -12479,135 +12479,7 @@ func TestMatrix_UsedTargetParity(t *testing.T) {
 	ct := parityCustom()
 	schemas := parityCases()
 
-	type position struct {
-		name   string
-		schema func(string) string
-		wrap   func(any) any
-		target func(old any) (ptr any, get func() any)
-		binPre []byte // the wire before the value
-		jsWrap func(string) string
-		// typed says the value goes in a slot of the old value's own type,
-		// not an any, which a decode that fails partway can write into.
-		typed bool
-	}
-	id := func(s string) string { return s }
-	arr := func(s string) string { return `{"type":"array","items":` + s + `}` }
-	mp := func(s string) string { return `{"type":"map","values":` + s + `}` }
-	rec := func(s string) string { return `{"type":"record","name":"H","fields":[{"name":"f","type":` + s + `}]}` }
-	same := func(v any) any { return v }
-	inArr := func(v any) any { return []any{v} }
-	inMap := func(v any) any { return map[string]any{"k": v} }
-	inRec := func(v any) any { return map[string]any{"f": v} }
-	jArr := func(s string) string { return `[` + s + `]` }
-	jMap := func(s string) string { return `{"k":` + s + `}` }
-	jRec := func(s string) string { return `{"f":` + s + `}` }
-	// from returns the value at key in the container x has, or a marker
-	// that names what x has instead.
-	from := func(x any, key any) any {
-		switch c := x.(type) {
-		case []any:
-			if len(c) > 0 {
-				return c[0]
-			}
-		case map[string]any:
-			return c[key.(string)]
-		case avro.ArrayRecord:
-			if len(c) > 0 {
-				return c[0]
-			}
-		}
-		return fmt.Sprintf("<%T>", x)
-	}
-	positions := []position{
-		{"top", id, same, func(o any) (any, func() any) { x := o; return &x, func() any { return x } }, nil, id, false},
-		{"*any target", id, same, func(o any) (any, func() any) { x := o; p := &x; return &p, func() any { return x } }, nil, id, false},
-		{"[]any elem", arr, inArr, func(o any) (any, func() any) { x := []any{o}; return &x, func() any { return from(x, 0) } }, []byte{2}, jArr, false},
-		{"any([]any) elem", arr, inArr, func(o any) (any, func() any) { var x any = []any{o}; return &x, func() any { return from(x, 0) } }, []byte{2}, jArr, false},
-		{"[1]any elem", arr, inArr, func(o any) (any, func() any) { x := [1]any{o}; return &x, func() any { return x[0] } }, []byte{2}, jArr, false},
-		{"[]named-interface elem", arr, inArr, func(o any) (any, func() any) {
-			x := []reuseEmptyInterface{o}
-			return &x, func() any {
-				if len(x) == 0 {
-					return "<empty>"
-				}
-				return x[0]
-			}
-		}, []byte{2}, jArr, false},
-		{"map[string]any value", mp, inMap, func(o any) (any, func() any) { x := map[string]any{"k": o}; return &x, func() any { return x["k"] } }, []byte{2, 2, 'k'}, jMap, false},
-		{"any(map) value", mp, inMap, func(o any) (any, func() any) {
-			var x any = map[string]any{"k": o}
-			return &x, func() any { return from(x, "k") }
-		}, []byte{2, 2, 'k'}, jMap, false},
-		{"any(map) record field", rec, inRec, func(o any) (any, func() any) {
-			var x any = map[string]any{"f": o}
-			return &x, func() any { return from(x, "f") }
-		}, nil, jRec, false},
-		{"map[string]any record field", rec, inRec, func(o any) (any, func() any) { x := map[string]any{"f": o}; return &x, func() any { return x["f"] } }, nil, jRec, false},
-		{"ArrayRecord slot", rec, inRec, func(o any) (any, func() any) { x := avro.ArrayRecord{o}; return &x, func() any { return from(x, 0) } }, nil, jRec, false},
-		{"any(ArrayRecord) slot", rec, inRec, func(o any) (any, func() any) {
-			var x any = avro.ArrayRecord{o}
-			return &x, func() any { return from(x, 0) }
-		}, nil, jRec, false},
-		{"struct any field", rec, inRec, func(o any) (any, func() any) { x := parityHolder{F: o}; return &x, func() any { return x.F } }, nil, jRec, false},
-		{"struct *any field", rec, inRec, func(o any) (any, func() any) {
-			a := o
-			x := parityHolderP{F: &a}
-			return &x, func() any {
-				if x.F == nil {
-					return nil
-				}
-				return *x.F
-			}
-		}, nil, jRec, false},
-	}
-	// Each old value is also a slot of its own type: a struct field, a
-	// pointer field, a slice element, and a map value. A nil has no type.
-	typedIn := func(name string, schema func(string) string, wrap func(any) any, binPre []byte, jsWrap func(string) string, mk func(t reflect.Type, o reflect.Value) (ptr reflect.Value, get func() reflect.Value)) position {
-		return position{name, schema, wrap, func(o any) (any, func() any) {
-			if o == nil {
-				return nil, nil
-			}
-			ptr, get := mk(reflect.TypeOf(o), reflect.ValueOf(o))
-			return ptr.Interface(), func() any { return get().Interface() }
-		}, binPre, jsWrap, true}
-	}
-	field := func(t reflect.Type) reflect.Type {
-		return reflect.StructOf([]reflect.StructField{{Name: "F", Type: t, Tag: `avro:"f"`}})
-	}
-	positions = append(positions,
-		typedIn("struct field of the old type", rec, inRec, nil, jRec, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
-			p := reflect.New(field(t))
-			p.Elem().Field(0).Set(o)
-			return p, func() reflect.Value { return p.Elem().Field(0) }
-		}),
-		typedIn("struct field of a pointer to the old type", rec, inRec, nil, jRec, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
-			p := reflect.New(field(reflect.PointerTo(t)))
-			p.Elem().Field(0).Set(reflect.New(t))
-			p.Elem().Field(0).Elem().Set(o)
-			return p, func() reflect.Value { return p.Elem().Field(0) }
-		}),
-		typedIn("slice element of the old type", arr, inArr, []byte{2}, jArr, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
-			p := reflect.New(reflect.SliceOf(t))
-			p.Elem().Set(reflect.Append(p.Elem(), o))
-			return p, func() reflect.Value {
-				if p.Elem().Len() == 0 {
-					return reflect.ValueOf("<empty>")
-				}
-				return p.Elem().Index(0)
-			}
-		}),
-		typedIn("map value of the old type", mp, inMap, []byte{2, 2, 'k'}, jMap, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
-			p := reflect.New(reflect.MapOf(reflect.TypeFor[string](), t))
-			p.Elem().Set(reflect.MakeMap(p.Elem().Type()))
-			p.Elem().SetMapIndex(reflect.ValueOf("k"), o)
-			return p, func() reflect.Value {
-				if v := p.Elem().MapIndex(reflect.ValueOf("k")); v.IsValid() {
-					return v
-				}
-				return reflect.ValueOf("<missing>")
-			}
-		}),
-	)
+	positions := parityPositions()
 
 	type input struct {
 		bin, js []byte
@@ -12786,6 +12658,147 @@ func TestMatrix_UsedTargetParity(t *testing.T) {
 		}
 		t.Error(f)
 	}
+}
+
+// parityPosition is a Go value that has a slot for a decoded value: the
+// schema around the value, the value that goes in the slot when encoding, and
+// the target with its old value when decoding.
+type parityPosition struct {
+	name   string
+	schema func(string) string
+	wrap   func(any) any
+	target func(old any) (ptr any, get func() any)
+	binPre []byte // the wire before the value
+	jsWrap func(string) string
+	// typed says the value goes in a slot of the old value's own type,
+	// not an any, which a decode that fails partway can write into.
+	typed bool
+}
+
+// parityPositions returns the slots the parity matrices decode into: an any,
+// a *any, a slice element, a map value, a record field, an ArrayRecord slot,
+// and a struct field, each as an any, and as a slot of the old value's own
+// type.
+func parityPositions() []parityPosition {
+	id := func(s string) string { return s }
+	arr := func(s string) string { return `{"type":"array","items":` + s + `}` }
+	mp := func(s string) string { return `{"type":"map","values":` + s + `}` }
+	rec := func(s string) string { return `{"type":"record","name":"H","fields":[{"name":"f","type":` + s + `}]}` }
+	same := func(v any) any { return v }
+	inArr := func(v any) any { return []any{v} }
+	inMap := func(v any) any { return map[string]any{"k": v} }
+	inRec := func(v any) any { return map[string]any{"f": v} }
+	jArr := func(s string) string { return `[` + s + `]` }
+	jMap := func(s string) string { return `{"k":` + s + `}` }
+	jRec := func(s string) string { return `{"f":` + s + `}` }
+	// from returns the value at key in the container x has, or a marker
+	// that names what x has instead.
+	from := func(x any, key any) any {
+		switch c := x.(type) {
+		case []any:
+			if len(c) > 0 {
+				return c[0]
+			}
+		case map[string]any:
+			return c[key.(string)]
+		case avro.ArrayRecord:
+			if len(c) > 0 {
+				return c[0]
+			}
+		}
+		return fmt.Sprintf("<%T>", x)
+	}
+	positions := []parityPosition{
+		{"top", id, same, func(o any) (any, func() any) { x := o; return &x, func() any { return x } }, nil, id, false},
+		{"*any target", id, same, func(o any) (any, func() any) { x := o; p := &x; return &p, func() any { return x } }, nil, id, false},
+		{"[]any elem", arr, inArr, func(o any) (any, func() any) { x := []any{o}; return &x, func() any { return from(x, 0) } }, []byte{2}, jArr, false},
+		{"any([]any) elem", arr, inArr, func(o any) (any, func() any) { var x any = []any{o}; return &x, func() any { return from(x, 0) } }, []byte{2}, jArr, false},
+		{"[1]any elem", arr, inArr, func(o any) (any, func() any) { x := [1]any{o}; return &x, func() any { return x[0] } }, []byte{2}, jArr, false},
+		{"[]named-interface elem", arr, inArr, func(o any) (any, func() any) {
+			x := []reuseEmptyInterface{o}
+			return &x, func() any {
+				if len(x) == 0 {
+					return "<empty>"
+				}
+				return x[0]
+			}
+		}, []byte{2}, jArr, false},
+		{"map[string]any value", mp, inMap, func(o any) (any, func() any) { x := map[string]any{"k": o}; return &x, func() any { return x["k"] } }, []byte{2, 2, 'k'}, jMap, false},
+		{"any(map) value", mp, inMap, func(o any) (any, func() any) {
+			var x any = map[string]any{"k": o}
+			return &x, func() any { return from(x, "k") }
+		}, []byte{2, 2, 'k'}, jMap, false},
+		{"any(map) record field", rec, inRec, func(o any) (any, func() any) {
+			var x any = map[string]any{"f": o}
+			return &x, func() any { return from(x, "f") }
+		}, nil, jRec, false},
+		{"map[string]any record field", rec, inRec, func(o any) (any, func() any) { x := map[string]any{"f": o}; return &x, func() any { return x["f"] } }, nil, jRec, false},
+		{"ArrayRecord slot", rec, inRec, func(o any) (any, func() any) { x := avro.ArrayRecord{o}; return &x, func() any { return from(x, 0) } }, nil, jRec, false},
+		{"any(ArrayRecord) slot", rec, inRec, func(o any) (any, func() any) {
+			var x any = avro.ArrayRecord{o}
+			return &x, func() any { return from(x, 0) }
+		}, nil, jRec, false},
+		{"struct any field", rec, inRec, func(o any) (any, func() any) { x := parityHolder{F: o}; return &x, func() any { return x.F } }, nil, jRec, false},
+		{"struct *any field", rec, inRec, func(o any) (any, func() any) {
+			a := o
+			x := parityHolderP{F: &a}
+			return &x, func() any {
+				if x.F == nil {
+					return nil
+				}
+				return *x.F
+			}
+		}, nil, jRec, false},
+	}
+	// Each old value is also a slot of its own type: a struct field, a
+	// pointer field, a slice element, and a map value. A nil has no type.
+	typedIn := func(name string, schema func(string) string, wrap func(any) any, binPre []byte, jsWrap func(string) string, mk func(t reflect.Type, o reflect.Value) (ptr reflect.Value, get func() reflect.Value)) parityPosition {
+		return parityPosition{name, schema, wrap, func(o any) (any, func() any) {
+			if o == nil {
+				return nil, nil
+			}
+			ptr, get := mk(reflect.TypeOf(o), reflect.ValueOf(o))
+			return ptr.Interface(), func() any { return get().Interface() }
+		}, binPre, jsWrap, true}
+	}
+	field := func(t reflect.Type) reflect.Type {
+		return reflect.StructOf([]reflect.StructField{{Name: "F", Type: t, Tag: `avro:"f"`}})
+	}
+	positions = append(positions,
+		typedIn("struct field of the old type", rec, inRec, nil, jRec, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(field(t))
+			p.Elem().Field(0).Set(o)
+			return p, func() reflect.Value { return p.Elem().Field(0) }
+		}),
+		typedIn("struct field of a pointer to the old type", rec, inRec, nil, jRec, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(field(reflect.PointerTo(t)))
+			p.Elem().Field(0).Set(reflect.New(t))
+			p.Elem().Field(0).Elem().Set(o)
+			return p, func() reflect.Value { return p.Elem().Field(0) }
+		}),
+		typedIn("slice element of the old type", arr, inArr, []byte{2}, jArr, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(reflect.SliceOf(t))
+			p.Elem().Set(reflect.Append(p.Elem(), o))
+			return p, func() reflect.Value {
+				if p.Elem().Len() == 0 {
+					return reflect.ValueOf("<empty>")
+				}
+				return p.Elem().Index(0)
+			}
+		}),
+		typedIn("map value of the old type", mp, inMap, []byte{2, 2, 'k'}, jMap, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(reflect.MapOf(reflect.TypeFor[string](), t))
+			p.Elem().Set(reflect.MakeMap(p.Elem().Type()))
+			p.Elem().SetMapIndex(reflect.ValueOf("k"), o)
+			return p, func() reflect.Value {
+				if v := p.Elem().MapIndex(reflect.ValueOf("k")); v.IsValid() {
+					return v
+				}
+				return reflect.ValueOf("<missing>")
+			}
+		}),
+	)
+	return positions
 }
 
 // parityCase is one schema the parity matrices decode, with values for it.
@@ -13244,6 +13257,195 @@ func TestMatrix_RoundTripParity(t *testing.T) {
 							fail("%s: the %T it decoded into encodes %s, the any it decoded into %s", cell, w, snap(dt), snap(db))
 						case !bytes.Equal(bin4, bin3) && !parityMultiKey(pb.Elem().Interface()):
 							fail("%s: the %T it decoded into encodes to %x, and to %x on the trip after", cell, w, bin3, bin4)
+						}
+					}
+				}
+			}
+		}
+	}
+	for i, f := range failures {
+		if i == 25 {
+			t.Errorf("... and %d more", len(failures)-i)
+			break
+		}
+		t.Error(f)
+	}
+}
+
+// TestMatrix_ResolvedTargetParity decodes writer data through a resolved
+// schema, and the same value encoded with the reader schema through the plain
+// reader, into every position of the parity matrices, from each old value, on
+// both wires, with and without TaggedUnions. The two decodes must fail the
+// same, leave the same value, and reuse the same containers, after one decode
+// and after two in a row, and a resolved decode that fails at its first byte
+// leaves the target as it was. The pairs are a reader union around the
+// writer's type and a reader record with a field the writer lacks, which
+// reach the record, map, and union decoders of resolve.go; a schema resolved
+// against itself is the reader. TestMatrix_UsedTargetParity covers the plain decoders, and
+// TestParity_ResolveMatrix checks resolution into new targets.
+func TestMatrix_ResolvedTargetParity(t *testing.T) {
+	ct := parityCustom()
+	positions := parityPositions()
+	// One old value of each kind. TestMatrix_UsedTargetParity crosses all of
+	// them with the decoders both pairs end in.
+	var olds []struct {
+		name string
+		mk   func() any
+	}
+	for _, old := range parityOlds() {
+		switch old.name {
+		case "nil", "int64", "string", "[]byte", "struct", "map[string]any{}", "map[string]any{own}",
+			"map[string]any{P:map}", "[]any{9,8}", "[]any{map}", "map[string]int64", "[]int64", "*int64",
+			"*P", "*big.Rat", "*any(map)", "*map[string]any", "ArrayRecord{x}", "nil []int64", "envelope{P:*map}",
+			"nil map[string]int64", "nil map[string]any":
+			olds = append(olds, old)
+		}
+	}
+	if len(olds) != 22 {
+		t.Fatalf("%d old values picked, want 22: a name in the list no longer matches parityOlds", len(olds))
+	}
+	rec := func(s string, extra string) string {
+		return `{"type":"record","name":"RW","fields":[{"name":"f","type":` + s + `}` + extra + `]}`
+	}
+	type wire struct {
+		bin, js []byte
+	}
+	var failures []string
+	fail := func(format string, args ...any) { failures = append(failures, fmt.Sprintf(format, args...)) }
+	try := func(f func() error) (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic: %v", r)
+			}
+		}()
+		return f()
+	}
+	for _, sc := range parityCases() {
+		pairs := []struct{ name, writer, reader string }{
+			{"added field", rec(sc.text, ""), rec(sc.text, `,{"name":"g","type":["null","long"],"default":null}`)},
+		}
+		if !strings.HasPrefix(sc.text, "[") && sc.text != `"null"` {
+			pairs = append(pairs, struct{ name, writer, reader string }{"reader union", sc.text, `["null",` + sc.text + `]`})
+		}
+		for _, pr := range pairs {
+			for _, pos := range positions {
+				w := avro.MustParse(pos.schema(pr.writer), ct)
+				r := avro.MustParse(pos.schema(pr.reader), ct)
+				res, err := avro.Resolve(w, r)
+				if err != nil {
+					fail("%s | %s | %s: Resolve: %v", pr.name, pos.name, sc.name, err)
+					continue
+				}
+				// Each value as writer data, and as reader data for the
+				// value a fresh resolved decode gives.
+				var fromWriter, fromReader []wire
+				var zeroByte []bool
+				top := avro.MustParse(pr.writer, ct)
+				for _, v := range sc.vals {
+					var in wire
+					if pr.name != "added field" {
+						zeroByte = append(zeroByte, len(avrotest.MustAppendEncode(t, top, nil, v, avro.TaggedUnions())) == 0)
+					} else {
+						zeroByte = append(zeroByte, false)
+					}
+					if pr.name == "added field" {
+						v = map[string]any{"f": v}
+					}
+					in.bin = avrotest.MustAppendEncode(t, w, nil, pos.wrap(v), avro.TaggedUnions())
+					in.js = avrotest.MustAppendEncodeJSON(t, w, nil, pos.wrap(v), avro.TaggedUnions())
+					var fresh any
+					if _, err := res.Decode(in.bin, &fresh); err != nil {
+						fail("%s | %s | %s: a fresh resolved decode: %v", pr.name, pos.name, sc.name, err)
+						continue
+					}
+					var out wire
+					out.bin = avrotest.MustAppendEncode(t, r, nil, fresh, avro.TaggedUnions())
+					out.js = avrotest.MustAppendEncodeJSON(t, r, nil, fresh, avro.TaggedUnions())
+					fromWriter, fromReader = append(fromWriter, in), append(fromReader, out)
+				}
+				for _, option := range []struct {
+					name string
+					opts []avro.Opt
+				}{{"plain", nil}, {"tagged", []avro.Opt{avro.TaggedUnions()}}} {
+					opts := option.opts
+					decode := func(s *avro.Schema, json bool, in wire, ptr any) error {
+						return try(func() error {
+							if json {
+								return s.DecodeJSON(in.js, ptr, opts...)
+							}
+							_, err := s.Decode(in.bin, ptr, opts...)
+							return err
+						})
+					}
+					for _, old := range olds {
+						for _, json := range []bool{false, true} {
+							cell := fmt.Sprintf("%s | %s | %s | %s | old %s | json=%v", option.name, pr.name, pos.name, sc.name, old.name, json)
+							// run decodes ins[first] if first >= 0, and then
+							// ins[i], into a target from the old value.
+							run := func(s *avro.Schema, ins []wire, first, i int) (string, string, bool, bool) {
+								ptr, get := pos.target(old.mk())
+								if ptr == nil {
+									return "", "", false, false
+								}
+								before := get()
+								if first >= 0 {
+									if err := decode(s, json, ins[first], ptr); err != nil {
+										return "first: " + err.Error(), "", false, true
+									}
+									before = get()
+								}
+								errText := ""
+								if err := decode(s, json, ins[i], ptr); err != nil {
+									errText = err.Error()
+								}
+								got := get()
+								id := parityID(parityInside(before))
+								return errText, paritySnap(reflect.ValueOf(got), 0), id != 0 && id == parityID(parityInside(got)), true
+							}
+							for i := range fromWriter {
+								for first := -1; first < len(fromWriter); first++ {
+									re, rs, rr, ok := run(res, fromWriter, first, i)
+									if !ok {
+										continue
+									}
+									pe, ps, pp, _ := run(r, fromReader, first, i)
+									label := fmt.Sprintf("value %d", i)
+									if first >= 0 {
+										label = fmt.Sprintf("value %d then %d", first, i)
+									}
+									switch {
+									case strings.HasPrefix(re, "panic: ") || strings.HasPrefix(pe, "panic: "):
+										fail("%s | %s: resolved %s, reader %s", cell, label, re, pe)
+									case (re == "") != (pe == ""):
+										fail("%s | %s: the resolved decode failed: %q, the reader decode: %q", cell, label, re, pe)
+									case rs != ps:
+										fail("%s | %s: the resolved decode left %s, the reader decode %s (errors %q, %q)", cell, label, rs, ps, re, pe)
+									case re == "" && rr != pp:
+										fail("%s | %s: the resolved decode reused the old value: %v, the reader decode: %v", cell, label, rr, pp)
+									}
+								}
+								// A resolved decode that fails at its first
+								// byte leaves the target as the decode
+								// before it left it. A value of zero bytes
+								// decodes from the prefix alone, and its
+								// decode fails only after it.
+								if len(zeroByte) > i && zeroByte[i] {
+									continue
+								}
+								ptr, get := pos.target(old.mk())
+								if ptr == nil || decode(res, json, fromWriter[i], ptr) != nil {
+									continue
+								}
+								mid := get()
+								before := paritySnap(reflect.ValueOf(mid), 0)
+								bad := wire{bin: pos.binPre, js: []byte(pos.jsWrap(`!`))}
+								if err := decode(res, json, bad, ptr); err != nil {
+									got := get()
+									if after := paritySnap(reflect.ValueOf(got), 0); strings.HasPrefix(err.Error(), "panic: ") || after != before || parityID(got) != parityID(mid) {
+										fail("%s | value %d then a failure: the resolved decode changed %s to %s (error %v)", cell, i, before, after, err)
+									}
+								}
+							}
 						}
 					}
 				}

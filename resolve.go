@@ -534,9 +534,11 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, m map[stri
 	return src, setIface(v, reflect.ValueOf(m), "record")
 }
 
-func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
-	if v.IsNil() {
-		v.Set(reflect.MakeMapWithSize(t, len(rr.readerNames)))
+func (rr *resolvedRecord) deserMap(src []byte, target reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
+	// A nil map target gets a new map only from a decode that worked.
+	v := target
+	if target.IsNil() {
+		v = reflect.MakeMapWithSize(t, len(rr.readerNames))
 	}
 	look := v.Len() > 0 && reusesMapValue(t.Elem())
 	var err error
@@ -580,7 +582,9 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 		v.SetMapIndex(key, elem)
 		elem.SetZero()
 	}
-
+	if target.IsNil() {
+		target.Set(v)
+	}
 	return src, nil
 }
 
