@@ -1751,7 +1751,7 @@ func (b *builder) siteNodeWith(node *schemaNode, w *customWiring) *schemaNode {
 		// wildcard keeps the logical transform on both paths. See
 		// buildCustomWiring for the suppression contract.
 		fn = wrapDecodeJSONWithCustomDecoders(nil, w.sn, w.suppressLogical)
-	default:
+	case node.name == "" || w == b.custom[node]:
 		return node
 	}
 	if node.name == "" {

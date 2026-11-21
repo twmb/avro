@@ -22325,6 +22325,26 @@ func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
 					t.Errorf("%s/%s: the callbacks saw props %v, want %v", c.name, name, seen, c.want)
 				}
 			}
+			// An Encode-only custom type sees the same props, in the order
+			// the records start encoding: the outer record moves first.
+			es := avro.MustParse(c.schema, avro.CustomType{AvroType: "record", Encode: func(v any, sn *avro.SchemaNode) (any, error) {
+				seen = append(seen, sn.Props["foo"])
+				return v, nil
+			}})
+			last := len(c.want) - 1
+			wantEnc := append([]any{c.want[last]}, c.want[:last]...)
+			for name, encode := range map[string]func() error{
+				"Encode":     func() error { _, err := es.Encode(c.v); return err },
+				"EncodeJSON": func() error { _, err := es.EncodeJSON(c.v); return err },
+			} {
+				seen = nil
+				if err := encode(); err != nil {
+					t.Fatalf("%s/%s: %v", c.name, name, err)
+				}
+				if !reflect.DeepEqual(seen, wantEnc) {
+					t.Errorf("%s/%s: the callbacks saw props %v, want %v", c.name, name, seen, wantEnc)
+				}
+			}
 		}
 	})
 }
