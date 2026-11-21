@@ -12872,6 +12872,40 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 				}
 			}
 		}
+		// A big.Rat field is not decoded into in place: a copy of the struct
+		// shares the field's storage, and must keep its value.
+		type priced struct {
+			Price big.Rat `avro:"price"`
+		}
+		ps := avro.MustParse(`{"type":"record","name":"P","fields":[{"name":"price","type":{"type":"bytes","logicalType":"decimal","precision":30,"scale":2}}]}`)
+		for _, w := range reuseWires {
+			var row priced
+			var rows []priced
+			vals := []*big.Rat{big.NewRat(61728394506172839, 50), big.NewRat(-5, 4), big.NewRat(5, 4)}
+			for _, r := range vals {
+				w.mustDecode(t, ps, w.encode(t, ps, map[string]any{"price": r}), &row)
+				rows = append(rows, row)
+			}
+			for i, r := range vals {
+				if rows[i].Price.Cmp(r) != 0 {
+					t.Errorf("%s: the copy kept after decode %d reads %s, want %s", w.name, i, rows[i].Price.String(), r.String())
+				}
+			}
+		}
+		// A decimal decodes into the *big.Rat itself, which makes no new
+		// big.Rat, so a used any takes fewer allocations than a new one.
+		dec := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":18,"scale":2}`)
+		wire := avrotest.MustEncode(t, dec, big.NewRat(1234567, 100))
+		var used any
+		avrotest.MustDecode(t, dec, wire, &used)
+		intoUsed := minAllocsPerRun(20, func() { _, _ = dec.Decode(wire, &used) })
+		intoNew := minAllocsPerRun(20, func() {
+			var x any
+			_, _ = dec.Decode(wire, &x)
+		})
+		if intoUsed >= intoNew {
+			t.Errorf("a decimal into a used any: %v allocations, want fewer than the %v into a new any", intoUsed, intoNew)
+		}
 		// DecodeJSON takes a decimal as a bare number too.
 		old := big.NewRat(1, 2)
 		var x any = old

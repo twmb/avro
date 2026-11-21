@@ -3022,6 +3022,83 @@ func setDecimalValue(v reflect.Value, b []byte, scale int) (bool, error) {
 	return setDecimalRat(v, bytesToRat(b, scale), scale)
 }
 
+// ratTarget returns the *big.Rat that a decimal decodes into in place: one we
+// reach through a pointer, such as a *big.Rat field or element, or the one an
+// any has. v is the target before indirectAlloc. A big.Rat we reach by value
+// is not one, although we can address it: a copy of its struct shares its
+// storage, and a decode in place would change every copy you kept. That
+// includes the big.Rat of Decode(src, r) for an r of type *big.Rat, which we
+// cannot tell from the address of a field.
+func ratTarget(v reflect.Value) *big.Rat {
+	for range maxIndirectDepth {
+		switch v.Kind() {
+		case reflect.Pointer:
+			if v.IsNil() || !v.CanInterface() {
+				return nil
+			}
+			if v.Type() == bigRatPtrType {
+				return v.Interface().(*big.Rat)
+			}
+			v = v.Elem()
+		case reflect.Interface:
+			if v.IsNil() {
+				return nil
+			}
+			v = v.Elem()
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// decimalInPlace decodes the decimal b into the *big.Rat the target v has,
+// and reports whether v has one. That reuses the numerator's storage and
+// makes no new big.Rat.
+func decimalInPlace(v reflect.Value, b []byte, scale int) (bool, error) {
+	r := ratTarget(v)
+	if r == nil {
+		return false, nil
+	}
+	if err := checkDecimalUnscaledLen(b); err != nil {
+		return true, err
+	}
+	ratInto(r, b, scale)
+	return true, nil
+}
+
+// ratInto sets dst to the two's complement big-endian integer b times
+// 10^-scale, as bytesToRat returns it, in dst's own storage. scale is not
+// negative.
+func ratInto(dst *big.Rat, b []byte, scale int) {
+	n := dst.Num() // a reference to dst's numerator
+	switch {
+	case len(b) == 0:
+		n.SetInt64(0)
+	case b[0]&0x80 == 0:
+		n.SetBytes(b)
+	default:
+		// A negative value: its magnitude is the two's complement of b.
+		var stack [64]byte
+		mag := stack[:0]
+		if len(b) > len(stack) {
+			mag = make([]byte, 0, len(b))
+		}
+		mag = mag[:len(b)]
+		carry := byte(1)
+		for i := len(b) - 1; i >= 0; i-- {
+			x := ^b[i] + carry
+			if x != 0 {
+				carry = 0
+			}
+			mag[i] = x
+		}
+		n.SetBytes(mag)
+		n.Neg(n)
+	}
+	dst.SetFrac(n, pow10(scale))
+}
+
 // setDecimalRat is the rat-input variant of setDecimalValue; the JSON
 // bare-number form already has a parsed *big.Rat. Both share this so the
 // target set and the float overflow guards stay the same on both wires.
@@ -3068,6 +3145,9 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	}
 	b := src[:n]
 	src = src[n:]
+	if ok, err := decimalInPlace(v, b, s.scale); ok {
+		return src, err
+	}
 	v = indirectAlloc(v)
 	if ok, err := setDecimalValue(v, b, s.scale); ok {
 		return src, err
@@ -3168,6 +3248,9 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	}
 	b := src[:s.size]
 	src = src[s.size:]
+	if ok, err := decimalInPlace(v, b, s.scale); ok {
+		return src, err
+	}
 	v = indirectAlloc(v)
 	if ok, err := setDecimalValue(v, b, s.scale); ok {
 		return src, err
