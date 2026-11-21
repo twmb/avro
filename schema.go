@@ -1743,6 +1743,11 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 
 	if len(encoders) > 0 {
 		customEncode := func(v reflect.Value) (reflect.Value, error) {
+			// A nil a union tries on this branch has no Go type to match,
+			// and the built-in serializer reports it.
+			if !v.IsValid() {
+				return v, nil
+			}
 			// Dereference pointers and interface wrappers so GoType
 			// matching compares against the concrete type. Check GoType
 			// at each level so pointer-valued GoTypes (e.g. *url.URL)

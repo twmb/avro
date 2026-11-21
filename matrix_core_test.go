@@ -12476,51 +12476,8 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 // shape against a fresh decode; this test crosses the target shapes and the
 // old values.
 func TestMatrix_UsedTargetParity(t *testing.T) {
-	const (
-		recP = `{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}`
-		recQ = `{"type":"record","name":"Q","fields":[{"name":"q","type":"long"}]}`
-		arrL = `{"type":"array","items":"long"}`
-		mapL = `{"type":"map","values":"long"}`
-		dec  = `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
-		mon  = `{"type":"long","logicalType":"money"}`
-	)
-	p := func(n int64) any { return map[string]any{"a": n} }
-	ct := avro.NewCustomType[*parityMoney, int64]("money",
-		func(v *parityMoney, _ *avro.SchemaNode) (int64, error) { return v.cents, nil },
-		func(c int64, _ *avro.SchemaNode) (*parityMoney, error) {
-			switch c {
-			case parityMoneyFails:
-				return nil, errParityMoney
-			case parityMoneyPanics:
-				panic(errParityMoney)
-			}
-			return &parityMoney{c}, nil
-		})
-	type schema struct {
-		name, text string
-		vals       []any
-		custom     bool // the money values that fail and panic apply
-	}
-	var schemas []schema
-	for _, fr := range matFrags() {
-		schemas = append(schemas, schema{fr.label, fr.schema(&uniq{}), fr.values[:min(2, len(fr.values))], false})
-	}
-	schemas = append(schemas, []schema{
-		{"u[null,record]", `["null",` + recP + `]`, []any{nil, p(1)}, false},
-		{"u[array,record]", `[` + arrL + `,` + recP + `]`, []any{[]any{int64(1)}, p(7)}, false},
-		{"u[recP,recQ]", `[` + recP + `,` + recQ + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"Q": map[string]any{"q": int64(2)}}}, false},
-		{"u[recP,map]", `[` + recP + `,` + mapL + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"map": map[string]any{"k": int64(5)}}}, false},
-		{"u[long,decimal]", `["long",` + dec + `]`, []any{int64(7), big.NewRat(5, 4)}, false},
-		{"u[null,array,map,string]", `["null",` + arrL + `,` + mapL + `,"string"]`, []any{nil, []any{int64(1)}, map[string]any{"k": int64(5)}, "x"}, false},
-		{"u[bytes,string]", `["bytes","string"]`, []any{map[string]any{"bytes": []byte("b")}, map[string]any{"string": "x"}}, false},
-		{"array<record>", `{"type":"array","items":` + recP + `}`, []any{[]any{p(1)}, []any{p(2), p(3)}}, false},
-		{"array<u[null,long]>", `{"type":"array","items":["null","long"]}`, []any{[]any{nil, int64(1)}, []any{int64(2)}}, false},
-		{"map<record>", `{"type":"map","values":` + recP + `}`, []any{map[string]any{"k": p(1)}}, false},
-		{"money", mon, []any{&parityMoney{5}}, true},
-		{"u[string,money]", `["string",` + mon + `]`, []any{"x", &parityMoney{5}}, true},
-		{"u[null,money]", `["null",` + mon + `]`, []any{nil, &parityMoney{5}}, true},
-		{"u[money,array,recP]", `[` + mon + `,` + arrL + `,` + recP + `]`, []any{&parityMoney{5}, []any{int64(1)}, p(3)}, true},
-	}...)
+	ct := parityCustom()
+	schemas := parityCases()
 
 	type position struct {
 		name   string
@@ -12831,6 +12788,64 @@ func TestMatrix_UsedTargetParity(t *testing.T) {
 	}
 }
 
+// parityCase is one schema the parity matrices decode, with values for it.
+// custom says the values of parityCustom that fail and panic apply.
+type parityCase struct {
+	name, text string
+	vals       []any
+	custom     bool
+}
+
+// parityCases returns each fragment, each union the reuse rules act on, and a
+// few containers and custom types, with up to two values each.
+func parityCases() []parityCase {
+	const (
+		recP = `{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}`
+		recQ = `{"type":"record","name":"Q","fields":[{"name":"q","type":"long"}]}`
+		arrL = `{"type":"array","items":"long"}`
+		mapL = `{"type":"map","values":"long"}`
+		dec  = `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+		mon  = `{"type":"long","logicalType":"money"}`
+	)
+	p := func(n int64) any { return map[string]any{"a": n} }
+	var cases []parityCase
+	for _, fr := range matFrags() {
+		cases = append(cases, parityCase{fr.label, fr.schema(&uniq{}), fr.values[:min(2, len(fr.values))], false})
+	}
+	return append(cases, []parityCase{
+		{"u[null,record]", `["null",` + recP + `]`, []any{nil, p(1)}, false},
+		{"u[array,record]", `[` + arrL + `,` + recP + `]`, []any{[]any{int64(1)}, p(7)}, false},
+		{"u[recP,recQ]", `[` + recP + `,` + recQ + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"Q": map[string]any{"q": int64(2)}}}, false},
+		{"u[recP,map]", `[` + recP + `,` + mapL + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"map": map[string]any{"k": int64(5)}}}, false},
+		{"u[long,decimal]", `["long",` + dec + `]`, []any{int64(7), big.NewRat(5, 4)}, false},
+		{"u[null,array,map,string]", `["null",` + arrL + `,` + mapL + `,"string"]`, []any{nil, []any{int64(1)}, map[string]any{"k": int64(5)}, "x"}, false},
+		{"u[bytes,string]", `["bytes","string"]`, []any{map[string]any{"bytes": []byte("b")}, map[string]any{"string": "x"}}, false},
+		{"array<record>", `{"type":"array","items":` + recP + `}`, []any{[]any{p(1)}, []any{p(2), p(3)}}, false},
+		{"array<u[null,long]>", `{"type":"array","items":["null","long"]}`, []any{[]any{nil, int64(1)}, []any{int64(2)}}, false},
+		{"map<record>", `{"type":"map","values":` + recP + `}`, []any{map[string]any{"k": p(1)}}, false},
+		{"money", mon, []any{&parityMoney{5}}, true},
+		{"u[string,money]", `["string",` + mon + `]`, []any{"x", &parityMoney{5}}, true},
+		{"u[null,money]", `["null",` + mon + `]`, []any{nil, &parityMoney{5}}, true},
+		{"u[money,array,recP]", `[` + mon + `,` + arrL + `,` + recP + `]`, []any{&parityMoney{5}, []any{int64(1)}, p(3)}, true},
+	}...)
+}
+
+// parityCustom returns the custom type for the money logical type: its Decode
+// returns an error for parityMoneyFails and panics for parityMoneyPanics.
+func parityCustom() avro.CustomType {
+	return avro.NewCustomType[*parityMoney, int64]("money",
+		func(v *parityMoney, _ *avro.SchemaNode) (int64, error) { return v.cents, nil },
+		func(c int64, _ *avro.SchemaNode) (*parityMoney, error) {
+			switch c {
+			case parityMoneyFails:
+				return nil, errParityMoney
+			case parityMoneyPanics:
+				panic(errParityMoney)
+			}
+			return &parityMoney{c}, nil
+		})
+}
+
 type parityMoney struct{ cents int64 }
 
 // The money values whose Decode returns an error, and whose Decode panics.
@@ -13007,6 +13022,322 @@ func parityInside(x any) any {
 		}
 	}
 	return x
+}
+
+// TestMatrix_RoundTripParity encodes many Go values into each parity schema,
+// at several positions and as several Go types, with Encode and EncodeJSON,
+// and decodes them back. The encoders must agree: both fail or neither does,
+// neither panics, and the two outputs decode to the same value. A value that
+// decodes must make the trip again unchanged on both wires, and its bytes do
+// not change on the trip after that: raw bytes you encode need not be the
+// form a decoded value encodes to, and that form must hold. Decoding into a
+// new value of the encoded Go type works or fails the same on both decoders,
+// gives the same value as decoding into an any, and makes the trip too. The
+// bare JSON form decodes to the same value as the tagged form wherever it has
+// one reading. TestParity_RoundTripMatrix checks hand-picked cells against
+// expected values; this test crosses the schemas, Go inputs, and positions and
+// checks the paths against each other.
+func TestMatrix_RoundTripParity(t *testing.T) {
+	ct := parityCustom()
+	ts := time.Date(2024, 6, 15, 12, 34, 56, 123_456_789, time.UTC)
+	i64, s1 := int64(7), "x"
+	var nilAny any
+	inputs := []struct {
+		name string
+		v    any
+	}{
+		{"int", 7}, {"int8", int8(7)}, {"int32", int32(7)}, {"int64 big", int64(1) << 40}, {"uint", uint(7)},
+		{"uint8", uint8(7)}, {"uint64 max", uint64(math.MaxUint64)}, {"float32", float32(1.5)}, {"float64", 1.5},
+		{"float64 whole", 7.0}, {"float64 NaN", math.NaN()}, {"float64 -Inf", math.Inf(-1)}, {"float64 -0", math.Copysign(0, -1)},
+		{"json.Number int", json.Number("7")}, {"json.Number frac", json.Number("1.25")}, {"json.Number bad", json.Number("x")},
+		{"string A", "A"}, {"string num", "7"}, {"string dec", "1.25"}, {"string uuid", "550e8400-e29b-41d4-a716-446655440000"},
+		{"string 4", "abcd"}, {"[]byte", []byte("abcd")}, {"[]byte empty", []byte{}}, {"[4]byte", [4]byte{1, 2, 3, 4}},
+		{"[16]byte", [16]byte{1}}, {"[12]byte", [12]byte{1}}, {"[8]byte", [8]byte{0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}}, {"time", ts}, {"*time", &ts}, {"duration", 5 * time.Second},
+		{"avro.Duration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}}, {"*big.Rat", big.NewRat(5, 4)},
+		{"big.Rat", *big.NewRat(5, 4)}, {"*big.Int", big.NewInt(7)}, {"bool", true},
+		{"map{a:1}", map[string]any{"a": int64(1)}}, {"map{a:str}", map[string]any{"a": "x"}}, {"map{}", map[string]any{}},
+		{"map{k:1,j:2}", map[string]any{"k": int64(1), "j": int64(2)}}, {"map[string]int64", map[string]int64{"a": 1}},
+		{"map[string]string", map[string]string{"a": "x"}}, {"envelope{long:7}", map[string]any{"long": int64(7)}},
+		{"envelope{P:{a:1}}", map[string]any{"P": map[string]any{"a": int64(1)}}}, {"envelope{string:x}", map[string]any{"string": "x"}},
+		{"struct P", parityP{A: 1}}, {"*P", &parityP{A: 1}}, {"*P nil", (*parityP)(nil)},
+		{"[]any{1}", []any{int64(1)}}, {"[]any{}", []any{}}, {"[]int64", []int64{1, 2}}, {"[]int32", []int32{1}},
+		{"[]string", []string{"x"}}, {"[1]int64", [1]int64{1}}, {"[]P", []parityP{{A: 1}}}, {"[]*P", []*parityP{{A: 1}}},
+		{"ArrayRecord{1}", avro.ArrayRecord{int64(1)}}, {"ArrayRecord{str}", avro.ArrayRecord{"x"}},
+		{"*int64", &i64}, {"*int64 nil", (*int64)(nil)}, {"*string", &s1}, {"*any nil", &nilAny},
+		{"named map", parityMap{"a": int64(1)}}, {"named slice", paritySlice{int64(1)}}, {"named bytes", parityBytes("abcd")},
+		{"*money", &parityMoney{5}}, {"money", parityMoney{5}}, {"nil", nil}, {"func", func() {}},
+	}
+	type position struct {
+		name   string
+		schema func(string) string
+		wrap   func(any) any // nil when the position needs the value's type and v is nil
+	}
+	id := func(s string) string { return s }
+	arr := func(s string) string { return `{"type":"array","items":` + s + `}` }
+	mp := func(s string) string { return `{"type":"map","values":` + s + `}` }
+	rec := func(s string) string { return `{"type":"record","name":"H","fields":[{"name":"f","type":` + s + `}]}` }
+	typed := func(mk func(t reflect.Type, v reflect.Value) reflect.Value) func(any) any {
+		return func(v any) any {
+			if v == nil {
+				return nil
+			}
+			return mk(reflect.TypeOf(v), reflect.ValueOf(v)).Interface()
+		}
+	}
+	positions := []position{
+		{"top", id, func(v any) any { return v }},
+		{"*any", id, func(v any) any { x := v; return &x }},
+		{"record field (map)", rec, func(v any) any { return map[string]any{"f": v} }},
+		{"record field (struct of its type)", rec, typed(func(t reflect.Type, v reflect.Value) reflect.Value {
+			p := reflect.New(reflect.StructOf([]reflect.StructField{{Name: "F", Type: t, Tag: `avro:"f"`}})).Elem()
+			p.Field(0).Set(v)
+			return p
+		})},
+		{"array item ([]any)", arr, func(v any) any { return []any{v} }},
+		{"array item (slice of its type)", arr, typed(func(t reflect.Type, v reflect.Value) reflect.Value {
+			return reflect.Append(reflect.MakeSlice(reflect.SliceOf(t), 0, 1), v)
+		})},
+		{"map value (map[string]any)", mp, func(v any) any { return map[string]any{"k": v} }},
+		{"map value (map of its type)", mp, typed(func(t reflect.Type, v reflect.Value) reflect.Value {
+			m := reflect.MakeMap(reflect.MapOf(reflect.TypeFor[string](), t))
+			m.SetMapIndex(reflect.ValueOf("k"), v)
+			return m
+		})},
+	}
+	// try runs f and returns its error, or the panic it recovered as one.
+	try := func(f func() error) (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic: %v", r)
+			}
+		}()
+		return f()
+	}
+	isPanic := func(err error) bool { return err != nil && strings.HasPrefix(err.Error(), "panic: ") }
+	snap := func(x any) string { return paritySnap(reflect.ValueOf(x), 0) }
+	var failures []string
+	fail := func(format string, args ...any) { failures = append(failures, fmt.Sprintf(format, args...)) }
+	cases := parityCases()
+	for _, option := range []struct {
+		name string
+		opts []avro.Opt
+	}{
+		{"plain", nil},
+		{"tagged", []avro.Opt{avro.TaggedUnions()}},
+		{"tagged+logical", []avro.Opt{avro.TaggedUnions(), avro.TagLogicalTypes()}},
+	} {
+		opts := option.opts
+		for _, pos := range positions {
+			for _, sc := range cases {
+				s := avro.MustParse(pos.schema(sc.text), ct)
+				var vals []struct {
+					name string
+					v    any
+				}
+				for i, v := range sc.vals {
+					vals = append(vals, struct {
+						name string
+						v    any
+					}{fmt.Sprintf("value %d", i), v})
+				}
+				for _, in := range append(vals, inputs...) {
+					w := pos.wrap(in.v)
+					if w == nil && in.v != nil || w == nil && pos.name != "top" && pos.name != "*any" && pos.name != "record field (map)" && pos.name != "array item ([]any)" && pos.name != "map value (map[string]any)" {
+						continue
+					}
+					cell := fmt.Sprintf("%s | %s | %s | %s", option.name, pos.name, sc.name, in.name)
+					// Raw bytes for a decimal are written as given, as the
+					// spec's bytes defaults are, and a []byte target reads
+					// them back as given. Read as a number, they can exceed
+					// the precision or fail to parse, so only the checks
+					// that the paths agree apply to them.
+					rv := reflect.ValueOf(in.v)
+					opaque := strings.Contains(sc.text, `decimal"`) && rv.IsValid() &&
+						(rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) && rv.Type().Elem().Kind() == reflect.Uint8
+					var bin, js, bare []byte
+					be := try(func() (err error) { bin, err = s.AppendEncode(nil, w); return err })
+					je := try(func() (err error) { js, err = s.AppendEncodeJSON(nil, w, avro.TaggedUnions()); return err })
+					re := try(func() (err error) { bare, err = s.AppendEncodeJSON(nil, w); return err })
+					switch {
+					case isPanic(be) || isPanic(je) || isPanic(re):
+						fail("%s: Encode %v, EncodeJSON %v, bare EncodeJSON %v", cell, be, je, re)
+						continue
+					case (be == nil) != (je == nil) || (be == nil) != (re == nil):
+						fail("%s: Encode error %v, EncodeJSON error %v, bare EncodeJSON error %v", cell, be, je, re)
+						continue
+					case be != nil:
+						continue
+					}
+					var db, dj any
+					de := try(func() error { _, err := s.Decode(bin, &db, opts...); return err })
+					dje := try(func() error { return s.DecodeJSON(js, &dj, opts...) })
+					switch {
+					case (de == nil) != (dje == nil) || isPanic(de) || isPanic(dje):
+						fail("%s: Decode of the encoded value %v, DecodeJSON %v", cell, de, dje)
+					case de == nil && snap(db) != snap(dj):
+						fail("%s: the encoders wrote different values: binary %s, JSON %s", cell, snap(db), snap(dj))
+					case de == nil && !opaque:
+						// The decoded value makes the trip again on both
+						// wires, and its bytes hold on the trip after. A map
+						// of two or more keys can encode its entries in
+						// another order.
+						var bin2, js2, bin3 []byte
+						var db2, dj2 any
+						be2 := try(func() (err error) { bin2, err = s.AppendEncode(nil, db); return err })
+						je2 := try(func() (err error) { js2, err = s.AppendEncodeJSON(nil, db, avro.TaggedUnions()); return err })
+						if be2 == nil {
+							be2 = try(func() error { _, err := s.Decode(bin2, &db2, opts...); return err })
+						}
+						if be2 == nil {
+							be2 = try(func() (err error) { bin3, err = s.AppendEncode(nil, db2); return err })
+						}
+						if je2 == nil {
+							je2 = try(func() error { return s.DecodeJSON(js2, &dj2, opts...) })
+						}
+						switch {
+						case be2 != nil || je2 != nil:
+							fail("%s: the decoded value %s does not make the trip again: binary %v, JSON %v", cell, snap(db), be2, je2)
+						case snap(db2) != snap(db) || snap(dj2) != snap(db):
+							fail("%s: the decoded value %s came back as %s on binary and %s on JSON", cell, snap(db), snap(db2), snap(dj2))
+						case !bytes.Equal(bin3, bin2) && !parityMultiKey(db):
+							fail("%s: the decoded value %s encodes to %x, and to %x on the trip after", cell, snap(db), bin2, bin3)
+						}
+						var dr any
+						if err := try(func() error { return s.DecodeJSON(bare, &dr, opts...) }); (err != nil || snap(dr) != snap(db)) && !parityBareAmbiguous(s, bare) {
+							fail("%s: the bare JSON %s decodes to %s, err %v; want %s", cell, bare, snap(dr), err, snap(db))
+						}
+					}
+					if w == nil {
+						continue
+					}
+					// Decoding into a new value of the encoded Go type.
+					pb, pj := reflect.New(reflect.TypeOf(w)), reflect.New(reflect.TypeOf(w))
+					tbe := try(func() error { _, err := s.Decode(bin, pb.Interface(), opts...); return err })
+					tje := try(func() error { return s.DecodeJSON(js, pj.Interface(), opts...) })
+					switch {
+					case (tbe == nil) != (tje == nil) || isPanic(tbe) || isPanic(tje):
+						fail("%s: Decode into a %T: %v, DecodeJSON: %v", cell, w, tbe, tje)
+					case tbe != nil && de != nil && !opaque:
+						fail("%s: the encoded value decodes into neither an any (%v) nor a %T (%v)", cell, de, w, tbe)
+					case tbe == nil && snap(pb.Elem().Interface()) != snap(pj.Elem().Interface()):
+						fail("%s: into a %T, Decode gives %s and DecodeJSON %s", cell, w, snap(pb.Elem().Interface()), snap(pj.Elem().Interface()))
+					case tbe == nil && !opaque:
+						// The typed value encodes to a datum that decodes as
+						// the any did, and its bytes hold on the trip after.
+						var bin3, bin4 []byte
+						var dt any
+						again := reflect.New(reflect.TypeOf(w))
+						err := try(func() (err error) { bin3, err = s.AppendEncode(nil, pb.Elem().Interface()); return err })
+						if err == nil {
+							err = try(func() error { _, err := s.Decode(bin3, again.Interface(), opts...); return err })
+						}
+						if err == nil {
+							err = try(func() (err error) { bin4, err = s.AppendEncode(nil, again.Elem().Interface()); return err })
+						}
+						if err == nil && de == nil {
+							err = try(func() error { _, err := s.Decode(bin3, &dt, opts...); return err })
+						}
+						switch {
+						case err != nil:
+							fail("%s: the %T it decoded into does not make the trip again: %v", cell, w, err)
+						case de == nil && snap(dt) != snap(db):
+							fail("%s: the %T it decoded into encodes %s, the any it decoded into %s", cell, w, snap(dt), snap(db))
+						case !bytes.Equal(bin4, bin3) && !parityMultiKey(pb.Elem().Interface()):
+							fail("%s: the %T it decoded into encodes to %x, and to %x on the trip after", cell, w, bin3, bin4)
+						}
+					}
+				}
+			}
+		}
+	}
+	for i, f := range failures {
+		if i == 25 {
+			t.Errorf("... and %d more", len(failures)-i)
+			break
+		}
+		t.Error(f)
+	}
+}
+
+// parityMultiKey reports whether x has a map with two or more entries, whose
+// entries can encode in another order.
+func parityMultiKey(x any) bool {
+	var walk func(v reflect.Value, depth int) bool
+	walk = func(v reflect.Value, depth int) bool {
+		if !v.IsValid() || depth > 16 {
+			return false
+		}
+		switch v.Kind() {
+		case reflect.Interface, reflect.Pointer:
+			return !v.IsNil() && walk(v.Elem(), depth+1)
+		case reflect.Map:
+			if v.Len() > 1 {
+				return true
+			}
+			for it := v.MapRange(); it.Next(); {
+				if walk(it.Value(), depth+1) {
+					return true
+				}
+			}
+		case reflect.Slice, reflect.Array:
+			for i := range v.Len() {
+				if walk(v.Index(i), depth+1) {
+					return true
+				}
+			}
+		case reflect.Struct:
+			for i := range v.NumField() {
+				if walk(v.Field(i), depth+1) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(reflect.ValueOf(x), 0)
+}
+
+// parityBareAmbiguous reports whether the bare JSON js of a value of s can
+// have more than one reading: a union in s has two branches whose JSON starts
+// alike, or js has an object key that names a branch of a union in s.
+func parityBareAmbiguous(s *avro.Schema, js []byte) bool {
+	var names []string
+	ambiguous := false
+	var walk func(n *avro.SchemaNode, depth int)
+	walk = func(n *avro.SchemaNode, depth int) {
+		if n == nil || depth > 16 {
+			return
+		}
+		if n.Type == "union" {
+			seen := map[string]bool{}
+			for i := range n.Branches {
+				b := &n.Branches[i]
+				c := tokenClass(b.Type)
+				ambiguous = ambiguous || seen[c]
+				seen[c] = true
+				names = append(names, b.Type, b.Name)
+				if b.LogicalType != "" {
+					names = append(names, b.Type+"."+b.LogicalType)
+				}
+				walk(b, depth+1)
+			}
+		}
+		for i := range n.Fields {
+			walk(&n.Fields[i].Type, depth+1)
+		}
+		walk(n.Items, depth+1)
+		walk(n.Values, depth+1)
+	}
+	walk(s.Root(), 0)
+	if ambiguous {
+		return true
+	}
+	for _, name := range names {
+		if name != "" && bytes.Contains(js, []byte(`"`+name+`":`)) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkTakenOut checks the values you took out of a used []any before the next
