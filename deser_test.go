@@ -3082,6 +3082,16 @@ func TestSemanticErrorFormat(t *testing.T) {
 			"avro: field f: unsupported Avro type bytes",
 		},
 		{
+			"field with one of our errors as the cause",
+			&SemanticError{Field: "f", Err: &ShortBufferError{Type: "uvarlong"}},
+			"avro: field f: short buffer for uvarlong",
+		},
+		{
+			"type mismatch with one of our errors as the cause",
+			&SemanticError{GoType: reflect.TypeFor[int](), AvroType: "string", Err: &ShortBufferError{Type: "string", Need: 10, Have: 3}},
+			"avro: cannot use int with Avro type string: short buffer for string: need 10, have 3",
+		},
+		{
 			"bare",
 			&SemanticError{},
 			"avro: semantic error",

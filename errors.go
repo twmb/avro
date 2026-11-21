@@ -50,7 +50,9 @@ func (e *SemanticError) Error() string {
 		s = "avro: semantic error"
 	}
 	if e.Err != nil {
-		s += ": " + e.Err.Error()
+		// The cause is often one of our own errors, which starts with
+		// "avro: " as well.
+		s += ": " + strings.TrimPrefix(e.Err.Error(), "avro: ")
 	}
 	return s
 }
