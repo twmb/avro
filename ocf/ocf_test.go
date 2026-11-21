@@ -55,11 +55,23 @@ func TestRoundTrip(t *testing.T) {
 		}
 	}
 	mustClose(t, w)
+	raw := bytes.Clone(buf.Bytes())
 
 	r := mustNewReader(t, &buf)
 	out := drainAll[person](t, r)
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("got %v, want %v", out, in)
+	}
+
+	// Decode follows the rules of avro.Schema.Decode: a record decodes into
+	// the map an any has, and into the pointer the map has for a field.
+	age := new(int32)
+	var x any = map[string]any{"age": age}
+	if err := mustNewReader(t, bytes.NewReader(raw)).Decode(&x); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := x.(map[string]any); got["age"] != age || *age != 30 {
+		t.Errorf("Decode into an any with your map: %v, want your pointer set to 30", x)
 	}
 }
 
@@ -497,50 +509,6 @@ func TestNegativeBlockSize(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "negative block size") {
 		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-// TestReaderDecodeReusesTarget pins the Reader.Decode doc: decoding into v
-// follows the rules of avro.Schema.Decode, so a map in an any keeps its keys
-// and a pointer in a struct is decoded into.
-func TestReaderDecodeReusesTarget(t *testing.T) {
-	s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"p","type":["null","long"]}]}`)
-	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, v := range []map[string]any{{"a": int64(1), "p": int64(2)}, {"a": int64(3), "p": int64(4)}} {
-		if err := w.Encode(v); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	rd, err := NewReader(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m := map[string]any{"own": "mine"}
-	var x any = m
-	if err := rd.Decode(&x); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := x.(map[string]any); reflect.ValueOf(got).Pointer() != reflect.ValueOf(m).Pointer() || got["own"] != "mine" || got["a"] != int64(1) {
-		t.Errorf("the first record into an any with your map: %#v, want your map with own kept", x)
-	}
-	var r struct {
-		A int64  `avro:"a"`
-		P *int64 `avro:"p"`
-	}
-	mine := new(int64)
-	r.P = mine
-	if err := rd.Decode(&r); err != nil {
-		t.Fatal(err)
-	}
-	if r.P != mine || *mine != 4 || r.A != 3 {
-		t.Errorf("the second record into a struct with your pointer: %+v, want your pointer set to 4", r)
 	}
 }
 

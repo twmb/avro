@@ -12752,7 +12752,9 @@ func parityPositions() []parityPosition {
 				return c[0]
 			}
 		case map[string]any:
-			return c[key.(string)]
+			if k, ok := key.(string); ok {
+				return c[k]
+			}
 		case avro.ArrayRecord:
 			if len(c) > 0 {
 				return c[0]
