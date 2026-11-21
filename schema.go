@@ -981,7 +981,7 @@ type builder struct {
 
 	named    map[string]*namedType
 	building map[*schemaNode]struct{} // record/error nodes whose field loop is in progress (shared across nest, like named)
-	// sites has, for a record in building, the copies siteNode made of it
+	// sites has, for a record in building, the copies siteNodeWith made of it
 	// for references inside its own fields. buildRecord copies the record
 	// into them again once its fields are done. Shared across nest, like
 	// building.
@@ -1134,9 +1134,9 @@ func makeCustomSer(ce func(reflect.Value) (reflect.Value, error), base serfn) se
 	}
 }
 
-// customWrappedSer returns base wrapped with node's custom-Encode chain when
-// one is registered (the same wrap applyCustomTypes installs for an in-order
-// reference), else base unchanged. The forward-ref fixups in finalize call this
+// customWrappedSer returns base wrapped with the custom-Encode chain of w, a
+// reference's wiring, when w has one (the same wrap applyCustomTypes installs
+// for an in-order reference), else base unchanged. The forward-ref fixups in finalize call this
 // so a forward reference to a custom-encoded named type applies the CustomType
 // on the binary path. Using the unwrapped namedType.ser instead silently
 // diverges binary from JSON: the forward-referenced field encodes raw on
@@ -1149,7 +1149,7 @@ func customWrappedSer(w *customWiring, base serfn) serfn {
 }
 
 // customWrappedDeser is the decode dual of customWrappedSer: base wrapped with
-// node's custom-Decode chain when one is registered, else base unchanged.
+// the custom-Decode chain of w when w has one, else base unchanged.
 // The forward-ref fixups in finalize call it so a forward reference to a
 // custom-decoded named type applies the CustomType on the binary path as the
 // JSON path already does. Logical suppression with no Decode callback needs
@@ -1585,10 +1585,10 @@ func (b *builder) build(parentName string, s *aschema) error {
 	// callbacks). A wrapped reference ({"type":"S","foo":1}) resolves to the
 	// named type's node, which every reference shares, so its props go only
 	// to this reference's custom types.
-	var refProps map[string]any
+	var props map[string]any
 	if b.node != nil && s.object != nil && len(s.object.extra) > 0 {
 		if s.object.Name == "" && isNamedKind(b.node.kind) {
-			refProps = s.object.extra
+			props = s.object.extra
 		} else {
 			b.node.props = s.object.extra
 		}
@@ -1596,7 +1596,7 @@ func (b *builder) build(parentName string, s *aschema) error {
 	// Apply custom types to newly built nodes (not unions: custom
 	// types fire on individual branches, not the union container).
 	if len(b.customTypes) > 0 && b.node != nil && b.node.kind != "union" {
-		if err := b.applyCustomTypes(b.node, refProps); err != nil {
+		if err := b.applyCustomTypes(b.node, props); err != nil {
 			return err
 		}
 	}
@@ -1666,7 +1666,7 @@ func (b *builder) hasMatchingCustomTypeCond(kind, logical string, requireEncode 
 	return false
 }
 
-func (b *builder) applyCustomTypes(node *schemaNode, refProps map[string]any) error {
+func (b *builder) applyCustomTypes(node *schemaNode, props map[string]any) error {
 	// Validate NewCustomType-created types with unsupported A type.
 	for _, ct := range b.customTypes {
 		if ct.needsAvroType && ct.AvroType == "" {
@@ -1675,9 +1675,9 @@ func (b *builder) applyCustomTypes(node *schemaNode, refProps map[string]any) er
 	}
 
 	src := node
-	if refProps != nil {
+	if props != nil {
 		ref := *node
-		ref.props = refProps
+		ref.props = props
 		src = &ref
 	}
 	wiring := b.buildCustomWiring(src)
@@ -1700,24 +1700,12 @@ func (b *builder) applyCustomTypes(node *schemaNode, refProps map[string]any) er
 	}
 	// The shared node keeps the wiring of the type's own props, and a
 	// wrapped reference's wiring goes only on its copy.
-	if refProps == nil {
+	if props == nil {
 		b.putCustomWiring(node, wiring)
 	}
 	b.node = b.siteNodeWith(node, wiring)
 	b.meta.hasCustomType = true
 	return nil
-}
-
-// siteNode returns the node a reference to node uses: node, or a node with
-// this parse's custom JSON decoder when a custom type matches node. The JSON
-// runtime (decodeValue) checks node.decodeJSON first and falls back to
-// decodeKind otherwise. A named type's node is shared by every reference to
-// it, in this parse and, through a SchemaCache, in others, so a reference to
-// one gets a copy with the decoder, as the binary decoder wraps the
-// reference and not the node. Any other node has one reference and gets the
-// decoder itself.
-func (b *builder) siteNode(node *schemaNode) *schemaNode {
-	return b.siteNodeWith(node, b.custom[node])
 }
 
 // refProps returns the extra keys of a wrapped reference such as
@@ -1741,7 +1729,13 @@ func (b *builder) refWiring(node *schemaNode, props map[string]any) *customWirin
 	return b.buildCustomWiring(&ref)
 }
 
-// siteNodeWith is siteNode with the wiring w for the reference.
+// siteNodeWith returns the node a reference to node uses, where w is the
+// reference's custom wiring: node, or a node with w and its custom JSON
+// decoder. The JSON runtime (decodeValue) checks node.decodeJSON first and
+// falls back to decodeKind otherwise. A named type's node is shared by every
+// reference to it, in this parse and, through a SchemaCache, in others, so a
+// reference to one gets a copy, as the binary codec wraps the reference and
+// not the node. Any other node has one reference and gets the decoder itself.
 func (b *builder) siteNodeWith(node *schemaNode, w *customWiring) *schemaNode {
 	if w == nil {
 		return node
