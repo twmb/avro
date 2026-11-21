@@ -12463,6 +12463,552 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 	}
 }
 
+// TestMatrix_UsedTargetParity decodes each fragment, and each union the reuse
+// rules act on, with Decode and with DecodeJSON into every target shape that
+// can already have a value, starting from each of many old values, with and
+// without TaggedUnions. The two decoders must agree: both fail or neither
+// does, and they leave the same value and reuse the same containers, after
+// one decode and after two in a row. A decode that fails, at its first byte
+// or in a CustomType Decode that returns an error or panics, must leave the
+// target as the decode before it left it. A decode that fails partway leaves
+// an any target with the value it had, or with the same container, which the
+// decode may have written into. TestMatrix_TargetReusePerKind checks one target
+// shape against a fresh decode; this test crosses the target shapes and the
+// old values.
+func TestMatrix_UsedTargetParity(t *testing.T) {
+	const (
+		recP = `{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}`
+		recQ = `{"type":"record","name":"Q","fields":[{"name":"q","type":"long"}]}`
+		arrL = `{"type":"array","items":"long"}`
+		mapL = `{"type":"map","values":"long"}`
+		dec  = `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+		mon  = `{"type":"long","logicalType":"money"}`
+	)
+	p := func(n int64) any { return map[string]any{"a": n} }
+	ct := avro.NewCustomType[*parityMoney, int64]("money",
+		func(v *parityMoney, _ *avro.SchemaNode) (int64, error) { return v.cents, nil },
+		func(c int64, _ *avro.SchemaNode) (*parityMoney, error) {
+			switch c {
+			case parityMoneyFails:
+				return nil, errParityMoney
+			case parityMoneyPanics:
+				panic(errParityMoney)
+			}
+			return &parityMoney{c}, nil
+		})
+	type schema struct {
+		name, text string
+		vals       []any
+		custom     bool // the money values that fail and panic apply
+	}
+	var schemas []schema
+	for _, fr := range matFrags() {
+		schemas = append(schemas, schema{fr.label, fr.schema(&uniq{}), fr.values[:min(2, len(fr.values))], false})
+	}
+	schemas = append(schemas, []schema{
+		{"u[null,record]", `["null",` + recP + `]`, []any{nil, p(1)}, false},
+		{"u[array,record]", `[` + arrL + `,` + recP + `]`, []any{[]any{int64(1)}, p(7)}, false},
+		{"u[recP,recQ]", `[` + recP + `,` + recQ + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"Q": map[string]any{"q": int64(2)}}}, false},
+		{"u[recP,map]", `[` + recP + `,` + mapL + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"map": map[string]any{"k": int64(5)}}}, false},
+		{"u[long,decimal]", `["long",` + dec + `]`, []any{int64(7), big.NewRat(5, 4)}, false},
+		{"u[null,array,map,string]", `["null",` + arrL + `,` + mapL + `,"string"]`, []any{nil, []any{int64(1)}, map[string]any{"k": int64(5)}, "x"}, false},
+		{"u[bytes,string]", `["bytes","string"]`, []any{map[string]any{"bytes": []byte("b")}, map[string]any{"string": "x"}}, false},
+		{"array<record>", `{"type":"array","items":` + recP + `}`, []any{[]any{p(1)}, []any{p(2), p(3)}}, false},
+		{"array<u[null,long]>", `{"type":"array","items":["null","long"]}`, []any{[]any{nil, int64(1)}, []any{int64(2)}}, false},
+		{"map<record>", `{"type":"map","values":` + recP + `}`, []any{map[string]any{"k": p(1)}}, false},
+		{"money", mon, []any{&parityMoney{5}}, true},
+		{"u[string,money]", `["string",` + mon + `]`, []any{"x", &parityMoney{5}}, true},
+		{"u[null,money]", `["null",` + mon + `]`, []any{nil, &parityMoney{5}}, true},
+		{"u[money,array,recP]", `[` + mon + `,` + arrL + `,` + recP + `]`, []any{&parityMoney{5}, []any{int64(1)}, p(3)}, true},
+	}...)
+
+	type position struct {
+		name   string
+		schema func(string) string
+		wrap   func(any) any
+		target func(old any) (ptr any, get func() any)
+		binPre []byte // the wire before the value
+		jsWrap func(string) string
+		// typed says the value goes in a slot of the old value's own type,
+		// not an any, which a decode that fails partway can write into.
+		typed bool
+	}
+	id := func(s string) string { return s }
+	arr := func(s string) string { return `{"type":"array","items":` + s + `}` }
+	mp := func(s string) string { return `{"type":"map","values":` + s + `}` }
+	rec := func(s string) string { return `{"type":"record","name":"H","fields":[{"name":"f","type":` + s + `}]}` }
+	same := func(v any) any { return v }
+	inArr := func(v any) any { return []any{v} }
+	inMap := func(v any) any { return map[string]any{"k": v} }
+	inRec := func(v any) any { return map[string]any{"f": v} }
+	jArr := func(s string) string { return `[` + s + `]` }
+	jMap := func(s string) string { return `{"k":` + s + `}` }
+	jRec := func(s string) string { return `{"f":` + s + `}` }
+	// from returns the value at key in the container x has, or a marker
+	// that names what x has instead.
+	from := func(x any, key any) any {
+		switch c := x.(type) {
+		case []any:
+			if len(c) > 0 {
+				return c[0]
+			}
+		case map[string]any:
+			return c[key.(string)]
+		case avro.ArrayRecord:
+			if len(c) > 0 {
+				return c[0]
+			}
+		}
+		return fmt.Sprintf("<%T>", x)
+	}
+	positions := []position{
+		{"top", id, same, func(o any) (any, func() any) { x := o; return &x, func() any { return x } }, nil, id, false},
+		{"*any target", id, same, func(o any) (any, func() any) { x := o; p := &x; return &p, func() any { return x } }, nil, id, false},
+		{"[]any elem", arr, inArr, func(o any) (any, func() any) { x := []any{o}; return &x, func() any { return from(x, 0) } }, []byte{2}, jArr, false},
+		{"any([]any) elem", arr, inArr, func(o any) (any, func() any) { var x any = []any{o}; return &x, func() any { return from(x, 0) } }, []byte{2}, jArr, false},
+		{"[1]any elem", arr, inArr, func(o any) (any, func() any) { x := [1]any{o}; return &x, func() any { return x[0] } }, []byte{2}, jArr, false},
+		{"[]named-interface elem", arr, inArr, func(o any) (any, func() any) {
+			x := []reuseEmptyInterface{o}
+			return &x, func() any {
+				if len(x) == 0 {
+					return "<empty>"
+				}
+				return x[0]
+			}
+		}, []byte{2}, jArr, false},
+		{"map[string]any value", mp, inMap, func(o any) (any, func() any) { x := map[string]any{"k": o}; return &x, func() any { return x["k"] } }, []byte{2, 2, 'k'}, jMap, false},
+		{"any(map) value", mp, inMap, func(o any) (any, func() any) {
+			var x any = map[string]any{"k": o}
+			return &x, func() any { return from(x, "k") }
+		}, []byte{2, 2, 'k'}, jMap, false},
+		{"any(map) record field", rec, inRec, func(o any) (any, func() any) {
+			var x any = map[string]any{"f": o}
+			return &x, func() any { return from(x, "f") }
+		}, nil, jRec, false},
+		{"map[string]any record field", rec, inRec, func(o any) (any, func() any) { x := map[string]any{"f": o}; return &x, func() any { return x["f"] } }, nil, jRec, false},
+		{"ArrayRecord slot", rec, inRec, func(o any) (any, func() any) { x := avro.ArrayRecord{o}; return &x, func() any { return from(x, 0) } }, nil, jRec, false},
+		{"any(ArrayRecord) slot", rec, inRec, func(o any) (any, func() any) {
+			var x any = avro.ArrayRecord{o}
+			return &x, func() any { return from(x, 0) }
+		}, nil, jRec, false},
+		{"struct any field", rec, inRec, func(o any) (any, func() any) { x := parityHolder{F: o}; return &x, func() any { return x.F } }, nil, jRec, false},
+		{"struct *any field", rec, inRec, func(o any) (any, func() any) {
+			a := o
+			x := parityHolderP{F: &a}
+			return &x, func() any {
+				if x.F == nil {
+					return nil
+				}
+				return *x.F
+			}
+		}, nil, jRec, false},
+	}
+	// Each old value is also a slot of its own type: a struct field, a
+	// pointer field, a slice element, and a map value. A nil has no type.
+	typedIn := func(name string, schema func(string) string, wrap func(any) any, binPre []byte, jsWrap func(string) string, mk func(t reflect.Type, o reflect.Value) (ptr reflect.Value, get func() reflect.Value)) position {
+		return position{name, schema, wrap, func(o any) (any, func() any) {
+			if o == nil {
+				return nil, nil
+			}
+			ptr, get := mk(reflect.TypeOf(o), reflect.ValueOf(o))
+			return ptr.Interface(), func() any { return get().Interface() }
+		}, binPre, jsWrap, true}
+	}
+	field := func(t reflect.Type) reflect.Type {
+		return reflect.StructOf([]reflect.StructField{{Name: "F", Type: t, Tag: `avro:"f"`}})
+	}
+	positions = append(positions,
+		typedIn("struct field of the old type", rec, inRec, nil, jRec, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(field(t))
+			p.Elem().Field(0).Set(o)
+			return p, func() reflect.Value { return p.Elem().Field(0) }
+		}),
+		typedIn("struct field of a pointer to the old type", rec, inRec, nil, jRec, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(field(reflect.PointerTo(t)))
+			p.Elem().Field(0).Set(reflect.New(t))
+			p.Elem().Field(0).Elem().Set(o)
+			return p, func() reflect.Value { return p.Elem().Field(0) }
+		}),
+		typedIn("slice element of the old type", arr, inArr, []byte{2}, jArr, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(reflect.SliceOf(t))
+			p.Elem().Set(reflect.Append(p.Elem(), o))
+			return p, func() reflect.Value {
+				if p.Elem().Len() == 0 {
+					return reflect.ValueOf("<empty>")
+				}
+				return p.Elem().Index(0)
+			}
+		}),
+		typedIn("map value of the old type", mp, inMap, []byte{2, 2, 'k'}, jMap, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(reflect.MapOf(reflect.TypeFor[string](), t))
+			p.Elem().Set(reflect.MakeMap(p.Elem().Type()))
+			p.Elem().SetMapIndex(reflect.ValueOf("k"), o)
+			return p, func() reflect.Value {
+				if v := p.Elem().MapIndex(reflect.ValueOf("k")); v.IsValid() {
+					return v
+				}
+				return reflect.ValueOf("<missing>")
+			}
+		}),
+	)
+
+	type input struct {
+		bin, js []byte
+		panics  bool
+	}
+	var failures []string
+	fail := func(format string, args ...any) {
+		failures = append(failures, fmt.Sprintf(format, args...))
+	}
+	for _, option := range []struct {
+		name string
+		opts []avro.Opt
+	}{
+		{"plain", nil},
+		{"tagged", []avro.Opt{avro.TaggedUnions()}},
+		{"tagged+logical", []avro.Opt{avro.TaggedUnions(), avro.TagLogicalTypes()}},
+	} {
+		opts := option.opts
+		for _, pos := range positions {
+			for _, sc := range schemas {
+				s := avro.MustParse(pos.schema(sc.text), ct)
+				top := avro.MustParse(sc.text, ct)
+				union := strings.HasPrefix(sc.text, "[")
+				enc := func(v any) input {
+					return input{
+						bin: avrotest.MustAppendEncode(t, s, nil, pos.wrap(v), avro.TaggedUnions()),
+						js:  avrotest.MustAppendEncodeJSON(t, s, nil, pos.wrap(v), avro.TaggedUnions()),
+					}
+				}
+				var oks []input
+				var bads [][]input // the inputs that fail, after each value of oks
+				for _, v := range sc.vals {
+					oks = append(oks, enc(v))
+					var bad []input
+					topBin := avrotest.MustAppendEncode(t, top, nil, v, avro.TaggedUnions())
+					topJS := string(avrotest.MustAppendEncodeJSON(t, top, nil, v, avro.TaggedUnions()))
+					switch {
+					case !union:
+						bad = append(bad, input{bin: pos.binPre, js: []byte(pos.jsWrap(`!`))})
+					case v != nil && strings.HasPrefix(topJS, `{"`):
+						tag := topJS[2:strings.Index(topJS, `":`)]
+						bad = append(bad, input{bin: append(slices.Clone(pos.binPre), topBin[0]), js: []byte(pos.jsWrap(`{"` + tag + `":!}`))})
+					}
+					if sc.custom {
+						f, pn := enc(&parityMoney{parityMoneyFails}), enc(&parityMoney{parityMoneyPanics})
+						pn.panics = true
+						bad = append(bad, f, pn)
+					}
+					bads = append(bads, bad)
+				}
+				// decode decodes in with decoder w (0 for Decode, 1 for
+				// DecodeJSON) into ptr, and returns the error and what a
+				// panic recovered.
+				decode := func(w int, in input, ptr any) (err error, panicked any) {
+					defer func() { panicked = recover() }()
+					if w == 0 {
+						_, err = s.Decode(in.bin, ptr, opts...)
+						return err, nil
+					}
+					return s.DecodeJSON(in.js, ptr, opts...), nil
+				}
+				for _, old := range parityOlds() {
+					cell := fmt.Sprintf("%s | %s | %s | old %s", option.name, pos.name, sc.name, old.name)
+					// compare decodes first, if it is not nil, and then in,
+					// on each decoder from a new old value, and compares the
+					// two decoders.
+					compare := func(label string, first *input, in input) {
+						var res, errs [2]string
+						var reused, firstFailed [2]bool
+						for w := range 2 {
+							o := old.mk()
+							ptr, get := pos.target(o)
+							if ptr == nil {
+								return
+							}
+							before := get()
+							if first != nil {
+								if err, pn := decode(w, *first, ptr); err != nil || pn != nil {
+									firstFailed[w] = true
+									continue
+								}
+								before = get()
+							}
+							err, pn := decode(w, in, ptr)
+							if pn != nil {
+								fail("%s | %s: decoder %d panicked: %v", cell, label, w, pn)
+								return
+							}
+							if err != nil {
+								errs[w] = err.Error()
+							}
+							got := get()
+							res[w] = paritySnap(reflect.ValueOf(got), 0)
+							id := parityID(parityInside(before))
+							reused[w] = id != 0 && id == parityID(parityInside(got))
+						}
+						switch {
+						case firstFailed[0] != firstFailed[1]:
+							fail("%s | %s: the first decode failed on Decode: %v, on DecodeJSON: %v", cell, label, firstFailed[0], firstFailed[1])
+						case firstFailed[0]:
+						case (errs[0] == "") != (errs[1] == ""):
+							fail("%s | %s: Decode error %q, DecodeJSON error %q", cell, label, errs[0], errs[1])
+						case res[0] != res[1]:
+							fail("%s | %s: Decode left %s, DecodeJSON left %s (errors %q, %q)", cell, label, res[0], res[1], errs[0], errs[1])
+						case errs[0] == "" && reused[0] != reused[1]:
+							fail("%s | %s: Decode reused the old value: %v, DecodeJSON: %v", cell, label, reused[0], reused[1])
+						}
+					}
+					for i, in := range oks {
+						compare(fmt.Sprintf("value %d", i), nil, in)
+						for j := range oks {
+							compare(fmt.Sprintf("value %d then %d", i, j), &oks[i], oks[j])
+						}
+						for _, bad := range bads[i] {
+							for w := range 2 {
+								o := old.mk()
+								ptr, get := pos.target(o)
+								if ptr == nil {
+									break
+								}
+								if err, pn := decode(w, in, ptr); err != nil || pn != nil {
+									continue
+								}
+								mid := get()
+								before := paritySnap(reflect.ValueOf(mid), 0)
+								err, pn := decode(w, bad, ptr)
+								switch {
+								case pn != nil && (!bad.panics || pn != errParityMoney):
+									fail("%s | value %d then a failure: decoder %d panicked: %v", cell, i, w, pn)
+									continue
+								case pn == nil && err == nil:
+									continue // a value of zero bytes decodes from the prefix alone
+								}
+								got := get()
+								if after := paritySnap(reflect.ValueOf(got), 0); after != before || parityID(got) != parityID(mid) || parityID(parityInside(got)) != parityID(parityInside(mid)) {
+									fail("%s | value %d then a failure: decoder %d changed the target from %s to %s (error %v)", cell, i, w, before, after, err)
+								}
+							}
+						}
+						// The same value cut by its last byte fails partway.
+						// Only the target itself keeps its value: a slot in
+						// a container the decode fills is written as it goes.
+						cut := input{bin: in.bin[:max(len(in.bin)-1, 0)], js: in.js[:max(len(in.js)-1, 0)]}
+						for w := range 2 {
+							o := old.mk()
+							ptr, get := pos.target(o)
+							if ptr == nil || pos.name != "top" && pos.name != "*any target" {
+								break
+							}
+							if err, pn := decode(w, in, ptr); err != nil || pn != nil {
+								continue
+							}
+							mid := get()
+							err, pn := decode(w, cut, ptr)
+							switch {
+							case pn != nil:
+								fail("%s | value %d then the value cut short: decoder %d panicked: %v", cell, i, w, pn)
+								continue
+							case err == nil:
+								continue
+							}
+							got := get()
+							if parityID(got) != parityID(mid) || parityID(mid) == 0 && paritySnap(reflect.ValueOf(got), 0) != paritySnap(reflect.ValueOf(mid), 0) {
+								fail("%s | value %d then the value cut short: decoder %d replaced %s with %s (error %v)", cell, i, w, paritySnap(reflect.ValueOf(mid), 0), paritySnap(reflect.ValueOf(got), 0), err)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	for i, f := range failures {
+		if i == 25 {
+			t.Errorf("... and %d more", len(failures)-i)
+			break
+		}
+		t.Error(f)
+	}
+}
+
+type parityMoney struct{ cents int64 }
+
+// The money values whose Decode returns an error, and whose Decode panics.
+const parityMoneyFails, parityMoneyPanics = 13, 14
+
+var errParityMoney = errors.New("money decode fails")
+
+type (
+	parityP struct {
+		A int64 `avro:"a"`
+	}
+	parityMap    map[string]any
+	paritySlice  []any
+	parityBytes  []byte
+	parityHolder struct {
+		F any `avro:"f"`
+	}
+	parityHolderP struct {
+		F *any `avro:"f"`
+	}
+)
+
+// parityOlds returns the values a target starts from.
+func parityOlds() []struct {
+	name string
+	mk   func() any
+} {
+	return []struct {
+		name string
+		mk   func() any
+	}{
+		{"nil", func() any { return nil }},
+		{"int32", func() any { return int32(1) }},
+		{"int64", func() any { return int64(1) }},
+		{"string", func() any { return "old" }},
+		{"[]byte", func() any { return []byte("old") }},
+		{"bool", func() any { return true }},
+		{"float64", func() any { return 1.5 }},
+		{"time", func() any { return time.Unix(5, 0).UTC() }},
+		{"duration", func() any { return time.Second }},
+		{"[16]byte", func() any { return [16]byte{9} }},
+		{"struct", func() any { return parityP{A: 9} }},
+		{"map[string]any{}", func() any { return map[string]any{} }},
+		{"map[string]any{own}", func() any { return map[string]any{"own": "mine", "too": "mine"} }},
+		{"map[string]any{a:map}", func() any {
+			return map[string]any{"a": map[string]any{"z": int64(1)}, "k": map[string]any{"z": int64(1)}}
+		}},
+		{"map[string]any{long:1}", func() any { return map[string]any{"long": int64(1)} }},
+		{"map[string]any{P:map}", func() any { return map[string]any{"P": map[string]any{"own": "mine"}} }},
+		{"[]any{}", func() any { return []any{} }},
+		{"[]any{9,8}", func() any { return []any{int64(9), int64(8)} }},
+		{"[]any{map}", func() any { return []any{map[string]any{"own": "mine"}, "tail"} }},
+		{"[]any{*P}", func() any { return []any{&parityP{A: 9}} }},
+		{"map[string]int64", func() any { return map[string]int64{"own": 1} }},
+		{"map[string]string", func() any { return map[string]string{"own": "x"} }},
+		{"map[string]*P", func() any { return map[string]*parityP{"k": {A: 9}} }},
+		{"map[int]string", func() any { return map[int]string{1: "x"} }},
+		{"[]int64", func() any { return []int64{9} }},
+		{"[]string", func() any { return []string{"x"} }},
+		{"[]*P", func() any { return []*parityP{{A: 9}} }},
+		{"[]P", func() any { return []parityP{{A: 9}} }},
+		{"*int64", func() any { return new(int64) }},
+		{"*int32", func() any { return new(int32) }},
+		{"*string", func() any { return new(string) }},
+		{"*bool", func() any { return new(bool) }},
+		{"*[]byte", func() any { return new([]byte) }},
+		{"*P", func() any { return &parityP{A: 9} }},
+		{"*big.Rat", func() any { return big.NewRat(1, 2) }},
+		{"*any(nil)", func() any { return new(any) }},
+		{"*any(map)", func() any { var x any = map[string]any{"own": "mine"}; return &x }},
+		{"*any([]any)", func() any { var x any = []any{int64(9)}; return &x }},
+		{"*any(*any(map))", func() any { var y any = map[string]any{"own": "mine"}; var x any = &y; return &x }},
+		{"*map[string]any", func() any { m := map[string]any{"own": "mine"}; return &m }},
+		{"*map[string]int64", func() any { m := map[string]int64{"own": 1}; return &m }},
+		{"*[]any", func() any { s := []any{int64(9)}; return &s }},
+		{"**int64", func() any { p := new(int64); return &p }},
+		{"ArrayRecord{x}", func() any { return avro.ArrayRecord{"x"} }},
+		{"ArrayRecord{}", func() any { return avro.ArrayRecord{} }},
+		{"nil map[string]int64", func() any { return map[string]int64(nil) }},
+		{"nil []int64", func() any { return []int64(nil) }},
+		{"nil *int64", func() any { return (*int64)(nil) }},
+		{"nil map[string]any", func() any { return map[string]any(nil) }},
+		{"nil []any", func() any { return []any(nil) }},
+		{"named map", func() any { return parityMap{"own": "mine"} }},
+		{"named slice", func() any { return paritySlice{int64(9)} }},
+		{"named bytes", func() any { return parityBytes("old") }},
+		{"*time.Time", func() any { return new(time.Time) }},
+		{"*time.Duration", func() any { return new(time.Duration) }},
+		{"*avro.Duration", func() any { return new(avro.Duration) }},
+		{"*[16]byte", func() any { return new([16]byte) }},
+		{"*[4]byte", func() any { return new([4]byte) }},
+		{"*float64", func() any { return new(float64) }},
+		{"*money", func() any { return &parityMoney{1} }},
+		{"envelope{long:*any}", func() any { var x any = int64(3); return map[string]any{"long": &x} }},
+		{"envelope{P:*map}", func() any { m := map[string]any{"own": "mine"}; return map[string]any{"P": &m} }},
+	}
+}
+
+// paritySnap prints v with every pointer followed and map keys sorted, so that
+// two targets compare by value.
+func paritySnap(v reflect.Value, depth int) string {
+	if depth > 8 {
+		return "<deep>"
+	}
+	if !v.IsValid() {
+		return "nil"
+	}
+	if v.CanInterface() {
+		switch x := v.Interface().(type) {
+		case *big.Rat:
+			if x != nil {
+				return "&rat(" + x.String() + ")"
+			}
+		case time.Time:
+			return "time(" + x.UTC().Format(time.RFC3339Nano) + ")"
+		}
+	}
+	t := strings.ReplaceAll(v.Type().String(), "interface {}", "any")
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			return "nil"
+		}
+		return paritySnap(v.Elem(), depth+1)
+	case reflect.Pointer:
+		if v.IsNil() {
+			return t + "(nil)"
+		}
+		return "&" + paritySnap(v.Elem(), depth+1)
+	case reflect.Map:
+		if v.IsNil() {
+			return t + "(nil)"
+		}
+		var kv []string
+		for it := v.MapRange(); it.Next(); {
+			kv = append(kv, fmt.Sprint(it.Key())+":"+paritySnap(it.Value(), depth+1))
+		}
+		slices.Sort(kv)
+		return t + "{" + strings.Join(kv, ", ") + "}"
+	case reflect.Slice, reflect.Array:
+		if v.Kind() == reflect.Slice && v.IsNil() {
+			return t + "(nil)"
+		}
+		parts := make([]string, v.Len())
+		for i := range parts {
+			parts[i] = paritySnap(v.Index(i), depth+1)
+		}
+		return t + "[" + strings.Join(parts, ", ") + "]"
+	case reflect.Struct:
+		parts := make([]string, v.NumField())
+		for i := range parts {
+			parts[i] = paritySnap(v.Field(i), depth+1)
+		}
+		return t + "{" + strings.Join(parts, ", ") + "}"
+	}
+	return fmt.Sprintf("%s(%v)", t, v)
+}
+
+// parityID returns the address of the map, slice, or pointer x has, and 0 for
+// any other value.
+func parityID(x any) uintptr {
+	switch v := reflect.ValueOf(x); v.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Pointer:
+		return v.Pointer()
+	}
+	return 0
+}
+
+// parityInside returns the value in a TaggedUnions envelope, and x otherwise.
+func parityInside(x any) any {
+	if w, ok := x.(map[string]any); ok && len(w) == 1 {
+		for _, in := range w {
+			return in
+		}
+	}
+	return x
+}
+
 // checkTakenOut checks the values you took out of a used []any before the next
 // decode into it: a map or a *big.Rat at an element the next decode reaches is
 // the one the element now has, and any other value still equals want, its
@@ -13160,6 +13706,22 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 			}
 			if got := reflect.ValueOf(ptr).Elem().Interface(); !reflect.DeepEqual(got, own()) {
 				t.Errorf("a failed union decode left %#v in a %T, want your value", got, ptr)
+			}
+		}
+		// A field or an item that fails to decode leaves the value its slot
+		// had, on both decoders.
+		pair := avro.MustParse(`{"type":"record","name":"P","fields":[{"name":"a","type":"long"},{"name":"b","type":"long"}]}`)
+		items := avro.MustParse(`{"type":"array","items":["null","long"]}`)
+		for _, w := range reuseWires {
+			badPair := map[string][]byte{"binary": {2}, "json": []byte(`{"a":1,"b":!}`)}[w.name]
+			badItems := map[string][]byte{"binary": {4, 2, 2, 2}, "json": []byte(`[1,!]`)}[w.name]
+			row := avro.ArrayRecord{"keep-a", "keep-b"}
+			var list any = []any{"keep0", "keep1"}
+			if w.decode(pair, badPair, &row) == nil || w.decode(items, badItems, &list) == nil {
+				t.Fatalf("%s: a truncated record or array decoded", w.name)
+			}
+			if row[1] != "keep-b" || list.([]any)[1] != "keep1" {
+				t.Errorf("%s: a failed field left %#v, and a failed item left %#v; want keep-b and keep1 in the slots that failed", w.name, row, list)
 			}
 		}
 		// With TaggedUnions, the envelope in the any and the map behind the

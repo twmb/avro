@@ -839,8 +839,30 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 			return err
 		}
 	}
-	// We decode each element in place, as the binary decoder does. Grow
-	// keeps the elements of the old backing array.
+	return ctx.decodeTypedSlice(v, node)
+}
+
+// decodeTypedSlice decodes each element in place, as the binary decoder does.
+// Grow keeps the elements of the old backing array. When the decode fails or
+// panics, the deferred call gives a nil pointer element whose item was
+// decoding its nil back, and puts v's header back, so that v gets its new
+// length only from a decode that worked.
+func (ctx *jsonDecoder) decodeTypedSlice(v reflect.Value, node *schemaNode) error {
+	var saved sliceHeader
+	var at *sliceHeader
+	if v.CanAddr() {
+		at = (*sliceHeader)(unsafe.Pointer(v.UnsafeAddr()))
+		saved = *at
+	}
+	var nilElem reflect.Value
+	defer func() {
+		if nilElem.IsValid() {
+			nilElem.SetZero()
+		}
+		if at != nil {
+			*at = saved
+		}
+	}()
 	v.SetLen(0)
 	if ctx.scanner.peek() != ']' {
 		for n := 0; ; n++ {
@@ -848,20 +870,29 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 				v.Grow(1)
 			}
 			v.SetLen(n + 1)
-			if err := ctx.decodeValue(v.Index(n), node.items); err != nil {
+			elem := v.Index(n)
+			if elem.Kind() == reflect.Pointer && elem.IsNil() {
+				nilElem = elem
+			}
+			if err := ctx.decodeValue(elem, node.items); err != nil {
 				return err
 			}
+			nilElem = reflect.Value{}
 			if ctx.scanner.peek() != ',' {
 				break
 			}
 			ctx.scanner.pos++
 		}
 	}
+	if err := ctx.scanner.expect(']'); err != nil {
+		return err
+	}
 	// An empty array decodes to a non-nil empty slice.
 	if v.IsNil() {
 		v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 	}
-	return ctx.scanner.expect(']')
+	at = nil
+	return nil
 }
 
 func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool) error {
@@ -906,13 +937,24 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 		}
 		return setIface(v, reflect.ValueOf(m), "map")
 	}
-	// Typed map target.
+	// Typed map target. A nil map gets a new map only from a decode that
+	// worked.
 	if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String {
 		return semErr(v, "map")
 	}
-	if v.IsNil() {
-		v.Set(reflect.MakeMap(v.Type()))
+	if !v.IsNil() {
+		return ctx.decodeTypedMap(v, node)
 	}
+	m := reflect.MakeMap(v.Type())
+	if err := ctx.decodeTypedMap(m, node); err != nil {
+		return err
+	}
+	v.Set(m)
+	return nil
+}
+
+// decodeTypedMap decodes the entries of the JSON object into the map v.
+func (ctx *jsonDecoder) decodeTypedMap(v reflect.Value, node *schemaNode) error {
 	keyType := v.Type().Key()
 	valType := v.Type().Elem()
 	// Native fast path for a plain primitive value under a string key, which
@@ -1288,16 +1330,18 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 	return nil
 }
 
-func (ctx *jsonDecoder) decodeRecordMap(v reflect.Value, node *schemaNode) error {
-	if v.IsNil() {
-		v.Set(reflect.MakeMapWithSize(v.Type(), len(node.fields)))
+func (ctx *jsonDecoder) decodeRecordMap(target reflect.Value, node *schemaNode) error {
+	// A nil map target gets a new map only from a decode that worked.
+	v := target
+	if target.IsNil() {
+		v = reflect.MakeMapWithSize(target.Type(), len(node.fields))
 	}
 	elem := reflect.New(v.Type().Elem()).Elem()
 	mapType := v.Type()
 	keyType := mapType.Key()
 	// A field decodes into the value the map has for it.
 	look := v.Len() > 0 && reusesMapValue(mapType.Elem())
-	return ctx.iterateRecordFields(node,
+	err := ctx.iterateRecordFields(node,
 		func(idx int, _ string) error {
 			f := &node.fields[idx]
 			if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
@@ -1331,6 +1375,10 @@ func (ctx *jsonDecoder) decodeRecordMap(v reflect.Value, node *schemaNode) error
 			return nil
 		},
 	)
+	if err == nil && target.IsNil() {
+		target.Set(v)
+	}
+	return err
 }
 
 func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) error {

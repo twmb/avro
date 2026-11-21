@@ -127,10 +127,20 @@ const numSlabLen = 64
 // a data word.
 type eface struct{ typ, data unsafe.Pointer }
 
+// sliceHeader is the layout of a slice. A decode into a typed slice keeps a
+// copy of the slice's header and puts it back when the decode fails, so that
+// your slice gets its new length only from a decode that worked.
+type sliceHeader struct {
+	data     unsafe.Pointer
+	len, cap int
+}
+
 // These fail to compile if an any is not the size of an eface.
 var (
 	_ [unsafe.Sizeof(eface{}) - unsafe.Sizeof(any(nil))]struct{}
 	_ [unsafe.Sizeof(any(nil)) - unsafe.Sizeof(eface{})]struct{}
+	_ [unsafe.Sizeof(sliceHeader{}) - unsafe.Sizeof([]byte(nil))]struct{}
+	_ [unsafe.Sizeof([]byte(nil)) - unsafe.Sizeof(sliceHeader{})]struct{}
 )
 
 // numSlabOK reports whether an any that we point at a number reads back as
@@ -1103,10 +1113,12 @@ func (s *deserRecord) deserMapTarget(src []byte, v reflect.Value, sl *slab) ([]b
 		return nil, &SemanticError{GoType: t, AvroType: "record"}
 	}
 	keyType := t.Key()
+	// A nil map target gets a new map only from a decode that worked.
+	m := v
 	if v.IsNil() {
-		v.Set(reflect.MakeMapWithSize(t, len(s.fields)))
+		m = reflect.MakeMapWithSize(t, len(s.fields))
 	}
-	look := v.Len() > 0 && reusesMapValue(t.Elem())
+	look := m.Len() > 0 && reusesMapValue(t.Elem())
 	elem := reflect.New(t.Elem()).Elem()
 	var err error
 	for _, f := range s.fields {
@@ -1115,13 +1127,16 @@ func (s *deserRecord) deserMapTarget(src []byte, v reflect.Value, sl *slab) ([]b
 		}
 		key := mapKeyAs(t, f.nameVal)
 		if look {
-			mapValueInto(v, key, elem)
+			mapValueInto(m, key, elem)
 		}
 		if src, err = f.fn(src, elem, sl); err != nil {
 			return nil, recordFieldError(nil, f.name, err)
 		}
-		v.SetMapIndex(key, elem)
+		m.SetMapIndex(key, elem)
 		elem.SetZero()
+	}
+	if v.IsNil() {
+		v.Set(m)
 	}
 	return src, nil
 }
@@ -1135,9 +1150,11 @@ func (s *deserRecord) deserArrayRecord(src []byte, row ArrayRecord, sl *slab) ([
 	for i := range s.fields {
 		f := &s.fields[i]
 		if f.fnIface != nil && !isTarget(row[i]) {
-			if row[i], src, err = f.fnIface(src, sl); err != nil {
+			val, rest, err := f.fnIface(src, sl)
+			if err != nil {
 				return nil, recordFieldError(arrayRecordType, f.name, err)
 			}
+			row[i], src = val, rest
 			continue
 		}
 		if src, err = f.fn(src, reflect.ValueOf(&row[i]).Elem(), sl); err != nil {
@@ -1732,7 +1749,16 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		return nil, errTooDeep
 	}
 	sl.depth++
-	defer func() { sl.depth-- }()
+	// While at is set, the typed slice at it may have a new length, and the
+	// deferred call puts saved back when the decode fails or panics.
+	var saved sliceHeader
+	var at *sliceHeader
+	defer func() {
+		sl.depth--
+		if at != nil {
+			*at = saved
+		}
+	}()
 	v = indirectAlloc(v)
 	iface := v.Kind() == reflect.Interface
 	fixedArray := v.Kind() == reflect.Array
@@ -1753,6 +1779,10 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		sliceType reflect.Type
 	)
 	if !iface {
+		if v.CanAddr() {
+			at = (*sliceHeader)(unsafe.Pointer(v.UnsafeAddr()))
+			saved = *at
+		}
 		v.SetLen(0)
 		sliceVal = v
 		sliceType = v.Type()
@@ -1800,6 +1830,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			if v.IsNil() {
 				v.Set(reflect.MakeSlice(sliceType, 0, 0))
 			}
+			at = nil
 			return src, nil
 		}
 		if err := checkArrayBlockBounds(count, totalItems, len(src), s.minItemBytes); err != nil {
@@ -1817,55 +1848,54 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		if start > math.MaxInt-n {
 			return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
 		}
-		newLen := start + n
-		// Both arms grow as append does. Growing to the exact length on
-		// every block would copy the whole slice once per block.
-		if iface {
-			anys = slices.Grow(anys, n)[:newLen]
-		} else {
-			if sliceVal.Cap() < newLen {
-				sliceVal.Grow(n)
+		// A block fills the room the slice has, in place, before it grows the
+		// slice for the rest, as DecodeJSON grows it one item at a time, so
+		// that a decode that fails has written the same items into your
+		// backing array on both decoders. Both arms grow as append does.
+		for n > 0 {
+			var k int
+			if iface {
+				if len(anys) == cap(anys) {
+					anys = slices.Grow(anys, n)
+				}
+				k = min(n, cap(anys)-start)
+				anys = anys[:start+k]
+			} else {
+				if sliceVal.Cap() == start {
+					sliceVal.Grow(n)
+				}
+				k = min(n, sliceVal.Cap()-start)
+				sliceVal.SetLen(start + k)
 			}
-			sliceVal.SetLen(newLen)
-		}
-		if useFastNative {
-			handled, rest, nerr := s.nativeLoop(sliceVal, src, start, n, sl)
-			if nerr != nil {
-				return nil, nerr
-			}
-			if handled {
-				src = rest
-				continue
-			}
-			useFastNative = false // named slice/elem type: fall back to fastLoop henceforth
-		}
-		if useFast {
-			src, err = s.fastLoop(src, sliceVal, start, n, sl)
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if useFastIface && (start >= oldCap || !hasTarget(anys[start:min(newLen, oldCap)])) {
-			src, err = s.fastIfaceLoop(src, anys, start, n, sl)
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if iface {
-			for i := start; i < newLen; i++ {
-				src, err = s.deserItem(src, reflect.ValueOf(&anys[i]).Elem(), sl)
-				if err != nil {
-					return nil, err
+			end := start + k
+			handled := false
+			if useFastNative {
+				var rest []byte
+				if handled, rest, err = s.nativeLoop(sliceVal, src, start, k, sl); handled {
+					src = rest
+				} else if err == nil {
+					useFastNative = false // named slice/elem type: fall back to fastLoop henceforth
 				}
 			}
-			continue
-		}
-		// The block body is a function of its own so that deser keeps few
-		// enough returns for the compiler to open-code its defer.
-		if src, err = s.typedBlock(src, sliceVal, start, n, sl); err != nil {
-			return nil, err
+			if err == nil && !handled {
+				switch {
+				case useFast:
+					src, err = s.fastLoop(src, sliceVal, start, k, sl)
+				case useFastIface && (start >= oldCap || !hasTarget(anys[start:min(end, oldCap)])):
+					src, err = s.fastIfaceLoop(src, anys, start, k, sl)
+				case iface:
+					for i := start; i < end && err == nil; i++ {
+						src, err = s.deserItem(src, reflect.ValueOf(&anys[i]).Elem(), sl)
+					}
+				default:
+					src, err = s.typedBlock(src, sliceVal, start, k, sl)
+				}
+			}
+			if err != nil {
+				return nil, err
+			}
+			start += k
+			n -= k
 		}
 	}
 }
@@ -1939,14 +1969,16 @@ func (s *deserArray) typedBlock(src []byte, sliceVal reflect.Value, start, n int
 			return src, nil
 		}
 	}
+	// We batch-allocate backing for nil pointer slots only and reuse any
+	// non-nil retained pointer, so an element aliased from a prior decode is
+	// updated in place. That matches the unsafe struct-field path
+	// (udArrayPtrRecord) and the documented pointer-reuse contract. A slice
+	// that grows keeps the pointers it had, since Grow copies them, so only
+	// the new slots get fresh backing. A slot gets its pointer just before
+	// its item decodes, and the deferred call gives it a nil back when the
+	// item fails or panics.
+	var backing reflect.Value
 	if elemType.Kind() == reflect.Pointer {
-		innerType := elemType.Elem()
-		// We batch-allocate backing for nil slots only and reuse any
-		// non-nil retained pointer, so an element aliased from a prior
-		// decode is updated in place. That matches the unsafe struct-field
-		// path (udArrayPtrRecord) and the documented pointer-reuse
-		// contract. A slice that grows keeps the pointers it had, since
-		// Grow copies them, so only the new slots get fresh backing.
 		var need int
 		for i := range n {
 			if sliceVal.Index(start + i).IsNil() {
@@ -1954,23 +1986,28 @@ func (s *deserArray) typedBlock(src []byte, sliceVal reflect.Value, start, n int
 			}
 		}
 		if need > 0 {
-			backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
-			j := 0
-			for i := range n {
-				slot := sliceVal.Index(start + i)
-				if slot.IsNil() {
-					slot.Set(backing.Index(j).Addr())
-					j++
-				}
-			}
+			backing = reflect.MakeSlice(reflect.SliceOf(elemType.Elem()), need, need)
 		}
 	}
 	var err error
+	var fresh reflect.Value // a slot that has a new pointer while its item decodes
+	defer func() {
+		if fresh.IsValid() {
+			fresh.SetZero()
+		}
+	}()
+	j := 0
 	for i := start; i < start+n; i++ {
-		src, err = s.deserItem(src, sliceVal.Index(i), sl)
-		if err != nil {
+		slot := sliceVal.Index(i)
+		if backing.IsValid() && slot.IsNil() {
+			slot.Set(backing.Index(j).Addr())
+			j++
+			fresh = slot
+		}
+		if src, err = s.deserItem(src, slot, sl); err != nil {
 			return nil, err
 		}
+		fresh = reflect.Value{}
 	}
 	return src, nil
 }
@@ -2046,11 +2083,12 @@ func deserArrayIfaceLoop[T any](readOne func(src []byte, sl *slab) (T, []byte, e
 // deserArrayFnIfaceLoop is deserArrayIfaceLoop for items that fn decodes.
 func deserArrayFnIfaceLoop(fn deserIfaceFn) func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
 	return func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
-		var err error
 		for i := start; i < start+count; i++ {
-			if slice[i], src, err = fn(src, sl); err != nil {
+			v, rest, err := fn(src, sl)
+			if err != nil {
 				return nil, err
 			}
+			slice[i], src = v, rest
 		}
 		return src, nil
 	}
@@ -2251,12 +2289,14 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			// Empty map: allocate zero-sized backing if we never saw a block.
 			if !mapVal.IsValid() {
 				mapVal = reflect.MakeMap(mapTyp)
-				if !iface {
-					v.Set(mapVal)
-				}
 			}
 			if iface {
 				return src, setIface(v, mapVal, "map")
+			}
+			// A nil map target gets the new map only from a decode that
+			// worked.
+			if v.IsNil() {
+				v.Set(mapVal)
 			}
 			return src, nil
 		}
@@ -2272,9 +2312,6 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		if !mapVal.IsValid() {
 			hint := min(int(count), maxMapPreAllocSize)
 			mapVal = reflect.MakeMapWithSize(mapTyp, hint)
-			if !iface {
-				v.Set(mapVal)
-			}
 		}
 		if useFastNative {
 			handled, rest, nerr := s.nativeBlock(mapVal, src, int(count), sl)
