@@ -244,17 +244,15 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 }
 
 // decodeIntoTarget decodes into old, the map or slice that the interface v
-// has. A map[string]any takes a record or a map, and a []any takes an array,
-// through the any paths, which decode into them. A map or slice of another
-// type is decoded into as the typed target it is; what an interface has is
-// not addressable, so a slice goes through a copy of its header, which reuses
-// the backing array. Any other value is the error a typed target of old's
-// type returns.
+// has, as into the typed target it is. Any other value is the error a typed
+// target of old's type returns.
 func (ctx *jsonDecoder) decodeIntoTarget(v, old reflect.Value, node *schemaNode) error {
 	t := old.Type()
 	switch node.kind {
 	case "record", "map":
 		switch {
+		// A map[string]any and a []any take the any paths, which decode
+		// into them.
 		case t == mapStringAnyType && node.kind == "record":
 			return ctx.decodeRecord(v, node, true)
 		case t == mapStringAnyType:
@@ -277,6 +275,9 @@ func (ctx *jsonDecoder) decodeIntoTarget(v, old reflect.Value, node *schemaNode)
 		case t == reflect.TypeFor[[]any]():
 			return ctx.decodeArray(v, node, true)
 		case old.Kind() == reflect.Slice && t != arrayRecordType:
+			// What an interface has is not addressable, so the slice
+			// decodes through a copy of its header, which reuses the
+			// backing array.
 			tmp := reflect.New(t).Elem()
 			tmp.Set(old)
 			if err := ctx.decodeArray(tmp, node, false); err != nil {
@@ -1586,11 +1587,7 @@ func (ctx *jsonDecoder) wrapBranch(v reflect.Value, union, branch *schemaNode) {
 
 // undoTagged removes what the tagged form of branch wrote into the value the
 // target has, after the form decoded and its object did not close, so that
-// the bare form does not decode into it. A map loses the record's field names
-// or the tagged map's keys, and so loses a value you had under one of those
-// names. An ArrayRecord's slots for the record's fields are set to nil, and a
-// struct's fields for the record are set to zero. Without that, a map the bare
-// form fills in would keep the keys the tagged form wrote.
+// the bare form does not decode into it.
 //
 // We decode the tagged form into your value and not into a copy, because the
 // tagged form's object closes in every document but these, and a copy would
@@ -1615,6 +1612,8 @@ func (ctx *jsonDecoder) undoTagged(target reflect.Value, branch *schemaNode, val
 	}
 	switch t := v.Type(); {
 	case v.Kind() == reflect.Map && t.Key().Kind() == reflect.String:
+		// A map loses the record's field names or the tagged map's keys,
+		// and so loses a value you had under one of those names.
 		del := func(key string) { v.SetMapIndex(reflect.ValueOf(key).Convert(t.Key()), reflect.Value{}) }
 		if branch.kind == "record" {
 			for i := range branch.fields {
@@ -1646,6 +1645,7 @@ func (ctx *jsonDecoder) undoTagged(target reflect.Value, branch *schemaNode, val
 		row := v.Interface().(ArrayRecord)
 		clear(row[:min(len(row), len(branch.fields))])
 	case v.Kind() == reflect.Struct && v.CanSet():
+		// The struct's fields for the record go back to zero.
 		dr := branch.deserRecord
 		if dr == nil {
 			return

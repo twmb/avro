@@ -74,9 +74,6 @@ func appendByteArray(dst []byte, v reflect.Value) []byte {
 // for a record an [ArrayRecord], which the caller decodes into as a typed
 // target. A slice that v has is an error, as it is for a typed target. When
 // v has nothing to decode into, both are zero and the caller makes a map.
-//
-// A map v has keeps its keys, so a decode keeps the keys the schema does not
-// name.
 func anyMap(v reflect.Value, avroType string) (m map[string]any, typed reflect.Value, err error) {
 	if v.IsNil() || !v.CanInterface() {
 		return nil, reflect.Value{}, nil

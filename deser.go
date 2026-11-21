@@ -127,9 +127,8 @@ const numSlabLen = 64
 // a data word.
 type eface struct{ typ, data unsafe.Pointer }
 
-// sliceHeader is the layout of a slice. A decode into a typed slice keeps a
-// copy of the slice's header and puts it back when the decode fails, so that
-// your slice gets its new length only from a decode that worked.
+// sliceHeader is the layout of a slice, which a decode into a typed slice
+// copies and puts back when the decode fails.
 type sliceHeader struct {
 	data     unsafe.Pointer
 	len, cap int
@@ -487,11 +486,9 @@ type unionTarget struct {
 // branch with class c, fills t with where the value goes, and reports whether
 // the value decodes straight into the target, at dst. tagged says a
 // TaggedUnions envelope goes around the value, so an any with the envelope of
-// an earlier decode stands for the value inside it. A value in an any that
-// has another branch's type is replaced, and so is a map when the union has
-// two or more records or maps. A null decodes into no value, so it decodes
-// straight into v.
+// an earlier decode stands for the value inside it.
 func (u *unionShape) target(t *unionTarget, v reflect.Value, c byte, tagged bool) (direct bool) {
+	// A null decodes into no value, so it decodes straight into v.
 	if c == 'n' {
 		return true
 	}
@@ -628,34 +625,29 @@ func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 // branch decodes a value of branch idx into v with fn. The union rules apply
 // to the value v has, and TaggedUnions wraps the result.
 func (s *deserUnion) branch(src []byte, v reflect.Value, sl *slab, idx int, fn deserfn) ([]byte, error) {
+	var t unionTarget
+	dst, inCell := v, false
 	// A nil any has no value for the rules to apply to.
 	if v.Kind() != reflect.Interface || !v.IsNil() {
 		var c byte
 		if idx < len(s.shape.class) {
 			c = s.shape.class[idx]
 		}
-		var t unionTarget
-		if !s.shape.target(&t, v, c, sl.taggedUnions && !s.noWrap) {
-			cell := t.cell()
-			src, err := fn(src, cell, sl)
-			if err != nil {
-				return src, err
-			}
-			t.store(cell)
-			s.maybeWrap(v, sl, int32(idx))
-			return src, nil
+		if s.shape.target(&t, v, c, sl.taggedUnions && !s.noWrap) {
+			dst = t.dst(v)
+		} else {
+			dst, inCell = t.cell(), true
 		}
-		src, err := fn(src, t.dst(v), sl)
-		if err == nil {
-			s.maybeWrap(v, sl, int32(idx))
-		}
+	}
+	src, err := fn(src, dst, sl)
+	if err != nil {
 		return src, err
 	}
-	src, err := fn(src, v, sl)
-	if err == nil {
-		s.maybeWrap(v, sl, int32(idx))
+	if inCell {
+		t.store(dst)
 	}
-	return src, err
+	s.maybeWrap(v, sl, int32(idx))
+	return src, nil
 }
 
 // maybeWrap wraps a decoded union value with its branch name when TaggedUnions
