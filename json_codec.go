@@ -285,7 +285,7 @@ func (s *Schema) decodeJSONResolved(src []byte, rv reflect.Value, opts ...Opt) e
 	}
 	wb, err := w.Encode(inter)
 	if err != nil {
-		return fmt.Errorf("avro: re-encoding resolved JSON intermediate: %w", err)
+		return &causeError{"avro: re-encoding resolved JSON intermediate", err}
 	}
 	_, err = s.Decode(wb, rv.Interface(), dropAliasingOpts(opts)...)
 	return err

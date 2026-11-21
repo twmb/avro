@@ -66,7 +66,7 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 	if writer.customBaked {
 		raw, err := Parse(writer.full, internalReparseNames)
 		if err != nil {
-			return nil, fmt.Errorf("avro: building custom-free writer view for resolved JSON decode: %w", err)
+			return nil, &causeError{"avro: building custom-free writer view for resolved JSON decode", err}
 		}
 		s.resolveWriterRaw = raw
 	}
