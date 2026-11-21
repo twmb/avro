@@ -54,7 +54,8 @@ func validateSOEHeader(data []byte) error {
 }
 
 // DecodeSingleObject decodes a Single Object Encoding message into v after
-// verifying the magic and fingerprint match this schema.
+// verifying the magic and fingerprint match this schema. Decoding into v
+// follows the rules of [Schema.Decode].
 //
 // For a schema returned by [Resolve], we also accept the writer's
 // fingerprint, since single-object bytes carry the fingerprint of the schema

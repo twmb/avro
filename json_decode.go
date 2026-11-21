@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"strconv"
 	"time"
 	"unsafe"
@@ -210,12 +211,25 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 		return ctx.decodeUnion(v, node)
 	}
 
+	switch node.kind {
+	case "null":
+		// A null sets the target itself to its zero value, a pointer and
+		// an any that has one included, as the binary decoder does.
+		return ctx.decodeNull(v)
+	}
+
 	v = indirectAlloc(v)
 	toAny := v.Kind() == reflect.Interface
 
+	// A map or slice that an any has is a typed target, as in the binary
+	// decoder.
+	if toAny && !v.IsNil() {
+		if old := v.Elem(); isTargetValue(old) {
+			return ctx.decodeIntoTarget(v, old, node)
+		}
+	}
+
 	switch node.kind {
-	case "null":
-		return ctx.decodeNull(v)
 	case "boolean":
 		return ctx.decodeBool(v, toAny)
 	case "int":
@@ -243,6 +257,52 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 	default:
 		return fmt.Errorf("avro json: unsupported schema kind %q", node.kind)
 	}
+}
+
+// decodeIntoTarget decodes into old, the map or slice that the interface v
+// has. A map[string]any takes a record or a map, and a []any takes an array,
+// through the any paths, which decode into them. A map or slice of another
+// type is decoded into as the typed target it is; what an interface has is
+// not addressable, so a slice goes through a copy of its header, which reuses
+// the backing array. Any other value is the error a typed target of old's
+// type returns.
+func (ctx *jsonDecoder) decodeIntoTarget(v, old reflect.Value, node *schemaNode) error {
+	t := old.Type()
+	switch node.kind {
+	case "record", "map":
+		switch {
+		case t == mapStringAnyType && node.kind == "record":
+			return ctx.decodeRecord(v, node, true)
+		case t == mapStringAnyType:
+			return ctx.decodeMap(v, node, true)
+		case old.Kind() == reflect.Map && node.kind == "record":
+			return ctx.decodeRecord(old, node, false)
+		case old.Kind() == reflect.Map:
+			return ctx.decodeMap(old, node, false)
+		case t == arrayRecordType && node.kind == "record":
+			row := reflect.New(t).Elem()
+			row.Set(old)
+			if err := ctx.decodeRecord(row, node, false); err != nil {
+				return err
+			}
+			v.Set(row)
+			return nil
+		}
+	case "array":
+		switch {
+		case t == reflect.TypeFor[[]any]():
+			return ctx.decodeArray(v, node, true)
+		case old.Kind() == reflect.Slice && t != arrayRecordType:
+			tmp := reflect.New(t).Elem()
+			tmp.Set(old)
+			if err := ctx.decodeArray(tmp, node, false); err != nil {
+				return err
+			}
+			v.Set(tmp)
+			return nil
+		}
+	}
+	return &SemanticError{GoType: t, AvroType: node.kind}
 }
 
 // wrapDecodeJSONWithCustomDecoders builds a per-node JSON decode closure that
@@ -748,16 +808,16 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 		return err
 	}
 	if toAny {
-		var arr []any
+		// We decode each element in place, in the backing array of the
+		// []any v has, if v has one.
+		arr, _ := v.Interface().([]any)
+		arr = arr[:0]
 		if ctx.scanner.peek() != ']' {
-			var elem any
-			elemV := reflect.ValueOf(&elem).Elem()
 			for {
-				if err := ctx.decodeValue(elemV, node.items); err != nil {
+				arr = slices.Grow(arr, 1)[:len(arr)+1]
+				if err := ctx.decodeValue(reflect.ValueOf(&arr[len(arr)-1]).Elem(), node.items); err != nil {
 					return err
 				}
-				arr = append(arr, elem)
-				elem = nil
 				if ctx.scanner.peek() != ',' {
 					break
 				}
@@ -775,10 +835,6 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 	// Typed array target ([N]T): we require exactly len(v) elements, as the
 	// binary side does.
 	if v.Kind() == reflect.Array {
-		// An any element starts from nil, as in the binary decoder.
-		if isEmptyInterface(v.Type().Elem()) {
-			v.SetZero()
-		}
 		arrLen := v.Len()
 		idx := 0
 		if ctx.scanner.peek() != ']' {
@@ -812,20 +868,27 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 			return err
 		}
 	}
-	v.Set(reflect.MakeSlice(v.Type(), 0, 0))
+	// We decode each element in place, as the binary decoder does. Grow
+	// keeps the elements of the old backing array.
+	v.SetLen(0)
 	if ctx.scanner.peek() != ']' {
-		elem := reflect.New(v.Type().Elem()).Elem()
-		for {
-			if err := ctx.decodeValue(elem, node.items); err != nil {
+		for n := 0; ; n++ {
+			if n == v.Cap() {
+				v.Grow(1)
+			}
+			v.SetLen(n + 1)
+			if err := ctx.decodeValue(v.Index(n), node.items); err != nil {
 				return err
 			}
-			v.Set(reflect.Append(v, elem))
-			elem.SetZero()
 			if ctx.scanner.peek() != ',' {
 				break
 			}
 			ctx.scanner.pos++
 		}
+	}
+	// An empty array decodes to a non-nil empty slice.
+	if v.IsNil() {
+		v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 	}
 	return ctx.scanner.expect(']')
 }
@@ -835,7 +898,13 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 		return err
 	}
 	if toAny {
-		m := make(map[string]any)
+		// We decode into the map[string]any v has, and a value decodes
+		// into the value the map has for its key.
+		m, _ := v.Interface().(map[string]any)
+		if m == nil {
+			m = make(map[string]any)
+		}
+		look := len(m) > 0
 		if ctx.scanner.peek() != '}' {
 			var val any
 			valV := reflect.ValueOf(&val).Elem()
@@ -846,6 +915,9 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 				}
 				if err := ctx.scanner.expect(':'); err != nil {
 					return err
+				}
+				if look {
+					val = m[key]
 				}
 				if err := ctx.decodeValue(valV, node.values); err != nil {
 					return err
@@ -882,6 +954,8 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 	if ctx.scanner.peek() != '}' {
 		elem := reflect.New(valType).Elem()
 		keyVal := reflect.New(keyType).Elem() // typed for a named string key
+		// A value decodes into the value the map has for its key.
+		look := v.Len() > 0 && reusesMapValue(valType)
 
 		for {
 			key, err := ctx.consumeSlabString()
@@ -894,10 +968,13 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 			if err := ctx.scanner.expect(':'); err != nil {
 				return err
 			}
+			keyVal.SetString(key)
+			if look {
+				mapValueInto(v, keyVal, elem)
+			}
 			if err := ctx.decodeValue(elem, node.values); err != nil {
 				return err
 			}
-			keyVal.SetString(key)
 			v.SetMapIndex(keyVal, elem)
 			elem.SetZero()
 			if ctx.scanner.peek() != ',' {
@@ -961,8 +1038,10 @@ func decodeJSONNativeStringMap[V any](ctx *jsonDecoder, m map[string]V, readOne 
 	return ctx.scanner.expect('}')
 }
 
+// decodeJSONNativeSlice appends to v's own backing array.
 func decodeJSONNativeSlice[V any](ctx *jsonDecoder, v reflect.Value, readOne func(*jsonDecoder) (V, error)) error {
-	var s []V
+	s, _ := sliceOf[V](v)
+	s = s[:0]
 	if ctx.scanner.peek() != ']' {
 		for {
 			val, err := readOne(ctx)
@@ -979,7 +1058,13 @@ func decodeJSONNativeSlice[V any](ctx *jsonDecoder, v reflect.Value, readOne fun
 	if s == nil {
 		s = []V{}
 	}
-	v.Set(reflect.ValueOf(s))
+	// We store s where v is, since v.Set(reflect.ValueOf(s)) would first copy
+	// the slice header to the heap.
+	if v.CanAddr() {
+		*(*[]V)(v.Addr().UnsafePointer()) = s
+	} else {
+		v.Set(reflect.ValueOf(s))
+	}
 	return ctx.scanner.expect(']')
 }
 
@@ -1161,15 +1246,12 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 }
 
 // decodeArrayRecord decodes a JSON object's fields into row by the schema's
-// field positions, whatever order the keys arrive in. row has one nil slot per
-// field.
+// field positions, whatever order the keys arrive in. row has one slot per
+// field, and a field decodes into the value its slot has.
 func (ctx *jsonDecoder) decodeArrayRecord(row ArrayRecord, node *schemaNode) error {
 	return ctx.iterateRecordFields(node,
 		func(idx int, key string) error {
 			f := &node.fields[idx]
-			// A key that repeats decodes afresh; the last one wins, as it
-			// does for a map.
-			row[idx] = nil
 			if err := ctx.decodeValue(reflect.ValueOf(&row[idx]).Elem(), f.node); err != nil {
 				return recordFieldError(arrayRecordType, f.name, err)
 			}
@@ -1191,12 +1273,22 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 	if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
 		return semErr(v, "record")
 	}
-	m := reuseOrMakeStringAnyMap(v, len(node.fields))
+	// We decode into the map[string]any v has, which keeps the keys the
+	// schema does not name, and a field decodes into the value the map has
+	// for it.
+	m, _ := v.Interface().(map[string]any)
+	if m == nil {
+		m = make(map[string]any, len(node.fields))
+	}
+	look := len(m) > 0
 	var val any
 	valV := reflect.ValueOf(&val).Elem()
 	err := ctx.iterateRecordFields(node,
 		func(idx int, key string) error {
 			f := &node.fields[idx]
+			if look {
+				val = m[f.name]
+			}
 			if err := ctx.decodeValue(valV, f.node); err != nil {
 				return recordFieldError(v.Type(), f.name, err)
 			}
@@ -1207,6 +1299,9 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 		func(idx int) error {
 			f := &node.fields[idx]
 			var defVal any
+			if look {
+				defVal = m[f.name]
+			}
 			defValV := reflect.ValueOf(&defVal).Elem()
 			if err := ctx.applyFieldDefault(defValV, node, idx); err != nil {
 				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
@@ -1229,16 +1324,22 @@ func (ctx *jsonDecoder) decodeRecordMap(v reflect.Value, node *schemaNode) error
 	elem := reflect.New(v.Type().Elem()).Elem()
 	mapType := v.Type()
 	keyType := mapType.Key()
+	// A field decodes into the value the map has for it.
+	look := v.Len() > 0 && reusesMapValue(mapType.Elem())
 	return ctx.iterateRecordFields(node,
-		func(idx int, key string) error {
+		func(idx int, _ string) error {
 			f := &node.fields[idx]
 			if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
 				return err
 			}
+			key := mapKeyAs(mapType, f.nameVal)
+			if look {
+				mapValueInto(v, key, elem)
+			}
 			if err := ctx.decodeValue(elem, f.node); err != nil {
 				return recordFieldError(v.Type(), f.name, err)
 			}
-			v.SetMapIndex(mapKeyAs(mapType, f.nameVal), elem)
+			v.SetMapIndex(key, elem)
 			elem.SetZero()
 			return nil
 		},
@@ -1247,10 +1348,14 @@ func (ctx *jsonDecoder) decodeRecordMap(v reflect.Value, node *schemaNode) error
 			if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
 				return err
 			}
+			key := mapKeyAs(mapType, f.nameVal)
+			if look {
+				mapValueInto(v, key, elem)
+			}
 			if err := ctx.applyFieldDefault(elem, node, idx); err != nil {
 				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
 			}
-			v.SetMapIndex(mapKeyAs(mapType, f.nameVal), elem)
+			v.SetMapIndex(key, elem)
 			elem.SetZero()
 			return nil
 		},
@@ -1378,65 +1483,56 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 		if err == nil {
 			if branch := findUnionBranch(node, key); branch != nil {
 				if err := ctx.scanner.expect(':'); err == nil {
+					// start applies the union rules to the value the target
+					// has. A malformed `{"long": 42,` backtracks to the
+					// bare fallback. Before it does, what the tagged form
+					// wrote into the target's value is gone (see
+					// undoTagged), and the any or the map that start
+					// stopped at has its value back.
+					start, old := unionShapeOf(node).start(v, unionClass(branch), ctx.slab.taggedUnions)
 					target, toAny := unionTarget(v, branch)
-					if ctx.decodesIntoAny(target, toAny) {
-						// The target has the caller's value again unless the
-						// close brace arrives: a malformed `{"long": 42,` puts
-						// the value back and backtracks to the bare fallback.
-						old := target.Interface()
-						target.SetZero()
-						err := ctx.decodeValue(target, branch)
-						if err == nil && ctx.scanner.peek() == '}' {
-							ctx.scanner.pos++
-							return nil
-						}
-						restoreAny(target, old)
-						if errors.Is(err, errTooDeep) || err != nil && unionBranchRecurses(branch.kind) {
-							return err
-						}
-						taggedErr = err
-					} else if toAny {
-						// We decode into a temporary so the target stays
-						// untouched until the close brace arrives; a malformed
-						// `{"long": 42,` would otherwise write it and then
-						// backtrack to the bare fallback.
-						var val any
-						err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch)
-						if err == nil {
-							if ctx.scanner.peek() == '}' {
-								ctx.scanner.pos++
-								return assignAny(target, ctx.wrapUnion(target, val, node, branch), branch.kind)
-							}
-						} else if errors.Is(err, errTooDeep) {
-							return err
-						} else if unionBranchRecurses(branch.kind) {
-							// A key matching a container branch commits to
-							// the tagged form: the bare retry would re-decode
-							// the subtree, 2^depth when a record field name
-							// collides with a branch name.
-							return err
-						} else {
-							taggedErr = err
-						}
-					} else {
-						// The typed path writes target directly. The only
-						// backtrack trigger is a missing close brace on
-						// otherwise valid JSON, and the bare fallback
-						// overwrites if it matches.
-						err := ctx.decodeValue(target, branch)
-						if err == nil {
-							if ctx.scanner.peek() == '}' {
-								ctx.scanner.pos++
-								return nil
-							}
-						} else if errors.Is(err, errTooDeep) {
-							return err
-						} else if unionBranchRecurses(branch.kind) {
-							return err
-						} else {
-							taggedErr = err
-						}
+					var seed any
+					if target.Kind() == reflect.Interface && target.CanInterface() {
+						seed = target.Interface()
 					}
+					// The value decodes straight into target, or into a
+					// temporary when a TaggedUnions envelope goes around it.
+					direct := !toAny || ctx.decodesIntoAny(target, toAny)
+					cell, val := target, seed
+					if !direct {
+						cell = reflect.ValueOf(&val).Elem()
+					}
+					valuePos := ctx.scanner.pos
+					err := ctx.decodeValue(cell, branch)
+					if err == nil && ctx.scanner.peek() == '}' {
+						ctx.scanner.pos++
+						switch {
+						case !toAny:
+							err = ctx.wrapPointer(target, node, branch)
+						case !direct:
+							err = assignAny(target, ctx.wrapUnion(target, val, node, branch), branch.kind)
+						}
+						if err != nil && start.IsValid() {
+							setAny(start, old)
+						}
+						return err
+					}
+					if err == nil {
+						// Before the put-back, while the target still has
+						// the value the tagged form decoded into.
+						ctx.undoTagged(target, branch, valuePos)
+					}
+					if start.IsValid() {
+						setAny(start, old)
+					}
+					// A key matching a container branch commits to the
+					// tagged form: the bare retry would re-decode the
+					// subtree, 2^depth when a record field name collides
+					// with a branch name.
+					if errors.Is(err, errTooDeep) || err != nil && unionBranchRecurses(branch.kind) {
+						return err
+					}
+					taggedErr = err
 				}
 			}
 		}
@@ -1456,43 +1552,133 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 // decodeBranchInto decodes the next JSON value as the given union branch and
 // writes the result into v.
 func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, union, branch *schemaNode) error {
+	start, old := unionShapeOf(union).start(rawV, unionClass(branch), ctx.slab.taggedUnions)
+	err := ctx.decodeBranch(rawV, union, branch)
+	if err != nil && start.IsValid() {
+		// The next branch the bare form tries starts from your value.
+		setAny(start, old)
+	}
+	return err
+}
+
+func (ctx *jsonDecoder) decodeBranch(rawV reflect.Value, union, branch *schemaNode) error {
 	v, toAny := unionTarget(rawV, branch)
-	if ctx.decodesIntoAny(v, toAny) {
-		old := v.Interface()
-		v.SetZero()
+	if !toAny {
 		if err := ctx.decodeValue(v, branch); err != nil {
-			restoreAny(v, old)
 			return err
 		}
+		return ctx.wrapPointer(v, union, branch)
+	}
+	if ctx.decodesIntoAny(v, toAny) {
+		return ctx.decodeValue(v, branch)
+	}
+	// A TaggedUnions envelope goes around the value, so it decodes into a
+	// temporary that starts from the value v has.
+	var val any
+	if v.CanInterface() {
+		val = v.Interface()
+	}
+	if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err != nil {
+		return err
+	}
+	// wrapUnion returns nil for a null branch, so we go through
+	// assignAny, which sets a typed nil for an interface target.
+	return assignAny(v, ctx.wrapUnion(v, val, union, branch), branch.kind)
+}
+
+// undoTagged removes what the tagged form of branch wrote into the value the
+// target has, after the form decoded and its object did not close, so that
+// the bare form does not decode into it. A map loses the record's field names
+// or the tagged map's keys, an ArrayRecord's slots are set to nil, and a
+// struct's fields for the record are set to zero. Without that, a map the bare
+// form fills in would keep the keys the tagged form wrote.
+//
+// We decode the tagged form into your value and not into a copy, because the
+// tagged form is the one that closes in every document but these, and a copy
+// would give up the reuse.
+func (ctx *jsonDecoder) undoTagged(target reflect.Value, branch *schemaNode, valuePos int) {
+	if branch.kind != "record" && branch.kind != "map" {
+		return
+	}
+	// Follow the pointers the decode followed, a pointer in an any included,
+	// and look at the map or slice an any has.
+	v := target
+	for range maxIndirectDepth {
+		next := v
+		if v.Kind() == reflect.Interface && !v.IsNil() {
+			next = v.Elem()
+		}
+		if next.Kind() != reflect.Pointer || next.IsNil() {
+			v = next
+			break
+		}
+		v = next.Elem()
+	}
+	switch t := v.Type(); {
+	case v.Kind() == reflect.Map && t.Key().Kind() == reflect.String:
+		del := func(key string) { v.SetMapIndex(reflect.ValueOf(key).Convert(t.Key()), reflect.Value{}) }
+		if branch.kind == "record" {
+			for i := range branch.fields {
+				del(branch.fields[i].name)
+			}
+			return
+		}
+		// The tagged map's keys are in the document, which we read again.
+		end := ctx.scanner.pos
+		ctx.scanner.pos = valuePos
+		if ctx.scanner.expect('{') == nil && ctx.scanner.peek() != '}' {
+			for {
+				key, err := ctx.consumeSlabString()
+				if err != nil || ctx.scanner.expect(':') != nil || ctx.scanner.skipValue() != nil {
+					break
+				}
+				del(key)
+				if ctx.scanner.peek() != ',' {
+					break
+				}
+				ctx.scanner.pos++
+			}
+		}
+		ctx.scanner.pos = end
+	case branch.kind != "record":
+	case t == arrayRecordType && v.CanInterface():
+		clear(v.Interface().(ArrayRecord))
+	case v.Kind() == reflect.Struct && v.CanSet():
+		dr := branch.deserRecord
+		if dr == nil {
+			return
+		}
+		mapping, err := typeFieldMappingSkip(dr.names, &dr.cache, t, ctx.slab.skipUnknown)
+		if err != nil {
+			return
+		}
+		for idx := range branch.fields {
+			if mapping.unmapped(idx) {
+				continue
+			}
+			if fv := fieldByIndexZero(v, mapping.indices[idx]); fv.CanSet() {
+				fv.SetZero()
+			}
+		}
+	}
+}
+
+// wrapPointer wraps the value of v in a TaggedUnions envelope when v is an
+// any with your pointer, which a union value decoded through, as Decode wraps
+// it. Any other v here is a typed target, which gets the bare value.
+func (ctx *jsonDecoder) wrapPointer(v reflect.Value, union, branch *schemaNode) error {
+	if !ctx.slab.taggedUnions || v.Kind() != reflect.Interface {
 		return nil
 	}
-	if toAny {
-		var val any
-		if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err != nil {
-			return err
-		}
-		// wrapUnion returns nil for a null branch, so we go through
-		// assignAny, which sets a typed nil for an interface target.
-		return assignAny(v, ctx.wrapUnion(v, val, union, branch), branch.kind)
-	}
-	return ctx.decodeValue(v, branch)
+	return assignAny(v, ctx.wrapUnion(v, v.Interface(), union, branch), branch.kind)
 }
 
 // decodesIntoAny reports whether a union value goes straight into the
-// interface target, where a temporary would cost an allocation per value: v
-// takes any value, and no TaggedUnions envelope wraps the value first. The
-// caller saves v's value and puts it back if the decode fails.
+// interface target, where a temporary would cost an allocation per value and
+// would not reuse v's value: v takes any value, and no TaggedUnions envelope
+// wraps the value first.
 func (ctx *jsonDecoder) decodesIntoAny(v reflect.Value, toAny bool) bool {
 	return toAny && !ctx.slab.taggedUnions && v.Type().NumMethod() == 0 && v.CanInterface()
-}
-
-// restoreAny puts old back into the interface v.
-func restoreAny(v reflect.Value, old any) {
-	if old == nil {
-		v.SetZero()
-		return
-	}
-	v.Set(reflect.ValueOf(old))
 }
 
 // unionTarget selects the decode target and toAny flag for a matched union
@@ -1507,11 +1693,29 @@ func unionTarget(rawV reflect.Value, branch *schemaNode) (reflect.Value, bool) {
 	if branch.decodeJSON != nil {
 		return rawV, rawV.Kind() == reflect.Interface
 	}
+	// A pointer in an any is decoded through like any other pointer, so
+	// that TaggedUnions wraps that any, as the binary decoder does, and not
+	// an any the pointer points at.
+	if a := derefNoAlloc(rawV); a.Kind() == reflect.Interface && !a.IsNil() && a.Elem().Kind() == reflect.Pointer && !a.Elem().IsNil() {
+		return rawV, false
+	}
 	iv := indirectAlloc(rawV)
 	if iv.Kind() == reflect.Interface {
 		return iv, true
 	}
 	return rawV, false
+}
+
+// derefNoAlloc follows the non-nil pointers at v and returns the first value
+// that is not one.
+func derefNoAlloc(v reflect.Value) reflect.Value {
+	for range maxIndirectDepth {
+		if v.Kind() != reflect.Pointer || v.IsNil() {
+			break
+		}
+		v = v.Elem()
+	}
+	return v
 }
 
 func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, p byte) error {

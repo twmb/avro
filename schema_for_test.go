@@ -5498,6 +5498,7 @@ var embedIndexSites = map[string]int{
 	"unsafe.go:deserRecordFast":                     1, // binary: the only binary decode route (struct records always compile)
 	"json_decode.go:jsonDecoder.decodeRecordStruct": 2, // JSON: present-key arm + default-fill arm
 	"resolve.go:resolvedRecord.deserStruct":         2, // resolved: writer-op arm + reader-default arm
+	"json_decode.go:jsonDecoder.undoTagged":         1, // JSON: zeroes the fields a tagged union form wrote before the bare form decodes
 	// encode (fieldByIndexZero: reads a nil embed as zero)
 	"ser.go:serRecord.ser":               1, // binary, non-addressable (reflect path)
 	"unsafe.go:serRecordFast":            1, // binary, addressable (compiled slow-field arm)
@@ -5536,6 +5537,10 @@ func TestMatrix_NilEmbedPointerRouteAgreement(t *testing.T) {
 	// thinWriter lacks "a" entirely, so the reader's own default fills it and the
 	// resolved decoder's default arm runs.
 	thinWriter := MustParse(`{"type":"record","name":"R","fields":[{"name":"c","type":"int"}]}`)
+
+	// unionOfR has R as its one record branch, so a tagged form can decode
+	// into the target before the bare form does.
+	unionOfR := MustParse(`[{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"c","type":"int"}]},"string"]`)
 
 	resolvedWire, err := Resolve(wideWriter, full)
 	if err != nil {
@@ -5614,6 +5619,11 @@ func TestMatrix_NilEmbedPointerRouteAgreement(t *testing.T) {
 	}, {
 		"JSON, key absent (default fill)", "json_decode.go:jsonDecoder.decodeRecordStruct", 5,
 		func(dst any) error { return withDefault.DecodeJSON([]byte(`{"c":3}`), dst) },
+	}, {
+		// The tagged form decodes and its object does not close, so the
+		// fields it wrote are zeroed and the bare form decodes the object.
+		"JSON, a tagged union form that does not close", "json_decode.go:jsonDecoder.undoTagged", 7,
+		func(dst any) error { return unionOfR.DecodeJSON([]byte(`{"R":{"a":1,"c":2},"a":7,"c":3}`), dst) },
 	}, {
 		"resolved, writer op", "resolve.go:resolvedRecord.deserStruct", 7,
 		func(dst any) error { _, e := resolvedWire.Decode(binWide, dst); return e },

@@ -4514,6 +4514,29 @@ func TestDoSBattery_C7_CyclicGoType(t *testing.T) {
 		return nil
 	})
 
+	// A pointer that points at itself, at a union: the union looks at the
+	// value the target has before a branch decodes, and that walk is
+	// bounded too. Both decoders.
+	union := MustParse(`["null","long"]`)
+	wantTerminate(t, "Decode/self-pointing-target-at-a-union", func() error {
+		type P *P
+		var p P
+		p = &p
+		if _, err := union.Decode([]byte{2, 2}, &p); err == nil {
+			return errors.New("self-pointing target unexpectedly accepted")
+		}
+		return nil
+	})
+	wantTerminate(t, "DecodeJSON/self-pointing-target-at-a-union", func() error {
+		type P *P
+		var p P
+		p = &p
+		if err := union.DecodeJSON([]byte(`7`), &p); err == nil {
+			return errors.New("self-pointing target unexpectedly accepted")
+		}
+		return nil
+	})
+
 	// A deep-but-finite pointer chain past maxIndirectDepth must also terminate
 	// (the bound is depth, not cyclicity) rather than walking/allocating the
 	// whole chain.

@@ -115,10 +115,10 @@ type CustomType struct {
 	// into the target faithfully (identical to a no-custom decode). A
 	// wildcard custom (empty LogicalType and AvroType) that matches leaf
 	// nodes but skips containers therefore makes decoding into a
-	// deeply-nested *typed* target (struct/slice/map) cost O(depth^2).
-	// For untrusted deeply-nested data, decode into an interface /
-	// map[string]any (single-pass) or register against a specific
-	// LogicalType/AvroType.
+	// deeply-nested *typed* target (struct/slice/map) cost O(depth^2), and
+	// the same for an any that is not nil. For untrusted deeply-nested
+	// data, decode into a nil any (single-pass) or register against a
+	// specific LogicalType/AvroType.
 	//
 	// If nil, we bypass the built-in logical type handler and use the
 	// base Avro type decoder directly, producing raw Avro-native values

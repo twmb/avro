@@ -202,6 +202,8 @@ func (s *Schema) AppendEncodeJSON(dst []byte, v any, opts ...Opt) ([]byte, error
 // convert bytes/fixed strings, and coerce numeric types to match the schema.
 // When v is *any, you get the natural Go value directly.
 //
+// Decoding into v follows the rules of [Schema.Decode].
+//
 // We accept every input format: tagged and bare unions, the Java and goavro
 // NaN/Infinity conventions, and the linkedin/goavro union branch naming
 // ("long.timestamp-millis" instead of "long"). Pass [TaggedUnions] to wrap

@@ -24031,48 +24031,133 @@ func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 }
 
 // TestMatrix_JSONUnionFailureKeepsTarget pins that a union value DecodeJSON
-// cannot decode leaves the caller's value in an any target, with and without
-// TaggedUnions: a tagged form whose value decodes but whose object does not
-// close, where the bare fallback then fails too; a record branch that fails
-// partway; and a number no branch holds. The last row decodes, to show the
-// target is written at all.
+// cannot decode leaves the value the caller has in an any target, with and
+// without TaggedUnions: a tagged form whose value decodes but whose object
+// does not close, where the bare fallback then fails too; a record branch that
+// fails partway; and a number no branch holds. The "decodes" row shows the
+// target is written at all. In the rows named "then bare decodes", the tagged
+// form writes into the caller's map or pointer before the bare fallback, and
+// the result must have nothing the tagged form wrote. A union with one record decodes
+// into the caller's map, which keeps the caller's own keys. A union with two
+// records or maps decodes into a new map. A struct keeps the field the
+// schema does not map. A map target, a struct target, an ArrayRecord, and a
+// target of an interface type with methods follow after the table.
 func TestMatrix_JSONUnionFailureKeepsTarget(t *testing.T) {
 	rec := `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int"}]}`
+	// recM has a map field with a default, so a key that a failed tagged
+	// attempt wrote into it could outlive the bare fallback.
+	recM := `{"type":"record","name":"R2","fields":[{"name":"a","type":"int"},{"name":"b","type":"int"},{"name":"m","type":{"type":"map","values":"long"},"default":{}}]}`
+	// mapU is a map whose values can be maps, so one document decodes both
+	// as its tagged form and, with more keys, as its bare form.
+	mapU := `{"type":"map","values":["long",{"type":"map","values":"long"}]}`
 	for _, c := range []struct {
 		name, union, doc string
-		want             any // nil: the decode must fail
+		want             any        // nil: the decode must fail
+		start            func() any // nil: the string "caller"
 	}{
-		{"tagged then bare fails", `["long",{"type":"map","values":"string"}]`, `{"long":42,"x":1}`, nil},
-		{"record fails partway", `["null",` + rec + `]`, `{"a":1,"b":"x"}`, nil},
-		{"no branch holds the number", `["null","int"]`, `9999999999`, nil},
-		{"decodes", `["null","long"]`, `{"long":42}`, int64(42)},
+		{"tagged then bare fails", `["long",{"type":"map","values":"string"}]`, `{"long":42,"x":1}`, nil, nil},
+		{"tagged then bare fails, a nil any", `["long",{"type":"map","values":"string"}]`, `{"long":42,"x":1}`, nil, func() any { return nil }},
+		{"record fails partway", `["null",` + rec + `]`, `{"a":1,"b":"x"}`, nil, nil},
+		{"no branch holds the number", `["null","int"]`, `9999999999`, nil, nil},
+		{"decodes", `["null","long"]`, `{"long":42}`, int64(42), nil},
+		{"tagged record into a map then bare decodes", `[` + recM + `,"string"]`, `{"R2":{"a":1,"b":2,"m":{"x":1}},"a":5,"b":6}`,
+			map[string]any{"own": "mine", "too": "mine", "a": int32(5), "b": int32(6), "m": map[string]any{}},
+			func() any { return map[string]any{"own": "mine", "too": "mine"} }},
+		{"two records or maps then bare decodes", `[` + rec + `,{"type":"map","values":"long"}]`, `{"map":{"x":1},"a":5,"b":6}`,
+			map[string]any{"a": int32(5), "b": int32(6)}, func() any { return map[string]any{"own": "mine", "too": "mine"} }},
+		{"tagged into a pointer then bare decodes", `[` + recM + `,"string"]`, `{"R2":{"a":1,"b":2,"m":{"x":1}},"a":5,"b":6}`,
+			&jsonUnionFallbackR{A: 5, B: 6, M: map[string]int64{}, Extra: "mine"}, func() any { return &jsonUnionFallbackR{Extra: "mine"} }},
+		// A nil any is nil again before the bare form decodes.
+		{"tagged record into a nil any then bare decodes", `["null",` + recM + `]`, `{"R2":{"a":1,"b":2,"m":{"x":1}},"a":5,"b":6}`,
+			map[string]any{"a": int32(5), "b": int32(6), "m": map[string]any{}}, func() any { return nil }},
+		{"tagged record into a map of your type then bare decodes", `[{"type":"record","name":"K","fields":[{"name":"m","type":{"type":"map","values":"long"}}]},"string"]`,
+			`{"K":{"m":{"x":1}},"m":{"y":2}}`,
+			map[string]map[string]int64{"m": {"y": 2}}, func() any { return map[string]map[string]int64{} }},
+		// The int branch replaces the array branch's []any before it
+		// decodes, and the []any is back after the int overflows.
+		{"a failed branch gives the value back", `[{"type":"array","items":"long"},"int"]`, `9999999999`, nil, func() any { return []any{int64(1)} }},
 	} {
 		for _, opts := range [][]avro.Opt{nil, {avro.TaggedUnions()}} {
 			t.Run(fmt.Sprintf("%s/options=%d", c.name, len(opts)), func(t *testing.T) {
 				s := avro.MustParse(c.union)
 				var out any = "caller"
+				if c.start != nil {
+					out = c.start()
+				}
 				err := s.DecodeJSON([]byte(c.doc), &out, opts...)
 				if c.want == nil {
 					if err == nil {
 						t.Fatalf("DecodeJSON(%s) = %#v, want an error", c.doc, out)
 					}
-					if out != "caller" {
-						t.Errorf("a failed DecodeJSON(%s) left %#v in the target, want the caller's value", c.doc, out)
+					want := any("caller")
+					if c.start != nil {
+						want = c.start()
+					}
+					if !reflect.DeepEqual(out, want) {
+						t.Errorf("a failed DecodeJSON(%s) left %#v in the target, want the caller's %#v", c.doc, out, want)
 					}
 					return
 				}
 				if err != nil {
 					t.Fatalf("DecodeJSON(%s): %v", c.doc, err)
 				}
-				if m, tagged := out.(map[string]any); tagged {
-					out = m["long"]
+				if m, tagged := out.(map[string]any); tagged && len(opts) > 0 {
+					for _, v := range m {
+						out = v
+					}
 				}
-				if out != c.want {
+				if !reflect.DeepEqual(out, c.want) {
 					t.Errorf("DecodeJSON(%s) = %#v, want %#v", c.doc, out, c.want)
 				}
 			})
 		}
 	}
+	// The same document into a map target and into a struct target.
+	s := avro.MustParse(`[` + recM + `,"string"]`)
+	doc := []byte(`{"R2":{"a":1,"b":2,"m":{"x":1}},"a":5,"b":6}`)
+	m := map[string]any{"own": "mine"}
+	avrotest.MustDecodeJSON(t, s, doc, &m)
+	if want := (map[string]any{"own": "mine", "a": int32(5), "b": int32(6), "m": map[string]any{}}); !reflect.DeepEqual(m, want) {
+		t.Errorf("map target: %#v, want %#v", m, want)
+	}
+	r := jsonUnionFallbackR{Extra: "mine"}
+	avrotest.MustDecodeJSON(t, s, doc, &r)
+	if want := (jsonUnionFallbackR{A: 5, B: 6, M: map[string]int64{}, Extra: "mine"}); !reflect.DeepEqual(r, want) {
+		t.Errorf("struct target: %#v, want %#v", r, want)
+	}
+	var row avro.ArrayRecord
+	avrotest.MustDecodeJSON(t, s, doc, &row)
+	if want := (avro.ArrayRecord{int32(5), int32(6), map[string]any{}}); !reflect.DeepEqual(row, want) {
+		t.Errorf("ArrayRecord target: %#v, want %#v", row, want)
+	}
+	// A map branch: the keys of the tagged map are gone and the caller's
+	// own keys stay, in an any and in a map target.
+	mu := avro.MustParse(`["null",` + mapU + `]`)
+	wantMap := map[string]any{"own": int64(1), "a": int64(5), "map": map[string]any{"x": int64(1)}}
+	var inAny any = map[string]any{"own": int64(1)}
+	avrotest.MustDecodeJSON(t, mu, []byte(`{"map":{"x":1},"a":5}`), &inAny)
+	typed := map[string]any{"own": int64(1)}
+	avrotest.MustDecodeJSON(t, mu, []byte(`{"map":{"x":1},"a":5}`), &typed)
+	if !reflect.DeepEqual(inAny, any(wantMap)) || !reflect.DeepEqual(typed, wantMap) {
+		t.Errorf("a tagged map that does not close: %#v in an any and %#v in a map target, want %#v", inAny, typed, wantMap)
+	}
+	// A tagged form that closes and cannot go into the target leaves the
+	// target as it was.
+	dec := avro.MustParse(`["long",{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}]`)
+	var str fmt.Stringer = big.NewRat(1, 2)
+	if err := dec.DecodeJSON([]byte(`{"long":5}`), &str); err == nil || str == nil {
+		t.Errorf("a long into a fmt.Stringer with a *big.Rat: err %v, and the target has %v; want an error and the *big.Rat", err, str)
+	}
+}
+
+// jsonUnionFallbackR is a record with a map field, so a key that a failed
+// tagged attempt wrote could outlive the bare fallback, and a field the schema
+// does not map.
+type jsonUnionFallbackR struct {
+	A     int32            `avro:"a"`
+	B     int32            `avro:"b"`
+	M     map[string]int64 `avro:"m"`
+	Extra string           `avro:"-"`
 }
 
 // minAllocsPerRun returns the fewest allocations one call of f makes over

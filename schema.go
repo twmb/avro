@@ -100,6 +100,11 @@ type customWiring struct {
 	// CustomType has an Encode. The runtime proxy custom[node].encode != nil
 	// would wrongly skip the arm for a wildcard with Encode.
 	encodeSuppresses bool
+	// goTypes is the GoType of each matching CustomType with a Decode: what
+	// a value of the node decodes to besides its Avro-native value. A union
+	// with the node as a branch replaces a value of one of these types when
+	// another branch arrives.
+	goTypes []reflect.Type
 }
 
 // schemaNode preserves full schema metadata that canonical form strips:
@@ -1370,7 +1375,7 @@ func (b *builder) finalize() error {
 		// branch-name tables) from the resolved names: buildUnion ran
 		// them with the unresolved as-written names for fwd-ref branches.
 		if m.branches != nil && m.deser != nil {
-			if err := finalizeUnionNames(m.ser.tags, m.deser, m.branches); err != nil {
+			if err := finalizeUnionNames(m.ser.tags, m.deser, m.branches, b.custom); err != nil {
 				return err
 			}
 		}
@@ -1695,6 +1700,7 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 	}
 	var encoders []encoder
 	var decoders []func(any, *SchemaNode) (any, error)
+	var goTypes []reflect.Type
 
 	for _, ct := range b.customTypes {
 		if !ct.matches(node) {
@@ -1705,6 +1711,9 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 		}
 		if ct.Decode != nil {
 			decoders = append(decoders, ct.Decode)
+			if ct.GoType != nil && !slices.Contains(goTypes, ct.GoType) {
+				goTypes = append(goTypes, ct.GoType)
+			}
 		}
 	}
 
@@ -1804,6 +1813,7 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 	if len(decoders) > 0 {
 		wiring.decoders = decoders
 	}
+	wiring.goTypes = goTypes
 	return wiring
 }
 
@@ -2097,7 +2107,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		unionStd = append(unionStd, bn)
 		unionLog = append(unionLog, ln)
 	}
-	fillUnionTagTables(tags, deser, branchNodes, unionStd, unionLog)
+	fillUnionTagTables(tags, deser, branchNodes, b.custom, unionStd, unionLog)
 	// byKind serves type-name dispatch in the encoders (see
 	// unionTypeNameForValue). Primitive kinds only: named branches go through
 	// tagged dispatch, and the spec guarantees primitive kinds are unique
@@ -2164,6 +2174,7 @@ type unionTags struct {
 	byName map[string]int // the tag you write, to branch index
 	byKind map[string]int // primitive branch kind to branch index; first wins
 	emit   []string       // the tag each branch emits under TagLogicalTypes
+	shape  unionShape     // what each branch decodes to in an any
 }
 
 func (t *unionTags) branchByName(name string) (int, bool) {
@@ -2186,8 +2197,11 @@ func (t *unionTags) branchByKind(kind string) (int, bool) {
 // emits, a copy of the logical one that the JSON encoder and decoder emit,
 // and the one the encoders and the JSON decoder resolve a written tag
 // through. An exact branch name outranks a logical qualifier, so a branch
-// never emits a tag the decoder would hand to a different branch.
-func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNode, standard, logical []string) {
+// never emits a tag the decoder would hand to a different branch. It also
+// builds the union's shape, with the custom types of this parse's overlay.
+func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNode, custom map[*schemaNode]*customWiring, standard, logical []string) {
+	tags.shape = newUnionShape(branches, custom)
+	deser.shape = tags.shape
 	deser.branchNames = append(deser.branchNames[:0], standard...)
 	deser.logicalNames = deser.logicalNames[:0]
 	for i, ln := range logical {
@@ -2265,7 +2279,7 @@ func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNo
 // branch-name tables. Duplicate detection re-keys by resolved fullname, so a
 // short-name forward reference and an inline definition of the same type now
 // collide, and the tag tables rebuild on the resolved full name.
-func finalizeUnionNames(tags *unionTags, deser *deserUnion, branches []*schemaNode) error {
+func finalizeUnionNames(tags *unionTags, deser *deserUnion, branches []*schemaNode, custom map[*schemaNode]*customWiring) error {
 	saw := make(map[string]bool, len(branches))
 	for _, n := range branches {
 		key := n.kind
@@ -2282,7 +2296,7 @@ func finalizeUnionNames(tags *unionTags, deser *deserUnion, branches []*schemaNo
 	for i, n := range branches {
 		_, log[i] = unionBranchNames(n)
 	}
-	fillUnionTagTables(tags, deser, branches, std, log)
+	fillUnionTagTables(tags, deser, branches, custom, std, log)
 	return nil
 }
 

@@ -1181,6 +1181,8 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 // at a block boundary. A stream truncated mid-block, with a promised block
 // header, data, or sync marker cut short, returns an error matching
 // [io.ErrUnexpectedEOF] instead, never one matching [io.EOF].
+//
+// Decoding into v follows the rules of [avro.Schema.Decode].
 func (rd *Reader) Decode(v any) error {
 	if rd.closed {
 		return errClosed
