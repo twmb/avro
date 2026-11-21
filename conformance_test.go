@@ -22722,7 +22722,7 @@ func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
 	// The path is the wire, and how the caller passes the record, since a
 	// struct by value, a pointer to a struct, a map, and an ArrayRecord
 	// each go through a different serializer. The error names the record's
-	// Go type and the field.
+	// Go type and the field, and no Avro type: a nil is not a type mismatch.
 	three := int32(3)
 	nils := []struct {
 		name, schema string
@@ -22775,8 +22775,8 @@ func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
 					wire string
 					se   *avro.SemanticError
 				}{{"binary", bse}, {"JSON", jse}} {
-					if e.se.GoType != wantGo || e.se.AvroType != "record" || e.se.Field != "f" {
-						t.Errorf("%s: GoType %v, AvroType %q, Field %q; want %v, \"record\", \"f\"", e.wire, e.se.GoType, e.se.AvroType, e.se.Field, wantGo)
+					if e.se.GoType != wantGo || e.se.AvroType != "" || e.se.Field != "f" {
+						t.Errorf("%s: GoType %v, AvroType %q, Field %q; want %v, no Avro type, \"f\"", e.wire, e.se.GoType, e.se.AvroType, e.se.Field, wantGo)
 					}
 				}
 				if berr.Error() != jerr.Error() {

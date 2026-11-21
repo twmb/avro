@@ -13185,6 +13185,25 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 				t.Errorf("%s: a failed decode left %#v, want %#v", name, out, want)
 			}
 		}
+		// A record field that fails names the field and then the cause, on
+		// both decoders, into an any, a struct, and an ArrayRecord.
+		fieldErr := avro.MustParse(recB)
+		type bOnly struct {
+			B int64 `avro:"b"`
+		}
+		for name, target := range map[string]func() any{
+			"an any":         func() any { return new(any) },
+			"a struct":       func() any { return new(bOnly) },
+			"an ArrayRecord": func() any { return new(avro.ArrayRecord) },
+		} {
+			_, err := fieldErr.Decode(nil, target())
+			errj := fieldErr.DecodeJSON([]byte(`{"b":}`), target())
+			for _, err := range []error{err, errj} {
+				if err == nil || !strings.HasPrefix(err.Error(), "avro: field b: ") || strings.Contains(err.Error(), "cannot use") {
+					t.Errorf("a record with a bad field into %s: %v, want \"avro: field b: \" and the cause", name, err)
+				}
+			}
+		}
 		// A JSON null sets a pointer target to nil, as a binary null does.
 		null := avro.MustParse(`"null"`)
 		for _, w := range reuseWires {

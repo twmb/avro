@@ -25,12 +25,21 @@ func (e *SemanticError) Error() string {
 	gt := formatGoType(e.GoType)
 	var s string
 	switch {
-	case e.Field != "" && gt != "":
+	case e.Field != "" && gt != "" && e.AvroType != "":
 		// Field is built from schema field names, which have no length cap
 		// (WithLaxNames admits any non-empty string), so we truncate it here
 		// rather than let a hostile name amplify into an equally large error
 		// on every mismatched datum. The public e.Field keeps the full value.
 		s = fmt.Sprintf("avro: field %s: cannot use %s with Avro type %s", truncForError(e.Field), gt, e.AvroType)
+	case e.Field != "":
+		// The field is what tells you where the cause is. A field that
+		// failed for a cause other than a type mismatch has no Avro type,
+		// and a record that decodes into an any or a map has no Go type to
+		// name. With no cause, the Avro type is all there is to say.
+		s = fmt.Sprintf("avro: field %s", truncForError(e.Field))
+		if e.Err == nil && e.AvroType != "" {
+			s += ": unsupported Avro type " + e.AvroType
+		}
 	case gt != "" && e.AvroType != "":
 		s = fmt.Sprintf("avro: cannot use %s with Avro type %s", gt, e.AvroType)
 	case gt != "":
@@ -66,7 +75,8 @@ func semErrW(v reflect.Value, avroType string, err error) error {
 // recordFieldError builds the dotted path for nested records. For an inner
 // SemanticError we prepend the field name to the path and keep the inner
 // error's type information, so the chain does not fill with misleading
-// intermediate "record" types.
+// intermediate "record" types. Any other cause is not a type mismatch, so the
+// error names the record's Go type and no Avro type.
 func recordFieldError(goType reflect.Type, fieldName string, err error) error {
 	var inner *SemanticError
 	if errors.As(err, &inner) {
@@ -81,7 +91,7 @@ func recordFieldError(goType reflect.Type, fieldName string, err error) error {
 			Err:      inner.Err,
 		}
 	}
-	return &SemanticError{GoType: goType, AvroType: "record", Field: fieldName, Err: err}
+	return &SemanticError{GoType: goType, Field: fieldName, Err: err}
 }
 
 // ShortBufferError indicates the input buffer is too short for the value

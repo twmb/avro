@@ -3067,6 +3067,21 @@ func TestSemanticErrorFormat(t *testing.T) {
 			"avro: unsupported Avro type map",
 		},
 		{
+			"field with no Go type",
+			&SemanticError{AvroType: "record", Field: "b", Err: fmt.Errorf("oops")},
+			"avro: field b: oops",
+		},
+		{
+			"field of a Go type, with a cause",
+			&SemanticError{GoType: reflect.TypeFor[struct{}](), Field: "b", Err: fmt.Errorf("oops")},
+			"avro: field b: oops",
+		},
+		{
+			"field with no Go type and no cause",
+			&SemanticError{AvroType: "bytes", Field: "f"},
+			"avro: field f: unsupported Avro type bytes",
+		},
+		{
 			"bare",
 			&SemanticError{},
 			"avro: semantic error",
