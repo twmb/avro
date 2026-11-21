@@ -22241,6 +22241,29 @@ func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
 			}
 		})
 	}
+	// A custom type's callback gets the record's props at a reference
+	// inside the record, as at the record itself.
+	t.Run("props", func(t *testing.T) {
+		var seen []any
+		ct := avro.CustomType{AvroType: "record", Decode: func(v any, sn *avro.SchemaNode) (any, error) {
+			seen = append(seen, sn.Props["foo"])
+			return v, nil
+		}}
+		s := avro.MustParse(`{"type":"record","name":"R","foo":"bar","fields":[{"name":"a","type":"long"},{"name":"next","type":["null","R"]}]}`, ct)
+		v := map[string]any{"a": int64(1), "next": map[string]any{"a": int64(2), "next": nil}}
+		for name, decode := range map[string]func() error{
+			"Decode":     func() error { var out any; _, err := s.Decode(avrotest.MustEncode(t, s, v), &out); return err },
+			"DecodeJSON": func() error { var out any; return s.DecodeJSON(avrotest.MustEncodeJSON(t, s, v), &out) },
+		} {
+			seen = nil
+			if err := decode(); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if len(seen) != 2 || seen[0] != "bar" || seen[1] != "bar" {
+				t.Errorf("%s: the callback saw props %v, want bar at both records", name, seen)
+			}
+		}
+	})
 }
 
 // A forward-referenced named type carrying a CustomType must encode and decode

@@ -2672,6 +2672,11 @@ func (b *builder) buildRecord(o *aobject) error {
 		serRecord:   sr,
 		deserRecord: dr,
 	}
+	// A reference inside the record's own fields wires its custom types
+	// before build sets the props, so the node has them from the start.
+	if len(o.extra) > 0 {
+		nd.props = o.extra
+	}
 	// The node and the parse's skip walk back dr.fieldSkips, which
 	// compiles lazily at decode time, after every field fixup has landed.
 	dr.node = nd
