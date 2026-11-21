@@ -1881,6 +1881,9 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 						src, err = s.deserItem(src, reflect.ValueOf(&anys[i]).Elem(), sl)
 					}
 				default:
+					// The block body is a function of its own so that
+					// deser keeps few enough returns for the compiler to
+					// open-code its defer.
 					src, err = s.typedBlock(src, sliceVal, start, k, sl)
 				}
 			}
@@ -1897,7 +1900,8 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 // found an error, or found typed, a slice of a type other than []any, which
 // is a typed target. What an interface has is not addressable, so we decode
 // into a copy of the slice header, which reuses the backing array, and store
-// the copy.
+// the copy. It takes anySlice's err, rather than deser returning it, so that
+// deser keeps few enough returns for the compiler to open-code its defer.
 func (s *deserArray) deserTypedInAny(src []byte, v, typed reflect.Value, err error, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err

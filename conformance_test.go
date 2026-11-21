@@ -9641,9 +9641,9 @@ func TestMatrix_SchemaCacheCustomTypeRefRejected(t *testing.T) {
 
 	t.Run("wildcard CT (both empty) with a callback triggers rejection", func(t *testing.T) {
 		// A wildcard's callback runs on every node and converts values
-		// there, which a cached subtree bakes in as it does any other
-		// custom type's, in both directions. A wildcard with no callback
-		// changes nothing and is not checked.
+		// there. A cached subtree keeps those conversions, as it keeps any
+		// other custom type's, in both directions. A wildcard with no
+		// callback changes nothing and is not checked.
 		wildcard := avro.CustomType{
 			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
 				return nil, avro.ErrSkipCustomType

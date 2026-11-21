@@ -1475,9 +1475,9 @@ func (ctx *jsonDecoder) decodeUnion(v reflect.Value, node *schemaNode) error {
 		return nil
 	}
 
-	// Indirection is per-branch (see unionTarget), as in the binary
-	// deserUnion.deser. Pre-indirecting here would dereference a reused *T
-	// held in an interface and reject a custom Decode returning a pointer.
+	// Each branch follows pointers itself (unionShape.target), as the binary
+	// deserUnion.deser does. Following them here would dereference a reused
+	// *T in an interface and reject a custom Decode returning a pointer.
 
 	// A JSON object is either a tagged union {"type": value} or a bare
 	// record/map.

@@ -1780,8 +1780,8 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 
 	if len(encoders) > 0 {
 		customEncode := func(v reflect.Value) (reflect.Value, error) {
-			// A nil a union tries on this branch has no Go type to match,
-			// and the built-in serializer reports it.
+			// A nil that a union tries on this branch has no Go type to
+			// match, and the built-in serializer reports it.
 			if !v.IsValid() {
 				return v, nil
 			}
@@ -1947,12 +1947,12 @@ func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *name
 		return fmt.Errorf("avro: cached type %q contains %q which would match a CustomType on this Parse; re-parse %q with the CustomType first", truncForError(refName), truncForError(currentMatches), truncForError(refName))
 	case nt.hadCustomType && currentMatches == "":
 		// Reverse: the cached node was built with a CustomType (its raw
-		// ser/deser and JSON decodeJSON bake that conversion onto the shared
-		// node), but this Parse registers no matching CustomType. Reusing it
-		// would silently apply the original conversion to a Schema that never
-		// opted in, giving suppressed/raw values on both wire formats.
-		// Register the same CustomType in this Parse, or parse the inner type
-		// without one.
+		// ser/deser, and the JSON decoders of the references inside it,
+		// convert values), but this Parse registers no matching
+		// CustomType. Reusing it would silently apply the original
+		// conversion to a Schema that never opted in, giving suppressed/raw
+		// values on both wire formats. Register the same CustomType in this
+		// Parse, or parse the inner type without one.
 		return fmt.Errorf("avro: cached type %q was parsed with a CustomType affecting its subtree, but this Parse registers no matching CustomType; reusing it would apply that conversion here: register the CustomType in this Parse, or parse %q without one", truncForError(refName), truncForError(refName))
 	}
 	return nil
