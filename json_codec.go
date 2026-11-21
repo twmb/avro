@@ -218,9 +218,9 @@ func (s *Schema) AppendEncodeJSON(dst []byte, v any, opts ...Opt) ([]byte, error
 //
 // A bare record or map whose first key is the name of a union branch, with a
 // value that can start that branch, can decode as the tagged form of that
-// branch: the decode fails, or returns another value. If a record field or a
-// map key can have a branch's name, pass [TaggedUnions] to
-// [Schema.EncodeJSON]; the tagged form has one reading.
+// branch: the decode fails, or returns a value other than the one encoded. If
+// a record field or a map key can have a branch's name, pass [TaggedUnions]
+// to [Schema.EncodeJSON]; the tagged form has one reading.
 //
 // On a schema returned by [Resolve], src is JSON in the writer's shape, as a
 // producer using the writer schema would emit it. We apply full

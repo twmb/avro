@@ -1217,8 +1217,9 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 					return err
 				}
 			} else {
-				// The same key appearing twice is last-wins, matching Java,
-				// fastavro, and encoding/json on duplicate keys.
+				// The same key appearing twice decodes into what the first
+				// one wrote, as into any target you reuse: a map or a record
+				// gets the keys of both, and any other value is last-wins.
 				if seen[idx] {
 					prev := node.fields[idx].name
 					if seenKey != nil {
@@ -1610,8 +1611,8 @@ func (ctx *jsonDecoder) wrapBranch(v reflect.Value, union, branch *schemaNode) {
 // the bare form does not decode into it.
 //
 // We decode the tagged form into the map or pointer you have, not into a copy
-// of it, because the tagged form's object closes in every document but these,
-// and a copy would give up the reuse.
+// of it, because the tagged form's object closes in every document except one
+// that falls back to the bare form, and a copy would give up the reuse.
 func (ctx *jsonDecoder) undoTagged(target reflect.Value, branch *schemaNode, valuePos int) {
 	if branch.kind != "record" && branch.kind != "map" {
 		return

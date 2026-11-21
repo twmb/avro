@@ -340,15 +340,15 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, errors.New("decode requires a non-nil pointer")
 	}
+	// A nil pointer that v points at, and that the decode allocates before
+	// its value fails, stays nil.
+	fresh := nilPointerOnPath(rv.Elem())
 	// Slab-free schemas (scalar leaves, no custom wiring) never need the
 	// slab, so we skip the pool entirely. A nil slab keeps scalar decodes
 	// allocation-free even when GC has drained the pool. Opts only ever alter
 	// slab state, and they are inert outside union and record paths, which are
 	// never slab-free. So their mere presence takes the pooled path, keeping
 	// the nil-slab proof trivial.
-	// A nil pointer that v points at, and that the decode allocates before
-	// its value fails, stays nil.
-	fresh := nilPointerOnPath(rv.Elem())
 	if s.slabFree && len(opts) == 0 {
 		rest, err := s.deser(src, rv.Elem(), nil)
 		if err != nil && fresh.IsValid() {
@@ -1031,12 +1031,12 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
 			return nil, semErr(v, "record")
 		}
-		// A map or slice that v has is a typed target. We decode into a
-		// map[string]any here, which is the streaming-decode pattern, and
-		// into any other map or an ArrayRecord below, as into a typed
-		// target. We take the map out of v rather than unwrap v in
-		// indirectAlloc, because what an interface has is not addressable,
-		// and a decoder that calls v.Set on it would panic.
+		// A map or slice that v has is a typed target. We decode into any
+		// other map or an ArrayRecord immediately, as into a typed target,
+		// and into a map[string]any, which is the streaming-decode pattern,
+		// in the field loop below. We take the map out of v rather than
+		// unwrap v in indirectAlloc, because what an interface has is not
+		// addressable, and a decoder that calls v.Set on it would panic.
 		m, typed, err := anyMap(v, "record")
 		if err != nil {
 			return nil, err

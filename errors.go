@@ -55,9 +55,9 @@ func (e *SemanticError) Error() string {
 	return s
 }
 
-// causeText returns the text of err for the end of one of our messages. When
-// err is one of our own errors, we drop the "avro: " or "avro json: " that
-// starts it, so that a chain of our errors names the package once.
+// causeText returns the text of err for the end of one of our messages. We
+// drop a leading "avro: " or "avro json: ", which starts each of our own
+// errors, so that a chain of our errors names the package once.
 func causeText(err error) string {
 	s := err.Error()
 	if t, ok := strings.CutPrefix(s, "avro: "); ok {
