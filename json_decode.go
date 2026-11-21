@@ -139,22 +139,6 @@ func decodeLogicalFixed(b []byte, node *schemaNode) any {
 	return b
 }
 
-// assignAny sets a native Go value on a reflect.Value target. A nil val zeros
-// v; a val not assignable to a non-empty interface target returns a
-// SemanticError.
-func assignAny(v reflect.Value, val any, avroType string) error {
-	if val == nil {
-		setZero(v)
-		return nil
-	}
-	rv := reflect.ValueOf(val)
-	if v.Kind() == reflect.Interface && v.Type().NumMethod() != 0 && !rv.Type().AssignableTo(v.Type()) {
-		return &SemanticError{GoType: v.Type(), AvroType: avroType}
-	}
-	v.Set(rv)
-	return nil
-}
-
 // consumeSlabString consumes a JSON string and copies it into the slab
 // allocator, batching small string allocations into one backing buffer.
 func (ctx *jsonDecoder) consumeSlabString() (string, error) {
@@ -1487,47 +1471,31 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 				// bare record or map with that key, such as a map with the
 				// key "map".
 				if err := ctx.scanner.expect(':'); err == nil && (!unionBranchRecurses(branch.kind) || jsonTokenMatchesBranch(ctx.scanner.peek(), branch)) {
-					// start applies the union rules to the value the target
-					// has. A malformed `{"long": 42,` backtracks to the
-					// bare fallback. Before it does, what the tagged form
-					// wrote into the target's value is gone (see
-					// undoTagged), and the any or the map that start
-					// stopped at has its value back.
-					start, old := unionShapeOf(node).start(v, unionClass(branch), ctx.slab.taggedUnions)
-					target, toAny := unionTarget(v, branch)
-					var seed any
-					if target.Kind() == reflect.Interface && target.CanInterface() {
-						seed = target.Interface()
-					}
-					// The value decodes straight into target, or into a
-					// temporary when a TaggedUnions envelope goes around it.
-					direct := !toAny || ctx.decodesIntoAny(target, toAny)
-					cell, val := target, seed
-					if !direct {
-						cell = reflect.ValueOf(&val).Elem()
+					// The tagged form is known only when its object closes,
+					// so the value decodes into a cell whenever the target
+					// has an any or a map for it, and the target gets the
+					// value after the object closes. A malformed
+					// `{"long": 42,` backtracks to the bare form, after
+					// undoTagged removes what the value wrote into a value
+					// the target has.
+					var t unionTarget
+					unionShapeOf(node).target(&t, v, unionClass(branch), ctx.slab.taggedUnions)
+					dst := v
+					if t.slot.IsValid() {
+						dst = t.cell()
 					}
 					valuePos := ctx.scanner.pos
-					err := ctx.decodeValue(cell, branch)
+					err := ctx.decodeValue(dst, branch)
 					if err == nil && ctx.scanner.peek() == '}' {
 						ctx.scanner.pos++
-						switch {
-						case !toAny:
-							err = ctx.wrapPointer(target, node, branch)
-						case !direct:
-							err = assignAny(target, ctx.wrapUnion(target, val, node, branch), branch.kind)
+						if t.slot.IsValid() {
+							t.store(dst)
 						}
-						if err != nil && start.IsValid() {
-							setAny(start, old)
-						}
-						return err
+						ctx.wrapBranch(v, node, branch)
+						return nil
 					}
 					if err == nil {
-						// Before the put-back, while the target still has
-						// the value the tagged form decoded into.
-						ctx.undoTagged(target, branch, valuePos)
-					}
-					if start.IsValid() {
-						setAny(start, old)
+						ctx.undoTagged(dst, branch, valuePos)
 					}
 					// A key matching a container branch commits to the
 					// tagged form: the bare retry would re-decode the
@@ -1554,46 +1522,38 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 }
 
 // decodeBranchInto decodes the next JSON value as the given union branch and
-// writes the result into v.
-func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, union, branch *schemaNode) error {
-	start, old := unionShapeOf(union).start(rawV, unionClass(branch), ctx.slab.taggedUnions)
-	err := ctx.decodeBranch(rawV, union, branch)
-	if err != nil && start.IsValid() {
-		// The next branch the bare form tries starts from your value.
-		setAny(start, old)
-	}
-	return err
-}
-
-func (ctx *jsonDecoder) decodeBranch(rawV reflect.Value, union, branch *schemaNode) error {
-	v, toAny := unionTarget(rawV, branch)
-	if !toAny {
-		if err := ctx.decodeValue(v, branch); err != nil {
+// writes the result into v. A decode that fails leaves v as it was, for the
+// next branch the bare form tries.
+func (ctx *jsonDecoder) decodeBranchInto(v reflect.Value, union, branch *schemaNode) error {
+	var t unionTarget
+	if unionShapeOf(union).target(&t, v, unionClass(branch), ctx.slab.taggedUnions) {
+		if err := ctx.decodeValue(t.dst(v), branch); err != nil {
 			return err
 		}
-		return ctx.wrapPointer(v, union, branch)
+	} else {
+		cell := t.cell()
+		if err := ctx.decodeValue(cell, branch); err != nil {
+			return err
+		}
+		t.store(cell)
 	}
-	if ctx.decodesIntoAny(v, toAny) {
-		return ctx.decodeValue(v, branch)
+	ctx.wrapBranch(v, union, branch)
+	return nil
+}
+
+// wrapBranch wraps the value at v in the TaggedUnions envelope of branch.
+// unionEmitTag keeps the key byte-identical to the encode side's.
+func (ctx *jsonDecoder) wrapBranch(v reflect.Value, union, branch *schemaNode) {
+	if ctx.slab.taggedUnions {
+		wrapEnvelope(v, unionEmitTag(union, branch, ctx.slab.tagLogicalTypes))
 	}
-	// A TaggedUnions envelope goes around the value, so it decodes into a
-	// temporary that starts from the value v has.
-	var val any
-	if v.CanInterface() {
-		val = v.Interface()
-	}
-	if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err != nil {
-		return err
-	}
-	// wrapUnion returns nil for a null branch, so we go through
-	// assignAny, which sets a typed nil for an interface target.
-	return assignAny(v, ctx.wrapUnion(v, val, union, branch), branch.kind)
 }
 
 // undoTagged removes what the tagged form of branch wrote into the value the
 // target has, after the form decoded and its object did not close, so that
 // the bare form does not decode into it. A map loses the record's field names
-// or the tagged map's keys, an ArrayRecord's slots are set to nil, and a
+// or the tagged map's keys, and so loses a value you had under one of those
+// names. An ArrayRecord's slots for the record's fields are set to nil, and a
 // struct's fields for the record are set to zero. Without that, a map the bare
 // form fills in would keep the keys the tagged form wrote.
 //
@@ -1646,7 +1606,10 @@ func (ctx *jsonDecoder) undoTagged(target reflect.Value, branch *schemaNode, val
 		ctx.scanner.pos = end
 	case branch.kind != "record":
 	case t == arrayRecordType && v.CanInterface():
-		clear(v.Interface().(ArrayRecord))
+		// The tagged form wrote the slots of the fields. A TaggedUnions
+		// envelope kept the row's old length, which can be longer.
+		row := v.Interface().(ArrayRecord)
+		clear(row[:min(len(row), len(branch.fields))])
 	case v.Kind() == reflect.Struct && v.CanSet():
 		dr := branch.deserRecord
 		if dr == nil {
@@ -1665,49 +1628,6 @@ func (ctx *jsonDecoder) undoTagged(target reflect.Value, branch *schemaNode, val
 			}
 		}
 	}
-}
-
-// wrapPointer wraps the value of v in a TaggedUnions envelope when v is an
-// any with your pointer, which a union value decoded through, as Decode wraps
-// it. Any other v here is a typed target, which gets the bare value.
-func (ctx *jsonDecoder) wrapPointer(v reflect.Value, union, branch *schemaNode) error {
-	if !ctx.slab.taggedUnions || v.Kind() != reflect.Interface {
-		return nil
-	}
-	return assignAny(v, ctx.wrapUnion(v, v.Interface(), union, branch), branch.kind)
-}
-
-// decodesIntoAny reports whether a union value goes straight into the
-// interface target, where a temporary would cost an allocation per value and
-// would not reuse v's value: v takes any value, and no TaggedUnions envelope
-// wraps the value first.
-func (ctx *jsonDecoder) decodesIntoAny(v reflect.Value, toAny bool) bool {
-	return toAny && !ctx.slab.taggedUnions && v.Type().NumMethod() == 0 && v.CanInterface()
-}
-
-// unionTarget selects the decode target and toAny flag for a matched union
-// branch, with the same per-branch indirection as the binary
-// deserUnion.deser. A custom branch keeps the raw target so its
-// setCustomResult can put a pointer result into a reused interface or a
-// concrete *T field. An interface target is peeled and assigned directly. A
-// concrete target returns the un-peeled rawV, since the branch decode runs
-// its own indirectAlloc; returning the peeled value would let a union
-// pointer target accept twice maxIndirectDepth levels.
-func unionTarget(rawV reflect.Value, branch *schemaNode) (reflect.Value, bool) {
-	if branch.decodeJSON != nil {
-		return rawV, rawV.Kind() == reflect.Interface
-	}
-	// A pointer in an any is decoded through like any other pointer, so
-	// that TaggedUnions wraps that any, as the binary decoder does, and not
-	// an any the pointer points at.
-	if a := derefNoAlloc(rawV); a.Kind() == reflect.Interface && !a.IsNil() && a.Elem().Kind() == reflect.Pointer && !a.Elem().IsNil() {
-		return rawV, false
-	}
-	iv := indirectAlloc(rawV)
-	if iv.Kind() == reflect.Interface {
-		return iv, true
-	}
-	return rawV, false
 }
 
 // derefNoAlloc follows the non-nil pointers at v and returns the first value
@@ -1757,21 +1677,6 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, p byt
 		return fmt.Errorf("avro json: no union branch matched at offset %d: %w", ctx.scanner.pos, lastErr)
 	}
 	return fmt.Errorf("avro json: no union branch matched at offset %d", ctx.scanner.pos)
-}
-
-func (ctx *jsonDecoder) wrapUnion(v reflect.Value, val any, union, branch *schemaNode) any {
-	if !ctx.slab.taggedUnions || val == nil {
-		return val
-	}
-	// As in the binary deserUnion.maybeWrap, the envelope applies only to an
-	// interface target that map[string]any is assignable to; a non-empty
-	// interface receives the bare value.
-	if v.Kind() == reflect.Interface && !mapStringAnyType.AssignableTo(v.Type()) {
-		return val
-	}
-	// unionEmitTag keeps the decode-side key byte-identical to the encode
-	// side's.
-	return map[string]any{unionEmitTag(union, branch, ctx.slab.tagLogicalTypes): val}
 }
 
 func jsonTokenMatchesBranch(p byte, branch *schemaNode) bool {

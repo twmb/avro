@@ -13162,6 +13162,20 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 				t.Errorf("a failed union decode left %#v in a %T, want your value", got, ptr)
 			}
 		}
+		// With TaggedUnions, the envelope in the any and the map behind the
+		// pointer in the envelope both come back.
+		for _, w := range reuseWires {
+			bad := map[string][]byte{"binary": {2}, "json": []byte(`{"B":{"b":"x"}}`)}[w.name]
+			m := map[string]any{"own": "mine"}
+			var x any = &m
+			w.mustDecode(t, two, w.encode(t, two, a(1), avro.TaggedUnions()), &x, avro.TaggedUnions())
+			if err := w.decode(two, bad, &x, avro.TaggedUnions()); err == nil {
+				t.Fatalf("%s: a bad union value decoded", w.name)
+			}
+			if want := (map[string]any{"A": &m}); !reflect.DeepEqual(x, any(want)) || x.(map[string]any)["A"] != any(&m) || !reflect.DeepEqual(m, a(1)) {
+				t.Errorf("%s: a failed union decode left %#v and %#v behind the pointer, want %#v and %#v", w.name, x, m, want, a(1))
+			}
+		}
 		// The same after a ["null", T] union and after a resolved union,
 		// which decode a branch from code of their own.
 		nl := avro.MustParse(`["null","long"]`)
@@ -13204,13 +13218,56 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 				}
 			}
 		}
-		// A JSON null sets a pointer target to nil, as a binary null does.
-		null := avro.MustParse(`"null"`)
+		// A null sets a pointer target and a pointer in an any to nil, on
+		// both decoders and in a union, and leaves the value behind the
+		// pointer.
+		for _, schema := range []string{`"null"`, `["null",` + arrL + `,"string"]`} {
+			null := avro.MustParse(schema)
+			for _, w := range reuseWires {
+				var x any = []any{int64(9)}
+				p, inAny := &x, any(&x)
+				w.mustDecode(t, null, w.encode(t, null, nil), &p)
+				w.mustDecode(t, null, w.encode(t, null, nil), &inAny)
+				if p != nil || inAny != nil || !reflect.DeepEqual(x, any([]any{int64(9)})) {
+					t.Errorf("%s: %s: a null left the pointer target %v, the any %v, and %#v behind the pointer; want nil, nil, and []any{9}", w.name, schema, p, inAny, x)
+				}
+			}
+		}
+		// With TaggedUnions, the any that a *any target points at gets the
+		// envelope on both decoders, on every decode, and so does the any of
+		// a *any field and of each element of a []*any field.
+		for _, c := range []struct {
+			name, schema string
+			val          any
+			want         map[string]any
+		}{
+			{"a long", `["long","string"]`, int64(5), map[string]any{"long": int64(5)}},
+			{"a decimal", `["long",{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}]`, big.NewRat(5, 4), map[string]any{"bytes": big.NewRat(5, 4)}},
+			{"a custom type", `["string",{"type":"long","logicalType":"money"}]`, &money{500}, map[string]any{"long": &money{500}}},
+		} {
+			s := avro.MustParse(c.schema, ct)
+			for _, w := range reuseWires {
+				var x any
+				p := &x
+				for i := range 2 {
+					w.mustDecode(t, s, w.encode(t, s, c.val, avro.TaggedUnions()), &p, avro.TaggedUnions())
+					if !reflect.DeepEqual(x, any(c.want)) {
+						t.Errorf("%s: %s: decode %d into a *any target: %#v, want %#v", w.name, c.name, i, x, c.want)
+					}
+				}
+			}
+		}
+		type anyFields struct {
+			F *any   `avro:"f"`
+			L []*any `avro:"l"`
+		}
+		fields := avro.MustParse(`{"type":"record","name":"H","fields":[{"name":"f","type":["null",` + recA + `]},{"name":"l","type":{"type":"array","items":["null","A"]}}]}`)
 		for _, w := range reuseWires {
-			p := new(int64)
-			w.mustDecode(t, null, w.encode(t, null, nil), &p)
-			if p != nil {
-				t.Errorf("%s: a null left a pointer target non-nil", w.name)
+			var h anyFields
+			w.mustDecode(t, fields, w.encode(t, fields, map[string]any{"f": a(1), "l": []any{a(1)}}), &h, avro.TaggedUnions())
+			want := any(map[string]any{"A": a(1)})
+			if h.F == nil || !reflect.DeepEqual(*h.F, want) || len(h.L) != 1 || h.L[0] == nil || !reflect.DeepEqual(*h.L[0], want) {
+				t.Errorf("%s: a *any field and a []*any field: %#v, want %#v in each any", w.name, h, want)
 			}
 		}
 		// A slice of your own type in an any counts once against the depth

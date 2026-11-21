@@ -384,7 +384,7 @@ type deserUnion struct {
 // replaced, and a union with two or more records or maps always decodes one
 // of them into a new map.
 type unionShape struct {
-	class              []byte // per branch: 'm', 'a', 'r', or 0
+	class              []byte // per branch: 'm', 'a', 'r', 'n' for null, or 0
 	maps, arrays, rats int    // how many branches have each class
 	// customGo is the Go type each custom type on a branch declares for
 	// what its Decode returns.
@@ -396,13 +396,16 @@ func unionClass(n *schemaNode) byte {
 	if n == nil {
 		return 0
 	}
-	switch {
-	case n.kind == "record" || n.kind == "map":
-		return 'm'
-	case n.kind == "array":
-		return 'a'
-	case n.logical == "decimal" || n.logical == "big-decimal":
+	if n.logical == "decimal" || n.logical == "big-decimal" {
 		return 'r'
+	}
+	switch n.kind {
+	case "record", "map":
+		return 'm'
+	case "array":
+		return 'a'
+	case "null":
+		return 'n'
 	}
 	return 0
 }
@@ -457,21 +460,33 @@ func (u *unionShape) replaces(x any, c byte) bool {
 	return c == 'm' && u.maps > 1 && reflect.ValueOf(x).Kind() == reflect.Map
 }
 
-// start applies the union rules to the value the target v has, before a value
-// of a branch with class c decodes into it. tagged says a TaggedUnions
-// envelope goes around the value: an any then has the envelope of an earlier
-// decode, and we put the value inside it back in the any. A value in an any
-// that has another branch's type is set to nil, and so is a map when the
-// union has two or more records or maps, so that the branch decodes into a
-// new one.
-//
-// start returns the any or the map it stopped at and the value that had, for
-// the caller to put back when the decode fails. After an envelope, that is
-// the any with the envelope.
-func (u *unionShape) start(v reflect.Value, c byte, tagged bool) (at reflect.Value, old any) {
+// unionTarget says where the value of one branch of a union goes in a
+// target: straight into the target, or into a cell, a new value of slot's
+// type that starts from seed, which store puts in the target after a decode
+// that worked, so that a decode that fails or panics leaves the target as it
+// was.
+type unionTarget struct {
+	slot   reflect.Value // the any or the map the value goes in
+	seed   any           // what the value decodes into: what slot has, or nil
+	env    reflect.Value // an any whose TaggedUnions envelope has a pointer to slot
+	inside any           // that pointer
+}
+
+// target applies the union rules to what the target v has, for a value of a
+// branch with class c, fills t with where the value goes, and reports whether
+// the value decodes straight into the target, at dst. tagged says a
+// TaggedUnions envelope goes around the value, so an any with the envelope of
+// an earlier decode stands for the value inside it. A value in an any that
+// has another branch's type is replaced, and so is a map when the union has
+// two or more records or maps. A null decodes into no value, so it decodes
+// straight into v.
+func (u *unionShape) target(t *unionTarget, v reflect.Value, c byte, tagged bool) (direct bool) {
+	if c == 'n' {
+		return true
+	}
+	direct = true
 	// We follow the pointers the decoders follow, a pointer and a pointer in
 	// an any, without allocating one.
-	inEnvelope := false
 	for range maxIndirectDepth {
 		if v.Kind() == reflect.Pointer && !v.IsNil() {
 			v = v.Elem()
@@ -481,34 +496,83 @@ func (u *unionShape) start(v reflect.Value, c byte, tagged bool) (at reflect.Val
 			break
 		}
 		x := v.Interface()
-		if !inEnvelope {
-			at, old = v, x
-		}
+		env := false
 		if w, ok := x.(map[string]any); ok && len(w) == 1 && tagged {
-			// The rules apply to the value inside, which we look at next.
-			tagged, inEnvelope = false, true
+			// The rules apply to the value inside.
+			tagged, env, direct = false, true, false
 			for _, x = range w {
 			}
-			setAny(v, x)
+		}
+		replace := u.replaces(x, c)
+		if p := reflect.ValueOf(x); !replace && p.Kind() == reflect.Pointer && !p.IsNil() {
+			if env {
+				t.env, t.inside = v, x
+			}
+			v = p.Elem()
 			continue
 		}
-		if u.replaces(x, c) {
-			v.SetZero()
-			return at, old
+		t.slot, t.seed = v, x
+		if replace {
+			t.seed, direct = nil, false
 		}
-		in := v.Elem()
-		if in.Kind() != reflect.Pointer || in.IsNil() {
-			return at, old
-		}
-		v = in.Elem()
+		return direct
 	}
-	if v.Kind() == reflect.Map && c == 'm' && u.maps > 1 && !v.IsNil() && v.CanSet() && v.CanInterface() {
-		if !inEnvelope {
-			at, old = v, v.Interface()
-		}
-		v.SetZero()
+	switch {
+	case v.Kind() == reflect.Map && c == 'm' && u.maps > 1 && !v.IsNil() && v.CanSet():
+		// The cell starts as a nil map.
+		t.slot, direct = v, false
+	case t.env.IsValid():
+		// A value behind the pointer in the envelope that is not an any
+		// decodes through the pointer.
+		t.slot, t.seed, t.env = t.env, t.inside, reflect.Value{}
 	}
-	return at, old
+	return direct
+}
+
+// dst returns where a value that decodes straight into the target v goes: the
+// any that target stopped at, which is where v's pointers lead, so that a
+// custom type's branch decodes into the same any as every other branch.
+func (t *unionTarget) dst(v reflect.Value) reflect.Value {
+	if t.slot.IsValid() {
+		return t.slot
+	}
+	return v
+}
+
+// cell returns a new value of slot's type that has seed.
+func (t *unionTarget) cell() reflect.Value {
+	if t.slot.Type() == anyType {
+		p := new(any)
+		*p = t.seed
+		return reflect.ValueOf(p).Elem()
+	}
+	c := reflect.New(t.slot.Type()).Elem()
+	if t.seed != nil {
+		c.Set(reflect.ValueOf(t.seed))
+	}
+	return c
+}
+
+// store puts the value that cell c decoded into the target. An any whose
+// envelope had a pointer to slot gets the pointer back, for the caller to
+// wrap.
+func (t *unionTarget) store(c reflect.Value) {
+	t.slot.Set(c)
+	if t.env.IsValid() {
+		t.env.Set(reflect.ValueOf(t.inside))
+	}
+}
+
+// wrapEnvelope puts the value of the any at v, or of the any that v's
+// pointers point at, in a TaggedUnions envelope named name. An interface with
+// methods, a nil any, and any other target keep the bare value: a
+// map[string]any does not have an interface's methods.
+func wrapEnvelope(v reflect.Value, name string) {
+	v = derefNoAlloc(v)
+	if v.Kind() != reflect.Interface || !v.Elem().IsValid() || !mapStringAnyType.AssignableTo(v.Type()) {
+		return
+	}
+	v.Set(reflect.ValueOf(map[string]any{name: v.Elem().Interface()}))
 }
 
 // unionShapeOf returns the shape of the union node n, which Parse builds with
@@ -551,49 +615,49 @@ func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 }
 
 // branch decodes a value of branch idx into v with fn. The union rules apply
-// to the value v has first, TaggedUnions wraps the result, and a decode that
-// fails leaves your value in the target.
+// to the value v has, and TaggedUnions wraps the result.
 func (s *deserUnion) branch(src []byte, v reflect.Value, sl *slab, idx int, fn deserfn) ([]byte, error) {
-	var at reflect.Value
-	var old any
-	// A nil any has no value for the rules to apply to, and a branch that
-	// fails leaves it nil.
+	// A nil any has no value for the rules to apply to.
 	if v.Kind() != reflect.Interface || !v.IsNil() {
 		var c byte
 		if idx < len(s.shape.class) {
 			c = s.shape.class[idx]
 		}
-		at, old = s.shape.start(v, c, sl.taggedUnions && !s.noWrap)
+		var t unionTarget
+		if !s.shape.target(&t, v, c, sl.taggedUnions && !s.noWrap) {
+			cell := t.cell()
+			src, err := fn(src, cell, sl)
+			if err != nil {
+				return src, err
+			}
+			t.store(cell)
+			s.maybeWrap(v, sl, int32(idx))
+			return src, nil
+		}
+		src, err := fn(src, t.dst(v), sl)
+		if err == nil {
+			s.maybeWrap(v, sl, int32(idx))
+		}
+		return src, err
 	}
 	src, err := fn(src, v, sl)
 	if err == nil {
 		s.maybeWrap(v, sl, int32(idx))
-	} else if at.IsValid() {
-		setAny(at, old)
 	}
 	return src, err
 }
 
 // maybeWrap wraps a decoded union value with its branch name when TaggedUnions
-// is enabled and the target is an interface type that map[string]any can be
-// assigned to. In practice that means *any: a plain map does not satisfy any
-// non-empty interface's method set. We skip non-interface targets and
-// interfaces with methods.
+// is enabled.
 func (s *deserUnion) maybeWrap(v reflect.Value, sl *slab, idx int32) {
-	if s.noWrap || !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
-		return
-	}
-	// Skip if the wrapping map[string]any can't be assigned to v's
-	// interface type. We use the cached type rather than building a throwaway
-	// reflect.Value(map[string]any{}), which allocates per call.
-	if !mapStringAnyType.AssignableTo(v.Type()) {
+	if s.noWrap || !sl.taggedUnions {
 		return
 	}
 	name := s.branchNames[idx]
 	if sl.tagLogicalTypes {
 		name = s.logicalNames[idx]
 	}
-	v.Set(reflect.ValueOf(map[string]any{name: v.Elem().Interface()}))
+	wrapEnvelope(v, name)
 }
 
 // deserNullUnion handles ["null", T] unions. The branch index is a varint:

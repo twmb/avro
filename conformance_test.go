@@ -24033,15 +24033,16 @@ func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 // TestMatrix_JSONUnionFailureKeepsTarget pins that a union value DecodeJSON
 // cannot decode leaves the value the caller has in an any target, with and
 // without TaggedUnions: a tagged form whose value decodes but whose object
-// does not close, where the bare fallback then fails too; a record branch that
-// fails partway; and a number no branch holds. The "decodes" row shows the
-// target is written at all. In the rows named "then bare decodes", the tagged
-// form writes into the caller's map or pointer before the bare fallback, and
-// the result must have nothing the tagged form wrote. A union with one record decodes
-// into the caller's map, which keeps the caller's own keys. A union with two
-// records or maps decodes into a new map. A struct keeps the field the
-// schema does not map. A map target, a struct target, an ArrayRecord, and a
-// target of an interface type with methods follow after the table.
+// does not close, where the bare fallback then fails too; a record branch
+// that fails partway; and a number no branch holds. The "decodes" row shows
+// the target is written at all. In the rows named "then bare decodes", the
+// tagged form writes into the caller's map or pointer before the bare
+// fallback, and the result must have nothing the tagged form wrote. A union
+// with one record decodes into the caller's map, which keeps the caller's own
+// keys. A union with two records or maps decodes into a new map. A struct
+// keeps the field the schema does not map. A map target, a struct target, an
+// ArrayRecord, and a target of an interface type with methods follow after
+// the table.
 func TestMatrix_JSONUnionFailureKeepsTarget(t *testing.T) {
 	rec := `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int"}]}`
 	// recM has a map field with a default, so a key that a failed tagged
@@ -24078,6 +24079,15 @@ func TestMatrix_JSONUnionFailureKeepsTarget(t *testing.T) {
 		// for a map with the key "map".
 		{"a map with the key map", `["null",{"type":"map","values":"string"}]`, `{"map":"x","other":"y"}`,
 			map[string]any{"map": "x", "other": "y"}, func() any { return nil }},
+		{"a record with a field named as its branch", `["null",{"type":"record","name":"R","fields":[{"name":"R","type":"string"}]}]`, `{"R":"x"}`,
+			map[string]any{"R": "x"}, func() any { return nil }},
+		{"a map with the key array", `[{"type":"array","items":"long"},{"type":"map","values":"long"}]`, `{"array":5}`,
+			map[string]any{"array": int64(5)}, func() any { return nil }},
+		// The tagged record decodes into a new map behind the pointer and
+		// its object does not close. The map you had comes back with the
+		// key "a" it had, which is also a field of the record.
+		{"tagged into a new map then bare fails", `[` + recM + `,{"type":"map","values":"long"}]`, `{"R2":{"a":1,"b":2},"zz":1}`,
+			nil, func() any { m := map[string]any{"a": "mine", "own": "x"}; return &m }},
 		// The int branch replaces the array branch's []any before it
 		// decodes, and the []any is back after the int overflows.
 		{"a failed branch gives the value back", `[{"type":"array","items":"long"},"int"]`, `9999999999`, nil, func() any { return []any{int64(1)} }},
@@ -24134,6 +24144,13 @@ func TestMatrix_JSONUnionFailureKeepsTarget(t *testing.T) {
 	avrotest.MustDecodeJSON(t, s, doc, &row)
 	if want := (avro.ArrayRecord{int32(5), int32(6), map[string]any{}}); !reflect.DeepEqual(row, want) {
 		t.Errorf("ArrayRecord target: %#v, want %#v", row, want)
+	}
+	// The tagged form clears the slots of the record's fields only, also
+	// in an ArrayRecord in a TaggedUnions envelope.
+	long := avro.ArrayRecord{"p", "q", nil, "extra4", "extra5"}
+	var env any = map[string]any{"R2": long}
+	if err := s.DecodeJSON([]byte(`{"R2":{"a":1,"b":2,"m":{"x":1}},"a":5,"b":"bad"}`), &env, avro.TaggedUnions()); err == nil || long[3] != "extra4" || long[4] != "extra5" {
+		t.Errorf("an ArrayRecord longer than the record: err %v, and the slots past the fields have %#v; want an error and extra4 and extra5", err, long[3:])
 	}
 	// A map branch: the keys of the tagged map are gone and the caller's
 	// own keys stay, in an any and in a map target.

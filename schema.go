@@ -127,7 +127,7 @@ type schemaNode struct {
 	branches    []*schemaNode // union branches
 	ser         serfn
 	deser       deserfn
-	decodeJSON  jsonDecodeFn // non-nil only when custom decoders are wired
+	decodeJSON  jsonDecodeFn // non-nil when a CustomType changes what DecodeJSON returns here
 	serRecord   *serRecord
 	deserRecord *deserRecord
 

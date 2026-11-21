@@ -7711,23 +7711,44 @@ func TestCustomTypeErrors(t *testing.T) {
 	})
 
 	t.Run("decode_panic", func(t *testing.T) {
-		// A panic in Decode leaves your value in an any target.
-		s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"long","logicalType":"money"}}]}`, CustomType{
-			LogicalType: "money",
-			Decode:      func(any, *SchemaNode) (any, error) { panic("boom") },
-		})
-		data, _ := s.Encode(map[string]any{"m": int64(1)})
-		var v any = "caller"
-		func() {
-			defer func() {
-				if r := recover(); r != "boom" {
-					t.Errorf("recovered %v, want the panic from Decode", r)
+		// A panic in Decode leaves your value in an any target, after a
+		// union took the value out of its envelope or replaced it too.
+		money := `{"type":"long","logicalType":"money"}`
+		for _, c := range []struct {
+			name, schema string
+			val, start   any
+			opts         []Opt
+		}{
+			{"record", `{"type":"record","name":"R","fields":[{"name":"m","type":` + money + `}]}`, map[string]any{"m": int64(1)}, "caller", nil},
+			{"union envelope", `["string",` + money + `]`, int64(1), map[string]any{"string": "x"}, []Opt{TaggedUnions()}},
+			{"union replaces", `[{"type":"array","items":"long"},` + money + `]`, int64(1), []any{int64(1)}, nil},
+		} {
+			s, err := Parse(c.schema, CustomType{
+				LogicalType: "money",
+				Decode:      func(any, *SchemaNode) (any, error) { panic("boom") },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bin, _ := s.Encode(c.val)
+			js, _ := s.EncodeJSON(c.val)
+			for name, decode := range map[string]func(*any){
+				"Decode":     func(v *any) { s.Decode(bin, v, c.opts...) },
+				"DecodeJSON": func(v *any) { s.DecodeJSON(js, v, c.opts...) },
+			} {
+				v := c.start
+				func() {
+					defer func() {
+						if r := recover(); r != "boom" {
+							t.Errorf("%s: %s: recovered %v, want the panic from Decode", c.name, name, r)
+						}
+					}()
+					decode(&v)
+				}()
+				if !reflect.DeepEqual(v, c.start) {
+					t.Errorf("%s: %s: got %#v, want the caller's %#v", c.name, name, v, c.start)
 				}
-			}()
-			s.Decode(data, &v)
-		}()
-		if v != "caller" {
-			t.Errorf("got %#v, want the caller's value", v)
+			}
 		}
 	})
 

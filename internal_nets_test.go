@@ -804,7 +804,7 @@ var censusRegistry = []censusQuestion{
 			"round trip must land where it started",
 		answerers: []censusAnswerer{
 			{repr: "JSON encode envelope (EMIT)", site: "appendUnionBranch", file: "json_codec.go"},
-			{repr: "JSON decode tagged-map wrap (EMIT)", site: "wrapUnion", file: "json_decode.go"},
+			{repr: "JSON decode tagged-map wrap (EMIT)", site: "wrapBranch", file: "json_decode.go"},
 			{repr: "resolved union wrap tables (EMIT)", site: "resolveReaderUnion / resolveUnionUnion", file: "resolve.go"},
 			{
 				repr: "compiled EMIT tables (binary decode wrap)",
@@ -821,7 +821,7 @@ var censusRegistry = []censusQuestion{
 				// Definition, its doc heading, and the one call in
 				// appendUnionBranch.
 				"json_codec.go",
-				// wrapUnion's call plus the comment naming why it is shared
+				// wrapBranch's call plus the comment naming why it is shared
 				// with the encode side.
 				"json_decode.go",
 				// Two calls, each with a comment line naming the reader union

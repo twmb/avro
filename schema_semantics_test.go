@@ -15162,9 +15162,10 @@ func TestRegression_SliceElementPointerChainBounded(t *testing.T) {
 }
 
 // Binary and JSON decode must accept the same set of pointer-target depths. A
-// JSON union decode that indirects at two stages (unionTarget then the branch's
-// decodeKind) peels up to 2*maxIndirectDepth levels and accepts targets binary
-// rejects. Sweep every depth and assert the two wires agree.
+// JSON union decode that indirects at two stages (the union's walk to its
+// target, then the branch's decodeKind) peels up to 2*maxIndirectDepth levels
+// and accepts targets binary rejects. Sweep every depth and assert the two
+// wires agree.
 func TestGenerative_UnionPointerTargetDepthBinaryJSONParity(t *testing.T) {
 	s := avro.MustParse(`["null","int"]`)
 	bin, _ := s.Encode(int64(7))
