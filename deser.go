@@ -399,6 +399,10 @@ type unionShape struct {
 	// customGo is the Go type each custom type on a branch declares for
 	// what its Decode returns.
 	customGo []reflect.Type
+	// names are the keys a TaggedUnions envelope of the union has: each
+	// branch's name and its logical name. A one-key map with another key
+	// is not an envelope.
+	names []string
 }
 
 // unionClass returns the unionShape class of one branch.
@@ -506,9 +510,12 @@ func (u *unionShape) target(t *unionTarget, v reflect.Value, c byte, tagged bool
 		x := v.Interface()
 		env := false
 		if w, ok := x.(map[string]any); ok && len(w) == 1 && tagged {
-			// The rules apply to the value inside.
-			tagged, env, direct = false, true, false
-			for _, x = range w {
+			for k, in := range w {
+				// The rules apply to the value inside an envelope.
+				if slices.Contains(u.names, k) {
+					tagged, env, direct = false, true, false
+					x = in
+				}
 			}
 		}
 		replace := u.replaces(x, c)
@@ -599,6 +606,9 @@ func unionShapeOf(n *schemaNode) *unionShape {
 // writer's values decode as.
 func readerShape(r *schemaNode, custom map[*schemaNode]*customWiring, branches ...*schemaNode) unionShape {
 	u := newUnionShape(r.branches, custom)
+	if r.tags != nil {
+		u.names = r.tags.shape.names
+	}
 	u.class = make([]byte, len(branches))
 	for i, b := range branches {
 		u.class[i] = unionClass(b)

@@ -2247,7 +2247,6 @@ func (t *unionTags) branchByKind(kind string) (int, bool) {
 // builds the union's shape, with the custom types of this parse's overlay.
 func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNode, custom map[*schemaNode]*customWiring, standard, logical []string) {
 	tags.shape = newUnionShape(branches, custom)
-	deser.shape = tags.shape
 	deser.branchNames = append(deser.branchNames[:0], standard...)
 	deser.logicalNames = deser.logicalNames[:0]
 	for i, ln := range logical {
@@ -2256,6 +2255,8 @@ func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNo
 		}
 		deser.logicalNames = append(deser.logicalNames, ln)
 	}
+	tags.shape.names = append(slices.Clip(deser.branchNames), deser.logicalNames...)
+	deser.shape = tags.shape
 	tags.emit = append(tags.emit[:0], deser.logicalNames...)
 	// We build the accept table by offering every branch to every tier in
 	// order, so it is the same set findUnionBranch accepts: across tiers

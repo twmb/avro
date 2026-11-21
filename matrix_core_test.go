@@ -14048,6 +14048,10 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 				[]any{[]any{int64(7)}}, nil, []any{int64(7)}, "", same},
 			{"union of two records: a map of your own type is replaced", `[` + recA + `,` + recB + `]`, func() any { return map[string]int64{"own": 1} },
 				[]any{a(1)}, nil, a(1), "", fresh},
+			// The kept key shows the map was decoded into.
+			{"TaggedUnions: a one-key map whose key names no branch is not an envelope", `["null",` + mapL + `]`,
+				func() any { return map[string]any{"k": int64(1)} },
+				[]any{map[string]any{"x": int64(2)}}, []avro.Opt{avro.TaggedUnions()}, map[string]any{"map": map[string]any{"k": int64(1), "x": int64(2)}}, "", 0},
 		} {
 			s := avro.MustParse(c.schema)
 			// inside returns the map, slice, or pointer the any has, from
