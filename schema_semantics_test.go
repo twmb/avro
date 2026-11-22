@@ -12134,6 +12134,61 @@ func TestMatrix_SchemaCacheCustomBoundaryGuard(t *testing.T) {
 			}
 		}
 	})
+	// Inside a cached type, both encoders use the custom types of the parse
+	// that defined it, even when a later parse registers others.
+	t.Run("custom-encoders-inside-a-cached-type", func(t *testing.T) {
+		times := func(n int64) avro.CustomType {
+			return avro.CustomType{LogicalType: "cents", AvroType: "long", Encode: func(v any, _ *avro.SchemaNode) (any, error) {
+				return v.(int64) * n, nil
+			}}
+		}
+		var cache avro.SchemaCache
+		if _, err := cache.Parse(`{"type":"record","name":"Inner","fields":[{"name":"c","type":{"type":"long","logicalType":"cents"}}]}`, times(10)); err != nil {
+			t.Fatal(err)
+		}
+		s, err := cache.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":"Inner"}]}`, times(100))
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := map[string]any{"i": map[string]any{"c": int64(5)}}
+		bin, err := s.Encode(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		js, err := s.EncodeJSON(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fromBin, fromJSON any
+		avrotest.MustDecode(t, s, bin, &fromBin)
+		avrotest.MustDecodeJSON(t, s, js, &fromJSON)
+		if want := map[string]any{"i": map[string]any{"c": int64(50)}}; !reflect.DeepEqual(fromBin, want) || !reflect.DeepEqual(fromJSON, want) {
+			t.Errorf("Encode gives %v and EncodeJSON %v, want %v from the first parse's custom type", fromBin, fromJSON, want)
+		}
+		// A resolved decode with the later schema as reader uses the first
+		// parse's custom type inside the type too, as a plain Decode does.
+		named := func(out string) avro.CustomType {
+			return avro.CustomType{LogicalType: "cents", AvroType: "long", Decode: func(any, *avro.SchemaNode) (any, error) { return out, nil }}
+		}
+		var dcache avro.SchemaCache
+		if _, err := dcache.Parse(`{"type":"record","name":"Inner","fields":[{"name":"c","type":{"type":"long","logicalType":"cents"}}]}`, named("first")); err != nil {
+			t.Fatal(err)
+		}
+		reader, err := dcache.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":"Inner"}]}`, named("later"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		writer := avro.MustParse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"c","type":"long"}]}},{"name":"x","type":"long"}]}`)
+		rs, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resolved any
+		avrotest.MustDecode(t, rs, avrotest.MustEncode(t, writer, map[string]any{"i": map[string]any{"c": int64(5)}, "x": int64(1)}), &resolved)
+		if want := map[string]any{"i": map[string]any{"c": "first"}}; !reflect.DeepEqual(resolved, want) {
+			t.Errorf("a resolved decode gives %v, want %v from the first parse's custom type", resolved, want)
+		}
+	})
 }
 
 // A self-referential schema cached without a CustomType and re-parsed (the

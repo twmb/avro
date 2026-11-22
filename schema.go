@@ -973,6 +973,11 @@ type namedType struct {
 	// mismatches; the documented remediation path "re-parse Inner with the CT
 	// first" depends on this signal.
 	hadCustomType bool
+	// custom is the custom-type overlay of the parse that defined this
+	// named type. A later parse that references the type copies the
+	// wiring of the type's nodes from it, so EncodeJSON and Resolve apply
+	// the custom types that the type's compiled encoder and decoder have.
+	custom map[*schemaNode]*customWiring
 }
 
 type builder struct {
@@ -1354,7 +1359,7 @@ func (b *builder) tryAssignNamedRef(name, parentName string) (bool, error) {
 		if b.overlayDone == nil {
 			b.overlayDone = make(map[*schemaNode]bool)
 		}
-		b.overlayInheritedCustom(nt.node, b.overlayDone)
+		b.overlayInheritedCustom(nt.node, nt.custom, b.overlayDone)
 	}
 	b.canon = aschema{primitive: resolved}
 	b.ser = nt.node.ser
@@ -1517,6 +1522,7 @@ func (b *builder) finalize() error {
 			if b.customMatchInSubtree(nt.node) != "" {
 				nt.hadCustomType = true
 			}
+			nt.custom = b.custom
 		}
 	}
 	return nil
@@ -1774,9 +1780,7 @@ func (b *builder) siteNodeWith(node *schemaNode, w *customWiring) *schemaNode {
 
 // buildCustomWiring collects the per-node custom-type wiring from this parse's
 // registrations, or nil when none matches. It is pure with respect to the
-// builder and the node, which lets applyCustomTypes and
-// overlayInheritedCustom share it; inherited nodes get the overlay only,
-// since their wraps already live inside the inherited composition.
+// builder and the node.
 func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 	// Collect all matching encoders and decoders for this node.
 	type encoder struct {
@@ -1908,30 +1912,30 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 }
 
 // overlayInheritedCustom completes this parse's custom overlay for a
-// SchemaCache-inherited subtree. applyCustomTypes visits only newly built
-// nodes, so a reference to an inherited type left its matching nodes without
-// overlay entries: the wraps still fired on a direct decode, but Resolve,
-// which re-applies customs from the overlay, dropped the reader's custom and
-// returned raw values. We insert wiring only, no wraps, and keep existing
-// entries. visited is the per-parse b.overlayDone set; sharing it is sound
-// because the walk is idempotent within a parse.
-func (b *builder) overlayInheritedCustom(node *schemaNode, visited map[*schemaNode]bool) {
+// SchemaCache-inherited subtree with def, the overlay of the parse that
+// defined the type. applyCustomTypes visits only newly built nodes, so a
+// reference to an inherited type left its matching nodes without the overlay
+// entries that Resolve and EncodeJSON read. The wraps inside the type are the
+// defining parse's, so the overlay copies that parse's wiring, and keeps
+// existing entries. visited is the per-parse b.overlayDone set; sharing it is
+// sound because the walk is idempotent within a parse.
+func (b *builder) overlayInheritedCustom(node *schemaNode, def map[*schemaNode]*customWiring, visited map[*schemaNode]bool) {
 	if node == nil || visited[node] {
 		return
 	}
 	visited[node] = true
 	if b.custom[node] == nil {
-		if w := b.buildCustomWiring(node); w != nil {
+		if w := def[node]; w != nil {
 			b.putCustomWiring(node, w)
 		}
 	}
 	for _, f := range node.fields {
-		b.overlayInheritedCustom(f.node, visited)
+		b.overlayInheritedCustom(f.node, def, visited)
 	}
-	b.overlayInheritedCustom(node.items, visited)
-	b.overlayInheritedCustom(node.values, visited)
+	b.overlayInheritedCustom(node.items, def, visited)
+	b.overlayInheritedCustom(node.values, def, visited)
 	for _, br := range node.branches {
-		b.overlayInheritedCustom(br, visited)
+		b.overlayInheritedCustom(br, def, visited)
 	}
 }
 
