@@ -14098,6 +14098,15 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 		if intoUsed >= intoNew {
 			t.Errorf("a decimal into a used any: %v allocations, want fewer than the %v into a new any", intoUsed, intoNew)
 		}
+		// The tagged JSON form of a union value goes where the bare form
+		// goes, so it takes no more allocations.
+		nl := avro.MustParse(`["null","long"]`)
+		taggedJSON, bareJSON := []byte(`{"long":500}`), []byte(`500`)
+		tagged := minAllocsPerRun(20, func() { var x any; _ = nl.DecodeJSON(taggedJSON, &x) })
+		bare := minAllocsPerRun(20, func() { var x any; _ = nl.DecodeJSON(bareJSON, &x) })
+		if tagged > bare {
+			t.Errorf("a tagged union value into a new any: %v allocations, want no more than the %v of the bare form", tagged, bare)
+		}
 		// DecodeJSON takes a decimal as a bare number too.
 		old := big.NewRat(1, 2)
 		var x any = old

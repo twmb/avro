@@ -1528,24 +1528,23 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 				// bare record or map with that key, such as a map with the
 				// key "map".
 				if err := ctx.scanner.expect(':'); err == nil && (!unionBranchRecurses(branch.kind) || jsonTokenMatchesBranch(ctx.scanner.peek(), branch)) {
-					// The tagged form is known only when its object closes,
-					// so the value decodes into a cell whenever the target
-					// has an any or a map for it, and the target gets the
-					// value after the object closes. A malformed
-					// `{"long": 42,` backtracks to the bare form, after
-					// undoTagged removes what the value wrote into a value
-					// the target has.
+					// The value goes where the union rules put it, as in
+					// decodeBranchInto. The tagged form is known only when
+					// its object closes: a malformed `{"long": 42,`
+					// backtracks to the bare form, after undoTagged removes
+					// what the value wrote into a value the target has and
+					// the any gets that value back.
 					var t unionTarget
-					unionShapeOf(node).target(&t, v, unionClass(branch), ctx.slab.taggedUnions)
-					dst := v
-					if t.slot.IsValid() {
+					direct := unionShapeOf(node).target(&t, v, unionClass(branch), ctx.slab.taggedUnions)
+					dst := t.dst(v)
+					if !direct {
 						dst = t.cell()
 					}
 					valuePos := ctx.scanner.pos
 					err := ctx.decodeValue(dst, branch)
 					if err == nil && ctx.scanner.peek() == '}' {
 						ctx.scanner.pos++
-						if t.slot.IsValid() {
+						if !direct {
 							t.store(dst)
 						}
 						ctx.wrapBranch(v, node, branch)
@@ -1553,6 +1552,9 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 					}
 					if err == nil {
 						ctx.undoTagged(dst, branch, valuePos)
+						if direct && t.slot.IsValid() {
+							setAny(t.slot, t.seed)
+						}
 					}
 					// A key matching a container branch commits to the
 					// tagged form: the bare retry would re-decode the
