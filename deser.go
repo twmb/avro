@@ -3253,7 +3253,7 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	// text, and the encoder rejects a non-numeric string for a decimal. So
 	// string is numeric-text-only and []byte the sole opaque carrier,
 	// symmetric on both sides.
-	return src, setBytesValue(v, b, "decimal", sl)
+	return src, setBytesValue(v, b, "bytes", sl)
 }
 
 type deserBigDecimal struct{}

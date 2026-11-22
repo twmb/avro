@@ -3257,22 +3257,27 @@ func TestLogicalTypeDeserTypeMismatch(t *testing.T) {
 	tests := []struct {
 		name   string
 		schema string
+		in     any
 	}{
-		{"timestamp-millis into bool", `{"type":"long","logicalType":"timestamp-millis"}`},
-		{"timestamp-micros into bool", `{"type":"long","logicalType":"timestamp-micros"}`},
-		{"date into bool", `{"type":"int","logicalType":"date"}`},
-		{"time-millis into bool", `{"type":"int","logicalType":"time-millis"}`},
-		{"time-micros into bool", `{"type":"long","logicalType":"time-micros"}`},
+		{"timestamp-millis into bool", `{"type":"long","logicalType":"timestamp-millis"}`, ptr(int64(42))},
+		{"timestamp-micros into bool", `{"type":"long","logicalType":"timestamp-micros"}`, ptr(int64(42))},
+		{"date into bool", `{"type":"int","logicalType":"date"}`, ptr(int64(42))},
+		{"time-millis into bool", `{"type":"int","logicalType":"time-millis"}`, ptr(int64(42))},
+		{"time-micros into bool", `{"type":"long","logicalType":"time-micros"}`, ptr(int64(42))},
+		{"bytes decimal into bool", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`, big.NewRat(1, 2)},
+		{"fixed decimal into bool", `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":4,"scale":2}`, big.NewRat(1, 2)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := mustParse(t, tt.schema)
-			encoded := mustAppendEncode(t, s, nil, ptr(int64(42)))
-			// Decode into incompatible type.
+			// Decode into incompatible type. Both decoders name the same
+			// Avro type in the error.
 			var v bool
-			_, err := s.Decode(encoded, &v)
-			if err == nil {
-				t.Fatal("expected error decoding logical type into bool")
+			_, err := s.Decode(mustAppendEncode(t, s, nil, tt.in), &v)
+			jerr := s.DecodeJSON(mustAppendEncodeJSON(t, s, nil, tt.in), &v)
+			var se, jse *SemanticError
+			if !errors.As(err, &se) || !errors.As(jerr, &jse) || se.AvroType != jse.AvroType {
+				t.Fatalf("Decode: %v; DecodeJSON: %v; want a SemanticError with the same AvroType", err, jerr)
 			}
 		})
 	}
