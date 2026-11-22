@@ -1069,17 +1069,19 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		// your value.
 		//
 		// A field decodes into the value m has for it, which only a map m
-		// had before this decode can have. fnIface stores a new value
-		// without reading the old one, so a field whose old value is a
-		// target takes fn.
+		// had before this decode can have, when that value is a target.
+		// fnIface stores a new value without reading the old one, so a
+		// field whose old value is a target takes fn.
 		look := len(m) > 0
 		for i := range s.fields {
 			f := &s.fields[i]
 			var old any
 			if look {
-				old = m[f.name]
+				if x := m[f.name]; isTarget(x) {
+					old = x
+				}
 			}
-			if f.fnIface != nil && !isTarget(old) {
+			if f.fnIface != nil && old == nil {
 				var val any
 				val, src, err = f.fnIface(src, sl)
 				if err != nil {

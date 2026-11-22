@@ -154,12 +154,13 @@ func reusesMapValue(t reflect.Type) bool {
 	return false
 }
 
-// mapValueInto sets elem to the value the map m has for key, if m has one. We
-// read a map[string]any as a Go map, since MapIndex copies an interface value
-// to the heap.
+// mapValueInto sets elem to the value the map m has for key, if m has one. A
+// map[string]any gives only a value that is a target, since a decode replaces
+// any other. We read a map[string]any as a Go map, since MapIndex copies an
+// interface value to the heap.
 func mapValueInto(m, key, elem reflect.Value) {
 	if m.Type() == mapStringAnyType && m.CanInterface() {
-		if x, ok := m.Interface().(map[string]any)[key.String()]; ok {
+		if x := m.Interface().(map[string]any)[key.String()]; isTarget(x) {
 			setAny(elem, x)
 		}
 		return

@@ -926,7 +926,9 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 					return err
 				}
 				if look {
-					val = m[key]
+					if x := m[key]; isTarget(x) {
+						val = x
+					}
 				}
 				if err := ctx.decodeValue(valV, node.values); err != nil {
 					return err
@@ -1313,7 +1315,9 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 		func(idx int, key string) error {
 			f := &node.fields[idx]
 			if look {
-				val = m[f.name]
+				if x := m[f.name]; isTarget(x) {
+					val = x
+				}
 			}
 			if err := ctx.decodeValue(valV, f.node); err != nil {
 				return recordFieldError(nil, f.name, err)
@@ -1326,7 +1330,9 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 			f := &node.fields[idx]
 			var defVal any
 			if look {
-				defVal = m[f.name]
+				if x := m[f.name]; isTarget(x) {
+					defVal = x
+				}
 			}
 			defValV := reflect.ValueOf(&defVal).Elem()
 			if err := ctx.applyFieldDefault(defValV, node, idx); err != nil {

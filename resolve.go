@@ -510,7 +510,9 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, m map[stri
 		}
 		name := rr.readerNames[op.readerIdx]
 		if look {
-			setAny(elem, m[name])
+			if x := m[name]; isTarget(x) {
+				setAny(elem, x)
+			}
 		}
 		if src, err = op.read(src, elem, sl); err != nil {
 			return nil, recordFieldError(nil, name, err)
@@ -522,7 +524,9 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, m map[stri
 	for _, d := range rr.defaults {
 		name := rr.readerNames[d.readerIdx]
 		if look {
-			setAny(elem, m[name])
+			if x := m[name]; isTarget(x) {
+				setAny(elem, x)
+			}
 		}
 		if _, err = d.deser(d.encodedDefault, elem, sl); err != nil {
 			return nil, recordFieldError(nil, name, err)

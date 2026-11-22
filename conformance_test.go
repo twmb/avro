@@ -23567,6 +23567,25 @@ func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 		if !reflect.DeepEqual(nb, sb) {
 			t.Errorf("binary record-into-any: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
 		}
+		// A field's old number is replaced, so a field that a custom type
+		// matches decodes as if the map had no value for it, with no more
+		// allocations.
+		fschema := `{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"long","logicalType":"money"}}]}`
+		fskip := avro.MustParse(fschema, avro.CustomType{LogicalType: "money", Decode: skip.Decode})
+		fbin := avrotest.MustEncode(t, avro.MustParse(fschema), Rw{A: 5})
+		fjson := avrotest.MustEncodeJSON(t, avro.MustParse(fschema), Rw{A: 5})
+		m := map[string]any{"a": int64(1)}
+		var x any = m
+		for name, decode := range map[string]func(){
+			"Decode":     func() { _, _ = fskip.Decode(fbin, &x) },
+			"DecodeJSON": func() { _ = fskip.DecodeJSON(fjson, &x) },
+		} {
+			withOld := minAllocsPerRun(20, decode)
+			without := minAllocsPerRun(20, func() { delete(m, "a"); decode() })
+			if withOld > without {
+				t.Errorf("%s: %v allocations with the field's old number in the map, want no more than the %v without it", name, withOld, without)
+			}
+		}
 	})
 
 	t.Run("map-into-any-control", func(t *testing.T) {
