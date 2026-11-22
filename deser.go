@@ -463,7 +463,9 @@ func newUnionShape(branches []*schemaNode, custom map[*schemaNode]*customWiring)
 
 // replaces reports whether a value of a branch with class c replaces x, the
 // value an any has, where a decode outside a union would decode into x or
-// return an error: x has the type another branch decodes to.
+// return an error: x has the type of another branch. A Go map or an
+// ArrayRecord has the type of a record or map branch, and any other slice
+// has the type of an array branch.
 func (u *unionShape) replaces(x any, c byte) bool {
 	if x == nil {
 		return false
@@ -473,16 +475,20 @@ func (u *unionShape) replaces(x any, c byte) bool {
 		return true
 	}
 	switch x.(type) {
-	case map[string]any:
+	case map[string]any, ArrayRecord:
 		return c != 'm' && u.maps > 0 || c == 'm' && u.maps > 1
 	case []any:
 		return c != 'a' && u.arrays > 0
 	case *big.Rat:
 		return c != 'r' && u.rats > 0
 	}
-	// A map of your own type is still a Go map, and an ArrayRecord gets new
-	// slots as a map gets a new map.
-	return c == 'm' && u.maps > 1 && (reflect.ValueOf(x).Kind() == reflect.Map || reflect.TypeOf(x) == arrayRecordType)
+	switch v := reflect.ValueOf(x); v.Kind() {
+	case reflect.Map:
+		return c != 'm' && u.maps > 0 || c == 'm' && u.maps > 1
+	case reflect.Slice:
+		return v.Type().Elem().Kind() != reflect.Uint8 && c != 'a' && u.arrays > 0
+	}
+	return false
 }
 
 // unionTarget says where the value of one branch of a union goes in a
@@ -540,7 +546,9 @@ func (u *unionShape) target(t *unionTarget, v reflect.Value, c byte, tagged bool
 		t.slot, t.seed = v, x
 		if replace {
 			t.seed, direct = nil, false
-			if _, ok := x.(ArrayRecord); ok {
+			// A record gets new slots in an ArrayRecord, as a map gets a
+			// new map.
+			if _, ok := x.(ArrayRecord); ok && c == 'm' {
 				t.seed = ArrayRecord{}
 			}
 		}
