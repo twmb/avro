@@ -686,7 +686,7 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool, sl *slab
 	// resurrection, whose contract is the raw value.
 	switch node.logical {
 	case "decimal":
-		if ok, err := setDecimalValue(v, b, node.scale); ok {
+		if ok, err := setDecimalValue(v, b, node.scale, node.kind); ok {
 			return err
 		}
 	case "big-decimal":
@@ -769,7 +769,7 @@ func (ctx *jsonDecoder) decodeBareDecimal(v reflect.Value, node *schemaNode, toA
 		}
 		scale = s
 	}
-	if applied, err := setDecimalRat(v, r, scale); applied {
+	if applied, err := setDecimalRat(v, r, scale, node.kind); applied {
 		return true, err
 	}
 	return true, &SemanticError{GoType: v.Type(), AvroType: node.kind}

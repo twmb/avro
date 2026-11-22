@@ -190,7 +190,7 @@ func promoteStringToBytesDecimal(scale int) deserfn {
 		}
 		b := src[:n]
 		v = indirectAlloc(v)
-		ok, err := setDecimalValue(v, b, scale)
+		ok, err := setDecimalValue(v, b, scale, "bytes")
 		if err != nil {
 			return nil, err
 		}

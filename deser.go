@@ -3146,8 +3146,9 @@ func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 
 // setDecimalValue sets v from decimal bytes. Returns true if v was set,
 // false if v's Go type is not supported by the decimal decoder (caller
-// may fall back to the underlying bytes/fixed handler).
-func setDecimalValue(v reflect.Value, b []byte, scale int) (bool, error) {
+// may fall back to the underlying bytes/fixed handler). avroType is the
+// decimal's Avro type, bytes or fixed, which an error names.
+func setDecimalValue(v reflect.Value, b []byte, scale int, avroType string) (bool, error) {
 	// Bound the unscaled length before bytesToRat materializes a big.Int and
 	// setDecimalRat base-converts it (see maxDecimalUnscaledBytes). Returning
 	// (true, err) makes the binary deserBytesDecimal / deserFixedDecimal and
@@ -3156,7 +3157,7 @@ func setDecimalValue(v reflect.Value, b []byte, scale int) (bool, error) {
 	if err := checkDecimalUnscaledLen(b); err != nil {
 		return true, err
 	}
-	return setDecimalRat(v, bytesToRat(b, scale), scale)
+	return setDecimalRat(v, bytesToRat(b, scale), scale, avroType)
 }
 
 // ratTarget returns the *big.Rat that a decimal decodes into in place: one
@@ -3207,9 +3208,9 @@ func decimalInPlace(v reflect.Value, b []byte, scale int) (bool, error) {
 // setDecimalRat is the rat-input variant of setDecimalValue; the JSON
 // bare-number form already has a parsed *big.Rat. Both share this so the
 // target set and the float overflow guards stay the same on both wires.
-func setDecimalRat(v reflect.Value, r *big.Rat, scale int) (bool, error) {
+func setDecimalRat(v reflect.Value, r *big.Rat, scale int, avroType string) (bool, error) {
 	if v.Kind() == reflect.Interface {
-		return true, setIface(v, reflect.ValueOf(r), "decimal")
+		return true, setIface(v, reflect.ValueOf(r), avroType)
 	}
 	if v.Type() == bigRatType {
 		v.Set(reflect.ValueOf(*r))
@@ -3254,7 +3255,7 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 		return src, err
 	}
 	v = indirectAlloc(v)
-	if ok, err := setDecimalValue(v, b, s.scale); ok {
+	if ok, err := setDecimalValue(v, b, s.scale, "bytes"); ok {
 		return src, err
 	}
 	// Opaque-bytes pass-through for a []byte target, mirroring
@@ -3287,7 +3288,7 @@ func setBigDecimalTarget(v reflect.Value, payload []byte, sl *slab) error {
 	v = indirectAlloc(v)
 	done, err := applyBigDecimalPayload(v, payload)
 	if !done {
-		err = setBytesValue(v, payload, "big-decimal", sl)
+		err = setBytesValue(v, payload, "bytes", sl)
 	}
 	return err
 }
@@ -3302,7 +3303,7 @@ func setBigDecimalTarget(v reflect.Value, payload []byte, sl *slab) error {
 func applyBigDecimalPayload(v reflect.Value, payload []byte) (done bool, err error) {
 	r, displayScale, perr := parseBigDecimalPayload(payload)
 	if perr == nil {
-		if ok, serr := setDecimalRat(v, r, displayScale); ok {
+		if ok, serr := setDecimalRat(v, r, displayScale, "bytes"); ok {
 			return true, serr
 		}
 		return false, nil
@@ -3357,7 +3358,7 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 		return src, err
 	}
 	v = indirectAlloc(v)
-	if ok, err := setDecimalValue(v, b, s.scale); ok {
+	if ok, err := setDecimalValue(v, b, s.scale, "fixed"); ok {
 		return src, err
 	}
 	// Fall back to the opaque [N]byte or []byte fixed. The delegate gets a

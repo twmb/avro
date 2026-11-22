@@ -3266,18 +3266,23 @@ func TestLogicalTypeDeserTypeMismatch(t *testing.T) {
 		{"time-micros into bool", `{"type":"long","logicalType":"time-micros"}`, ptr(int64(42))},
 		{"bytes decimal into bool", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`, big.NewRat(1, 2)},
 		{"fixed decimal into bool", `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":4,"scale":2}`, big.NewRat(1, 2)},
+		{"big-decimal into bool", `{"type":"bytes","logicalType":"big-decimal"}`, big.NewRat(1, 2)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := mustParse(t, tt.schema)
-			// Decode into incompatible type. Both decoders name the same
-			// Avro type in the error.
-			var v bool
-			_, err := s.Decode(mustAppendEncode(t, s, nil, tt.in), &v)
-			jerr := s.DecodeJSON(mustAppendEncodeJSON(t, s, nil, tt.in), &v)
-			var se, jse *SemanticError
-			if !errors.As(err, &se) || !errors.As(jerr, &jse) || se.AvroType != jse.AvroType {
-				t.Fatalf("Decode: %v; DecodeJSON: %v; want a SemanticError with the same AvroType", err, jerr)
+			// Decode into incompatible type: a bool, and an any that has a
+			// map. Both decoders name the same Avro type in the error.
+			for _, target := range []func() any{
+				func() any { return new(bool) },
+				func() any { var x any = map[string]any{}; return &x },
+			} {
+				_, err := s.Decode(mustAppendEncode(t, s, nil, tt.in), target())
+				jerr := s.DecodeJSON(mustAppendEncodeJSON(t, s, nil, tt.in), target())
+				var se, jse *SemanticError
+				if !errors.As(err, &se) || !errors.As(jerr, &jse) || se.AvroType != jse.AvroType {
+					t.Errorf("Decode: %v; DecodeJSON: %v; want a SemanticError with the same AvroType", err, jerr)
+				}
 			}
 		})
 	}
