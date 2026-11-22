@@ -114,8 +114,9 @@ type CustomType struct {
 	// Decode converts a raw Avro-native value to your Go value. We call
 	// it after deserialization with the raw Avro-native value (int32 for
 	// int, int64 for long, []byte for bytes/fixed, etc.); return the
-	// type you want. Return [ErrSkipCustomType] to fall through. Any
-	// other non-nil error is fatal.
+	// type you want. Into an any, your result replaces the value the any
+	// has, a pointer included. Return [ErrSkipCustomType] to fall
+	// through. Any other non-nil error is fatal.
 	//
 	// When all matching decoders skip at a node, we re-decode the wire
 	// into the target faithfully (identical to a no-custom decode). A
