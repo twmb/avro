@@ -1219,9 +1219,11 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 					return err
 				}
 			} else {
-				// The same key appearing twice decodes into what the first
-				// one wrote, as into any target you reuse: a map or a record
-				// gets the keys of both, and any other value is last-wins.
+				// A key that appears twice decodes again. A struct field,
+				// an ArrayRecord slot, and a map that had entries before
+				// this decode are decoded into in place, so a map or record
+				// value gets the keys of both. A map that was empty gets the
+				// second value only.
 				if seen[idx] {
 					prev := node.fields[idx].name
 					if seenKey != nil {
