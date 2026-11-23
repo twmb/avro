@@ -12585,7 +12585,7 @@ func TestMatrix_UsedTargetParity(t *testing.T) {
 					// JSON decode with Decode.
 					compare := func(label string, first *input, in input) {
 						var res, errs [3]string
-						var reused, firstFailed, ran [3]bool
+						var reused, firstFailed, ran, sem [3]bool
 						for w := range 3 {
 							if w == 2 && (in.bare == nil || first != nil && first.bare == nil) {
 								continue
@@ -12614,6 +12614,8 @@ func TestMatrix_UsedTargetParity(t *testing.T) {
 							}
 							if err != nil {
 								errs[w] = err.Error()
+								var se *avro.SemanticError
+								sem[w] = errors.As(err, &se)
 							}
 							got := get()
 							res[w] = paritySnap(reflect.ValueOf(got), 0)
@@ -12628,6 +12630,8 @@ func TestMatrix_UsedTargetParity(t *testing.T) {
 							case firstFailed[0]:
 							case (errs[0] == "") != (errs[w] == ""):
 								fail("%s | %s: Decode error %q, %s error %q", cell, label, errs[0], d, errs[w])
+							case sem[0] != sem[w]:
+								fail("%s | %s: Decode error %q is a SemanticError: %v, %s error %q: %v", cell, label, errs[0], sem[0], d, errs[w], sem[w])
 							case res[0] != res[w]:
 								fail("%s | %s: Decode left %s, %s left %s (errors %q, %q)", cell, label, res[0], d, res[w], errs[0], errs[w])
 							case errs[0] == "" && reused[0] != reused[w]:
@@ -12885,6 +12889,7 @@ func parityCases() []parityCase {
 		{"u[recP,recQ]", `[` + recP + `,` + recQ + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"Q": map[string]any{"q": int64(2)}}}, false},
 		{"u[recP,map]", `[` + recP + `,` + mapL + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"map": map[string]any{"k": int64(5)}}}, false},
 		{"u[long,decimal]", `["long",` + dec + `]`, []any{int64(7), big.NewRat(5, 4)}, false},
+		{"u[long,map]", `["long",` + mapL + `]`, []any{int64(7), map[string]any{"k": int64(5)}}, false},
 		{"u[null,array,map,string]", `["null",` + arrL + `,` + mapL + `,"string"]`, []any{nil, []any{int64(1)}, map[string]any{"k": int64(5)}, "x"}, false},
 		{"u[bytes,string]", `["bytes","string"]`, []any{map[string]any{"bytes": []byte("b")}, map[string]any{"string": "x"}}, false},
 		{"array<record>", `{"type":"array","items":` + recP + `}`, []any{[]any{p(1)}, []any{p(2), p(3)}}, false},

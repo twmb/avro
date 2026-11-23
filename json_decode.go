@@ -1535,7 +1535,9 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 				// when its value can start that branch. Otherwise it is a
 				// bare record or map with that key, such as a map with the
 				// key "map".
-				if err := ctx.scanner.expect(':'); err == nil && (!unionBranchRecurses(branch.kind) || jsonTokenMatchesBranch(ctx.scanner.peek(), branch)) {
+				colonErr := ctx.scanner.expect(':')
+				fits := colonErr == nil && jsonTokenMatchesBranch(ctx.scanner.peek(), branch)
+				if colonErr == nil && (!unionBranchRecurses(branch.kind) || fits) {
 					// The value goes where the union rules put it, as in
 					// decodeBranchInto. The tagged form is known only when
 					// its object closes: a malformed `{"long": 42,`
@@ -1564,11 +1566,13 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 							setAny(t.slot, t.seed)
 						}
 					}
-					// A key matching a container branch commits to the
-					// tagged form: the bare retry would re-decode the
-					// subtree, 2^depth when a record field name collides
-					// with a branch name.
-					if errors.Is(err, errTooDeep) || err != nil && unionBranchRecurses(branch.kind) {
+					// A value that can start the branch commits to the
+					// tagged form, so its error is the error, as Decode
+					// returns for the same value. For a container branch,
+					// the bare retry would also re-decode the subtree,
+					// 2^depth when a record field name collides with a
+					// branch name.
+					if errors.Is(err, errTooDeep) || err != nil && fits {
 						return err
 					}
 					taggedErr = err
