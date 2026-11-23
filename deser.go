@@ -157,9 +157,24 @@ var numSlabOK = func() bool {
 // it. The elements an earlier decode stored mostly have one type, so we
 // compare each element's type word with that of the last element whose type
 // is never a target, and ask isTarget only for an element of another type.
-func hasTarget(s []any) bool {
-	if !numSlabOK {
-		return slices.ContainsFunc(s, isTarget)
+// names are the envelope keys of a union with TaggedUnions, or nil.
+func hasTarget(s []any, names []string) bool {
+	if !numSlabOK || names != nil {
+		for _, x := range s {
+			// With TaggedUnions, an envelope of an earlier decode stands
+			// for the value inside it.
+			if m, ok := x.(map[string]any); ok && len(m) == 1 && names != nil {
+				for k, in := range m {
+					if slices.Contains(names, k) {
+						x = in
+					}
+				}
+			}
+			if isTarget(x) {
+				return true
+			}
+		}
+		return false
 	}
 	var never unsafe.Pointer
 	for i := range s {
@@ -1283,6 +1298,9 @@ type deserArray struct {
 	// bypassing reflect. Selected at schema-build time based on the avro
 	// item type. nil for items with no iface-direct decoder; see ifaceFnFor.
 	fastIfaceLoop func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error)
+	// items is the items' node, whose union shape names the keys of a
+	// TaggedUnions envelope.
+	items *schemaNode
 	// rec is the items' record when deserItem is that record's own deser, with
 	// no custom type wrapped around it. A slice of structs or of single
 	// pointers to structs then decodes each block through the record's
@@ -1832,6 +1850,11 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	// element without reading the old one, so a block whose old elements
 	// have a target takes the generic loop below.
 	useFastIface := iface && s.fastIfaceLoop != nil
+	// envNames are the envelope keys of a union of items with TaggedUnions.
+	var envNames []string
+	if useFastIface && sl != nil && sl.taggedUnions && s.items != nil && s.items.kind == "union" {
+		envNames = unionShapeOf(s.items).names
+	}
 	// Avro arrays are encoded as a series of blocks. Each block starts
 	// with a count. Positive means N elements follow, zero means end of
 	// array. Negative means |N| elements follow, and the next varint is
@@ -1908,7 +1931,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 				switch {
 				case useFast:
 					src, err = s.fastLoop(src, sliceVal, start, k, sl)
-				case useFastIface && (start >= oldCap || !hasTarget(anys[start:min(end, oldCap)])):
+				case useFastIface && (start >= oldCap || !hasTarget(anys[start:min(end, oldCap)], envNames)):
 					src, err = s.fastIfaceLoop(src, anys, start, k, sl)
 				case iface:
 					for i := start; i < end && err == nil; i++ {

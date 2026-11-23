@@ -2987,7 +2987,7 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 	// it separately is how they came to hold different answers. Only
 	// da's was patched by the forward-ref fixup below.
 	itemMin := b.minBytes.minBytesOf(af.node)
-	da := &deserArray{deserItem: af.deser, minItemBytes: itemMin}
+	da := &deserArray{deserItem: af.deser, minItemBytes: itemMin, items: af.node}
 	// The same gate as the unsafe []*record field (tryCompileFieldDeser): a
 	// forward reference is not wired yet, and a custom type wraps deserItem.
 	if !isFwdRef && !af.meta.hasCustomType && af.meta.deserRecord != nil {
