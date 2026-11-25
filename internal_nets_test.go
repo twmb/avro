@@ -804,7 +804,7 @@ var censusRegistry = []censusQuestion{
 			"round trip must land where it started",
 		answerers: []censusAnswerer{
 			{repr: "JSON encode envelope (EMIT)", site: "appendUnionBranch", file: "json_codec.go"},
-			{repr: "JSON decode tagged-map wrap (EMIT)", site: "wrapUnion", file: "json_decode.go"},
+			{repr: "JSON decode tagged-map wrap (EMIT)", site: "wrapBranch", file: "json_decode.go"},
 			{repr: "resolved union wrap tables (EMIT)", site: "resolveReaderUnion / resolveUnionUnion", file: "resolve.go"},
 			{
 				repr: "compiled EMIT tables (binary decode wrap)",
@@ -821,7 +821,7 @@ var censusRegistry = []censusQuestion{
 				// Definition, its doc heading, and the one call in
 				// appendUnionBranch.
 				"json_codec.go",
-				// wrapUnion's call plus the comment naming why it is shared
+				// wrapBranch's call plus the comment naming why it is shared
 				// with the encode side.
 				"json_decode.go",
 				// Two calls, each with a comment line naming the reader union
@@ -4510,6 +4510,29 @@ func TestDoSBattery_C7_CyclicGoType(t *testing.T) {
 		_, err := long.Decode(wire, &p)
 		if err == nil {
 			return errors.New("cyclic pointer target unexpectedly accepted")
+		}
+		return nil
+	})
+
+	// A pointer that points at itself, at a union: the union looks at the
+	// value the target has before a branch decodes, and that walk is
+	// bounded too. Both decoders.
+	union := MustParse(`["null","long"]`)
+	wantTerminate(t, "Decode/self-pointing-target-at-a-union", func() error {
+		type P *P
+		var p P
+		p = &p
+		if _, err := union.Decode([]byte{2, 2}, &p); err == nil {
+			return errors.New("self-pointing target unexpectedly accepted")
+		}
+		return nil
+	})
+	wantTerminate(t, "DecodeJSON/self-pointing-target-at-a-union", func() error {
+		type P *P
+		var p P
+		p = &p
+		if err := union.DecodeJSON([]byte(`7`), &p); err == nil {
+			return errors.New("self-pointing target unexpectedly accepted")
 		}
 		return nil
 	})

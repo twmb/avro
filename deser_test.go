@@ -3067,6 +3067,36 @@ func TestSemanticErrorFormat(t *testing.T) {
 			"avro: unsupported Avro type map",
 		},
 		{
+			"field with no Go type",
+			&SemanticError{AvroType: "record", Field: "b", Err: fmt.Errorf("oops")},
+			"avro: field b: oops",
+		},
+		{
+			"field of a Go type, with a cause",
+			&SemanticError{GoType: reflect.TypeFor[struct{}](), Field: "b", Err: fmt.Errorf("oops")},
+			"avro: field b: oops",
+		},
+		{
+			"field with no Go type and no cause",
+			&SemanticError{AvroType: "bytes", Field: "f"},
+			"avro: field f: unsupported Avro type bytes",
+		},
+		{
+			"field with one of our errors as the cause",
+			&SemanticError{Field: "f", Err: &ShortBufferError{Type: "uvarlong"}},
+			"avro: field f: short buffer for uvarlong",
+		},
+		{
+			"field with one of our JSON errors as the cause",
+			&SemanticError{Field: "f", Err: fmt.Errorf("avro json: expected number at offset 5")},
+			"avro: field f: expected number at offset 5",
+		},
+		{
+			"type mismatch with one of our errors as the cause",
+			&SemanticError{GoType: reflect.TypeFor[int](), AvroType: "string", Err: &ShortBufferError{Type: "string", Need: 10, Have: 3}},
+			"avro: cannot use int with Avro type string: short buffer for string: need 10, have 3",
+		},
+		{
 			"bare",
 			&SemanticError{},
 			"avro: semantic error",
@@ -3227,22 +3257,32 @@ func TestLogicalTypeDeserTypeMismatch(t *testing.T) {
 	tests := []struct {
 		name   string
 		schema string
+		in     any
 	}{
-		{"timestamp-millis into bool", `{"type":"long","logicalType":"timestamp-millis"}`},
-		{"timestamp-micros into bool", `{"type":"long","logicalType":"timestamp-micros"}`},
-		{"date into bool", `{"type":"int","logicalType":"date"}`},
-		{"time-millis into bool", `{"type":"int","logicalType":"time-millis"}`},
-		{"time-micros into bool", `{"type":"long","logicalType":"time-micros"}`},
+		{"timestamp-millis into bool", `{"type":"long","logicalType":"timestamp-millis"}`, ptr(int64(42))},
+		{"timestamp-micros into bool", `{"type":"long","logicalType":"timestamp-micros"}`, ptr(int64(42))},
+		{"date into bool", `{"type":"int","logicalType":"date"}`, ptr(int64(42))},
+		{"time-millis into bool", `{"type":"int","logicalType":"time-millis"}`, ptr(int64(42))},
+		{"time-micros into bool", `{"type":"long","logicalType":"time-micros"}`, ptr(int64(42))},
+		{"bytes decimal into bool", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`, big.NewRat(1, 2)},
+		{"fixed decimal into bool", `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":4,"scale":2}`, big.NewRat(1, 2)},
+		{"big-decimal into bool", `{"type":"bytes","logicalType":"big-decimal"}`, big.NewRat(1, 2)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := mustParse(t, tt.schema)
-			encoded := mustAppendEncode(t, s, nil, ptr(int64(42)))
-			// Decode into incompatible type.
-			var v bool
-			_, err := s.Decode(encoded, &v)
-			if err == nil {
-				t.Fatal("expected error decoding logical type into bool")
+			// Decode into incompatible type: a bool, and an any that has a
+			// map. Both decoders name the same Avro type in the error.
+			for _, target := range []func() any{
+				func() any { return new(bool) },
+				func() any { var x any = map[string]any{}; return &x },
+			} {
+				_, err := s.Decode(mustAppendEncode(t, s, nil, tt.in), target())
+				jerr := s.DecodeJSON(mustAppendEncodeJSON(t, s, nil, tt.in), target())
+				var se, jse *SemanticError
+				if !errors.As(err, &se) || !errors.As(jerr, &jse) || se.AvroType != jse.AvroType {
+					t.Errorf("Decode: %v; DecodeJSON: %v; want a SemanticError with the same AvroType", err, jerr)
+				}
 			}
 		})
 	}
@@ -7682,37 +7722,65 @@ func parseMoney(t *testing.T, schema string) *Schema {
 
 func TestCustomTypeErrors(t *testing.T) {
 	t.Run("decode_fatal", func(t *testing.T) {
+		// The error from Decode comes back, and a nil any stays nil.
 		myErr := errors.New("boom")
-		s, _ := Parse(`{"type":"long","logicalType":"money"}`, CustomType{
-			LogicalType: "money",
-			Decode:      func(any, *SchemaNode) (any, error) { return nil, myErr },
-		})
-		data, _ := s.Encode(int64(1))
-		var v any
-		_, err := s.Decode(data, &v)
-		if !errors.Is(err, myErr) {
-			t.Fatalf("got %v", err)
+		money := `{"type":"long","logicalType":"money"}`
+		for _, schema := range []string{money, `["null",` + money + `]`, `["null","string",` + money + `]`} {
+			s, _ := Parse(schema, CustomType{
+				LogicalType: "money",
+				Decode:      func(any, *SchemaNode) (any, error) { return nil, myErr },
+			})
+			bin, _ := s.Encode(int64(1))
+			js, _ := s.EncodeJSON(int64(1))
+			var v, vj any
+			_, err := s.Decode(bin, &v)
+			errj := s.DecodeJSON(js, &vj)
+			if !errors.Is(err, myErr) || !errors.Is(errj, myErr) || v != nil || vj != nil {
+				t.Errorf("%s: Decode %v and %#v, DecodeJSON %v and %#v; want the error and a nil any", schema, err, v, errj, vj)
+			}
 		}
 	})
 
 	t.Run("decode_panic", func(t *testing.T) {
-		// A panic in Decode leaves your value in an any target.
-		s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"long","logicalType":"money"}}]}`, CustomType{
-			LogicalType: "money",
-			Decode:      func(any, *SchemaNode) (any, error) { panic("boom") },
-		})
-		data, _ := s.Encode(map[string]any{"m": int64(1)})
-		var v any = "caller"
-		func() {
-			defer func() {
-				if r := recover(); r != "boom" {
-					t.Errorf("recovered %v, want the panic from Decode", r)
+		// A panic in Decode leaves your value in an any target, after a
+		// union took the value out of its envelope or replaced it too.
+		money := `{"type":"long","logicalType":"money"}`
+		for _, c := range []struct {
+			name, schema string
+			val, start   any
+			opts         []Opt
+		}{
+			{"record", `{"type":"record","name":"R","fields":[{"name":"m","type":` + money + `}]}`, map[string]any{"m": int64(1)}, "caller", nil},
+			{"nil any", money, int64(1), nil, nil},
+			{"union envelope", `["string",` + money + `]`, int64(1), map[string]any{"string": "x"}, []Opt{TaggedUnions()}},
+			{"union replaces", `[{"type":"array","items":"long"},` + money + `]`, int64(1), []any{int64(1)}, nil},
+		} {
+			s, err := Parse(c.schema, CustomType{
+				LogicalType: "money",
+				Decode:      func(any, *SchemaNode) (any, error) { panic("boom") },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bin, _ := s.Encode(c.val)
+			js, _ := s.EncodeJSON(c.val)
+			for name, decode := range map[string]func(*any){
+				"Decode":     func(v *any) { s.Decode(bin, v, c.opts...) },
+				"DecodeJSON": func(v *any) { s.DecodeJSON(js, v, c.opts...) },
+			} {
+				v := c.start
+				func() {
+					defer func() {
+						if r := recover(); r != "boom" {
+							t.Errorf("%s: %s: recovered %v, want the panic from Decode", c.name, name, r)
+						}
+					}()
+					decode(&v)
+				}()
+				if !reflect.DeepEqual(v, c.start) {
+					t.Errorf("%s: %s: got %#v, want the caller's %#v", c.name, name, v, c.start)
 				}
-			}()
-			s.Decode(data, &v)
-		}()
-		if v != "caller" {
-			t.Errorf("got %#v, want the caller's value", v)
+			}
 		}
 	})
 

@@ -224,7 +224,11 @@ func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *sla
 			if ferr != nil {
 				return nil, recordFieldError(fast.typ, f.name, ferr)
 			}
-			src, err = f.slowFn(src, fv, sl)
+			// A nil pointer field whose value fails stays nil.
+			fresh := nilPointerOnPath(fv)
+			if src, err = f.slowFn(src, fv, sl); err != nil && fresh.IsValid() {
+				fresh.SetZero()
+			}
 		}
 		if err != nil {
 			return nil, recordFieldError(fast.typ, f.name, err)
@@ -513,6 +517,11 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type, skipUnknown 
 		// maxIndirectDepth every other path enforces. The record inner has
 		// its own branch below, so this guard must precede it.
 		if innerGoType.Kind() == reflect.Pointer {
+			return nil
+		}
+		// A *any takes the reflection path, which wraps the any with
+		// TaggedUnions.
+		if innerGoType.Kind() == reflect.Interface {
 			return nil
 		}
 		if inner.deserRecord != nil {
@@ -1377,22 +1386,23 @@ func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte
 // src directly, since we already zeroed the pointer field; otherwise pp points
 // at the T for your branch decoder to fill, which is the caller's own T when
 // the pointer was already set.
-func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valIdx int, nullByte, valByte byte) (pp unsafe.Pointer, rest []byte, isNull bool, err error) {
+func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valIdx int, nullByte, valByte byte) (pp unsafe.Pointer, rest []byte, isNull, fresh bool, err error) {
 	isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, false, false, err
 	}
 	if !isVal {
 		*(*unsafe.Pointer)(p) = nil
-		return nil, src, true, nil
+		return nil, src, true, false, nil
 	}
 	pp = *(*unsafe.Pointer)(p)
 	if pp == nil {
 		v := reflect.New(innerType)
 		pp = v.UnsafePointer()
 		*(*unsafe.Pointer)(p) = pp
+		fresh = true
 	}
-	return pp, src, false, nil
+	return pp, src, false, fresh, nil
 }
 
 // udNullUnionPtr handles null-union deser for *T where T has a compiled
@@ -1410,13 +1420,17 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type, valIdx int, nullByte
 			return nil, errTooDeep
 		}
 		sl.depth++
-		pp, src, isNull, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
+		pp, src, isNull, fresh, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
 		if err != nil || isNull {
 			sl.depth--
 			return src, err
 		}
 		src, err = inner(src, pp, sl)
 		sl.depth--
+		if err != nil && fresh {
+			// A nil pointer whose value fails stays nil.
+			*(*unsafe.Pointer)(p) = nil
+		}
 		return src, err
 	}
 }
@@ -1438,13 +1452,17 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nul
 			return nil, errTooDeep
 		}
 		sl.depth++
-		pp, src, isNull, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
+		pp, src, isNull, fresh, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
 		if err != nil || isNull {
 			sl.depth--
 			return src, err
 		}
 		src, err = deserRecordVia(src, rec.fastFor(innerType, sl.skipUnknown), rec, innerType, pp, sl)
 		sl.depth--
+		if err != nil && fresh {
+			// A nil pointer whose record fails stays nil.
+			*(*unsafe.Pointer)(p) = nil
+		}
 		return src, err
 	}
 }
@@ -1656,7 +1674,16 @@ func udArrayBlocks(
 		return nil, errTooDeep
 	}
 	sl.depth++
-	defer func() { sl.depth-- }()
+	// The deferred call puts the slice's header back when the decode fails
+	// or panics, as deserArray.deser does.
+	at := (*sliceHeader)(p)
+	saved := *at
+	defer func() {
+		sl.depth--
+		if at != nil {
+			*at = saved
+		}
+	}()
 	v := reflect.NewAt(sliceType, p).Elem()
 	v.SetLen(0)
 	var totalItems int64
@@ -1672,6 +1699,7 @@ func udArrayBlocks(
 			if v.IsNil() {
 				v.Set(reflect.MakeSlice(sliceType, 0, 0))
 			}
+			at = nil
 			return src, nil
 		}
 		if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
@@ -1683,15 +1711,20 @@ func udArrayBlocks(
 		if start > math.MaxInt-n {
 			return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
 		}
-		newLen := start + n
-		// Grow is append's growth. Growing to the exact length on every
-		// block would copy the whole slice once per block.
-		if v.Cap() < newLen {
-			v.Grow(n)
-		}
-		v.SetLen(newLen)
-		if src, err = onBlock(src, v, p, start, n, sl); err != nil {
-			return nil, err
+		// A block fills the room the slice has, in place, before it grows
+		// the slice for the rest, as deserArray.deser does. Grow is append's
+		// growth.
+		for n > 0 {
+			if v.Cap() == start {
+				v.Grow(n)
+			}
+			k := min(n, v.Cap()-start)
+			v.SetLen(start + k)
+			if src, err = onBlock(src, v, p, start, k, sl); err != nil {
+				return nil, err
+			}
+			start += k
+			n -= k
 		}
 	}
 }
@@ -1709,8 +1742,9 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minIt
 }
 
 // udPtrRecordBlock decodes one record through each *innerType in s. A nil
-// pointer gets new backing, one allocation for every nil pointer in s, and a
-// non-nil pointer is decoded in place.
+// pointer gets new backing, one allocation for every nil pointer in s, just
+// before its record decodes, and the deferred call gives it a nil back when
+// the record fails or panics. A non-nil pointer is decoded in place.
 func udPtrRecordBlock(src []byte, rec *deserRecord, innerType reflect.Type, s []unsafe.Pointer, sl *slab) ([]byte, error) {
 	var need int
 	for _, p := range s {
@@ -1718,22 +1752,28 @@ func udPtrRecordBlock(src []byte, rec *deserRecord, innerType reflect.Type, s []
 			need++
 		}
 	}
+	var backingBase unsafe.Pointer
+	innerSize := innerType.Size()
 	if need > 0 {
-		backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
-		backingBase := backing.Index(0).Addr().UnsafePointer()
-		innerSize := innerType.Size()
-		j := 0
-		for i := range s {
-			if s[i] == nil {
-				s[i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
-				j++
-			}
-		}
+		backingBase = reflect.MakeSlice(reflect.SliceOf(innerType), need, need).Index(0).Addr().UnsafePointer()
 	}
 	fast := rec.fastFor(innerType, sl.skipUnknown)
 	useFast := fast != nil && fast.allFast
 	var err error
-	for _, elemP := range s {
+	fresh := -1 // the index of a pointer that is new while its record decodes
+	defer func() {
+		if fresh >= 0 {
+			s[fresh] = nil
+		}
+	}()
+	j := 0
+	for i, elemP := range s {
+		if elemP == nil {
+			elemP = unsafe.Add(backingBase, uintptr(j)*innerSize)
+			s[i] = elemP
+			j++
+			fresh = i
+		}
 		if useFast {
 			src, err = deserRecordFastPtr(src, fast, elemP, sl)
 		} else {
@@ -1742,6 +1782,7 @@ func udPtrRecordBlock(src []byte, rec *deserRecord, innerType reflect.Type, s []
 		if err != nil {
 			return nil, err
 		}
+		fresh = -1
 	}
 	return src, nil
 }

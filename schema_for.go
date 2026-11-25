@@ -270,7 +270,7 @@ func renderCustomSchemaTree(n *SchemaNode) (any, error) {
 	}
 	tree := n.toJSONDedup(d)
 	if d.err != nil {
-		return nil, fmt.Errorf("avro: SchemaFor: CustomType.Schema: %w", d.err)
+		return nil, &causeError{"avro: SchemaFor: CustomType.Schema", d.err}
 	}
 	return deepCopyJSONTree(tree), nil
 }
@@ -555,7 +555,7 @@ func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]s
 	for _, f := range fields {
 		af, err := inferField(f, namespace, seen, customTypes, applied)
 		if err != nil {
-			return nil, fmt.Errorf("avro: field %q: %w", f.name, err)
+			return nil, &causeError{fmt.Sprintf("avro: field %q", f.name), err}
 		}
 		avroFields = append(avroFields, af)
 	}

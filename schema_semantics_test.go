@@ -12079,6 +12079,116 @@ func TestMatrix_SchemaCacheCustomBoundaryGuard(t *testing.T) {
 			t.Errorf("clean reference should resolve, got: %v", err)
 		}
 	})
+	// A custom type's JSON decoder for a named type goes on the reference,
+	// as the binary decoder's wrap does, so one parse's custom types change
+	// nothing another parse decodes, and each schema decodes the same on both
+	// wires. A pair the guard above refuses is skipped.
+	t.Run("custom-decoders-stay-with-their-parse", func(t *testing.T) {
+		dec := func(avroType, out string) avro.CustomType {
+			return avro.CustomType{AvroType: avroType, Decode: func(v any, sn *avro.SchemaNode) (any, error) {
+				if sn.Type != "fixed" {
+					return nil, avro.ErrSkipCustomType
+				}
+				return out, nil
+			}}
+		}
+		regs := map[string][]avro.SchemaOpt{
+			"none":       nil,
+			"wildcard A": {dec("", "A")},
+			"wildcard B": {dec("", "B")},
+			"fixed A":    {dec("fixed", "A")},
+			"fixed B":    {dec("fixed", "B")},
+		}
+		both := func(t *testing.T, s *avro.Schema, bin []byte, js string) string {
+			t.Helper()
+			var b, j any
+			if _, err := s.Decode(bin, &b); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.DecodeJSON([]byte(js), &j); err != nil {
+				t.Fatal(err)
+			}
+			if fmt.Sprint(b) != fmt.Sprint(j) {
+				t.Errorf("Decode gives %v and DecodeJSON %v", b, j)
+			}
+			return fmt.Sprint(b)
+		}
+		for n1, r1 := range regs {
+			for n2, r2 := range regs {
+				t.Run(n1+" then "+n2, func(t *testing.T) {
+					var cache avro.SchemaCache
+					s1, err := cache.Parse(`{"type":"fixed","name":"N","size":2}`, r1...)
+					if err != nil {
+						t.Fatal(err)
+					}
+					before := both(t, s1, []byte("ab"), `"ab"`)
+					s2, err := cache.Parse(`{"type":"record","name":"W","fields":[{"name":"n","type":"N"}]}`, r2...)
+					if err != nil {
+						return
+					}
+					both(t, s2, []byte("ab"), `{"n":"ab"}`)
+					if after := both(t, s1, []byte("ab"), `"ab"`); after != before {
+						t.Errorf("the first schema decoded %v, and %v after the second parse", before, after)
+					}
+				})
+			}
+		}
+	})
+	// Inside a cached type, both encoders use the custom types of the parse
+	// that defined it, even when a later parse registers others.
+	t.Run("custom-encoders-inside-a-cached-type", func(t *testing.T) {
+		times := func(n int64) avro.CustomType {
+			return avro.CustomType{LogicalType: "cents", AvroType: "long", Encode: func(v any, _ *avro.SchemaNode) (any, error) {
+				return v.(int64) * n, nil
+			}}
+		}
+		var cache avro.SchemaCache
+		if _, err := cache.Parse(`{"type":"record","name":"Inner","fields":[{"name":"c","type":{"type":"long","logicalType":"cents"}}]}`, times(10)); err != nil {
+			t.Fatal(err)
+		}
+		s, err := cache.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":"Inner"}]}`, times(100))
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := map[string]any{"i": map[string]any{"c": int64(5)}}
+		bin, err := s.Encode(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		js, err := s.EncodeJSON(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fromBin, fromJSON any
+		avrotest.MustDecode(t, s, bin, &fromBin)
+		avrotest.MustDecodeJSON(t, s, js, &fromJSON)
+		if want := map[string]any{"i": map[string]any{"c": int64(50)}}; !reflect.DeepEqual(fromBin, want) || !reflect.DeepEqual(fromJSON, want) {
+			t.Errorf("Encode gives %v and EncodeJSON %v, want %v from the first parse's custom type", fromBin, fromJSON, want)
+		}
+		// A resolved decode with the later schema as reader uses the first
+		// parse's custom type inside the type too, as a plain Decode does.
+		named := func(out string) avro.CustomType {
+			return avro.CustomType{LogicalType: "cents", AvroType: "long", Decode: func(any, *avro.SchemaNode) (any, error) { return out, nil }}
+		}
+		var dcache avro.SchemaCache
+		if _, err := dcache.Parse(`{"type":"record","name":"Inner","fields":[{"name":"c","type":{"type":"long","logicalType":"cents"}}]}`, named("first")); err != nil {
+			t.Fatal(err)
+		}
+		reader, err := dcache.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":"Inner"}]}`, named("later"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		writer := avro.MustParse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"c","type":"long"}]}},{"name":"x","type":"long"}]}`)
+		rs, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resolved any
+		avrotest.MustDecode(t, rs, avrotest.MustEncode(t, writer, map[string]any{"i": map[string]any{"c": int64(5)}, "x": int64(1)}), &resolved)
+		if want := map[string]any{"i": map[string]any{"c": "first"}}; !reflect.DeepEqual(resolved, want) {
+			t.Errorf("a resolved decode gives %v, want %v from the first parse's custom type", resolved, want)
+		}
+	})
 }
 
 // A self-referential schema cached without a CustomType and re-parsed (the
@@ -15162,9 +15272,10 @@ func TestRegression_SliceElementPointerChainBounded(t *testing.T) {
 }
 
 // Binary and JSON decode must accept the same set of pointer-target depths. A
-// JSON union decode that indirects at two stages (unionTarget then the branch's
-// decodeKind) peels up to 2*maxIndirectDepth levels and accepts targets binary
-// rejects. Sweep every depth and assert the two wires agree.
+// JSON union decode that indirects at two stages (the union's walk to its
+// target, then the branch's decodeKind) peels up to 2*maxIndirectDepth levels
+// and accepts targets binary rejects. Sweep every depth and assert the two
+// wires agree.
 func TestGenerative_UnionPointerTargetDepthBinaryJSONParity(t *testing.T) {
 	s := avro.MustParse(`["null","int"]`)
 	bin, _ := s.Encode(int64(7))

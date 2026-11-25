@@ -127,10 +127,19 @@ const numSlabLen = 64
 // a data word.
 type eface struct{ typ, data unsafe.Pointer }
 
+// sliceHeader is the layout of a slice, which a decode into a typed slice
+// copies and puts back when the decode fails.
+type sliceHeader struct {
+	data     unsafe.Pointer
+	len, cap int
+}
+
 // These fail to compile if an any is not the size of an eface.
 var (
 	_ [unsafe.Sizeof(eface{}) - unsafe.Sizeof(any(nil))]struct{}
 	_ [unsafe.Sizeof(any(nil)) - unsafe.Sizeof(eface{})]struct{}
+	_ [unsafe.Sizeof(sliceHeader{}) - unsafe.Sizeof([]byte(nil))]struct{}
+	_ [unsafe.Sizeof([]byte(nil)) - unsafe.Sizeof(sliceHeader{})]struct{}
 )
 
 // numSlabOK reports whether an any that we point at a number reads back as
@@ -143,6 +152,47 @@ var numSlabOK = func() bool {
 	(*eface)(unsafe.Pointer(&boxed)).data = unsafe.Pointer(&slot)
 	return boxed == any(want)
 }()
+
+// hasTarget reports whether an element of s is a target, as isTarget defines
+// it. The elements an earlier decode stored mostly have one type, so we
+// compare each element's type word with that of the last element whose type
+// is never a target, and ask isTarget only for an element of another type.
+// names are the envelope keys of a union with TaggedUnions, or nil.
+func hasTarget(s []any, names []string) bool {
+	if !numSlabOK || names != nil {
+		for _, x := range s {
+			// With TaggedUnions, an envelope of an earlier decode stands
+			// for the value inside it.
+			if m, ok := x.(map[string]any); ok && len(m) == 1 && names != nil {
+				for k, in := range m {
+					if slices.Contains(names, k) {
+						x = in
+					}
+				}
+			}
+			if isTarget(x) {
+				return true
+			}
+		}
+		return false
+	}
+	var never unsafe.Pointer
+	for i := range s {
+		typ := (*eface)(unsafe.Pointer(&s[i])).typ
+		if typ == nil || typ == never {
+			continue
+		}
+		switch s[i].(type) {
+		case int64, int32, string, float64, float32, bool, []byte, time.Time, time.Duration:
+			never = typ
+			continue
+		}
+		if isTarget(s[i]) {
+			return true
+		}
+	}
+	return false
+}
 
 // numLike is a number type we decode into an any. ~int64 takes in
 // time.Duration, the any value of a time-millis or time-micros.
@@ -276,6 +326,22 @@ func (sl *slab) put() {
 //   - uuid on fixed(16): [16]byte
 //   - duration: [Duration]
 //
+// Decode reuses addressable values in v, with the following rules:
+//
+//   - A map keeps the keys it already has.
+//   - When a union has two or more Avro records or maps, decoding one of
+//     them into a Go map always creates a new map.
+//
+// Into an any:
+//
+//   - Decoding into an existing pointer, map, or slice, where the type is
+//     incompatible, is an error.
+//   - Avro primitives are replaced (including []byte).
+//   - In a union, Decode replaces a value in the any that has another
+//     branch's type.
+//
+// If you reuse v, copy out what you need before you decode into v again.
+//
 // To produce JSON from decoded *any data use [Schema.EncodeJSON], not a
 // generic JSON encoder: EncodeJSON is schema-aware and converts decoded values
 // back to their Avro representations (time.Time to epoch integers, []byte to
@@ -289,6 +355,9 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, errors.New("decode requires a non-nil pointer")
 	}
+	// A nil pointer that v points at, and that the decode allocates before
+	// its value fails, stays nil.
+	fresh := nilPointerOnPath(rv.Elem())
 	// Slab-free schemas (scalar leaves, no custom wiring) never need the
 	// slab, so we skip the pool entirely. A nil slab keeps scalar decodes
 	// allocation-free even when GC has drained the pool. Opts only ever alter
@@ -296,7 +365,11 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	// never slab-free. So their mere presence takes the pooled path, keeping
 	// the nil-slab proof trivial.
 	if s.slabFree && len(opts) == 0 {
-		return s.deser(src, rv.Elem(), nil)
+		rest, err := s.deser(src, rv.Elem(), nil)
+		if err != nil && fresh.IsValid() {
+			fresh.SetZero()
+		}
+		return rest, err
 	}
 	sl := slabPool.Get().(*slab)
 	if len(opts) > 0 {
@@ -308,6 +381,9 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	}
 	rest, err := s.deser(src, rv.Elem(), sl)
 	sl.put()
+	if err != nil && fresh.IsValid() {
+		fresh.SetZero()
+	}
 	return rest, err
 }
 
@@ -331,6 +407,250 @@ type deserUnion struct {
 	// resolveUnionUnion behavior: wrap when TaggedUnions is active
 	// and the target is *any (or compatible interface).
 	noWrap bool
+	// shape is what each branch decodes to in an any, which the `branch`
+	// method reads to apply the union rules.
+	shape unionShape
+}
+
+// unionShape says what each branch of a union decodes to in an any: a
+// map[string]any for a record or a map, a []any for an array, a *big.Rat for
+// a decimal, or a value with nothing to decode into. The shape serves two
+// rules about the value a target already has: a value with another branch's
+// type is replaced, and a union with two or more records or maps always
+// decodes one of them into a new map.
+type unionShape struct {
+	class              []byte // per branch: 'm', 'a', 'r', 'n' for null, or 0
+	maps, arrays, rats int    // how many branches have each class
+	// customGo is the Go type each custom type on a branch declares for
+	// what its Decode returns.
+	customGo []reflect.Type
+	// names are the keys a TaggedUnions envelope of the union has: each
+	// branch's name and its logical name. A one-key map with another key
+	// is not an envelope.
+	names []string
+}
+
+// unionClass returns the unionShape class of one branch.
+func unionClass(n *schemaNode) byte {
+	if n == nil {
+		return 0
+	}
+	if n.logical == "decimal" || n.logical == "big-decimal" {
+		return 'r'
+	}
+	switch n.kind {
+	case "record", "map":
+		return 'm'
+	case "array":
+		return 'a'
+	case "null":
+		return 'n'
+	}
+	return 0
+}
+
+// newUnionShape returns the shape of a union with these branches, where custom
+// is the custom-type overlay of the schema the union is in.
+func newUnionShape(branches []*schemaNode, custom map[*schemaNode]*customWiring) unionShape {
+	u := unionShape{class: make([]byte, len(branches))}
+	for i, b := range branches {
+		u.class[i] = unionClass(b)
+		if w := custom[b]; w != nil {
+			// We add each type once, so the list is as long as the custom
+			// types you registered and not as wide as the union.
+			for _, t := range w.goTypes {
+				if !slices.Contains(u.customGo, t) {
+					u.customGo = append(u.customGo, t)
+				}
+			}
+		}
+		switch u.class[i] {
+		case 'm':
+			u.maps++
+		case 'a':
+			u.arrays++
+		case 'r':
+			u.rats++
+		}
+	}
+	return u
+}
+
+// replaces reports whether a value of a branch with class c replaces x, the
+// value an any has, where a decode outside a union would decode into x or
+// return an error: x has the type of another branch. A Go map or an
+// ArrayRecord has the type of a record or map branch, and any other slice
+// has the type of an array branch.
+func (u *unionShape) replaces(x any, c byte) bool {
+	if x == nil {
+		return false
+	}
+	// A custom type on a branch decodes to the Go type it declares.
+	if len(u.customGo) > 0 && slices.Contains(u.customGo, reflect.TypeOf(x)) {
+		return true
+	}
+	switch x.(type) {
+	case map[string]any, ArrayRecord:
+		return c != 'm' && u.maps > 0 || c == 'm' && u.maps > 1
+	case []any:
+		return c != 'a' && u.arrays > 0
+	case *big.Rat:
+		return c != 'r' && u.rats > 0
+	}
+	switch v := reflect.ValueOf(x); v.Kind() {
+	case reflect.Map:
+		return c != 'm' && u.maps > 0 || c == 'm' && u.maps > 1
+	case reflect.Slice:
+		return v.Type().Elem().Kind() != reflect.Uint8 && c != 'a' && u.arrays > 0
+	}
+	return false
+}
+
+// unionTarget says where the value of one branch of a union goes in a
+// target: straight into the target, or into a cell, a new value of slot's
+// type that starts from seed, which store puts in the target after a decode
+// that worked, so that a decode that fails or panics leaves the target as it
+// was.
+type unionTarget struct {
+	slot   reflect.Value // the any or the map the value goes in
+	seed   any           // what the value decodes into: what slot has, or nil
+	env    reflect.Value // an any whose TaggedUnions envelope has a pointer to slot
+	inside any           // that pointer
+}
+
+// target applies the union rules to what the target v has, for a value of a
+// branch with class c, fills t with where the value goes, and reports whether
+// the value decodes straight into the target, at dst. tagged says a
+// TaggedUnions envelope goes around the value, so an any with the envelope of
+// an earlier decode stands for the value inside it.
+func (u *unionShape) target(t *unionTarget, v reflect.Value, c byte, tagged bool) (direct bool) {
+	// A null decodes into no value, so it decodes straight into v.
+	if c == 'n' {
+		return true
+	}
+	direct = true
+	// We follow the pointers the decoders follow, a pointer and a pointer in
+	// an any, without allocating one.
+	for range maxIndirectDepth {
+		if v.Kind() == reflect.Pointer && !v.IsNil() {
+			v = v.Elem()
+			continue
+		}
+		if v.Kind() != reflect.Interface || !v.CanSet() || !v.CanInterface() {
+			break
+		}
+		x := v.Interface()
+		env := false
+		if w, ok := x.(map[string]any); ok && len(w) == 1 && tagged {
+			for k, in := range w {
+				// The rules apply to the value inside an envelope.
+				if slices.Contains(u.names, k) {
+					tagged, env, direct = false, true, false
+					x = in
+				}
+			}
+		}
+		replace := u.replaces(x, c)
+		if p := reflect.ValueOf(x); !replace && p.Kind() == reflect.Pointer && !p.IsNil() {
+			if env {
+				t.env, t.inside = v, x
+			}
+			v = p.Elem()
+			continue
+		}
+		t.slot, t.seed = v, x
+		if replace {
+			t.seed, direct = nil, false
+			// A record gets new slots in an ArrayRecord, as a map gets a
+			// new map.
+			if _, ok := x.(ArrayRecord); ok && c == 'm' {
+				t.seed = ArrayRecord{}
+			}
+		}
+		return direct
+	}
+	switch {
+	case (v.Kind() == reflect.Map || v.Type() == arrayRecordType) && c == 'm' && u.maps > 1 && !v.IsNil() && v.CanSet():
+		// The cell starts as a nil map or a nil ArrayRecord.
+		t.slot, direct = v, false
+	case t.env.IsValid():
+		// A value behind the pointer in the envelope that is not an any
+		// decodes through the pointer.
+		t.slot, t.seed, t.env = t.env, t.inside, reflect.Value{}
+	}
+	return direct
+}
+
+// dst returns where a value that decodes straight into the target v goes: the
+// any that target stopped at, which is where v's pointers lead, so that a
+// custom type's branch decodes into the same any as every other branch.
+func (t *unionTarget) dst(v reflect.Value) reflect.Value {
+	if t.slot.IsValid() {
+		return t.slot
+	}
+	return v
+}
+
+// cell returns a new value of slot's type that has seed.
+func (t *unionTarget) cell() reflect.Value {
+	if t.slot.Type() == anyType {
+		p := new(any)
+		*p = t.seed
+		return reflect.ValueOf(p).Elem()
+	}
+	c := reflect.New(t.slot.Type()).Elem()
+	if t.seed != nil {
+		c.Set(reflect.ValueOf(t.seed))
+	}
+	return c
+}
+
+// store puts the value that cell c decoded into the target. An any whose
+// envelope had a pointer to slot gets the pointer back, for the caller to
+// wrap.
+func (t *unionTarget) store(c reflect.Value) {
+	t.slot.Set(c)
+	if t.env.IsValid() {
+		t.env.Set(reflect.ValueOf(t.inside))
+	}
+}
+
+// wrapEnvelope puts the value of the any at v, or of the any that v's
+// pointers point at, in a TaggedUnions envelope named name. An interface with
+// methods, a nil any, and any other target keep the bare value: a
+// map[string]any does not have an interface's methods.
+func wrapEnvelope(v reflect.Value, name string) {
+	v = derefNoAlloc(v)
+	if v.Kind() != reflect.Interface || !v.Elem().IsValid() || !mapStringAnyType.AssignableTo(v.Type()) {
+		return
+	}
+	v.Set(reflect.ValueOf(map[string]any{name: v.Elem().Interface()}))
+}
+
+// unionShapeOf returns the shape of the union node n, which Parse builds with
+// the union's tag tables. A hand-assembled node has none, and no rule applies
+// to it.
+func unionShapeOf(n *schemaNode) *unionShape {
+	if n.tags == nil {
+		return new(unionShape)
+	}
+	return &n.tags.shape
+}
+
+// readerShape returns the shape a resolved decoder uses for the reader union
+// r, where custom is the reader's overlay: the counts are r's, and class has
+// the one class each entry of branches has, which are the reader branches the
+// writer's values decode as.
+func readerShape(r *schemaNode, custom map[*schemaNode]*customWiring, branches ...*schemaNode) unionShape {
+	u := newUnionShape(r.branches, custom)
+	if r.tags != nil {
+		u.names = r.tags.shape.names
+	}
+	u.class = make([]byte, len(branches))
+	for i, b := range branches {
+		u.class[i] = unionClass(b)
+	}
+	return u
 }
 
 func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -346,33 +666,48 @@ func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	if idx < 0 || int(idx) >= len(s.fns) {
 		return nil, fmt.Errorf("union index %d out of range [0, %d)", idx, len(s.fns))
 	}
-	src, err = s.fns[idx](src, v, sl)
-	if err == nil {
-		s.maybeWrap(v, sl, idx)
+	return s.branch(src, v, sl, int(idx), s.fns[idx])
+}
+
+// branch decodes a value of branch idx into v with fn. The union rules apply
+// to the value v has, and TaggedUnions wraps the result.
+func (s *deserUnion) branch(src []byte, v reflect.Value, sl *slab, idx int, fn deserfn) ([]byte, error) {
+	var t unionTarget
+	dst, inCell := v, false
+	// A nil any has no value for the rules to apply to.
+	if v.Kind() != reflect.Interface || !v.IsNil() {
+		var c byte
+		if idx < len(s.shape.class) {
+			c = s.shape.class[idx]
+		}
+		if s.shape.target(&t, v, c, sl.taggedUnions && !s.noWrap) {
+			dst = t.dst(v)
+		} else {
+			dst, inCell = t.cell(), true
+		}
 	}
-	return src, err
+	src, err := fn(src, dst, sl)
+	if err != nil {
+		return src, err
+	}
+	if inCell {
+		t.store(dst)
+	}
+	s.maybeWrap(v, sl, int32(idx))
+	return src, nil
 }
 
 // maybeWrap wraps a decoded union value with its branch name when TaggedUnions
-// is enabled and the target is an interface type that map[string]any can be
-// assigned to. In practice that means *any: a plain map does not satisfy any
-// non-empty interface's method set. We skip non-interface targets and
-// interfaces with methods.
+// is enabled.
 func (s *deserUnion) maybeWrap(v reflect.Value, sl *slab, idx int32) {
-	if s.noWrap || !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
-		return
-	}
-	// Skip if the wrapping map[string]any can't be assigned to v's
-	// interface type. We use the cached type rather than building a throwaway
-	// reflect.Value(map[string]any{}), which allocates per call.
-	if !mapStringAnyType.AssignableTo(v.Type()) {
+	if s.noWrap || !sl.taggedUnions {
 		return
 	}
 	name := s.branchNames[idx]
 	if sl.tagLogicalTypes {
 		name = s.logicalNames[idx]
 	}
-	v.Set(reflect.ValueOf(map[string]any{name: v.Elem().Interface()}))
+	wrapEnvelope(v, name)
 }
 
 // deserNullUnion handles ["null", T] unions. The branch index is a varint:
@@ -441,11 +776,7 @@ func deserNullUnionAt(u *deserUnion, valIdx int, nullByte, valByte byte) deserfn
 		// indirect itself, as deserUnion.deser does, so a CustomType.Decode
 		// returning a pointer goes into a *T target here as it does in a
 		// 3-branch union.
-		out, err := u.fns[valIdx](src, v, sl)
-		if err == nil {
-			u.maybeWrap(v, sl, int32(valIdx))
-		}
-		return out, err
+		return u.branch(src, v, sl, valIdx, u.fns[valIdx])
 	}
 }
 
@@ -714,7 +1045,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	defer func() {
 		sl.depth--
 		if scratch {
-			restoreIface(v, orig)
+			setAny(v, orig)
 		}
 	}()
 	v = indirectAlloc(v)
@@ -723,22 +1054,49 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
 			return nil, semErr(v, "record")
 		}
-		// Reuse the existing map[string]any if v already wraps one
-		// (streaming decode, OCF reader, batch consumer reusing &out). We
-		// do it here rather than in indirectAlloc because the unwrapped
-		// non-addressable interface payload would break decoders that
-		// v.Set(...) on the result. We write into the map we take out, which
-		// needs no address. See [reuseOrMakeStringAnyMap].
-		//
+		// A map or slice that v has is a typed target. We decode into any
+		// other map or an ArrayRecord immediately, as into a typed target,
+		// and into a map[string]any, which is the streaming-decode pattern,
+		// in the field loop below. We take the map out of v rather than
+		// unwrap v in indirectAlloc, because what an interface has is not
+		// addressable, and a decoder that calls v.Set on it would panic.
+		m, typed, err := anyMap(v, "record")
+		if err != nil {
+			return nil, err
+		}
+		if m == nil && !typed.IsValid() {
+			m = make(map[string]any, len(s.fields))
+		}
+		if typed.IsValid() {
+			if typed.Kind() == reflect.Map {
+				return s.deserMapTarget(src, typed, sl)
+			}
+			row := reuseOrMakeArrayRecord(typed.Interface().(ArrayRecord), len(s.fields))
+			if src, err = s.deserArrayRecord(src, row, sl); err != nil {
+				return nil, err
+			}
+			v.Set(reflect.ValueOf(row))
+			return src, nil
+		}
 		// A field with no fnIface decodes into v itself, so we allocate no
 		// cell for it. From the first such field to the v.Set below, v has nil
 		// or a field's value: code in between must read orig, not v, for
 		// your value.
-		m := reuseOrMakeStringAnyMap(v, len(s.fields))
-		var err error
+		//
+		// A field decodes into the value m has for it, which only a map m
+		// had before this decode can have, when that value is a target.
+		// fnIface stores a new value without reading the old one, so a
+		// field whose old value is a target takes fn.
+		look := len(m) > 0
 		for i := range s.fields {
 			f := &s.fields[i]
-			if f.fnIface != nil {
+			var old any
+			if look {
+				if x := m[f.name]; isTarget(x) {
+					old = x
+				}
+			}
+			if f.fnIface != nil && old == nil {
 				var val any
 				val, src, err = f.fnIface(src, sl)
 				if err != nil {
@@ -750,9 +1108,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 			if !scratch {
 				orig, scratch = v.Interface(), true
 			}
-			// v must be nil here: a record field decoded into v reuses the
-			// map v has, which may be m or another field's map.
-			v.SetZero()
+			setAny(v, old)
 			if src, err = f.fn(src, v, sl); err != nil {
 				return nil, recordFieldError(nil, f.name, err)
 			}
@@ -776,24 +1132,8 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	if k != reflect.Struct && (k != reflect.Map || t.Key().Kind() != reflect.String) {
 		return nil, &SemanticError{GoType: t, AvroType: "record"}
 	}
-	var err error
 	if k == reflect.Map {
-		keyType := t.Key()
-		if v.IsNil() {
-			v.Set(reflect.MakeMapWithSize(t, len(s.fields)))
-		}
-		elem := reflect.New(t.Elem()).Elem()
-		for _, f := range s.fields {
-			if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
-				return nil, err
-			}
-			if src, err = f.fn(src, elem, sl); err != nil {
-				return nil, recordFieldError(nil, f.name, err)
-			}
-			v.SetMapIndex(mapKeyAs(t, f.nameVal), elem)
-			elem.SetZero()
-		}
-		return src, nil
+		return s.deserMapTarget(src, v, sl)
 	}
 	if v.CanAddr() {
 		if fast := s.loadOrCompileFast(t, sl.skipUnknown); fast != nil {
@@ -802,29 +1142,61 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	}
 	// compileFastDeser returned nil because typeFieldMapping failed; we
 	// re-call to report the error.
-	_, err = typeFieldMappingSkip(s.names, &s.cache, t, sl.skipUnknown)
+	_, err := typeFieldMappingSkip(s.names, &s.cache, t, sl.skipUnknown)
 	return nil, err
 }
 
-// restoreIface sets the interface v back to orig, the value it had.
-func restoreIface(v reflect.Value, orig any) {
-	if orig == nil {
-		v.SetZero()
-		return
+// deserMapTarget decodes the record's fields into v, a map target or a map
+// of your own type that an any has. A field decodes into the value v has for
+// it.
+func (s *deserRecord) deserMapTarget(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	t := v.Type()
+	if t.Key().Kind() != reflect.String {
+		return nil, &SemanticError{GoType: t, AvroType: "record"}
 	}
-	v.Set(reflect.ValueOf(orig))
+	keyType := t.Key()
+	// A nil map target gets a new map only from a decode that worked.
+	m := v
+	if v.IsNil() {
+		m = reflect.MakeMapWithSize(t, len(s.fields))
+	}
+	look := m.Len() > 0 && reusesMapValue(t.Elem())
+	elem := reflect.New(t.Elem()).Elem()
+	var err error
+	for _, f := range s.fields {
+		if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
+			return nil, err
+		}
+		key := mapKeyAs(t, f.nameVal)
+		if look {
+			mapValueInto(m, key, elem)
+		}
+		if src, err = f.fn(src, elem, sl); err != nil {
+			return nil, recordFieldError(nil, f.name, err)
+		}
+		m.SetMapIndex(key, elem)
+		elem.SetZero()
+	}
+	if v.IsNil() {
+		v.Set(m)
+	}
+	return src, nil
 }
 
 // deserArrayRecord decodes the record's fields into row, one per position.
-// row has one nil slot per field.
+// row has one slot per field, and a field decodes into the value its slot
+// has. fnIface stores a new value without reading the old one, so a slot
+// whose old value is a target takes fn.
 func (s *deserRecord) deserArrayRecord(src []byte, row ArrayRecord, sl *slab) ([]byte, error) {
 	var err error
 	for i := range s.fields {
 		f := &s.fields[i]
-		if f.fnIface != nil {
-			if row[i], src, err = f.fnIface(src, sl); err != nil {
+		if f.fnIface != nil && !isTarget(row[i]) {
+			val, rest, err := f.fnIface(src, sl)
+			if err != nil {
 				return nil, recordFieldError(arrayRecordType, f.name, err)
 			}
+			row[i], src = val, rest
 			continue
 		}
 		if src, err = f.fn(src, reflect.ValueOf(&row[i]).Elem(), sl); err != nil {
@@ -834,19 +1206,17 @@ func (s *deserRecord) deserArrayRecord(src []byte, row ArrayRecord, sl *slab) ([
 	return src, nil
 }
 
-// reuseOrMakeArrayRecord returns n nil slots: row's own backing array when it
-// has the room, which is the streaming-decode pattern, and a new one
-// otherwise. Every record-into-ArrayRecord decoder uses it, so they agree on
-// reuse. The n slots are cleared, so no value from a previous decode is
-// reused; a slot past n keeps its old value. The result is never nil, even for
-// a record with no fields: a nil ArrayRecord is null, and a record is not.
+// reuseOrMakeArrayRecord returns n slots: row's own backing array when it has
+// the room, which is the streaming-decode pattern, and a new one otherwise.
+// Every record-into-ArrayRecord decoder uses it, so they agree on reuse. A slot
+// keeps its value, and a field decodes into it as into any other any. The
+// result is never nil, even for a record with no fields: a nil ArrayRecord is
+// null, and a record is not.
 func reuseOrMakeArrayRecord(row ArrayRecord, n int) ArrayRecord {
 	if row == nil || cap(row) < n {
 		return make(ArrayRecord, n)
 	}
-	row = row[:n]
-	clear(row)
-	return row
+	return row[:n]
 }
 
 type deserEnum struct {
@@ -928,6 +1298,9 @@ type deserArray struct {
 	// bypassing reflect. Selected at schema-build time based on the avro
 	// item type. nil for items with no iface-direct decoder; see ifaceFnFor.
 	fastIfaceLoop func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error)
+	// items is the items' node, whose union shape names the keys of a
+	// TaggedUnions envelope.
+	items *schemaNode
 	// rec is the items' record when deserItem is that record's own deser, with
 	// no custom type wrapped around it. A slice of structs or of single
 	// pointers to structs then decodes each block through the record's
@@ -1421,7 +1794,16 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		return nil, errTooDeep
 	}
 	sl.depth++
-	defer func() { sl.depth-- }()
+	// While at is set, the typed slice at it may have a new length, and the
+	// deferred call puts saved back when the decode fails or panics.
+	var saved sliceHeader
+	var at *sliceHeader
+	defer func() {
+		sl.depth--
+		if at != nil {
+			*at = saved
+		}
+	}()
 	v = indirectAlloc(v)
 	iface := v.Kind() == reflect.Interface
 	fixedArray := v.Kind() == reflect.Array
@@ -1433,18 +1815,27 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	if fixedArray {
 		return s.deserFixedArray(src, v, sl)
 	}
-	// For an interface target we build a []any and box it once at the end.
-	// A typed target is decoded in place through sliceVal.
+	// For an interface target we build a []any and box it once at the end,
+	// in the backing array of the []any v has, if v has one. A typed target
+	// is decoded in place through sliceVal.
 	var (
 		anys      []any
 		sliceVal  reflect.Value
 		sliceType reflect.Type
 	)
 	if !iface {
+		if v.CanAddr() {
+			at = (*sliceHeader)(unsafe.Pointer(v.UnsafeAddr()))
+			saved = *at
+		}
 		v.SetLen(0)
 		sliceVal = v
 		sliceType = v.Type()
+	} else if typed, err := anySlice(v, &anys); err != nil || typed.IsValid() {
+		return s.deserTypedInAny(src, v, typed, err, sl)
 	}
+	// Only the elements the old []any had can have something to decode into.
+	oldCap := cap(anys)
 	// For primitive item types with matching Go element types we use a
 	// specialized loop that avoids per-element function pointer calls.
 	// fastPathSafeForElem screens both the Kind match and the json.Number
@@ -1455,19 +1846,14 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	// types, which fall back to fastLoop.
 	useFastNative := useFast && s.nativeLoop != nil
 	// For interface targets with primitive avro items, use the iface
-	// fast loop that operates directly on []any.
+	// fast loop that operates directly on []any. The loop stores each
+	// element without reading the old one, so a block whose old elements
+	// have a target takes the generic loop below.
 	useFastIface := iface && s.fastIfaceLoop != nil
-	// For a slice of any, or of another interface type with no methods, stale
-	// is how many slots at the front of v's backing
-	// array a previous decode into v may have filled. We set each such slot
-	// to nil before we decode into it. Otherwise we would decode into the
-	// map or the pointer the slot has, and a value you took out of the slice
-	// after the previous decode would change. A slot past stale is new
-	// capacity from Grow, and Grow zeros new capacity. An element of any
-	// other type is decoded in place.
-	var stale int
-	if !iface && isEmptyInterface(sliceType.Elem()) {
-		stale = v.Cap()
+	// envNames are the envelope keys of a union of items with TaggedUnions.
+	var envNames []string
+	if useFastIface && sl != nil && sl.taggedUnions && s.items != nil && s.items.kind == "union" {
+		envNames = unionShapeOf(s.items).names
 	}
 	// Avro arrays are encoded as a series of blocks. Each block starts
 	// with a count. Positive means N elements follow, zero means end of
@@ -1494,6 +1880,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			if v.IsNil() {
 				v.Set(reflect.MakeSlice(sliceType, 0, 0))
 			}
+			at = nil
 			return src, nil
 		}
 		if err := checkArrayBlockBounds(count, totalItems, len(src), s.minItemBytes); err != nil {
@@ -1511,61 +1898,82 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		if start > math.MaxInt-n {
 			return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
 		}
-		newLen := start + n
-		// Both arms grow as append does. Growing to the exact length on
-		// every block would copy the whole slice once per block.
-		if iface {
-			anys = slices.Grow(anys, n)[:newLen]
-		} else {
-			if sliceVal.Cap() < newLen {
-				sliceVal.Grow(n)
+		// A block fills the room the slice has, in place, before it grows the
+		// slice for the rest, as DecodeJSON grows it one item at a time, so
+		// that a decode that fails has written the same items into your
+		// backing array on both decoders. Both arms grow as append does.
+		for n > 0 {
+			var k int
+			if iface {
+				if len(anys) == cap(anys) {
+					anys = slices.Grow(anys, n)
+				}
+				k = min(n, cap(anys)-start)
+				anys = anys[:start+k]
+			} else {
+				if sliceVal.Cap() == start {
+					sliceVal.Grow(n)
+				}
+				k = min(n, sliceVal.Cap()-start)
+				sliceVal.SetLen(start + k)
 			}
-			sliceVal.SetLen(newLen)
-			if start < stale {
-				// An interface type with no methods has any's layout.
-				clear((*(*[]any)(sliceVal.Addr().UnsafePointer()))[start:min(newLen, stale)])
-			}
-		}
-		if useFastNative {
-			handled, rest, nerr := s.nativeLoop(sliceVal, src, start, n, sl)
-			if nerr != nil {
-				return nil, nerr
-			}
-			if handled {
-				src = rest
-				continue
-			}
-			useFastNative = false // named slice/elem type: fall back to fastLoop henceforth
-		}
-		if useFast {
-			src, err = s.fastLoop(src, sliceVal, start, n, sl)
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if useFastIface {
-			src, err = s.fastIfaceLoop(src, anys, start, n, sl)
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if iface {
-			for i := start; i < newLen; i++ {
-				src, err = s.deserItem(src, reflect.ValueOf(&anys[i]).Elem(), sl)
-				if err != nil {
-					return nil, err
+			end := start + k
+			handled := false
+			if useFastNative {
+				var rest []byte
+				if handled, rest, err = s.nativeLoop(sliceVal, src, start, k, sl); handled {
+					src = rest
+				} else if err == nil {
+					useFastNative = false // named slice/elem type: fall back to fastLoop henceforth
 				}
 			}
-			continue
-		}
-		// The block body is a function of its own so that deser keeps few
-		// enough returns for the compiler to open-code its defer.
-		if src, err = s.typedBlock(src, sliceVal, start, n, sl); err != nil {
-			return nil, err
+			if err == nil && !handled {
+				switch {
+				case useFast:
+					src, err = s.fastLoop(src, sliceVal, start, k, sl)
+				case useFastIface && (start >= oldCap || !hasTarget(anys[start:min(end, oldCap)], envNames)):
+					src, err = s.fastIfaceLoop(src, anys, start, k, sl)
+				case iface:
+					for i := start; i < end && err == nil; i++ {
+						src, err = s.deserItem(src, reflect.ValueOf(&anys[i]).Elem(), sl)
+					}
+				default:
+					// The block body is a function of its own so that
+					// deser keeps few enough returns for the compiler to
+					// open-code its defer.
+					src, err = s.typedBlock(src, sliceVal, start, k, sl)
+				}
+			}
+			if err != nil {
+				return nil, err
+			}
+			start += k
+			n -= k
 		}
 	}
+}
+
+// deserTypedInAny finishes a decode into the interface v after anySlice
+// found an error, or found typed, a slice of a type other than []any, which
+// is a typed target. What an interface has is not addressable, so we decode
+// into a copy of the slice header, which reuses the backing array, and store
+// the copy. It takes anySlice's err, rather than deser returning it, so that
+// deser keeps few enough returns for the compiler to open-code its defer.
+func (s *deserArray) deserTypedInAny(src []byte, v, typed reflect.Value, err error, sl *slab) ([]byte, error) {
+	if err != nil {
+		return nil, err
+	}
+	tmp := reflect.New(typed.Type()).Elem()
+	tmp.Set(typed)
+	// The caller counted this array's depth already.
+	sl.depth--
+	src, err = s.deser(src, tmp, sl)
+	sl.depth++
+	if err != nil {
+		return nil, err
+	}
+	v.Set(tmp)
+	return src, nil
 }
 
 // elemFor returns the unsafe decoder a struct field of type t gets for one
@@ -1615,14 +2023,16 @@ func (s *deserArray) typedBlock(src []byte, sliceVal reflect.Value, start, n int
 			return src, nil
 		}
 	}
+	// We batch-allocate backing for nil pointer slots only and reuse any
+	// non-nil retained pointer, so an element aliased from a prior decode is
+	// updated in place. That matches the unsafe struct-field path
+	// (udArrayPtrRecord) and the documented pointer-reuse contract. A slice
+	// that grows keeps the pointers it had, since Grow copies them, so only
+	// the new slots get fresh backing. A slot gets its pointer just before
+	// its item decodes, and the deferred call gives it a nil back when the
+	// item fails or panics.
+	var backing reflect.Value
 	if elemType.Kind() == reflect.Pointer {
-		innerType := elemType.Elem()
-		// We batch-allocate backing for nil slots only and reuse any
-		// non-nil retained pointer, so an element aliased from a prior
-		// decode is updated in place. That matches the unsafe struct-field
-		// path (udArrayPtrRecord) and the documented pointer-reuse
-		// contract. A slice that grows keeps the pointers it had, since
-		// Grow copies them, so only the new slots get fresh backing.
 		var need int
 		for i := range n {
 			if sliceVal.Index(start + i).IsNil() {
@@ -1630,38 +2040,33 @@ func (s *deserArray) typedBlock(src []byte, sliceVal reflect.Value, start, n int
 			}
 		}
 		if need > 0 {
-			backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
-			j := 0
-			for i := range n {
-				slot := sliceVal.Index(start + i)
-				if slot.IsNil() {
-					slot.Set(backing.Index(j).Addr())
-					j++
-				}
-			}
+			backing = reflect.MakeSlice(reflect.SliceOf(elemType.Elem()), need, need)
 		}
 	}
 	var err error
+	var fresh reflect.Value // a slot that has a new pointer while its item decodes
+	defer func() {
+		if fresh.IsValid() {
+			fresh.SetZero()
+		}
+	}()
+	j := 0
 	for i := start; i < start+n; i++ {
-		src, err = s.deserItem(src, sliceVal.Index(i), sl)
-		if err != nil {
+		slot := sliceVal.Index(i)
+		if backing.IsValid() && slot.IsNil() {
+			slot.Set(backing.Index(j).Addr())
+			j++
+			fresh = slot
+		}
+		if src, err = s.deserItem(src, slot, sl); err != nil {
 			return nil, err
 		}
+		fresh = reflect.Value{}
 	}
 	return src, nil
 }
 
-// isEmptyInterface reports whether t is any or another interface type with no
-// methods.
-func isEmptyInterface(t reflect.Type) bool {
-	return t.Kind() == reflect.Interface && t.NumMethod() == 0
-}
-
 func (s *deserArray) deserFixedArray(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	// An any element starts from nil, as in a slice of any.
-	if isEmptyInterface(v.Type().Elem()) {
-		v.SetZero()
-	}
 	arrLen := v.Len()
 	idx := 0
 	var err error
@@ -1687,7 +2092,12 @@ func (s *deserArray) deserFixedArray(src []byte, v reflect.Value, sl *slab) ([]b
 		}
 		n := int(count)
 		for range n {
-			src, err = s.deserItem(src, v.Index(idx), sl)
+			// A nil pointer element whose item fails stays nil.
+			ev := v.Index(idx)
+			fresh := nilPointerOnPath(ev)
+			if src, err = s.deserItem(src, ev, sl); err != nil && fresh.IsValid() {
+				fresh.SetZero()
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -1732,11 +2142,12 @@ func deserArrayIfaceLoop[T any](readOne func(src []byte, sl *slab) (T, []byte, e
 // deserArrayFnIfaceLoop is deserArrayIfaceLoop for items that fn decodes.
 func deserArrayFnIfaceLoop(fn deserIfaceFn) func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
 	return func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
-		var err error
 		for i := start; i < start+count; i++ {
-			if slice[i], src, err = fn(src, sl); err != nil {
+			v, rest, err := fn(src, sl)
+			if err != nil {
 				return nil, err
 			}
+			slice[i], src = v, rest
 		}
 		return src, nil
 	}
@@ -1866,14 +2277,28 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	v = indirectAlloc(v)
 	iface := v.Kind() == reflect.Interface
 	// We populate mapVal lazily so we can size the map with the first block's
-	// count as a hint, avoiding a rehash on the typical single-block path. For
-	// non-iface maps you may pass a pre-populated map; we merge into it as-is
-	// and skip the hint.
+	// count as a hint, avoiding a rehash on the typical single-block path. A
+	// map you pass, or the map[string]any your any has, is merged into as-is,
+	// with no hint.
 	var (
 		mapVal  reflect.Value
 		mapTyp  reflect.Type
 		elemTyp reflect.Type
 	)
+	if iface {
+		// A map v has is a typed target: we merge into a map[string]any
+		// here, and into a map of another type as into the typed target
+		// below.
+		m, typed, err := anyMap(v, "map")
+		if err != nil {
+			return nil, err
+		}
+		if typed.IsValid() {
+			v, iface = typed, false
+		} else if m != nil {
+			mapVal = reflect.ValueOf(m)
+		}
+	}
 	if iface {
 		mapTyp = mapStringAnyType
 		elemTyp = anyType
@@ -1897,6 +2322,10 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	// assertion can succeed) on top of the useFast eligibility. A named map
 	// or named key type returns handled=false and falls back to fastBlock.
 	useFastNative := useFast && s.nativeBlock != nil && mapTyp.Key() == stringType
+	// look reports whether a value decodes into the value the map has for its
+	// key: the map had entries before this decode, and a value of its type
+	// can hold something to reuse.
+	look := mapVal.IsValid() && mapVal.Len() > 0 && reusesMapValue(elemTyp)
 	// For interface targets with primitive avro values, use the
 	// iface-block fast path that operates directly on map[string]any.
 	useFastIface := iface && s.fastIfaceVal != nil
@@ -1919,12 +2348,14 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			// Empty map: allocate zero-sized backing if we never saw a block.
 			if !mapVal.IsValid() {
 				mapVal = reflect.MakeMap(mapTyp)
-				if !iface {
-					v.Set(mapVal)
-				}
 			}
 			if iface {
 				return src, setIface(v, mapVal, "map")
+			}
+			// A nil map target gets the new map only from a decode that
+			// worked.
+			if v.IsNil() {
+				v.Set(mapVal)
 			}
 			return src, nil
 		}
@@ -1940,9 +2371,6 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		if !mapVal.IsValid() {
 			hint := min(int(count), maxMapPreAllocSize)
 			mapVal = reflect.MakeMapWithSize(mapTyp, hint)
-			if !iface {
-				v.Set(mapVal)
-			}
 		}
 		if useFastNative {
 			handled, rest, nerr := s.nativeBlock(mapVal, src, int(count), sl)
@@ -1971,7 +2399,7 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			// via the extracted Go map is visible through mapVal too,
 			// so the trailing setIface picks up all entries.
 			m := mapVal.Interface().(map[string]any)
-			src, err = deserMapPrimitiveIfaceBlock(src, m, int(count), sl, s.fastIfaceVal)
+			src, err = deserMapPrimitiveIfaceBlock(src, m, int(count), sl, s.fastIfaceVal, look, s.deserItem)
 			if err != nil {
 				return nil, err
 			}
@@ -1994,6 +2422,9 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			}
 			if err := validateJSONNumberMapKey(keyVal.String(), keyType, "map"); err != nil {
 				return nil, err
+			}
+			if look {
+				mapValueInto(mapVal, keyVal, elemVal)
 			}
 			if fast != nil {
 				src, err = deserRecordFastPtr(src, fast, elemP, sl)
@@ -2142,11 +2573,29 @@ var (
 // reading into the native Go map. We select them at schema build time based
 // on the avro value type.
 
-func deserMapPrimitiveIfaceBlock(src []byte, m map[string]any, count int, sl *slab, decodeVal deserIfaceFn) ([]byte, error) {
+// deserMapPrimitiveIfaceBlock decodes one block of count entries into m.
+// decodeVal stores a new value without reading the old one. When look is set,
+// m had entries before this decode, and a key whose old value is a target
+// takes item, which decodes into a pointer and returns the error of a typed
+// target for a map or slice.
+func deserMapPrimitiveIfaceBlock(src []byte, m map[string]any, count int, sl *slab, decodeVal deserIfaceFn, look bool, item deserfn) ([]byte, error) {
 	for range count {
 		key, rest, err := readMapKeyString(src, sl)
 		if err != nil {
 			return nil, err
+		}
+		if look {
+			if old := m[key]; isTarget(old) {
+				// cell is its own variable so that only this path
+				// allocates one.
+				cell := old
+				src = rest
+				if src, err = item(src, reflect.ValueOf(&cell).Elem(), sl); err != nil {
+					return nil, err
+				}
+				m[key] = cell
+				continue
+			}
 		}
 		val, rest, err := decodeVal(rest, sl)
 		if err != nil {
@@ -2720,8 +3169,9 @@ func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 
 // setDecimalValue sets v from decimal bytes. Returns true if v was set,
 // false if v's Go type is not supported by the decimal decoder (caller
-// may fall back to the underlying bytes/fixed handler).
-func setDecimalValue(v reflect.Value, b []byte, scale int) (bool, error) {
+// may fall back to the underlying bytes/fixed handler). avroType is the
+// decimal's Avro type, bytes or fixed, which an error names.
+func setDecimalValue(v reflect.Value, b []byte, scale int, avroType string) (bool, error) {
 	// Bound the unscaled length before bytesToRat materializes a big.Int and
 	// setDecimalRat base-converts it (see maxDecimalUnscaledBytes). Returning
 	// (true, err) makes the binary deserBytesDecimal / deserFixedDecimal and
@@ -2730,15 +3180,60 @@ func setDecimalValue(v reflect.Value, b []byte, scale int) (bool, error) {
 	if err := checkDecimalUnscaledLen(b); err != nil {
 		return true, err
 	}
-	return setDecimalRat(v, bytesToRat(b, scale), scale)
+	return setDecimalRat(v, bytesToRat(b, scale), scale, avroType)
+}
+
+// ratTarget returns the *big.Rat that a decimal decodes into in place: one
+// behind a pointer, such as a *big.Rat field or element, or the one an any
+// has. v is the target before indirectAlloc. A big.Rat stored by value is
+// not one, although we can address it: a copy of its struct shares its
+// storage, and a decode in place would change every copy you kept. That
+// includes the big.Rat of Decode(src, r) for an r of type *big.Rat, which we
+// cannot tell from the address of a field.
+func ratTarget(v reflect.Value) *big.Rat {
+	for range maxIndirectDepth {
+		switch v.Kind() {
+		case reflect.Pointer:
+			if v.IsNil() || !v.CanInterface() {
+				return nil
+			}
+			if v.Type() == bigRatPtrType {
+				return v.Interface().(*big.Rat)
+			}
+			v = v.Elem()
+		case reflect.Interface:
+			if v.IsNil() {
+				return nil
+			}
+			v = v.Elem()
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// decimalInPlace decodes the decimal b into the *big.Rat the target v has,
+// and reports whether v has one. That reuses the numerator's storage and
+// makes no new big.Rat.
+func decimalInPlace(v reflect.Value, b []byte, scale int) (bool, error) {
+	r := ratTarget(v)
+	if r == nil {
+		return false, nil
+	}
+	if err := checkDecimalUnscaledLen(b); err != nil {
+		return true, err
+	}
+	r.SetFrac(setSigned(r.Num(), b), pow10(scale))
+	return true, nil
 }
 
 // setDecimalRat is the rat-input variant of setDecimalValue; the JSON
 // bare-number form already has a parsed *big.Rat. Both share this so the
 // target set and the float overflow guards stay the same on both wires.
-func setDecimalRat(v reflect.Value, r *big.Rat, scale int) (bool, error) {
+func setDecimalRat(v reflect.Value, r *big.Rat, scale int, avroType string) (bool, error) {
 	if v.Kind() == reflect.Interface {
-		return true, setIface(v, reflect.ValueOf(r), "decimal")
+		return true, setIface(v, reflect.ValueOf(r), avroType)
 	}
 	if v.Type() == bigRatType {
 		v.Set(reflect.ValueOf(*r))
@@ -2779,8 +3274,11 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	}
 	b := src[:n]
 	src = src[n:]
+	if ok, err := decimalInPlace(v, b, s.scale); ok {
+		return src, err
+	}
 	v = indirectAlloc(v)
-	if ok, err := setDecimalValue(v, b, s.scale); ok {
+	if ok, err := setDecimalValue(v, b, s.scale, "bytes"); ok {
 		return src, err
 	}
 	// Opaque-bytes pass-through for a []byte target, mirroring
@@ -2789,7 +3287,7 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	// text, and the encoder rejects a non-numeric string for a decimal. So
 	// string is numeric-text-only and []byte the sole opaque carrier,
 	// symmetric on both sides.
-	return src, setBytesValue(v, b, "decimal", sl)
+	return src, setBytesValue(v, b, "bytes", sl)
 }
 
 type deserBigDecimal struct{}
@@ -2813,7 +3311,7 @@ func setBigDecimalTarget(v reflect.Value, payload []byte, sl *slab) error {
 	v = indirectAlloc(v)
 	done, err := applyBigDecimalPayload(v, payload)
 	if !done {
-		err = setBytesValue(v, payload, "big-decimal", sl)
+		err = setBytesValue(v, payload, "bytes", sl)
 	}
 	return err
 }
@@ -2828,7 +3326,7 @@ func setBigDecimalTarget(v reflect.Value, payload []byte, sl *slab) error {
 func applyBigDecimalPayload(v reflect.Value, payload []byte) (done bool, err error) {
 	r, displayScale, perr := parseBigDecimalPayload(payload)
 	if perr == nil {
-		if ok, serr := setDecimalRat(v, r, displayScale); ok {
+		if ok, serr := setDecimalRat(v, r, displayScale, "bytes"); ok {
 			return true, serr
 		}
 		return false, nil
@@ -2879,8 +3377,11 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	}
 	b := src[:s.size]
 	src = src[s.size:]
+	if ok, err := decimalInPlace(v, b, s.scale); ok {
+		return src, err
+	}
 	v = indirectAlloc(v)
-	if ok, err := setDecimalValue(v, b, s.scale); ok {
+	if ok, err := setDecimalValue(v, b, s.scale, "fixed"); ok {
 		return src, err
 	}
 	// Fall back to the opaque [N]byte or []byte fixed. The delegate gets a
@@ -2925,19 +3426,25 @@ func bytesToRat(b []byte, scale int) *big.Rat {
 	return scaledRat(bytesToBigInt(b), scale)
 }
 
-func bytesToBigInt(b []byte) *big.Int {
-	if len(b) == 0 {
-		return new(big.Int)
+func bytesToBigInt(b []byte) *big.Int { return setSigned(new(big.Int), b) }
+
+// setSigned sets z to the two's complement big-endian integer b, in z's own
+// storage, and returns z.
+func setSigned(z *big.Int, b []byte) *big.Int {
+	if len(b) == 0 || b[0]&0x80 == 0 {
+		return z.SetBytes(b)
 	}
-	i := new(big.Int).SetBytes(b) // unsigned big-endian
-	if b[0]&0x80 != 0 {
-		// High bit set means negative in two's complement.
-		// SetBytes treated it as unsigned, so subtract 2^(8*len)
-		// to recover the signed value.
-		modulus := new(big.Int).Lsh(big.NewInt(1), uint(8*len(b)))
-		i.Sub(i, modulus)
+	// A negative value: its magnitude is the two's complement of b.
+	var stack [64]byte
+	mag := append(stack[:0], b...)
+	carry := byte(1)
+	for i := len(mag) - 1; i >= 0; i-- {
+		mag[i] = ^mag[i] + carry
+		if mag[i] != 0 {
+			carry = 0
+		}
 	}
-	return i
+	return z.Neg(z.SetBytes(mag))
 }
 
 // parseUUID parses an RFC 4122 hex-dash UUID string into a [16]byte. It is

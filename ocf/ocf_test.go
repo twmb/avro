@@ -55,11 +55,23 @@ func TestRoundTrip(t *testing.T) {
 		}
 	}
 	mustClose(t, w)
+	raw := bytes.Clone(buf.Bytes())
 
 	r := mustNewReader(t, &buf)
 	out := drainAll[person](t, r)
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("got %v, want %v", out, in)
+	}
+
+	// Decode follows the rules of avro.Schema.Decode: a record decodes into
+	// the map an any has, and into the pointer the map has for a field.
+	age := new(int32)
+	var x any = map[string]any{"age": age}
+	if err := mustNewReader(t, bytes.NewReader(raw)).Decode(&x); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := x.(map[string]any); got["age"] != age || *age != 30 {
+		t.Errorf("Decode into an any with your map: %v, want your pointer set to 30", x)
 	}
 }
 

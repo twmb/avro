@@ -157,7 +157,7 @@ func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		e.GoType = v.Type()
 	}
 	if lastErr != nil {
-		e.Err = fmt.Errorf("no matching branch: %w", lastErr)
+		e.Err = &causeError{"no matching branch", lastErr}
 	} else {
 		e.Err = errors.New("no matching branch")
 	}

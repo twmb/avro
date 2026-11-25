@@ -2987,7 +2987,7 @@ func TestInvariant_EveryUnionNodeCarriesItsTagTable(t *testing.T) {
 						_, log[i] = unionBranchNames(b)
 					}
 				}
-				fillUnionTagTables(fresh, new(deserUnion), n.branches, std, log)
+				fillUnionTagTables(fresh, new(deserUnion), n.branches, nil, std, log)
 				if len(fresh.byName) != len(n.tags.byName) {
 					t.Errorf("%s: union tag table holds %d names, a fresh build holds %d — the table is stale",
 						label, len(n.tags.byName), len(fresh.byName))

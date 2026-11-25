@@ -100,6 +100,11 @@ type customWiring struct {
 	// CustomType has an Encode. The runtime proxy custom[node].encode != nil
 	// would wrongly skip the arm for a wildcard with Encode.
 	encodeSuppresses bool
+	// goTypes is the GoType of each matching CustomType with a Decode: what
+	// a value of the node decodes to besides its Avro-native value. A union
+	// with the node as a branch replaces a value of one of these types when
+	// another branch arrives.
+	goTypes []reflect.Type
 }
 
 // schemaNode preserves full schema metadata that canonical form strips:
@@ -122,7 +127,7 @@ type schemaNode struct {
 	branches    []*schemaNode // union branches
 	ser         serfn
 	deser       deserfn
-	decodeJSON  jsonDecodeFn // non-nil only when custom decoders are wired
+	decodeJSON  jsonDecodeFn // non-nil when a CustomType changes what DecodeJSON returns here
 	serRecord   *serRecord
 	deserRecord *deserRecord
 
@@ -206,6 +211,7 @@ func Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	b := &builder{
 		named:      make(map[string]*namedType),
 		building:   make(map[*schemaNode]struct{}),
+		sites:      make(map[*schemaNode][]*schemaNode),
 		definedSet: make(map[*namedType]bool),
 		minBytes:   newMinBytesWalk(),
 	}
@@ -851,6 +857,9 @@ type unionMissing struct {
 	branches   []*schemaNode  // union node's branch slice; fwd-ref branch nodes are patched in finalize
 	missing    map[int]string // branch index to type name
 	parentName string         // enclosing scope, for the finalize namespace-qualified retry
+	// props are the extra keys of a wrapped forward-referenced branch, by
+	// branch index, which only that branch's custom types get.
+	props map[int]map[string]any
 }
 
 // fieldMeta carries Avro-level type info for a record field, used by the
@@ -898,6 +907,9 @@ type recordFieldFixup struct {
 	parentName string // enclosing record fullname, for the namespace-qualified retry
 	defaultVal any    // parsed JSON default; valid only when hasDefault is true
 	hasDefault bool   // whether the field had a "default" in the schema
+	// props are the extra keys of a wrapped reference, which only this
+	// field's custom types get.
+	props map[string]any
 }
 
 // containerFixup patches an array or map container whose element type
@@ -913,6 +925,9 @@ type containerFixup struct {
 	name        string       // referenced named-type name
 	parentName  string       // enclosing scope, for the namespace-qualified retry
 	ctxLabel    string       // "array" or "map" for error messages
+	// props are the extra keys of a wrapped reference, which only this
+	// element's custom types get.
+	props map[string]any
 }
 
 // defaultFixup defers a record field's default-value encoding to finalize,
@@ -940,7 +955,7 @@ func captureFwdRef(err error, ctxLabel string) (isFwdRef bool, fwdName string, w
 	if pe := (*unknownPrimitiveError)(nil); errors.As(err, &pe) {
 		return true, pe.p, nil
 	}
-	return false, "", fmt.Errorf("invalid %s: %v", ctxLabel, err)
+	return false, "", fmt.Errorf("invalid %s: %s", ctxLabel, causeText(err))
 }
 
 // namedType holds the compiled artifacts for a named Avro type (record,
@@ -951,23 +966,32 @@ type namedType struct {
 	// custom-typed reference wraps b.ser while leaving node.ser bare, and a
 	// copy could not be re-pointed.
 	node *schemaNode
-	// hadCustomType is true when this named type was defined by a parse that
-	// wired at least one CustomType anywhere (coarse: every
-	// definition of a custom-wired parse counts; stamped at finalize, see
-	// registerNamed). The cache-reference boundary guard compares it against
-	// the referencing parse's registrations to allow consistent reuse and
-	// reject mismatches; the documented remediation path "re-parse Inner with
-	// the CT first" depends on this signal.
+	// hadCustomType is true when a CustomType of the parse that defined this
+	// named type matches somewhere in the type's subtree, as finalize stamps
+	// it. The cache-reference boundary guard compares it against the
+	// referencing parse's registrations to allow consistent reuse and reject
+	// mismatches; the documented remediation path "re-parse Inner with the CT
+	// first" depends on this signal.
 	hadCustomType bool
+	// custom is the custom-type overlay of the parse that defined this
+	// named type. A later parse that references the type copies the
+	// wiring of the type's nodes from it, so EncodeJSON and Resolve apply
+	// the custom types that the type's compiled encoder and decoder have.
+	custom map[*schemaNode]*customWiring
 }
 
 type builder struct {
 	ser   serfn
 	deser deserfn
 
-	named        map[string]*namedType
-	building     map[*schemaNode]struct{} // record/error nodes whose field loop is in progress (shared across nest, like named)
-	definedNamed []*namedType             // named types defined by this parse (vs inherited); stamped custom-affected at finalize
+	named    map[string]*namedType
+	building map[*schemaNode]struct{} // record/error nodes whose field loop is in progress (shared across nest, like named)
+	// sites has, for a record in building, the copies siteNodeWith made of it
+	// for references inside its own fields. buildRecord copies the record
+	// into them again once its fields are done. Shared across nest, like
+	// building.
+	sites        map[*schemaNode][]*schemaNode
+	definedNamed []*namedType // named types defined by this parse (vs inherited); stamped custom-affected at finalize
 	// definedSet is the membership form of this-parse definitions. Unlike
 	// definedNamed, which merges up only at unnest, it is shared by reference
 	// across nest(), so a guard running in a nested builder can test whether
@@ -1055,6 +1079,7 @@ func (b *builder) nest() *builder {
 	return &builder{
 		named:           b.named,
 		building:        b.building,
+		sites:           b.sites,
 		checkName:       b.checkName,
 		customTypes:     b.customTypes,
 		custom:          b.custom,
@@ -1114,28 +1139,28 @@ func makeCustomSer(ce func(reflect.Value) (reflect.Value, error), base serfn) se
 	}
 }
 
-// customWrappedSer returns base wrapped with node's custom-Encode chain when
-// one is registered (the same wrap applyCustomTypes installs for an in-order
-// reference), else base unchanged. The forward-ref fixups in finalize call this
+// customWrappedSer returns base wrapped with the custom-Encode chain of w, a
+// reference's wiring, when w has one (the same wrap applyCustomTypes installs
+// for an in-order reference), else base unchanged. The forward-ref fixups in finalize call this
 // so a forward reference to a custom-encoded named type applies the CustomType
 // on the binary path. Using the unwrapped namedType.ser instead silently
 // diverges binary from JSON: the forward-referenced field encodes raw on
 // binary but converted on JSON.
-func (b *builder) customWrappedSer(node *schemaNode, base serfn) serfn {
-	if w := b.custom[node]; w != nil && w.encode != nil {
+func customWrappedSer(w *customWiring, base serfn) serfn {
+	if w != nil && w.encode != nil {
 		return makeCustomSer(w.encode, base)
 	}
 	return base
 }
 
 // customWrappedDeser is the decode dual of customWrappedSer: base wrapped with
-// node's custom-Decode chain when one is registered, else base unchanged.
+// the custom-Decode chain of w when w has one, else base unchanged.
 // The forward-ref fixups in finalize call it so a forward reference to a
 // custom-decoded named type applies the CustomType on the binary path as the
 // JSON path already does. Logical suppression with no Decode callback needs
 // no wrap, since the raw deser is baked onto the shared leaf node.
-func (b *builder) customWrappedDeser(node *schemaNode, base deserfn) deserfn {
-	if w := b.custom[node]; w != nil && len(w.decoders) > 0 {
+func customWrappedDeser(w *customWiring, base deserfn) deserfn {
+	if w != nil && len(w.decoders) > 0 {
 		return wrapDeserWithCustomDecoders(base, w.decoders, w.sn)
 	}
 	return base
@@ -1334,7 +1359,7 @@ func (b *builder) tryAssignNamedRef(name, parentName string) (bool, error) {
 		if b.overlayDone == nil {
 			b.overlayDone = make(map[*schemaNode]bool)
 		}
-		b.overlayInheritedCustom(nt.node, b.overlayDone)
+		b.overlayInheritedCustom(nt.node, nt.custom, b.overlayDone)
 	}
 	b.canon = aschema{primitive: resolved}
 	b.ser = nt.node.ser
@@ -1353,8 +1378,9 @@ func (b *builder) finalize() error {
 			if nt == nil {
 				return fmt.Errorf("unknown type %q", truncForError(name))
 			}
-			m.ser.fns[idx] = b.customWrappedSer(nt.node, nt.node.ser)
-			m.deser.fns[idx] = b.customWrappedDeser(nt.node, nt.node.deser)
+			w := b.refWiring(nt.node, m.props[idx])
+			m.ser.fns[idx] = customWrappedSer(w, nt.node.ser)
+			m.deser.fns[idx] = customWrappedDeser(w, nt.node.deser)
 			// The builder left branches[idx] nil for this forward-ref
 			// branch (the named type wasn't built yet). The binary path
 			// dispatches through the ser/deser fn tables (patched above),
@@ -1362,7 +1388,7 @@ func (b *builder) finalize() error {
 			// union-default-validation paths walk node.branches directly
 			// and would dereference the nil node.
 			if m.branches != nil {
-				m.branches[idx] = nt.node
+				m.branches[idx] = b.siteNodeWith(nt.node, w)
 			}
 		}
 		// With every branch node wired, re-derive the union's
@@ -1370,7 +1396,7 @@ func (b *builder) finalize() error {
 		// branch-name tables) from the resolved names: buildUnion ran
 		// them with the unresolved as-written names for fwd-ref branches.
 		if m.branches != nil && m.deser != nil {
-			if err := finalizeUnionNames(m.ser.tags, m.deser, m.branches); err != nil {
+			if err := finalizeUnionNames(m.ser.tags, m.deser, m.branches, b.custom); err != nil {
 				return err
 			}
 		}
@@ -1395,8 +1421,9 @@ func (b *builder) finalize() error {
 		if nt == nil {
 			return fmt.Errorf("unknown type %q", truncForError(m.name))
 		}
-		m.nd.serRecord.fields[m.idx].fn = b.customWrappedSer(nt.node, nt.node.ser)
-		m.nd.deserRecord.fields[m.idx].fn = b.customWrappedDeser(nt.node, nt.node.deser)
+		w := b.refWiring(nt.node, m.props)
+		m.nd.serRecord.fields[m.idx].fn = customWrappedSer(w, nt.node.ser)
+		m.nd.deserRecord.fields[m.idx].fn = customWrappedDeser(w, nt.node.deser)
 		if nt.node.serRecord != nil {
 			// The encode and decode entries for one field were handed the
 			// same *fieldMeta when the field was built, so naming the type
@@ -1407,8 +1434,8 @@ func (b *builder) finalize() error {
 		}
 		// We mark a custom type, as applyCustomTypes does for an in-order
 		// reference, so the unsafe paths keep the wrap on fn.
-		m.nd.serRecord.fields[m.idx].meta.hasCustomType = b.custom[nt.node] != nil
-		m.nd.fields[m.idx].node = nt.node
+		m.nd.serRecord.fields[m.idx].meta.hasCustomType = w != nil
+		m.nd.fields[m.idx].node = b.siteNodeWith(nt.node, w)
 	}
 	// Phase 1b: wire every forward-referenced array/map container child.
 	// One walk is shared across the loop: a schema can point any number of
@@ -1421,10 +1448,11 @@ func (b *builder) finalize() error {
 		if nt == nil {
 			return fmt.Errorf("%s references unknown named type %q", m.ctxLabel, truncForError(m.name))
 		}
-		*m.serItem = b.customWrappedSer(nt.node, nt.node.ser)
-		*m.deserItem = b.customWrappedDeser(nt.node, nt.node.deser)
+		w := b.refWiring(nt.node, m.props)
+		*m.serItem = customWrappedSer(w, nt.node.ser)
+		*m.deserItem = customWrappedDeser(w, nt.node.deser)
 		m.setMinBytes(mbw.minBytesOf(nt.node))
-		*m.nodeChild = nt.node
+		*m.nodeChild = b.siteNodeWith(nt.node, w)
 	}
 	// Phase 2: deferred field defaults, in two passes. encodeDefault fills
 	// an absent nested record field from its resolved f.defaultVal, so we
@@ -1480,20 +1508,21 @@ func (b *builder) finalize() error {
 		}
 	}
 	// We stamp each named type this parse defined as custom-affected iff a
-	// non-wildcard registration matches somewhere in its own subtree,
-	// which is when baked effects live inside the type. The predicate is
-	// the same one the cache-boundary guard applies on the reference side,
-	// so stamp and guard cannot disagree. Asking about the type's own
-	// subtree crosses into inherited subtrees, so a wrapper around an
-	// inherited custom-baked reference is stampable, and a sibling with
-	// no match is not stamped merely because the parse wired something
-	// elsewhere. Taken at finalize, after the tree is built, because
-	// registration happens early to support self-references.
+	// registration matches somewhere in its own subtree, a wildcard only
+	// with a callback, which is when custom conversions live inside the
+	// type. The predicate is the same one the cache-boundary guard applies
+	// on the reference side, so stamp and guard cannot disagree. Asking
+	// about the type's own subtree crosses into inherited subtrees, so a
+	// wrapper around an inherited custom-wired reference is stampable, and
+	// a sibling with no match is not stamped merely because the parse wired
+	// something elsewhere. Taken at finalize, after the tree is built,
+	// because registration happens early to support self-references.
 	if len(b.customTypes) > 0 {
 		for _, nt := range b.definedNamed {
 			if b.customMatchInSubtree(nt.node) != "" {
 				nt.hadCustomType = true
 			}
+			nt.custom = b.custom
 		}
 	}
 	return nil
@@ -1558,14 +1587,22 @@ func (b *builder) build(parentName string, s *aschema) error {
 	if err != nil {
 		return err
 	}
-	// Propagate extra schema properties to the node (for CustomType callbacks).
+	// Propagate extra schema properties to the node (for CustomType
+	// callbacks). A wrapped reference ({"type":"S","foo":1}) resolves to the
+	// named type's node, which every reference shares, so its props go only
+	// to this reference's custom types.
+	var props map[string]any
 	if b.node != nil && s.object != nil && len(s.object.extra) > 0 {
-		b.node.props = s.object.extra
+		if s.object.Name == "" && isNamedKind(b.node.kind) {
+			props = s.object.extra
+		} else {
+			b.node.props = s.object.extra
+		}
 	}
 	// Apply custom types to newly built nodes (not unions: custom
 	// types fire on individual branches, not the union container).
 	if len(b.customTypes) > 0 && b.node != nil && b.node.kind != "union" {
-		if err := b.applyCustomTypes(b.node); err != nil {
+		if err := b.applyCustomTypes(b.node, props); err != nil {
 			return err
 		}
 	}
@@ -1635,7 +1672,7 @@ func (b *builder) hasMatchingCustomTypeCond(kind, logical string, requireEncode 
 	return false
 }
 
-func (b *builder) applyCustomTypes(node *schemaNode) error {
+func (b *builder) applyCustomTypes(node *schemaNode, props map[string]any) error {
 	// Validate NewCustomType-created types with unsupported A type.
 	for _, ct := range b.customTypes {
 		if ct.needsAvroType && ct.AvroType == "" {
@@ -1643,7 +1680,13 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		}
 	}
 
-	wiring := b.buildCustomWiring(node)
+	src := node
+	if props != nil {
+		ref := *node
+		ref.props = props
+		src = &ref
+	}
+	wiring := b.buildCustomWiring(src)
 	if wiring == nil {
 		return nil
 	}
@@ -1658,35 +1701,86 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		b.ser = makeCustomSer(wiring.encode, node.ser)
 	}
 
-	// See buildCustomWiring for what this narrowing buys and the
-	// suppression contract behind it.
-	jsonAppliesLogical := wiring.suppressLogical && jsonDecodeAppliesLogical(node)
 	if len(wiring.decoders) > 0 {
 		b.deser = wrapDeserWithCustomDecoders(node.deser, wiring.decoders, wiring.sn)
-		// JSON-side: wrap the node's per-decode dispatch with a
-		// closure that captures the decoder chain. The JSON runtime
-		// (decodeValue) checks node.decodeJSON first and falls back
-		// to decodeKind otherwise: no per-call map lookup, no
-		// recursion guard, no shared mutable state.
-		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(wiring.decoders, wiring.sn, wiring.suppressLogical)
-	} else if jsonAppliesLogical {
-		// No Decode callback on a logical node the binary path suppresses: you
-		// receive the raw Avro-native value, so we install the raw-decode
-		// wrapper with an empty chain to produce the same raw value through
-		// DecodeJSON. A wildcard keeps the logical transform on both paths.
-		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(nil, wiring.sn, wiring.suppressLogical)
 	}
-
-	b.putCustomWiring(node, wiring)
+	// The shared node keeps the wiring of the type's own props, and a
+	// wrapped reference's wiring goes only on its copy.
+	if props == nil {
+		b.putCustomWiring(node, wiring)
+	}
+	b.node = b.siteNodeWith(node, wiring)
 	b.meta.hasCustomType = true
 	return nil
 }
 
+// refProps returns the extra keys of a wrapped reference such as
+// {"type":"S","foo":1}, or nil.
+func refProps(s *aschema) map[string]any {
+	if s == nil || s.object == nil || len(s.object.extra) == 0 {
+		return nil
+	}
+	return s.object.extra
+}
+
+// refWiring returns the custom wiring of a reference to node: node's own, or
+// for a wrapped reference with props, wiring built with those props, which
+// only that reference's custom types get.
+func (b *builder) refWiring(node *schemaNode, props map[string]any) *customWiring {
+	if props == nil {
+		return b.custom[node]
+	}
+	ref := *node
+	ref.props = props
+	return b.buildCustomWiring(&ref)
+}
+
+// siteNodeWith returns the node a reference to node uses, where w is the
+// reference's custom wiring: node, or a node with w and its custom JSON
+// decoder. The JSON runtime (decodeValue) checks node.decodeJSON first and
+// falls back to decodeKind otherwise. A named type's node is shared by every
+// reference to it, in this parse and, through a SchemaCache, in others, so a
+// reference to one gets a copy, as the binary codec wraps the reference and
+// not the node. Any other node has one reference and gets the decoder itself.
+func (b *builder) siteNodeWith(node *schemaNode, w *customWiring) *schemaNode {
+	if w == nil {
+		return node
+	}
+	var fn jsonDecodeFn
+	switch {
+	case len(w.decoders) > 0:
+		fn = wrapDecodeJSONWithCustomDecoders(w.decoders, w.sn, w.suppressLogical)
+	case w.suppressLogical && jsonDecodeAppliesLogical(node):
+		// No Decode callback on a logical node the binary path suppresses:
+		// you receive the raw Avro-native value, so the decoder has an
+		// empty chain and gives the same raw value through DecodeJSON. A
+		// wildcard keeps the logical transform on both paths. See
+		// buildCustomWiring for the suppression contract.
+		fn = wrapDecodeJSONWithCustomDecoders(nil, w.sn, w.suppressLogical)
+	case node.name == "" || w == b.custom[node]:
+		return node
+	}
+	if node.name == "" {
+		node.decodeJSON = fn
+		return node
+	}
+	site := *node
+	site.decodeJSON = fn
+	b.putCustomWiring(&site, w)
+	// A record that is still being built has only the fields declared so
+	// far, so the copy counts as building, and a default through it waits
+	// for finalize. buildRecord copies the record into it again when the
+	// fields are done.
+	if _, ok := b.building[node]; ok {
+		b.building[&site] = struct{}{}
+		b.sites[node] = append(b.sites[node], &site)
+	}
+	return &site
+}
+
 // buildCustomWiring collects the per-node custom-type wiring from this parse's
 // registrations, or nil when none matches. It is pure with respect to the
-// builder and the node, which lets applyCustomTypes and
-// overlayInheritedCustom share it; inherited nodes get the overlay only,
-// since their wraps already live inside the inherited composition.
+// builder and the node.
 func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 	// Collect all matching encoders and decoders for this node.
 	type encoder struct {
@@ -1695,6 +1789,7 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 	}
 	var encoders []encoder
 	var decoders []func(any, *SchemaNode) (any, error)
+	var goTypes []reflect.Type
 
 	for _, ct := range b.customTypes {
 		if !ct.matches(node) {
@@ -1705,6 +1800,9 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 		}
 		if ct.Decode != nil {
 			decoders = append(decoders, ct.Decode)
+			if ct.GoType != nil && !slices.Contains(goTypes, ct.GoType) {
+				goTypes = append(goTypes, ct.GoType)
+			}
 		}
 	}
 
@@ -1734,6 +1832,11 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 
 	if len(encoders) > 0 {
 		customEncode := func(v reflect.Value) (reflect.Value, error) {
+			// A nil that a union tries on this branch has no Go type to
+			// match, and the built-in serializer reports it.
+			if !v.IsValid() {
+				return v, nil
+			}
 			// Dereference pointers and interface wrappers so GoType
 			// matching compares against the concrete type. Check GoType
 			// at each level so pointer-valued GoTypes (e.g. *url.URL)
@@ -1804,34 +1907,35 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 	if len(decoders) > 0 {
 		wiring.decoders = decoders
 	}
+	wiring.goTypes = goTypes
 	return wiring
 }
 
 // overlayInheritedCustom completes this parse's custom overlay for a
-// SchemaCache-inherited subtree. applyCustomTypes visits only newly built
-// nodes, so a reference to an inherited type left its matching nodes without
-// overlay entries: the wraps still fired on a direct decode, but Resolve,
-// which re-applies customs from the overlay, dropped the reader's custom and
-// returned raw values. We insert wiring only, no wraps, and keep existing
-// entries. visited is the per-parse b.overlayDone set; sharing it is sound
-// because the walk is idempotent within a parse.
-func (b *builder) overlayInheritedCustom(node *schemaNode, visited map[*schemaNode]bool) {
+// SchemaCache-inherited subtree with def, the overlay of the parse that
+// defined the type. applyCustomTypes visits only newly built nodes, so a
+// reference to an inherited type left its matching nodes without the overlay
+// entries that Resolve and EncodeJSON read. The wraps inside the type are the
+// defining parse's, so the overlay copies that parse's wiring, and keeps
+// existing entries. visited is the per-parse b.overlayDone set; sharing it is
+// sound because the walk is idempotent within a parse.
+func (b *builder) overlayInheritedCustom(node *schemaNode, def map[*schemaNode]*customWiring, visited map[*schemaNode]bool) {
 	if node == nil || visited[node] {
 		return
 	}
 	visited[node] = true
 	if b.custom[node] == nil {
-		if w := b.buildCustomWiring(node); w != nil {
+		if w := def[node]; w != nil {
 			b.putCustomWiring(node, w)
 		}
 	}
 	for _, f := range node.fields {
-		b.overlayInheritedCustom(f.node, visited)
+		b.overlayInheritedCustom(f.node, def, visited)
 	}
-	b.overlayInheritedCustom(node.items, visited)
-	b.overlayInheritedCustom(node.values, visited)
+	b.overlayInheritedCustom(node.items, def, visited)
+	b.overlayInheritedCustom(node.values, def, visited)
 	for _, br := range node.branches {
-		b.overlayInheritedCustom(br, visited)
+		b.overlayInheritedCustom(br, def, visited)
 	}
 }
 
@@ -1895,12 +1999,12 @@ func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *name
 		return fmt.Errorf("avro: cached type %q contains %q which would match a CustomType on this Parse; re-parse %q with the CustomType first", truncForError(refName), truncForError(currentMatches), truncForError(refName))
 	case nt.hadCustomType && currentMatches == "":
 		// Reverse: the cached node was built with a CustomType (its raw
-		// ser/deser and JSON decodeJSON bake that conversion onto the shared
-		// node), but this Parse registers no matching CustomType. Reusing it
-		// would silently apply the original conversion to a Schema that never
-		// opted in, giving suppressed/raw values on both wire formats.
-		// Register the same CustomType in this Parse, or parse the inner type
-		// without one.
+		// ser/deser, and the JSON decoders of the references inside it,
+		// convert values), but this Parse registers no matching
+		// CustomType. Reusing it would apply the original conversion, with
+		// no error, to a Schema that never opted in, giving suppressed/raw
+		// values on both wire formats. Register the same CustomType in this
+		// Parse, or parse the inner type without one.
 		return fmt.Errorf("avro: cached type %q was parsed with a CustomType affecting its subtree, but this Parse registers no matching CustomType; reusing it would apply that conversion here: register the CustomType in this Parse, or parse %q without one", truncForError(refName), truncForError(refName))
 	}
 	return nil
@@ -1970,13 +2074,18 @@ func (b *builder) findCustomTypeMatchInSubtreeWalk(node *schemaNode, visited map
 		effLogical = node.unknownLogical
 	}
 	for _, ct := range b.customTypes {
-		// Wildcard CTs (both empty) opt into runtime ErrSkipCustomType
-		// dispatch: they don't reliably suppress built-ins at parse
-		// time, so they don't cause silent-drop on cached subtrees.
-		// Skip them in this check; only explicitly-typed CTs would
-		// silently fail to fire.
+		// A wildcard (both empty) with a callback runs on every node,
+		// and its callback converts values there. A cached subtree keeps
+		// those conversions, as it keeps any other custom type's. A
+		// wildcard with no callback changes nothing.
 		if ct.LogicalType == "" && ct.AvroType == "" {
-			continue
+			if ct.Decode == nil && ct.Encode == nil {
+				continue
+			}
+			if node.name != "" {
+				return node.name
+			}
+			return node.kind
 		}
 		ltMatch := ct.LogicalType == "" || ct.LogicalType == effLogical
 		atMatch := ct.AvroType == "" || ct.AvroType == node.kind
@@ -2024,6 +2133,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		ser         = &serUnion{tags: tags}
 		deser       = new(deserUnion)
 		missing     = make(map[int]string)
+		props       map[int]map[string]any // a wrapped forward branch's extra keys
 		sawTypes    = make(map[string]bool)
 		branchMetas = make([]fieldMeta, len(s.union))
 		branchNodes = make([]*schemaNode, len(s.union))
@@ -2046,12 +2156,19 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		// The name captureFwdRef hands back comes from either the
 		// bare-string form (where us.primitive is set) or the wrapped form
 		// {"type":"FwdName"} (where us.object.Type is set).
+		branchProps := refProps(&us) // before the build, which can rewrite us
 		isFwdRef, fwdName, err := captureFwdRef(u.build(parentName, &us), "union")
 		if err != nil {
 			return err
 		}
 		if isFwdRef {
 			missing[i] = fwdName
+			if p := branchProps; p != nil {
+				if props == nil {
+					props = make(map[int]map[string]any)
+				}
+				props[i] = p
+			}
 		}
 		b.unnest(u)
 		branchMetas[i] = u.meta
@@ -2097,7 +2214,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		unionStd = append(unionStd, bn)
 		unionLog = append(unionLog, ln)
 	}
-	fillUnionTagTables(tags, deser, branchNodes, unionStd, unionLog)
+	fillUnionTagTables(tags, deser, branchNodes, b.custom, unionStd, unionLog)
 	// byKind serves type-name dispatch in the encoders (see
 	// unionTypeNameForValue). Primitive kinds only: named branches go through
 	// tagged dispatch, and the spec guarantees primitive kinds are unique
@@ -2141,6 +2258,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 			branches:   branchNodes,
 			missing:    missing,
 			parentName: parentName,
+			props:      props,
 		})
 	}
 	b.node = &schemaNode{
@@ -2164,6 +2282,7 @@ type unionTags struct {
 	byName map[string]int // the tag you write, to branch index
 	byKind map[string]int // primitive branch kind to branch index; first wins
 	emit   []string       // the tag each branch emits under TagLogicalTypes
+	shape  unionShape     // what each branch decodes to in an any
 }
 
 func (t *unionTags) branchByName(name string) (int, bool) {
@@ -2186,8 +2305,10 @@ func (t *unionTags) branchByKind(kind string) (int, bool) {
 // emits, a copy of the logical one that the JSON encoder and decoder emit,
 // and the one the encoders and the JSON decoder resolve a written tag
 // through. An exact branch name outranks a logical qualifier, so a branch
-// never emits a tag the decoder would hand to a different branch.
-func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNode, standard, logical []string) {
+// never emits a tag the decoder would hand to a different branch. It also
+// builds the union's shape, with the custom types of this parse's overlay.
+func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNode, custom map[*schemaNode]*customWiring, standard, logical []string) {
+	tags.shape = newUnionShape(branches, custom)
 	deser.branchNames = append(deser.branchNames[:0], standard...)
 	deser.logicalNames = deser.logicalNames[:0]
 	for i, ln := range logical {
@@ -2196,6 +2317,8 @@ func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNo
 		}
 		deser.logicalNames = append(deser.logicalNames, ln)
 	}
+	tags.shape.names = append(slices.Clip(deser.branchNames), deser.logicalNames...)
+	deser.shape = tags.shape
 	tags.emit = append(tags.emit[:0], deser.logicalNames...)
 	// We build the accept table by offering every branch to every tier in
 	// order, so it is the same set findUnionBranch accepts: across tiers
@@ -2265,7 +2388,7 @@ func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNo
 // branch-name tables. Duplicate detection re-keys by resolved fullname, so a
 // short-name forward reference and an inline definition of the same type now
 // collide, and the tag tables rebuild on the resolved full name.
-func finalizeUnionNames(tags *unionTags, deser *deserUnion, branches []*schemaNode) error {
+func finalizeUnionNames(tags *unionTags, deser *deserUnion, branches []*schemaNode, custom map[*schemaNode]*customWiring) error {
 	saw := make(map[string]bool, len(branches))
 	for _, n := range branches {
 		key := n.kind
@@ -2282,7 +2405,7 @@ func finalizeUnionNames(tags *unionTags, deser *deserUnion, branches []*schemaNo
 	for i, n := range branches {
 		_, log[i] = unionBranchNames(n)
 	}
-	fillUnionTagTables(tags, deser, branches, std, log)
+	fillUnionTagTables(tags, deser, branches, custom, std, log)
 	return nil
 }
 
@@ -2612,6 +2735,11 @@ func (b *builder) buildRecord(o *aobject) error {
 		serRecord:   sr,
 		deserRecord: dr,
 	}
+	// A reference inside the record's own fields wires its custom types
+	// before build sets the props, so the node has them from the start.
+	if len(o.extra) > 0 {
+		nd.props = o.extra
+	}
 	// The node and the parse's skip walk back dr.fieldSkips, which
 	// compiles lazily at decode time, after every field fixup has landed.
 	dr.node = nd
@@ -2626,6 +2754,7 @@ func (b *builder) buildRecord(o *aobject) error {
 	// is shared through nest so a nested record sees it.
 	if b.building == nil {
 		b.building = make(map[*schemaNode]struct{})
+		b.sites = make(map[*schemaNode][]*schemaNode)
 	}
 	b.building[nd] = struct{}{}
 	defer delete(b.building, nd)
@@ -2652,6 +2781,7 @@ func (b *builder) buildRecord(o *aobject) error {
 		if of.orderSet && of.Order != "ascending" && of.Order != "descending" && of.Order != "ignore" {
 			return fmt.Errorf("invalid field order %q for field %q", truncForError(of.Order), truncForError(of.Name))
 		}
+		fieldProps := refProps(of.Type) // before the build, which can rewrite of.Type
 		bf, isFwdRef, fwdRefName, err := b.buildChild(o.Name, of.Type, "record field")
 		if err != nil {
 			return err
@@ -2689,6 +2819,7 @@ func (b *builder) buildRecord(o *aobject) error {
 				idx:        fieldIdx,
 				name:       fwdRefName,
 				parentName: o.Name, // fields build under the record's fullname
+				props:      fieldProps,
 			}
 			if len(of.Default) > 0 {
 				fix.defaultVal = unmarshalDefault(of.Default)
@@ -2767,6 +2898,13 @@ func (b *builder) buildRecord(o *aobject) error {
 			nd.fieldIdx[a] = i
 		}
 	}
+	for _, site := range b.sites[nd] {
+		fn := site.decodeJSON
+		*site = *nd
+		site.decodeJSON = fn
+		delete(b.building, site)
+	}
+	delete(b.sites, nd)
 	return nil
 }
 
@@ -2832,6 +2970,7 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 	if o.Items == nil {
 		return errors.New("array is missing items schema")
 	}
+	itemProps := refProps(o.Items) // before the build, which can rewrite o.Items
 	af, isFwdRef, fwdRefName, err := b.buildChild(parentName, o.Items, "array")
 	if err != nil {
 		return err
@@ -2848,7 +2987,7 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 	// it separately is how they came to hold different answers. Only
 	// da's was patched by the forward-ref fixup below.
 	itemMin := b.minBytes.minBytesOf(af.node)
-	da := &deserArray{deserItem: af.deser, minItemBytes: itemMin}
+	da := &deserArray{deserItem: af.deser, minItemBytes: itemMin, items: af.node}
 	// The same gate as the unsafe []*record field (tryCompileFieldDeser): a
 	// forward reference is not wired yet, and a custom type wraps deserItem.
 	if !isFwdRef && !af.meta.hasCustomType && af.meta.deserRecord != nil {
@@ -2908,6 +3047,7 @@ func (b *builder) buildArray(parentName string, o *aobject, canonObj *aobject) e
 			nodeChild:   &arrayNode.items,
 			name:        fwdRefName,
 			parentName:  parentName,
+			props:       itemProps,
 			ctxLabel:    "array",
 		})
 	}
@@ -2918,6 +3058,7 @@ func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) err
 	if o.Values == nil {
 		return errors.New("map is missing values schema")
 	}
+	valueProps := refProps(o.Values) // before the build, which can rewrite o.Values
 	mf, isFwdRef, fwdRefName, err := b.buildChild(parentName, o.Values, "map")
 	if err != nil {
 		return err
@@ -2976,6 +3117,7 @@ func (b *builder) buildMap(parentName string, o *aobject, canonObj *aobject) err
 			name:        fwdRefName,
 			parentName:  parentName,
 			ctxLabel:    "map",
+			props:       valueProps,
 		})
 	}
 	return nil

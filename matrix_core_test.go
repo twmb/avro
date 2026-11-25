@@ -756,20 +756,19 @@ func TestMatrix_ArrayRecordRules(t *testing.T) {
 			}
 		})
 	})
-	t.Run("decode/a used row keeps nothing from before", func(t *testing.T) {
-		// A decode into an any that holds a pointer writes through the
-		// pointer. A slot of a used row must not be decoded that way: the
-		// pointer belongs to whoever kept the last row.
+	t.Run("decode/a used row is decoded into", func(t *testing.T) {
+		// A slot of a used row is an any, so a decode writes through a
+		// pointer in the slot and replaces a string.
 		s := avro.MustParse(`{"type":"record","name":"U","fields":[{"name":"nums","type":` + longs + `},{"name":"b","type":"string"}]}`)
 		both(t, s, map[string]any{"nums": []any{int64(9)}, "b": "x"}, nil, func(wire string, decode func(any) error) {
 			kept := &[]int64{42}
 			got := avro.ArrayRecord{kept, "old", "extra"}[:2]
-			want := avro.ArrayRecord{[]any{int64(9)}, "x"}
+			want := avro.ArrayRecord{kept, "x"}
 			if err := decode(&got); err != nil || !reflect.DeepEqual(got, want) {
 				t.Errorf("%s: err=%v got=%#v want=%#v", wire, err, got, want)
 			}
-			if len(*kept) != 1 || (*kept)[0] != 42 {
-				t.Errorf("%s: the decode wrote through a pointer that was in the used row: %v", wire, *kept)
+			if len(*kept) != 1 || (*kept)[0] != 9 {
+				t.Errorf("%s: the decode did not write through your pointer in the used row: %v", wire, *kept)
 			}
 			if cap(got) != 3 {
 				t.Errorf("%s: a row with room was not reused: cap %d", wire, cap(got))
@@ -12288,12 +12287,12 @@ func TestDifferentialFastavroResolvedJSONUnion(t *testing.T) {
 // Target-reuse matrix: here we decode into already-populated targets. The
 // matrix core always decodes into fresh targets. The reuse semantics have
 // their own documented contracts, and historically their own bugs. Map targets
-// retain non-schema keys while schema fields overwrite (encoding/json parity),
-// slices are rewritten to exactly the new length, and pointers are reused. An
-// any element of a slice or of a Go array is the exception: the element starts
-// from nil, so a value you took out of the element survives the next decode.
-// Every fragment kind drives a decode-twice cycle on the same target, on both
-// wire formats.
+// retain non-schema keys while schema fields overwrite, slices are rewritten
+// to the new length in their own backing array, and pointers are
+// reused. A map, a []any, or a *big.Rat in an any is decoded into as well, so
+// a value you took out of a target can change on the next decode. Every
+// fragment kind drives a decode-twice cycle on the same target, on both wire
+// formats.
 // ---------------------------------------------------------------------------
 
 func TestMatrix_TargetReusePerKind(t *testing.T) {
@@ -12357,12 +12356,18 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 				}
 			}
 
-			// JSON decode into the same pre-populated map behaves alike.
+			// JSON decode into the same pre-populated map behaves alike. A
+			// field value that is not a map, a []any, or a pointer is replaced.
+			j1 := avrotest.MustAppendEncodeJSON(t, s, nil, want1)
 			j2, err := s.AppendEncodeJSON(nil, want2)
 			if err != nil {
 				t.Fatalf("encodeJSON: %v", err)
 			}
 			var jreused any = map[string]any{"stale": "keepme", "f": "overwrite-me"}
+			avrotest.MustDecodeJSON(t, s, j1, &jreused)
+			if !matEqual(jreused.(map[string]any)["f"], want1.(map[string]any)["f"]) {
+				t.Fatalf("JSON reuse did not replace a string field value: %#v", jreused.(map[string]any)["f"])
+			}
 			if err := s.DecodeJSON(j2, &jreused); err != nil {
 				t.Fatalf("JSON reuse decode: %v", err)
 			}
@@ -12374,101 +12379,1301 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 				t.Fatalf("JSON reuse field stale: %#v", jm["f"])
 			}
 
-			// A value you take out of a []any survives the next decode into
-			// the same slice, whether the next array fits the slice or
-			// outgrows it. A record with one array field has the array's
-			// own wire.
+			// The next decode into a []any decodes into each element the
+			// array has an item for, whether the next array fits the slice
+			// or outgrows it, so a map or a *big.Rat you took out of the
+			// slice changes; see checkTakenOut. The second value of every
+			// fragment has the keys of the first, so the used slice decodes
+			// to what a new slice decodes to. A record with one array field
+			// has the array's own wire.
 			arr := avro.MustParse(fmt.Sprintf(`{"type":"array","items":%s}`, fr.schema(&uniq{})))
 			holder := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"ReuseHolder","fields":[{"name":"f","type":%s}]}`, arr.String()))
-			first, err := arr.AppendEncode(nil, []any{fr.values[0], fr.values[0]})
-			if err != nil {
-				t.Fatalf("encode first array: %v", err)
-			}
-			var wantKept []any
-			if _, err := arr.Decode(first, &wantKept); err != nil {
-				t.Fatalf("fresh decode of the first array: %v", err)
-			}
 			item, err := avro.MustParse(fr.schema(&uniq{})).AppendEncode(nil, fr.values[1])
 			if err != nil {
 				t.Fatalf("encode item: %v", err)
 			}
-			for _, n := range []int{1, 3} {
-				// One block per item, so that every block after the first
-				// starts inside the used slice.
-				second := frameVariants(slices.Repeat([][]byte{item}, n))["block-per-item"]
-				var want []any
-				if _, err := arr.Decode(second, &want); err != nil {
-					t.Fatalf("fresh decode of the second array: %v", err)
+			firstValue, secondValue := []any{fr.values[0], fr.values[0]}, []any{fr.values[1], fr.values[1]}
+			for _, w := range reuseWires {
+				first := w.encode(t, arr, firstValue)
+				var wantKept []any
+				w.mustDecode(t, arr, first, &wantKept)
+				for _, n := range []int{1, 3} {
+					second := w.encode(t, arr, slices.Repeat([]any{fr.values[1]}, n))
+					if w.name == "binary" {
+						// One block per item, so that every block after the
+						// first starts inside the used slice.
+						second = frameVariants(slices.Repeat([][]byte{item}, n))["block-per-item"]
+					}
+					var want []any
+					w.mustDecode(t, arr, second, &want)
+					var top []any
+					var field struct {
+						F []any `avro:"f"`
+					}
+					for name, target := range map[string]struct {
+						schema *avro.Schema
+						ptr    any
+						elems  *[]any
+						wire   func([]byte) []byte
+					}{
+						"slice":        {arr, &top, &top, func(b []byte) []byte { return b }},
+						"struct field": {holder, &field, &field.F, func(b []byte) []byte { return w.wrapField(holder, b) }},
+					} {
+						name := w.name + "/" + name
+						w.mustDecode(t, target.schema, target.wire(first), target.ptr)
+						kept := slices.Clone(*target.elems)
+						w.mustDecode(t, target.schema, target.wire(second), target.ptr)
+						checkTakenOut(t, fmt.Sprintf("%s, second decode of %d", name, n), kept, *target.elems, wantKept)
+						if !matEqual(*target.elems, want) {
+							t.Errorf("%s: second decode of %d into the used slice:\n got=%#v\nwant=%#v", name, n, *target.elems, want)
+						}
+					}
 				}
-				var top []any
-				var field struct {
-					F []any `avro:"f"`
-				}
-				for name, target := range map[string]struct {
-					schema *avro.Schema
-					ptr    any
-					elems  *[]any
-				}{
-					"slice":        {arr, &top, &top},
-					"struct field": {holder, &field, &field.F},
-				} {
-					if _, err := target.schema.Decode(first, target.ptr); err != nil {
-						t.Fatalf("%s: first decode: %v", name, err)
-					}
-					kept := slices.Clone(*target.elems)
-					if _, err := target.schema.Decode(second, target.ptr); err != nil {
-						t.Fatalf("%s: second decode of %d: %v", name, n, err)
-					}
-					if !matEqual(kept, wantKept) {
-						t.Errorf("%s: the second decode of %d wrote a value taken from the first:\n got=%#v\nwant=%#v", name, n, kept, wantKept)
-					}
-					if !matEqual(*target.elems, want) {
-						t.Errorf("%s: second decode of %d into the used slice:\n got=%#v\nwant=%#v", name, n, *target.elems, want)
-					}
-				}
-			}
 
-			// The same for a Go array of any, which takes two items.
-			second, err := arr.AppendEncode(nil, []any{fr.values[1], fr.values[1]})
-			if err != nil {
-				t.Fatalf("encode second array: %v", err)
-			}
-			var goArr, wantArr [2]any
-			avrotest.MustDecode(t, arr, second, &wantArr)
-			avrotest.MustDecode(t, arr, first, &goArr)
-			kept := goArr
-			avrotest.MustDecode(t, arr, second, &goArr)
-			if !matEqual(kept[:], wantKept) {
-				t.Errorf("Go array: the second decode wrote a value taken from the first:\n got=%#v\nwant=%#v", kept, wantKept)
-			}
-			if !matEqual(goArr[:], wantArr[:]) {
-				t.Errorf("Go array: second decode into the used array:\n got=%#v\nwant=%#v", goArr, wantArr)
-			}
-			// DecodeJSON follows the same rule for a Go array. A slice
-			// target of DecodeJSON is always a new slice.
-			jsonFirst := avrotest.MustAppendEncodeJSON(t, arr, nil, []any{fr.values[0], fr.values[0]})
-			jsonSecond := avrotest.MustAppendEncodeJSON(t, arr, nil, []any{fr.values[1], fr.values[1]})
-			var jsonArr, wantJSONKept [2]any
-			avrotest.MustDecodeJSON(t, arr, jsonFirst, &wantJSONKept)
-			avrotest.MustDecodeJSON(t, arr, jsonFirst, &jsonArr)
-			keptJSON := jsonArr
-			avrotest.MustDecodeJSON(t, arr, jsonSecond, &jsonArr)
-			if !matEqual(keptJSON[:], wantJSONKept[:]) {
-				t.Errorf("Go array, DecodeJSON: the second decode wrote a value taken from the first:\n got=%#v\nwant=%#v", keptJSON, wantJSONKept)
-			}
-
-			// An interface type with no methods is an any by another name.
-			var named []reuseEmptyInterface
-			avrotest.MustDecode(t, arr, first, &named)
-			keptNamed := slices.Clone(named)
-			avrotest.MustDecode(t, arr, second, &named)
-			for i, k := range keptNamed {
-				if !matEqual(any(k), wantKept[i]) {
-					t.Errorf("defined empty interface: the second decode wrote element %d taken from the first:\n got=%#v\nwant=%#v", i, k, wantKept[i])
+				// The same for a Go array of any, which takes two items, and
+				// for an interface type with no methods, an any by another
+				// name.
+				second := w.encode(t, arr, secondValue)
+				var goArr, wantArr [2]any
+				w.mustDecode(t, arr, second, &wantArr)
+				w.mustDecode(t, arr, first, &goArr)
+				kept := goArr
+				w.mustDecode(t, arr, second, &goArr)
+				checkTakenOut(t, w.name+"/Go array", kept[:], goArr[:], wantKept)
+				if !matEqual(goArr[:], wantArr[:]) {
+					t.Errorf("%s/Go array: second decode into the used array:\n got=%#v\nwant=%#v", w.name, goArr, wantArr)
+				}
+				var named []reuseEmptyInterface
+				w.mustDecode(t, arr, first, &named)
+				keptNamed := slices.Clone(named)
+				w.mustDecode(t, arr, second, &named)
+				asAny := func(s []reuseEmptyInterface) []any {
+					out := make([]any, len(s))
+					for i, v := range s {
+						out[i] = v
+					}
+					return out
+				}
+				checkTakenOut(t, w.name+"/defined empty interface", asAny(keptNamed), asAny(named), wantKept)
+				if !matEqual(asAny(named), wantArr[:]) {
+					t.Errorf("%s/defined empty interface: second decode into the used slice:\n got=%#v\nwant=%#v", w.name, named, wantArr)
 				}
 			}
 		})
 	}
+}
+
+// TestMatrix_UsedTargetParity decodes each fragment, and each union the reuse
+// rules act on, with Decode and with DecodeJSON into every target shape that
+// can already have a value, starting from each of many old values, with and
+// without TaggedUnions. The two decoders must agree: both fail or neither
+// does, and they leave the same value and reuse the same containers, after
+// one decode and after two in a row. A decode that fails, at its first byte
+// or in a CustomType Decode that returns an error or panics, must leave the
+// target as the decode before it left it. A decode that fails partway leaves
+// an any target with the value it had, or with the same container, which the
+// decode may have written into. TestMatrix_TargetReusePerKind checks one target
+// shape against a fresh decode; this test crosses the target shapes and the
+// old values.
+func TestMatrix_UsedTargetParity(t *testing.T) {
+	ct := parityCustom()
+	schemas := parityCases()
+
+	positions := parityPositions()
+
+	type input struct {
+		bin, js []byte
+		bare    []byte // the bare JSON, or nil when it has more than one reading
+		panics  bool
+	}
+	var failures []string
+	fail := func(format string, args ...any) {
+		failures = append(failures, fmt.Sprintf(format, args...))
+	}
+	bareRuns := 0
+	for _, option := range []struct {
+		name string
+		opts []avro.Opt
+	}{
+		{"plain", nil},
+		{"tagged", []avro.Opt{avro.TaggedUnions()}},
+		{"tagged+logical", []avro.Opt{avro.TaggedUnions(), avro.TagLogicalTypes()}},
+	} {
+		opts := option.opts
+		for _, pos := range positions {
+			for _, sc := range schemas {
+				s := avro.MustParse(pos.schema(sc.text), ct)
+				top := avro.MustParse(sc.text, ct)
+				union := strings.HasPrefix(sc.text, "[")
+				enc := func(v any) input {
+					in := input{
+						bin: avrotest.MustAppendEncode(t, s, nil, pos.wrap(v), avro.TaggedUnions()),
+						js:  avrotest.MustAppendEncodeJSON(t, s, nil, pos.wrap(v), avro.TaggedUnions()),
+					}
+					if bare := avrotest.MustAppendEncodeJSON(t, s, nil, pos.wrap(v)); !parityBareAmbiguous(s, bare) {
+						in.bare = bare
+					}
+					return in
+				}
+				var oks []input
+				var bads [][]input  // the inputs that fail, after each value of oks
+				var partway []input // arrays whose last item fails
+				// moneys reports whether v is an array of money values.
+				moneys := func(v any) bool {
+					items, ok := v.([]any)
+					for _, x := range items {
+						_, ok = x.(*parityMoney)
+						if !ok {
+							break
+						}
+					}
+					return ok && len(items) > 0
+				}
+				for _, v := range sc.vals {
+					oks = append(oks, enc(v))
+					if moneys(v) {
+						items := v.([]any)
+						in := enc(append(slices.Clone(items), &parityMoney{parityMoneyFails}))
+						in.bare = nil
+						partway = append(partway, in)
+					}
+					var bad []input
+					topBin := avrotest.MustAppendEncode(t, top, nil, v, avro.TaggedUnions())
+					topJS := string(avrotest.MustAppendEncodeJSON(t, top, nil, v, avro.TaggedUnions()))
+					switch {
+					case !union:
+						bad = append(bad, input{bin: pos.binPre, js: []byte(pos.jsWrap(`!`))})
+					case v != nil && strings.HasPrefix(topJS, `{"`):
+						tag := topJS[2:strings.Index(topJS, `":`)]
+						bad = append(bad, input{bin: append(slices.Clone(pos.binPre), topBin[0]), js: []byte(pos.jsWrap(`{"` + tag + `":!}`))})
+					}
+					if sc.custom {
+						fails, panics := any(&parityMoney{parityMoneyFails}), any(&parityMoney{parityMoneyPanics})
+						if moneys(v) {
+							fails, panics = []any{fails}, []any{panics}
+						}
+						f, pn := enc(fails), enc(panics)
+						pn.panics = true
+						bad = append(bad, f, pn)
+					}
+					bads = append(bads, bad)
+				}
+				// decode decodes in with decoder w (0 for Decode, 1 for
+				// DecodeJSON, 2 for DecodeJSON of the bare form) into ptr,
+				// and returns the error and what a panic recovered.
+				decode := func(w int, in input, ptr any) (err error, panicked any) {
+					defer func() {
+						panicked = recover()
+						if parityNamesAvroTwice(err) {
+							fail("%s | %s: an error names the package twice: %v", option.name, sc.name, err)
+						}
+					}()
+					switch w {
+					case 0:
+						_, err = s.Decode(in.bin, ptr, opts...)
+						return err, nil
+					case 1:
+						return s.DecodeJSON(in.js, ptr, opts...), nil
+					}
+					return s.DecodeJSON(in.bare, ptr, opts...), nil
+				}
+				decoders := [3]string{"Decode", "DecodeJSON", "DecodeJSON of the bare form"}
+				for _, old := range parityOlds() {
+					cell := fmt.Sprintf("%s | %s | %s | old %s", option.name, pos.name, sc.name, old.name)
+					// compare decodes first, if it is not nil, and then in,
+					// on each decoder from a new old value, and compares each
+					// JSON decode with Decode.
+					compare := func(label string, first *input, in input) {
+						var res, errs [3]string
+						var reused, firstFailed, ran, sem [3]bool
+						for w := range 3 {
+							if w == 2 && (in.bare == nil || first != nil && first.bare == nil) {
+								continue
+							}
+							ran[w] = true
+							if w == 2 {
+								bareRuns++
+							}
+							o := old.mk()
+							ptr, get := pos.target(o)
+							if ptr == nil {
+								return
+							}
+							before := get()
+							if first != nil {
+								if err, pn := decode(w, *first, ptr); err != nil || pn != nil {
+									firstFailed[w] = true
+									continue
+								}
+								before = get()
+							}
+							err, pn := decode(w, in, ptr)
+							if pn != nil {
+								fail("%s | %s: decoder %d panicked: %v", cell, label, w, pn)
+								return
+							}
+							if err != nil {
+								errs[w] = err.Error()
+								var se *avro.SemanticError
+								sem[w] = errors.As(err, &se)
+							}
+							got := get()
+							res[w] = paritySnap(reflect.ValueOf(got), 0)
+							id := parityID(parityInside(before))
+							reused[w] = id != 0 && id == parityID(parityInside(got))
+						}
+						for w := 1; w < 3; w++ {
+							switch d := decoders[w]; {
+							case !ran[w]:
+							case firstFailed[0] != firstFailed[w]:
+								fail("%s | %s: the first decode failed on Decode: %v, on %s: %v", cell, label, firstFailed[0], d, firstFailed[w])
+							case firstFailed[0]:
+							case (errs[0] == "") != (errs[w] == ""):
+								fail("%s | %s: Decode error %q, %s error %q", cell, label, errs[0], d, errs[w])
+							case sem[0] != sem[w]:
+								fail("%s | %s: Decode error %q is a SemanticError: %v, %s error %q: %v", cell, label, errs[0], sem[0], d, errs[w], sem[w])
+							case res[0] != res[w]:
+								fail("%s | %s: Decode left %s, %s left %s (errors %q, %q)", cell, label, res[0], d, res[w], errs[0], errs[w])
+							case errs[0] == "" && reused[0] != reused[w]:
+								fail("%s | %s: Decode reused the old value: %v, %s: %v", cell, label, reused[0], d, reused[w])
+							}
+						}
+					}
+					for i, in := range oks {
+						compare(fmt.Sprintf("value %d", i), nil, in)
+						for j := range oks {
+							compare(fmt.Sprintf("value %d then %d", i, j), &oks[i], oks[j])
+						}
+						// An array whose last item fails leaves the same
+						// items written into the old backing array on both
+						// decoders.
+						for j := range partway {
+							compare(fmt.Sprintf("value %d then array %d failing at its last item", i, j), &oks[i], partway[j])
+						}
+						for _, bad := range bads[i] {
+							for w := range 2 {
+								o := old.mk()
+								ptr, get := pos.target(o)
+								if ptr == nil {
+									break
+								}
+								if err, pn := decode(w, in, ptr); err != nil || pn != nil {
+									continue
+								}
+								mid := get()
+								before := paritySnap(reflect.ValueOf(mid), 0)
+								err, pn := decode(w, bad, ptr)
+								switch {
+								case pn != nil && (!bad.panics || pn != errParityMoney):
+									fail("%s | value %d then a failure: decoder %d panicked: %v", cell, i, w, pn)
+									continue
+								case pn == nil && err == nil:
+									continue // a value of zero bytes decodes from the prefix alone
+								}
+								got := get()
+								if after := paritySnap(reflect.ValueOf(got), 0); after != before || parityID(got) != parityID(mid) || parityID(parityInside(got)) != parityID(parityInside(mid)) {
+									fail("%s | value %d then a failure: decoder %d changed the target from %s to %s (error %v)", cell, i, w, before, after, err)
+								}
+							}
+						}
+						// The same value cut by its last byte fails partway.
+						// Only the target itself keeps its value: a slot in
+						// a container the decode fills is written as it goes.
+						cut := input{bin: in.bin[:max(len(in.bin)-1, 0)], js: in.js[:max(len(in.js)-1, 0)]}
+						for w := range 2 {
+							o := old.mk()
+							ptr, get := pos.target(o)
+							if ptr == nil || pos.name != "top" && pos.name != "*any target" {
+								break
+							}
+							if err, pn := decode(w, in, ptr); err != nil || pn != nil {
+								continue
+							}
+							mid := get()
+							err, pn := decode(w, cut, ptr)
+							switch {
+							case pn != nil:
+								fail("%s | value %d then the value cut short: decoder %d panicked: %v", cell, i, w, pn)
+								continue
+							case err == nil:
+								continue
+							}
+							got := get()
+							if parityID(got) != parityID(mid) || parityID(mid) == 0 && paritySnap(reflect.ValueOf(got), 0) != paritySnap(reflect.ValueOf(mid), 0) {
+								fail("%s | value %d then the value cut short: decoder %d replaced %s with %s (error %v)", cell, i, w, paritySnap(reflect.ValueOf(mid), 0), paritySnap(reflect.ValueOf(got), 0), err)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	// The bare form runs about 760,000 times; an ambiguity check that
+	// grew too wide would skip it.
+	if bareRuns < 500000 {
+		t.Errorf("the bare JSON form decoded %d times, want it on most cells", bareRuns)
+	}
+	parityReport(t, failures)
+}
+
+// parityPosition is a Go value that has a slot for a decoded value: the
+// schema around the value, the value that goes in the slot when encoding, and
+// the target with its old value when decoding.
+type parityPosition struct {
+	name   string
+	schema func(string) string
+	wrap   func(any) any
+	target func(old any) (ptr any, get func() any)
+	binPre []byte // the wire before the value
+	jsWrap func(string) string
+	// typed says the value goes in a slot of the old value's own type,
+	// not an any, which a decode that fails partway can write into.
+	typed bool
+}
+
+// parityPositions returns the slots the parity matrices decode into: an any,
+// a *any, a slice element, a map value, a record field, an ArrayRecord slot,
+// and a struct field, each as an any, and as a slot of the old value's own
+// type.
+func parityPositions() []parityPosition {
+	id := func(s string) string { return s }
+	arr := func(s string) string { return `{"type":"array","items":` + s + `}` }
+	mp := func(s string) string { return `{"type":"map","values":` + s + `}` }
+	rec := func(s string) string { return `{"type":"record","name":"H","fields":[{"name":"f","type":` + s + `}]}` }
+	same := func(v any) any { return v }
+	inArr := func(v any) any { return []any{v} }
+	inMap := func(v any) any { return map[string]any{"k": v} }
+	inRec := func(v any) any { return map[string]any{"f": v} }
+	jArr := func(s string) string { return `[` + s + `]` }
+	jMap := func(s string) string { return `{"k":` + s + `}` }
+	jRec := func(s string) string { return `{"f":` + s + `}` }
+	// from returns the value at key in the container x has, or a marker
+	// that names what x has instead.
+	from := func(x any, key any) any {
+		switch c := x.(type) {
+		case []any:
+			if len(c) > 0 {
+				return c[0]
+			}
+		case map[string]any:
+			if k, ok := key.(string); ok {
+				return c[k]
+			}
+		case avro.ArrayRecord:
+			if len(c) > 0 {
+				return c[0]
+			}
+		}
+		return fmt.Sprintf("<%T>", x)
+	}
+	positions := []parityPosition{
+		{"top", id, same, func(o any) (any, func() any) { x := o; return &x, func() any { return x } }, nil, id, false},
+		{"*any target", id, same, func(o any) (any, func() any) { x := o; p := &x; return &p, func() any { return x } }, nil, id, false},
+		{"[]any elem", arr, inArr, func(o any) (any, func() any) { x := []any{o}; return &x, func() any { return from(x, 0) } }, []byte{2}, jArr, false},
+		{"any([]any) elem", arr, inArr, func(o any) (any, func() any) { var x any = []any{o}; return &x, func() any { return from(x, 0) } }, []byte{2}, jArr, false},
+		{"[1]any elem", arr, inArr, func(o any) (any, func() any) { x := [1]any{o}; return &x, func() any { return x[0] } }, []byte{2}, jArr, false},
+		{"[]named-interface elem", arr, inArr, func(o any) (any, func() any) {
+			x := []reuseEmptyInterface{o}
+			return &x, func() any {
+				if len(x) == 0 {
+					return "<empty>"
+				}
+				return x[0]
+			}
+		}, []byte{2}, jArr, false},
+		{"map[string]any value", mp, inMap, func(o any) (any, func() any) { x := map[string]any{"k": o}; return &x, func() any { return x["k"] } }, []byte{2, 2, 'k'}, jMap, false},
+		{"any(map) value", mp, inMap, func(o any) (any, func() any) {
+			var x any = map[string]any{"k": o}
+			return &x, func() any { return from(x, "k") }
+		}, []byte{2, 2, 'k'}, jMap, false},
+		{"any(map) record field", rec, inRec, func(o any) (any, func() any) {
+			var x any = map[string]any{"f": o}
+			return &x, func() any { return from(x, "f") }
+		}, nil, jRec, false},
+		{"map[string]any record field", rec, inRec, func(o any) (any, func() any) { x := map[string]any{"f": o}; return &x, func() any { return x["f"] } }, nil, jRec, false},
+		{"ArrayRecord slot", rec, inRec, func(o any) (any, func() any) { x := avro.ArrayRecord{o}; return &x, func() any { return from(x, 0) } }, nil, jRec, false},
+		{"any(ArrayRecord) slot", rec, inRec, func(o any) (any, func() any) {
+			var x any = avro.ArrayRecord{o}
+			return &x, func() any { return from(x, 0) }
+		}, nil, jRec, false},
+		{"struct any field", rec, inRec, func(o any) (any, func() any) { x := parityHolder{F: o}; return &x, func() any { return x.F } }, nil, jRec, false},
+		{"struct *any field", rec, inRec, func(o any) (any, func() any) {
+			a := o
+			x := parityHolderP{F: &a}
+			return &x, func() any {
+				if x.F == nil {
+					return nil
+				}
+				return *x.F
+			}
+		}, nil, jRec, false},
+	}
+	// Each old value is also a slot of its own type: a struct field, a
+	// pointer field, a slice element, and a map value. A nil has no type.
+	typedIn := func(name string, schema func(string) string, wrap func(any) any, binPre []byte, jsWrap func(string) string, mk func(t reflect.Type, o reflect.Value) (ptr reflect.Value, get func() reflect.Value)) parityPosition {
+		return parityPosition{name, schema, wrap, func(o any) (any, func() any) {
+			if o == nil {
+				return nil, nil
+			}
+			ptr, get := mk(reflect.TypeOf(o), reflect.ValueOf(o))
+			return ptr.Interface(), func() any { return get().Interface() }
+		}, binPre, jsWrap, true}
+	}
+	field := func(t reflect.Type) reflect.Type {
+		return reflect.StructOf([]reflect.StructField{{Name: "F", Type: t, Tag: `avro:"f"`}})
+	}
+	positions = append(positions,
+		typedIn("struct field of the old type", rec, inRec, nil, jRec, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(field(t))
+			p.Elem().Field(0).Set(o)
+			return p, func() reflect.Value { return p.Elem().Field(0) }
+		}),
+		typedIn("struct field of a pointer to the old type", rec, inRec, nil, jRec, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(field(reflect.PointerTo(t)))
+			p.Elem().Field(0).Set(reflect.New(t))
+			p.Elem().Field(0).Elem().Set(o)
+			return p, func() reflect.Value { return p.Elem().Field(0) }
+		}),
+		typedIn("slice element of the old type", arr, inArr, []byte{2}, jArr, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(reflect.SliceOf(t))
+			p.Elem().Set(reflect.Append(p.Elem(), o))
+			return p, func() reflect.Value {
+				if p.Elem().Len() == 0 {
+					return reflect.ValueOf("<empty>")
+				}
+				return p.Elem().Index(0)
+			}
+		}),
+		typedIn("map value of the old type", mp, inMap, []byte{2, 2, 'k'}, jMap, func(t reflect.Type, o reflect.Value) (reflect.Value, func() reflect.Value) {
+			p := reflect.New(reflect.MapOf(reflect.TypeFor[string](), t))
+			p.Elem().Set(reflect.MakeMap(p.Elem().Type()))
+			p.Elem().SetMapIndex(reflect.ValueOf("k"), o)
+			return p, func() reflect.Value {
+				if v := p.Elem().MapIndex(reflect.ValueOf("k")); v.IsValid() {
+					return v
+				}
+				return reflect.ValueOf("<missing>")
+			}
+		}),
+	)
+	return positions
+}
+
+// parityCase is one schema the parity matrices decode, with values for it.
+// custom says the values of parityCustom that fail and panic apply.
+type parityCase struct {
+	name, text string
+	vals       []any
+	custom     bool
+}
+
+// parityCases returns each fragment, each union the reuse rules act on, and a
+// few containers and custom types, with up to two values each.
+func parityCases() []parityCase {
+	const (
+		recP = `{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}`
+		recQ = `{"type":"record","name":"Q","fields":[{"name":"q","type":"long"}]}`
+		arrL = `{"type":"array","items":"long"}`
+		mapL = `{"type":"map","values":"long"}`
+		dec  = `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+		mon  = `{"type":"long","logicalType":"money"}`
+	)
+	p := func(n int64) any { return map[string]any{"a": n} }
+	var cases []parityCase
+	for _, fr := range matFrags() {
+		cases = append(cases, parityCase{fr.label, fr.schema(&uniq{}), fr.values[:min(2, len(fr.values))], false})
+	}
+	return append(cases, []parityCase{
+		{"u[null,record]", `["null",` + recP + `]`, []any{nil, p(1)}, false},
+		{"u[array,record]", `[` + arrL + `,` + recP + `]`, []any{[]any{int64(1)}, p(7)}, false},
+		{"u[recP,recQ]", `[` + recP + `,` + recQ + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"Q": map[string]any{"q": int64(2)}}}, false},
+		{"u[recP,map]", `[` + recP + `,` + mapL + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"map": map[string]any{"k": int64(5)}}}, false},
+		{"u[long,decimal]", `["long",` + dec + `]`, []any{int64(7), big.NewRat(5, 4)}, false},
+		{"u[long,map]", `["long",` + mapL + `]`, []any{int64(7), map[string]any{"k": int64(5)}}, false},
+		{"u[null,array,map,string]", `["null",` + arrL + `,` + mapL + `,"string"]`, []any{nil, []any{int64(1)}, map[string]any{"k": int64(5)}, "x"}, false},
+		{"u[bytes,string]", `["bytes","string"]`, []any{map[string]any{"bytes": []byte("b")}, map[string]any{"string": "x"}}, false},
+		{"array<record>", `{"type":"array","items":` + recP + `}`, []any{[]any{p(1)}, []any{p(2), p(3)}}, false},
+		{"array<u[null,long]>", `{"type":"array","items":["null","long"]}`, []any{[]any{nil, int64(1)}, []any{int64(2)}}, false},
+		{"map<record>", `{"type":"map","values":` + recP + `}`, []any{map[string]any{"k": p(1)}}, false},
+		{"money", mon, []any{&parityMoney{5}}, true},
+		{"array<money>", `{"type":"array","items":` + mon + `}`, []any{[]any{&parityMoney{5}}, []any{&parityMoney{6}, &parityMoney{7}}}, true},
+		{"u[string,money]", `["string",` + mon + `]`, []any{"x", &parityMoney{5}}, true},
+		{"u[null,money]", `["null",` + mon + `]`, []any{nil, &parityMoney{5}}, true},
+		{"u[money,array,recP]", `[` + mon + `,` + arrL + `,` + recP + `]`, []any{&parityMoney{5}, []any{int64(1)}, p(3)}, true},
+	}...)
+}
+
+// parityCustom returns the custom type for the money logical type: its Decode
+// returns an error for parityMoneyFails and panics for parityMoneyPanics.
+func parityCustom() avro.CustomType {
+	return avro.NewCustomType[*parityMoney, int64]("money",
+		func(v *parityMoney, _ *avro.SchemaNode) (int64, error) { return v.cents, nil },
+		func(c int64, _ *avro.SchemaNode) (*parityMoney, error) {
+			switch c {
+			case parityMoneyFails:
+				return nil, errParityMoney
+			case parityMoneyPanics:
+				panic(errParityMoney)
+			}
+			return &parityMoney{c}, nil
+		})
+}
+
+type parityMoney struct{ cents int64 }
+
+// The money values whose Decode returns an error, and whose Decode panics.
+const parityMoneyFails, parityMoneyPanics = 13, 14
+
+var errParityMoney = errors.New("money decode fails")
+
+type (
+	parityP struct {
+		A int64 `avro:"a"`
+	}
+	parityMap    map[string]any
+	paritySlice  []any
+	parityBytes  []byte
+	parityHolder struct {
+		F any `avro:"f"`
+	}
+	parityHolderP struct {
+		F *any `avro:"f"`
+	}
+)
+
+// parityOlds returns the values a target starts from.
+func parityOlds() []struct {
+	name string
+	mk   func() any
+} {
+	return []struct {
+		name string
+		mk   func() any
+	}{
+		{"nil", func() any { return nil }},
+		{"int32", func() any { return int32(1) }},
+		{"int64", func() any { return int64(1) }},
+		{"string", func() any { return "old" }},
+		{"[]byte", func() any { return []byte("old") }},
+		{"bool", func() any { return true }},
+		{"float64", func() any { return 1.5 }},
+		{"time", func() any { return time.Unix(5, 0).UTC() }},
+		{"duration", func() any { return time.Second }},
+		{"[16]byte", func() any { return [16]byte{9} }},
+		{"struct", func() any { return parityP{A: 9} }},
+		{"map[string]any{}", func() any { return map[string]any{} }},
+		{"map[string]any{own}", func() any { return map[string]any{"own": "mine", "too": "mine"} }},
+		{"map[string]any{a:map}", func() any {
+			return map[string]any{"a": map[string]any{"z": int64(1)}, "k": map[string]any{"z": int64(1)}}
+		}},
+		{"map[string]any{long:1}", func() any { return map[string]any{"long": int64(1)} }},
+		{"map[string]any{P:map}", func() any { return map[string]any{"P": map[string]any{"own": "mine"}} }},
+		{"[]any{}", func() any { return []any{} }},
+		{"[]any{9,8}", func() any { return []any{int64(9), int64(8)} }},
+		{"[]any{map}", func() any { return []any{map[string]any{"own": "mine"}, "tail"} }},
+		{"[]any{*P}", func() any { return []any{&parityP{A: 9}} }},
+		{"map[string]int64", func() any { return map[string]int64{"own": 1} }},
+		{"map[string]string", func() any { return map[string]string{"own": "x"} }},
+		{"map[string]*P", func() any { return map[string]*parityP{"k": {A: 9}} }},
+		{"map[int]string", func() any { return map[int]string{1: "x"} }},
+		{"[]int64", func() any { return []int64{9} }},
+		{"[]string", func() any { return []string{"x"} }},
+		{"[]*P", func() any { return []*parityP{{A: 9}} }},
+		{"[]P", func() any { return []parityP{{A: 9}} }},
+		{"[]*money", func() any { return []*parityMoney{{1}} }},
+		{"*int64", func() any { return new(int64) }},
+		{"*int32", func() any { return new(int32) }},
+		{"*string", func() any { return new(string) }},
+		{"*bool", func() any { return new(bool) }},
+		{"*[]byte", func() any { return new([]byte) }},
+		{"*P", func() any { return &parityP{A: 9} }},
+		{"*big.Rat", func() any { return big.NewRat(1, 2) }},
+		{"*any(nil)", func() any { return new(any) }},
+		{"*any(map)", func() any { var x any = map[string]any{"own": "mine"}; return &x }},
+		{"*any([]any)", func() any { var x any = []any{int64(9)}; return &x }},
+		{"*any(*any(map))", func() any { var y any = map[string]any{"own": "mine"}; var x any = &y; return &x }},
+		{"*map[string]any", func() any { m := map[string]any{"own": "mine"}; return &m }},
+		{"*map[string]int64", func() any { m := map[string]int64{"own": 1}; return &m }},
+		{"*[]any", func() any { s := []any{int64(9)}; return &s }},
+		{"**int64", func() any { p := new(int64); return &p }},
+		{"ArrayRecord{x}", func() any { return avro.ArrayRecord{"x"} }},
+		{"ArrayRecord{}", func() any { return avro.ArrayRecord{} }},
+		{"nil map[string]int64", func() any { return map[string]int64(nil) }},
+		{"nil []int64", func() any { return []int64(nil) }},
+		{"nil *int64", func() any { return (*int64)(nil) }},
+		{"nil *P", func() any { return (*parityP)(nil) }},
+		{"nil map[string]any", func() any { return map[string]any(nil) }},
+		{"nil []any", func() any { return []any(nil) }},
+		{"named map", func() any { return parityMap{"own": "mine"} }},
+		{"named slice", func() any { return paritySlice{int64(9)} }},
+		{"named bytes", func() any { return parityBytes("old") }},
+		{"*time.Time", func() any { return new(time.Time) }},
+		{"*time.Duration", func() any { return new(time.Duration) }},
+		{"*avro.Duration", func() any { return new(avro.Duration) }},
+		{"*[16]byte", func() any { return new([16]byte) }},
+		{"*[4]byte", func() any { return new([4]byte) }},
+		{"*float64", func() any { return new(float64) }},
+		{"*money", func() any { return &parityMoney{1} }},
+		{"envelope{long:*any}", func() any { var x any = int64(3); return map[string]any{"long": &x} }},
+		{"envelope{P:*map}", func() any { m := map[string]any{"own": "mine"}; return map[string]any{"P": &m} }},
+	}
+}
+
+// paritySnap prints v with every pointer followed and map keys sorted, so that
+// two targets compare by value.
+func paritySnap(v reflect.Value, depth int) string {
+	if depth > 8 {
+		return "<deep>"
+	}
+	if !v.IsValid() {
+		return "nil"
+	}
+	if v.CanInterface() {
+		switch x := v.Interface().(type) {
+		case *big.Rat:
+			if x != nil {
+				return "&rat(" + x.String() + ")"
+			}
+		case time.Time:
+			return "time(" + x.UTC().Format(time.RFC3339Nano) + ")"
+		}
+	}
+	t := strings.ReplaceAll(v.Type().String(), "interface {}", "any")
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			return "nil"
+		}
+		return paritySnap(v.Elem(), depth+1)
+	case reflect.Pointer:
+		if v.IsNil() {
+			return t + "(nil)"
+		}
+		return "&" + paritySnap(v.Elem(), depth+1)
+	case reflect.Map:
+		if v.IsNil() {
+			return t + "(nil)"
+		}
+		var kv []string
+		for it := v.MapRange(); it.Next(); {
+			kv = append(kv, fmt.Sprint(it.Key())+":"+paritySnap(it.Value(), depth+1))
+		}
+		slices.Sort(kv)
+		return t + "{" + strings.Join(kv, ", ") + "}"
+	case reflect.Slice, reflect.Array:
+		if v.Kind() == reflect.Slice && v.IsNil() {
+			return t + "(nil)"
+		}
+		parts := make([]string, v.Len())
+		for i := range parts {
+			parts[i] = paritySnap(v.Index(i), depth+1)
+		}
+		return t + "[" + strings.Join(parts, ", ") + "]"
+	case reflect.Struct:
+		parts := make([]string, v.NumField())
+		for i := range parts {
+			parts[i] = paritySnap(v.Field(i), depth+1)
+		}
+		return t + "{" + strings.Join(parts, ", ") + "}"
+	}
+	return fmt.Sprintf("%s(%v)", t, v)
+}
+
+// parityID returns the address of the map, slice, or pointer x has, and 0 for
+// any other value.
+func parityID(x any) uintptr {
+	switch v := reflect.ValueOf(x); v.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Pointer:
+		return v.Pointer()
+	}
+	return 0
+}
+
+// parityTry runs f and returns its error, or the panic it recovered as one.
+// It passes fail an error whose text names the package twice.
+func parityTry(fail func(string, ...any), f func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+		if parityNamesAvroTwice(err) {
+			fail("an error names the package twice: %v", err)
+		}
+	}()
+	return f()
+}
+
+// parityReport reports the first 25 failures and how many more there are.
+func parityReport(t *testing.T, failures []string) {
+	t.Helper()
+	for i, f := range failures {
+		if i == 25 {
+			t.Errorf("... and %d more", len(failures)-i)
+			return
+		}
+		t.Error(f)
+	}
+}
+
+// parityNamesAvroTwice reports whether the text of err names the package more
+// than once, as a chain of our errors does when each repeats "avro: ". The
+// parity matrices check every error they see with it.
+func parityNamesAvroTwice(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Count(s, "avro: ")+strings.Count(s, "avro json: ") > 1
+}
+
+// parityInside returns the value in a TaggedUnions envelope, and x otherwise.
+func parityInside(x any) any {
+	if w, ok := x.(map[string]any); ok && len(w) == 1 {
+		for _, in := range w {
+			return in
+		}
+	}
+	return x
+}
+
+// TestMatrix_RoundTripParity encodes many Go values into each parity schema,
+// at several positions and as several Go types, with Encode and EncodeJSON,
+// and decodes them back. The encoders must agree: both fail or neither does,
+// neither panics, and the two outputs decode to the same value. A value that
+// decodes must make the trip again unchanged on both wires, and its bytes do
+// not change on the trip after that: raw bytes you encode need not be the
+// form a decoded value encodes to, and that form must hold. Decoding into a
+// new value of the encoded Go type works or fails the same on both decoders,
+// gives the same value as decoding into an any, and makes the trip too. The
+// bare JSON form decodes to the same value as the tagged form wherever it has
+// one reading. TestParity_RoundTripMatrix checks hand-picked cells against
+// expected values; this test crosses the schemas, Go inputs, and positions and
+// checks the paths against each other.
+func TestMatrix_RoundTripParity(t *testing.T) {
+	ct := parityCustom()
+	ts := time.Date(2024, 6, 15, 12, 34, 56, 123_456_789, time.UTC)
+	i64, s1 := int64(7), "x"
+	var nilAny any
+	inputs := []struct {
+		name string
+		v    any
+	}{
+		{"int", 7}, {"int8", int8(7)}, {"int32", int32(7)}, {"int64 big", int64(1) << 40}, {"uint", uint(7)},
+		{"uint8", uint8(7)}, {"uint64 max", uint64(math.MaxUint64)}, {"float32", float32(1.5)}, {"float64", 1.5},
+		{"float64 whole", 7.0}, {"float64 NaN", math.NaN()}, {"float64 -Inf", math.Inf(-1)}, {"float64 -0", math.Copysign(0, -1)},
+		{"json.Number int", json.Number("7")}, {"json.Number frac", json.Number("1.25")}, {"json.Number bad", json.Number("x")},
+		{"string A", "A"}, {"string num", "7"}, {"string dec", "1.25"}, {"string uuid", "550e8400-e29b-41d4-a716-446655440000"},
+		{"string 4", "abcd"}, {"[]byte", []byte("abcd")}, {"[]byte empty", []byte{}}, {"[4]byte", [4]byte{1, 2, 3, 4}},
+		{"[16]byte", [16]byte{1}}, {"[12]byte", [12]byte{1}}, {"[8]byte", [8]byte{0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}}, {"time", ts}, {"*time", &ts}, {"duration", 5 * time.Second},
+		{"avro.Duration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}}, {"*big.Rat", big.NewRat(5, 4)},
+		{"big.Rat", *big.NewRat(5, 4)}, {"*big.Int", big.NewInt(7)}, {"bool", true},
+		{"map{a:1}", map[string]any{"a": int64(1)}}, {"map{a:str}", map[string]any{"a": "x"}}, {"map{}", map[string]any{}},
+		{"map{k:1,j:2}", map[string]any{"k": int64(1), "j": int64(2)}}, {"map[string]int64", map[string]int64{"a": 1}},
+		{"map[string]string", map[string]string{"a": "x"}}, {"envelope{long:7}", map[string]any{"long": int64(7)}},
+		{"envelope{P:{a:1}}", map[string]any{"P": map[string]any{"a": int64(1)}}}, {"envelope{string:x}", map[string]any{"string": "x"}},
+		{"struct P", parityP{A: 1}}, {"*P", &parityP{A: 1}}, {"*P nil", (*parityP)(nil)},
+		{"[]any{1}", []any{int64(1)}}, {"[]any{}", []any{}}, {"[]int64", []int64{1, 2}}, {"[]int32", []int32{1}},
+		{"[]string", []string{"x"}}, {"[1]int64", [1]int64{1}}, {"[]P", []parityP{{A: 1}}}, {"[]*P", []*parityP{{A: 1}}},
+		{"ArrayRecord{1}", avro.ArrayRecord{int64(1)}}, {"ArrayRecord{str}", avro.ArrayRecord{"x"}},
+		{"*int64", &i64}, {"*int64 nil", (*int64)(nil)}, {"*string", &s1}, {"*any nil", &nilAny},
+		{"named map", parityMap{"a": int64(1)}}, {"named slice", paritySlice{int64(1)}}, {"named bytes", parityBytes("abcd")},
+		{"*money", &parityMoney{5}}, {"money", parityMoney{5}}, {"nil", nil}, {"func", func() {}},
+	}
+	positions := parityPositions()
+	var failures []string
+	fail := func(format string, args ...any) { failures = append(failures, fmt.Sprintf(format, args...)) }
+	try := func(f func() error) error { return parityTry(fail, f) }
+	isPanic := func(err error) bool { return err != nil && strings.HasPrefix(err.Error(), "panic: ") }
+	snap := func(x any) string { return paritySnap(reflect.ValueOf(x), 0) }
+	cases := parityCases()
+	for _, option := range []struct {
+		name string
+		opts []avro.Opt
+	}{
+		{"plain", nil},
+		{"tagged", []avro.Opt{avro.TaggedUnions()}},
+		{"tagged+logical", []avro.Opt{avro.TaggedUnions(), avro.TagLogicalTypes()}},
+	} {
+		opts := option.opts
+		for _, pos := range positions {
+			for _, sc := range cases {
+				s := avro.MustParse(pos.schema(sc.text), ct)
+				var vals []struct {
+					name string
+					v    any
+				}
+				for i, v := range sc.vals {
+					vals = append(vals, struct {
+						name string
+						v    any
+					}{fmt.Sprintf("value %d", i), v})
+				}
+				for _, in := range append(vals, inputs...) {
+					// The encoded value is the target a position builds around the
+					// input. A slot of the input's own type needs the input's type.
+					ptr, _ := pos.target(in.v)
+					if ptr == nil {
+						continue
+					}
+					w := reflect.ValueOf(ptr).Elem().Interface()
+					cell := fmt.Sprintf("%s | %s | %s | %s", option.name, pos.name, sc.name, in.name)
+					// Raw bytes for a decimal are written as given, as the
+					// spec's bytes defaults are, and a []byte target reads
+					// them back as given. Read as a number, they can exceed
+					// the precision or fail to parse, so only the checks
+					// that the paths agree apply to them.
+					rv := reflect.ValueOf(in.v)
+					opaque := strings.Contains(sc.text, `decimal"`) && rv.IsValid() &&
+						(rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) && rv.Type().Elem().Kind() == reflect.Uint8
+					var bin, js, bare []byte
+					be := try(func() (err error) { bin, err = s.AppendEncode(nil, w); return err })
+					je := try(func() (err error) { js, err = s.AppendEncodeJSON(nil, w, avro.TaggedUnions()); return err })
+					re := try(func() (err error) { bare, err = s.AppendEncodeJSON(nil, w); return err })
+					switch {
+					case isPanic(be) || isPanic(je) || isPanic(re):
+						fail("%s: Encode %v, EncodeJSON %v, bare EncodeJSON %v", cell, be, je, re)
+						continue
+					case (be == nil) != (je == nil) || (be == nil) != (re == nil):
+						fail("%s: Encode error %v, EncodeJSON error %v, bare EncodeJSON error %v", cell, be, je, re)
+						continue
+					case be != nil:
+						continue
+					}
+					var db, dj any
+					de := try(func() error { _, err := s.Decode(bin, &db, opts...); return err })
+					dje := try(func() error { return s.DecodeJSON(js, &dj, opts...) })
+					switch {
+					case (de == nil) != (dje == nil) || isPanic(de) || isPanic(dje):
+						fail("%s: Decode of the encoded value %v, DecodeJSON %v", cell, de, dje)
+					case de == nil && snap(db) != snap(dj):
+						fail("%s: the encoders wrote different values: binary %s, JSON %s", cell, snap(db), snap(dj))
+					case de == nil && !opaque:
+						// The decoded value makes the trip again on both
+						// wires, and its bytes hold on the trip after. A map
+						// of two or more keys can encode its entries in
+						// another order.
+						var bin2, js2, bin3 []byte
+						var db2, dj2 any
+						be2 := try(func() (err error) { bin2, err = s.AppendEncode(nil, db); return err })
+						je2 := try(func() (err error) { js2, err = s.AppendEncodeJSON(nil, db, avro.TaggedUnions()); return err })
+						if be2 == nil {
+							be2 = try(func() error { _, err := s.Decode(bin2, &db2, opts...); return err })
+						}
+						if be2 == nil {
+							be2 = try(func() (err error) { bin3, err = s.AppendEncode(nil, db2); return err })
+						}
+						if je2 == nil {
+							je2 = try(func() error { return s.DecodeJSON(js2, &dj2, opts...) })
+						}
+						switch {
+						case be2 != nil || je2 != nil:
+							fail("%s: the decoded value %s does not make the trip again: binary %v, JSON %v", cell, snap(db), be2, je2)
+						case snap(db2) != snap(db) || snap(dj2) != snap(db):
+							fail("%s: the decoded value %s came back as %s on binary and %s on JSON", cell, snap(db), snap(db2), snap(dj2))
+						case !bytes.Equal(bin3, bin2) && !parityMultiKey(db):
+							fail("%s: the decoded value %s encodes to %x, and to %x on the trip after", cell, snap(db), bin2, bin3)
+						}
+						var dr any
+						if err := try(func() error { return s.DecodeJSON(bare, &dr, opts...) }); (err != nil || snap(dr) != snap(db)) && !parityBareAmbiguous(s, bare) {
+							fail("%s: the bare JSON %s decodes to %s, err %v; want %s", cell, bare, snap(dr), err, snap(db))
+						}
+					}
+					if w == nil {
+						continue
+					}
+					// Decoding into a new value of the encoded Go type.
+					pb, pj := reflect.New(reflect.TypeOf(w)), reflect.New(reflect.TypeOf(w))
+					tbe := try(func() error { _, err := s.Decode(bin, pb.Interface(), opts...); return err })
+					tje := try(func() error { return s.DecodeJSON(js, pj.Interface(), opts...) })
+					switch {
+					case (tbe == nil) != (tje == nil) || isPanic(tbe) || isPanic(tje):
+						fail("%s: Decode into a %T: %v, DecodeJSON: %v", cell, w, tbe, tje)
+					case tbe != nil && de != nil && !opaque:
+						fail("%s: the encoded value decodes into neither an any (%v) nor a %T (%v)", cell, de, w, tbe)
+					case tbe == nil && snap(pb.Elem().Interface()) != snap(pj.Elem().Interface()):
+						fail("%s: into a %T, Decode gives %s and DecodeJSON %s", cell, w, snap(pb.Elem().Interface()), snap(pj.Elem().Interface()))
+					case tbe == nil && !opaque:
+						// The typed value encodes to a datum that decodes as
+						// the any did, and its bytes hold on the trip after.
+						var bin3, bin4 []byte
+						var dt any
+						again := reflect.New(reflect.TypeOf(w))
+						err := try(func() (err error) { bin3, err = s.AppendEncode(nil, pb.Elem().Interface()); return err })
+						if err == nil {
+							err = try(func() error { _, err := s.Decode(bin3, again.Interface(), opts...); return err })
+						}
+						if err == nil {
+							err = try(func() (err error) { bin4, err = s.AppendEncode(nil, again.Elem().Interface()); return err })
+						}
+						if err == nil && de == nil {
+							err = try(func() error { _, err := s.Decode(bin3, &dt, opts...); return err })
+						}
+						switch {
+						case err != nil:
+							fail("%s: the %T it decoded into does not make the trip again: %v", cell, w, err)
+						case de == nil && snap(dt) != snap(db):
+							fail("%s: the %T it decoded into encodes %s, the any it decoded into %s", cell, w, snap(dt), snap(db))
+						case !bytes.Equal(bin4, bin3) && !parityMultiKey(pb.Elem().Interface()):
+							fail("%s: the %T it decoded into encodes to %x, and to %x on the trip after", cell, w, bin3, bin4)
+						}
+					}
+				}
+			}
+		}
+	}
+	parityReport(t, failures)
+}
+
+// TestMatrix_ResolvedTargetParity decodes writer data through a resolved
+// schema, and the same value encoded with the reader schema through the plain
+// reader, into every position of the parity matrices, from each old value, on
+// both wires, with and without TaggedUnions. The two decodes must fail the
+// same, leave the same value, and reuse the same containers, after one decode
+// and after two in a row, and a resolved decode that fails at its first byte
+// leaves the target as it was. The pairs are a schema resolved against
+// itself, a reader union around the writer's type, and a reader record with a
+// field the writer lacks, which run the record, map, and union decoders of
+// resolve.go. TestMatrix_UsedTargetParity covers the plain decoders, and
+// TestParity_ResolveMatrix checks resolution into new targets.
+func TestMatrix_ResolvedTargetParity(t *testing.T) {
+	ct := parityCustom()
+	positions := parityPositions()
+	// One old value of each kind. TestMatrix_UsedTargetParity crosses all of
+	// them with the decoders both pairs end in.
+	var olds []struct {
+		name string
+		mk   func() any
+	}
+	for _, old := range parityOlds() {
+		switch old.name {
+		case "nil", "int64", "string", "[]byte", "struct", "map[string]any{}", "map[string]any{own}",
+			"map[string]any{P:map}", "[]any{9,8}", "[]any{map}", "map[string]int64", "[]int64", "*int64",
+			"*P", "*big.Rat", "*any(map)", "*map[string]any", "ArrayRecord{x}", "nil []int64", "envelope{P:*map}",
+			"nil map[string]int64", "nil map[string]any":
+			olds = append(olds, old)
+		}
+	}
+	if len(olds) != 22 {
+		t.Fatalf("%d old values picked, want 22: a name in the list no longer matches parityOlds", len(olds))
+	}
+	rec := func(s string, extra string) string {
+		return `{"type":"record","name":"RW","fields":[{"name":"f","type":` + s + `}` + extra + `]}`
+	}
+	type wire struct {
+		bin, js []byte
+	}
+	var failures []string
+	fail := func(format string, args ...any) { failures = append(failures, fmt.Sprintf(format, args...)) }
+	try := func(f func() error) error { return parityTry(fail, f) }
+	for _, sc := range parityCases() {
+		pairs := []struct{ name, writer, reader string }{
+			{"added field", rec(sc.text, ""), rec(sc.text, `,{"name":"g","type":["null","long"],"default":null}`)},
+		}
+		if !strings.HasPrefix(sc.text, "[") && sc.text != `"null"` {
+			pairs = append(pairs, struct{ name, writer, reader string }{"reader union", sc.text, `["null",` + sc.text + `]`})
+		}
+		for _, pr := range pairs {
+			for _, pos := range positions {
+				w := avro.MustParse(pos.schema(pr.writer), ct)
+				r := avro.MustParse(pos.schema(pr.reader), ct)
+				res, err := avro.Resolve(w, r)
+				if err != nil {
+					fail("%s | %s | %s: Resolve: %v", pr.name, pos.name, sc.name, err)
+					continue
+				}
+				// Each value as writer data, and as reader data for the
+				// value a fresh resolved decode gives.
+				var fromWriter, fromReader []wire
+				var zeroByte []bool
+				top := avro.MustParse(pr.writer, ct)
+				for _, v := range sc.vals {
+					var in wire
+					if pr.name != "added field" {
+						zeroByte = append(zeroByte, len(avrotest.MustAppendEncode(t, top, nil, v, avro.TaggedUnions())) == 0)
+					} else {
+						zeroByte = append(zeroByte, false)
+					}
+					if pr.name == "added field" {
+						v = map[string]any{"f": v}
+					}
+					in.bin = avrotest.MustAppendEncode(t, w, nil, pos.wrap(v), avro.TaggedUnions())
+					in.js = avrotest.MustAppendEncodeJSON(t, w, nil, pos.wrap(v), avro.TaggedUnions())
+					var fresh any
+					if _, err := res.Decode(in.bin, &fresh); err != nil {
+						fail("%s | %s | %s: a fresh resolved decode: %v", pr.name, pos.name, sc.name, err)
+						continue
+					}
+					var out wire
+					out.bin = avrotest.MustAppendEncode(t, r, nil, fresh, avro.TaggedUnions())
+					out.js = avrotest.MustAppendEncodeJSON(t, r, nil, fresh, avro.TaggedUnions())
+					fromWriter, fromReader = append(fromWriter, in), append(fromReader, out)
+				}
+				for _, option := range []struct {
+					name string
+					opts []avro.Opt
+				}{{"plain", nil}, {"tagged", []avro.Opt{avro.TaggedUnions()}}} {
+					opts := option.opts
+					decode := func(s *avro.Schema, json bool, in wire, ptr any) error {
+						return try(func() error {
+							if json {
+								return s.DecodeJSON(in.js, ptr, opts...)
+							}
+							_, err := s.Decode(in.bin, ptr, opts...)
+							return err
+						})
+					}
+					for _, old := range olds {
+						for _, json := range []bool{false, true} {
+							cell := fmt.Sprintf("%s | %s | %s | %s | old %s | json=%v", option.name, pr.name, pos.name, sc.name, old.name, json)
+							// run decodes ins[first] if first >= 0, and then
+							// ins[i], into a target from the old value.
+							run := func(s *avro.Schema, ins []wire, first, i int) (string, string, bool, bool) {
+								ptr, get := pos.target(old.mk())
+								if ptr == nil {
+									return "", "", false, false
+								}
+								before := get()
+								if first >= 0 {
+									if err := decode(s, json, ins[first], ptr); err != nil {
+										return "first: " + err.Error(), "", false, true
+									}
+									before = get()
+								}
+								errText := ""
+								if err := decode(s, json, ins[i], ptr); err != nil {
+									errText = err.Error()
+								}
+								got := get()
+								id := parityID(parityInside(before))
+								return errText, paritySnap(reflect.ValueOf(got), 0), id != 0 && id == parityID(parityInside(got)), true
+							}
+							for i := range fromWriter {
+								for first := -1; first < len(fromWriter); first++ {
+									re, rs, rr, ok := run(res, fromWriter, first, i)
+									if !ok {
+										continue
+									}
+									pe, ps, pp, _ := run(r, fromReader, first, i)
+									label := fmt.Sprintf("value %d", i)
+									if first >= 0 {
+										label = fmt.Sprintf("value %d then %d", first, i)
+									}
+									switch {
+									case strings.HasPrefix(re, "panic: ") || strings.HasPrefix(pe, "panic: "):
+										fail("%s | %s: resolved %s, reader %s", cell, label, re, pe)
+									case (re == "") != (pe == ""):
+										fail("%s | %s: the resolved decode failed: %q, the reader decode: %q", cell, label, re, pe)
+									case rs != ps:
+										fail("%s | %s: the resolved decode left %s, the reader decode %s (errors %q, %q)", cell, label, rs, ps, re, pe)
+									case re == "" && rr != pp:
+										fail("%s | %s: the resolved decode reused the old value: %v, the reader decode: %v", cell, label, rr, pp)
+									}
+								}
+								// A resolved decode that fails at its first
+								// byte leaves the target as the decode
+								// before it left it. A value of zero bytes
+								// decodes from the prefix alone, and its
+								// decode fails only after it.
+								if len(zeroByte) > i && zeroByte[i] {
+									continue
+								}
+								ptr, get := pos.target(old.mk())
+								if ptr == nil || decode(res, json, fromWriter[i], ptr) != nil {
+									continue
+								}
+								mid := get()
+								before := paritySnap(reflect.ValueOf(mid), 0)
+								bad := wire{bin: pos.binPre, js: []byte(pos.jsWrap(`!`))}
+								if err := decode(res, json, bad, ptr); err != nil {
+									got := get()
+									if after := paritySnap(reflect.ValueOf(got), 0); strings.HasPrefix(err.Error(), "panic: ") || after != before || parityID(got) != parityID(mid) {
+										fail("%s | value %d then a failure: the resolved decode changed %s to %s (error %v)", cell, i, before, after, err)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	parityReport(t, failures)
+}
+
+// parityMultiKey reports whether x has a map with two or more entries, whose
+// entries can encode in another order.
+func parityMultiKey(x any) bool {
+	var walk func(v reflect.Value, depth int) bool
+	walk = func(v reflect.Value, depth int) bool {
+		if !v.IsValid() || depth > 16 {
+			return false
+		}
+		switch v.Kind() {
+		case reflect.Interface, reflect.Pointer:
+			return !v.IsNil() && walk(v.Elem(), depth+1)
+		case reflect.Map:
+			if v.Len() > 1 {
+				return true
+			}
+			for it := v.MapRange(); it.Next(); {
+				if walk(it.Value(), depth+1) {
+					return true
+				}
+			}
+		case reflect.Slice, reflect.Array:
+			for i := range v.Len() {
+				if walk(v.Index(i), depth+1) {
+					return true
+				}
+			}
+		case reflect.Struct:
+			for i := range v.NumField() {
+				if walk(v.Field(i), depth+1) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(reflect.ValueOf(x), 0)
+}
+
+// parityBareAmbiguous reports whether the bare JSON js of a value of s can
+// have more than one reading: a union in s has two branches whose JSON starts
+// alike, or js has an object key that names a branch of a union in s.
+func parityBareAmbiguous(s *avro.Schema, js []byte) bool {
+	var names []string
+	ambiguous, quotedFloat := false, false
+	var walk func(n *avro.SchemaNode, depth int)
+	walk = func(n *avro.SchemaNode, depth int) {
+		if n == nil || depth > 16 {
+			return
+		}
+		if n.Type == "union" {
+			seen := map[string]bool{}
+			for i := range n.Branches {
+				b := &n.Branches[i]
+				c := tokenClass(b.Type)
+				ambiguous = ambiguous || seen[c]
+				seen[c] = true
+				// DecodeJSON also reads a bare number as a decimal, and a
+				// quoted NaN or Infinity as a float or a double.
+				if b.LogicalType == "decimal" || b.LogicalType == "big-decimal" {
+					ambiguous = ambiguous || seen["digit"]
+					seen["digit"] = true
+				}
+				if b.Type == "float" || b.Type == "double" {
+					quotedFloat = quotedFloat || seen["string"]
+					seen["quoted float"] = true
+				} else if c == "string" {
+					quotedFloat = quotedFloat || seen["quoted float"]
+				}
+				names = append(names, b.Type, b.Name)
+				if b.LogicalType != "" {
+					names = append(names, b.Type+"."+b.LogicalType)
+				}
+				walk(b, depth+1)
+			}
+		}
+		for i := range n.Fields {
+			walk(&n.Fields[i].Type, depth+1)
+		}
+		walk(n.Items, depth+1)
+		walk(n.Values, depth+1)
+	}
+	walk(s.Root(), 0)
+	if ambiguous || quotedFloat && (bytes.Contains(js, []byte(`"NaN"`)) || bytes.Contains(js, []byte(`Infinity"`))) {
+		return true
+	}
+	for _, name := range names {
+		if name != "" && bytes.Contains(js, []byte(`"`+name+`":`)) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkTakenOut checks the values you took out of a used []any before the next
+// decode into it: a map or a *big.Rat at an element the next decode writes is
+// the one the element now has, and any other value still equals want, its
+// fresh decode.
+func checkTakenOut(t *testing.T, what string, kept, got, want []any) {
+	t.Helper()
+	for i, k := range kept {
+		switch k.(type) {
+		case map[string]any, *big.Rat:
+			if i >= len(got) {
+				break
+			}
+			if g := reflect.ValueOf(got[i]); g.Kind() != reflect.ValueOf(k).Kind() || g.UnsafePointer() != reflect.ValueOf(k).UnsafePointer() {
+				t.Errorf("%s: element %d is %#v, want the %T from the first decode, decoded into", what, i, got[i], k)
+			}
+			continue
+		}
+		if !matEqual(k, want[i]) {
+			t.Errorf("%s: the second decode wrote element %d, a value taken from the first:\n got=%#v\nwant=%#v", what, i, k, want[i])
+		}
+	}
+}
+
+// reuseWire decodes a wire's own encoding of a value. wrapField turns an
+// encoded value into the encoding of the record rec, whose one field "f" has
+// it. The single-object wire asserts the DecodeSingleObject doc: it decodes by
+// the rules of Decode.
+type reuseWire struct {
+	name      string
+	encode    func(t testing.TB, s *avro.Schema, v any, opts ...avro.Opt) []byte
+	decode    func(s *avro.Schema, src []byte, v any, opts ...avro.Opt) error
+	wrapField func(rec *avro.Schema, b []byte) []byte
+}
+
+func (w reuseWire) mustDecode(t *testing.T, s *avro.Schema, src []byte, v any, opts ...avro.Opt) {
+	t.Helper()
+	if err := w.decode(s, src, v, opts...); err != nil {
+		t.Fatalf("%s decode: %v", w.name, err)
+	}
+}
+
+var reuseWires = []reuseWire{
+	{"binary",
+		func(t testing.TB, s *avro.Schema, v any, opts ...avro.Opt) []byte {
+			return avrotest.MustEncode(t, s, v, opts...)
+		},
+		func(s *avro.Schema, src []byte, v any, opts ...avro.Opt) error {
+			_, err := s.Decode(src, v, opts...)
+			return err
+		},
+		func(_ *avro.Schema, b []byte) []byte { return b }},
+	{"json",
+		func(t testing.TB, s *avro.Schema, v any, opts ...avro.Opt) []byte {
+			return avrotest.MustEncodeJSON(t, s, v, opts...)
+		},
+		func(s *avro.Schema, src []byte, v any, opts ...avro.Opt) error {
+			return s.DecodeJSON(src, v, opts...)
+		},
+		func(_ *avro.Schema, b []byte) []byte { return append(append([]byte(`{"f":`), b...), '}') }},
+	{"single object",
+		func(t testing.TB, s *avro.Schema, v any, opts ...avro.Opt) []byte {
+			t.Helper()
+			b, err := s.AppendSingleObject(nil, v, opts...)
+			if err != nil {
+				t.Fatalf("AppendSingleObject: %v", err)
+			}
+			return b
+		},
+		func(s *avro.Schema, src []byte, v any, opts ...avro.Opt) error {
+			_, err := s.DecodeSingleObject(src, v, opts...)
+			return err
+		},
+		// The record's header, which no value changes, then the value's
+		// body, which is the record's body.
+		func(rec *avro.Schema, b []byte) []byte {
+			hdr, err := rec.AppendSingleObject(nil, map[string]any{"f": []any{}})
+			if err != nil {
+				panic(err)
+			}
+			return append(hdr[:10:10], b[10:]...)
+		}},
 }
 
 // Typed-container reuse: slices shrink and grow to exactly the decoded
@@ -12477,76 +13682,857 @@ func TestMatrix_TargetReusePerKind(t *testing.T) {
 func TestMatrix_TypedContainerReuse(t *testing.T) {
 	t.Run("slice-shrinks-and-grows", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"array","items":"int"}`)
-		big, _ := s.AppendEncode(nil, []int32{1, 2, 3, 4, 5})
-		small, _ := s.AppendEncode(nil, []int32{9})
-		var target []int32
-		if _, err := s.Decode(big, &target); err != nil {
-			t.Fatalf("decode big: %v", err)
+		for _, w := range reuseWires {
+			big := w.encode(t, s, []int32{1, 2, 3, 4, 5})
+			small := w.encode(t, s, []int32{9})
+			var target []int32
+			w.mustDecode(t, s, big, &target)
+			first := &target[0]
+			w.mustDecode(t, s, small, &target)
+			if len(target) != 1 || target[0] != 9 {
+				t.Fatalf("%s: slice reuse left stale elements: %v", w.name, target)
+			}
+			if &target[0] != first {
+				t.Errorf("%s: a slice that fits got a new backing array", w.name)
+			}
+			w.mustDecode(t, s, big, &target)
+			if len(target) != 5 || target[4] != 5 {
+				t.Fatalf("%s: slice regrow failed: %v", w.name, target)
+			}
 		}
-		if _, err := s.Decode(small, &target); err != nil {
-			t.Fatalf("decode small into used slice: %v", err)
+	})
+	t.Run("slice-field-fails-partway", func(t *testing.T) {
+		// A struct field's slice fills the room it has before it grows, as
+		// DecodeJSON does, so an array whose second item fails, or that does
+		// not end, has written its first item into your backing array on
+		// both decoders, and the field keeps its length.
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":"string"}}]}`)
+		for name, decode := range map[string]func(v any) error{
+			// Two items: "x", and then a string longer than the input.
+			"binary": func(v any) error { _, err := s.Decode([]byte{4, 2, 'x', 0xc8, 0x01}, v); return err },
+			"json":   func(v any) error { return s.DecodeJSON([]byte(`{"f":["x",1]}`), v) },
+			// Two items, and then no end of the array.
+			"binary, no end": func(v any) error { _, err := s.Decode([]byte{4, 2, 'x', 2, 'y'}, v); return err },
+			"json, no end":   func(v any) error { return s.DecodeJSON([]byte(`{"f":["x","y"}`), v) },
+		} {
+			target := struct {
+				F []string `avro:"f"`
+			}{F: []string{"old"}}
+			kept := target.F
+			if err := decode(&target); err == nil {
+				t.Fatalf("%s: the decode worked, want an error at the second item or the end", name)
+			}
+			if len(target.F) != 1 || kept[0] != "x" {
+				t.Errorf("%s: the field is %q and your backing array has %q, want length 1 and the first item written", name, target.F, kept)
+			}
 		}
-		if len(target) != 1 || target[0] != 9 {
-			t.Fatalf("slice reuse left stale elements: %v", target)
+		// A nil pointer element whose item fails stays nil.
+		ps := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":["null","long"]}}]}`)
+		for name, decode := range map[string]func(v any) error{
+			"binary": func(v any) error { _, err := ps.Decode([]byte{2, 2, 0x80}, v); return err },
+			"json":   func(v any) error { return ps.DecodeJSON([]byte(`{"f":[{"long":"x"}]}`), v) },
+		} {
+			target := struct {
+				F []*int64 `avro:"f"`
+			}{F: make([]*int64, 1)}
+			if err := decode(&target); err == nil || target.F[0] != nil {
+				t.Errorf("%s: a nil element whose item fails: err %v, element %v; want an error and nil", name, err, target.F[0])
+			}
 		}
-		if _, err := s.Decode(big, &target); err != nil {
-			t.Fatalf("decode big into shrunk slice: %v", err)
+	})
+	t.Run("nil-pointer-stays-nil-after-a-failure", func(t *testing.T) {
+		// A nil pointer whose value fails stays nil, on both decoders.
+		const long, nl = `"long"`, `["null","long"]`
+		rec := func(s string) string { return `{"type":"record","name":"R","fields":[{"name":"f","type":` + s + `}]}` }
+		arr := func(s string) string { return `{"type":"array","items":` + s + `}` }
+		for _, c := range []struct {
+			name, schema string
+			bin, js      []byte
+			target       func() (ptr any, isNil func() bool)
+		}{
+			{"top, long", long, []byte{0x80}, []byte(`"x"`), func() (any, func() bool) {
+				var p *int64
+				return &p, func() bool { return p == nil }
+			}},
+			{"top, null union", nl, []byte{2, 0x80}, []byte(`{"long":"x"}`), func() (any, func() bool) {
+				var p *int64
+				return &p, func() bool { return p == nil }
+			}},
+			{"field, long", rec(long), []byte{0x80}, []byte(`{"f":"x"}`), func() (any, func() bool) {
+				var x struct {
+					F *int64 `avro:"f"`
+				}
+				return &x, func() bool { return x.F == nil }
+			}},
+			{"field, null union", rec(nl), []byte{2, 0x80}, []byte(`{"f":{"long":"x"}}`), func() (any, func() bool) {
+				var x struct {
+					F *int64 `avro:"f"`
+				}
+				return &x, func() bool { return x.F == nil }
+			}},
+			{"Go array", arr(long), []byte{2, 0x80}, []byte(`["x"]`), func() (any, func() bool) {
+				var x [1]*int64
+				return &x, func() bool { return x[0] == nil }
+			}},
+			{"Go array field", rec(arr(long)), []byte{2, 0x80}, []byte(`{"f":["x"]}`), func() (any, func() bool) {
+				var x struct {
+					F [1]*int64 `avro:"f"`
+				}
+				return &x, func() bool { return x.F[0] == nil }
+			}},
+			{"top record", rec(long), []byte{0x80}, []byte(`{"f":"x"}`), func() (any, func() bool) {
+				var p *struct {
+					F int64 `avro:"f"`
+				}
+				return &p, func() bool { return p == nil }
+			}},
+			{"any with a pointer to a nil pointer", long, []byte{0x80}, []byte(`"x"`), func() (any, func() bool) {
+				pp := new(*int64)
+				var x any = pp
+				return &x, func() bool { return *pp == nil }
+			}},
+			{"any with a pointer to a nil pointer, wrong type", `"boolean"`, []byte{1}, []byte(`true`), func() (any, func() bool) {
+				pp := new(*int64)
+				var x any = pp
+				return &x, func() bool { return *pp == nil }
+			}},
+			// A value of the wrong type fails after the pointer would be
+			// allocated.
+			{"top, wrong type", `"boolean"`, []byte{1}, []byte(`true`), func() (any, func() bool) {
+				var p *int64
+				return &p, func() bool { return p == nil }
+			}},
+			{"field, wrong type", rec(`"boolean"`), []byte{1}, []byte(`{"f":true}`), func() (any, func() bool) {
+				var x struct {
+					F *int64 `avro:"f"`
+				}
+				return &x, func() bool { return x.F == nil }
+			}},
+			{"Go array, wrong type", arr(`"boolean"`), []byte{2, 1, 0}, []byte(`[true]`), func() (any, func() bool) {
+				var x [1]*int64
+				return &x, func() bool { return x[0] == nil }
+			}},
+			{"field, null union of a record", rec(`["null",{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}]`),
+				[]byte{2, 0x80}, []byte(`{"f":{"P":{"a":"x"}}}`), func() (any, func() bool) {
+					var x struct {
+						F *struct {
+							A int64 `avro:"a"`
+						} `avro:"f"`
+					}
+					return &x, func() bool { return x.F == nil }
+				}},
+		} {
+			s := avro.MustParse(c.schema)
+			for name, decode := range map[string]func(v any) error{
+				"binary": func(v any) error { _, err := s.Decode(c.bin, v); return err },
+				"json":   func(v any) error { return s.DecodeJSON(c.js, v) },
+			} {
+				ptr, isNil := c.target()
+				if err := decode(ptr); err == nil || !isNil() {
+					t.Errorf("%s/%s: err %v, pointer nil %v; want an error and nil", c.name, name, err, isNil())
+				}
+			}
 		}
-		if len(target) != 5 || target[4] != 5 {
-			t.Fatalf("slice regrow failed: %v", target)
+		// A default that DecodeJSON fills, and that the field cannot take,
+		// leaves the field's nil pointer nil.
+		dj := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"d","type":"int","default":42}]}`)
+		var dflt struct {
+			D *string `avro:"d"`
+		}
+		if err := dj.DecodeJSON([]byte(`{}`), &dflt); err == nil || dflt.D != nil {
+			t.Errorf("JSON default: err %v, pointer %v; want an error and nil", err, dflt.D)
+		}
+		// Through Resolve, a record field that fails, or a reader field's
+		// default that the Go field cannot take, leaves the nil pointer nil.
+		w := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+		r := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"d","type":"int","default":42}]}`)
+		res := avrotest.MustResolve(t, w, r)
+		pw := avro.MustParse(`{"type":"record","name":"O","fields":[{"name":"p","type":{"type":"record","name":"P","fields":[{"name":"x","type":"int"}]}}]}`)
+		pr := avro.MustParse(`{"type":"record","name":"O","fields":[{"name":"p","type":{"type":"record","name":"P","fields":[{"name":"x","type":"long"}]}}]}`)
+		var outer struct {
+			P *struct {
+				X int64 `avro:"x"`
+			} `avro:"p"`
+		}
+		if _, err := avrotest.MustResolve(t, pw, pr).Decode(nil, &outer); err == nil || outer.P != nil {
+			t.Errorf("resolved record field: err %v, pointer %v; want an error and nil", err, outer.P)
+		}
+		var def struct {
+			A int64   `avro:"a"`
+			D *string `avro:"d"`
+		}
+		if _, err := res.Decode([]byte{2}, &def); err == nil || def.D != nil {
+			t.Errorf("resolved default: err %v, pointer %v; want an error and nil", err, def.D)
 		}
 	})
 	t.Run("slice-of-pointers", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"array","items":["null","int"]}`)
-		w1, _ := s.AppendEncode(nil, []any{int32(1), nil, int32(3)})
-		w2, _ := s.AppendEncode(nil, []any{nil, int32(7), nil})
-		var target []*int32
-		if _, err := s.Decode(w1, &target); err != nil {
-			t.Fatalf("decode #1: %v", err)
-		}
-		if _, err := s.Decode(w2, &target); err != nil {
-			t.Fatalf("decode #2 into used []*int32: %v", err)
-		}
-		if target[0] != nil || target[1] == nil || *target[1] != 7 || target[2] != nil {
-			t.Fatalf("pointer-slice reuse wrong: %v", target)
-		}
-		// A slice that grows keeps the pointers it had, as a slice that
-		// fits does.
-		kept := target[1]
-		w3, _ := s.AppendEncode(nil, []any{nil, int32(8), nil, nil, int32(9)})
-		if _, err := s.Decode(w3, &target); err != nil {
-			t.Fatalf("decode #3 into a []*int32 that must grow: %v", err)
-		}
-		if target[1] != kept || *kept != 8 || *target[4] != 9 {
-			t.Fatalf("pointer-slice regrow: kept pointer reused=%v, reads %d; target[4]=%d", target[1] == kept, *kept, *target[4])
+		for _, w := range reuseWires {
+			t.Run(w.name, func(t *testing.T) {
+				var target []*int32
+				w.mustDecode(t, s, w.encode(t, s, []any{int32(1), nil, int32(3)}), &target)
+				kept := target[2]
+				w.mustDecode(t, s, w.encode(t, s, []any{nil, int32(7), int32(4)}), &target)
+				if target[0] != nil || target[1] == nil || *target[1] != 7 || target[2] != kept || *kept != 4 {
+					t.Fatalf("pointer-slice reuse wrong: %v, kept pointer reused=%v", target, target[2] == kept)
+				}
+				// A slice that grows keeps the pointers it had, as a slice
+				// that fits does.
+				kept = target[1]
+				w.mustDecode(t, s, w.encode(t, s, []any{nil, int32(8), nil, nil, int32(9)}), &target)
+				if target[1] != kept || *kept != 8 || *target[4] != 9 {
+					t.Fatalf("pointer-slice regrow: kept pointer reused=%v, reads %d; target[4]=%d", target[1] == kept, *kept, *target[4])
+				}
+			})
 		}
 	})
-	t.Run("pointer-in-any-element-is-replaced", func(t *testing.T) {
-		s := avro.MustParse(`{"type":"array","items":{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}}`)
-		wire, _ := s.AppendEncode(nil, []any{map[string]any{"a": int64(1)}})
-		mine := &reuseArrayElemP{}
-		target := []any{mine}
-		if _, err := s.Decode(wire, &target); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if _, ok := target[0].(map[string]any); !ok || mine.A != 0 {
-			t.Fatalf("an any element with the caller's pointer decoded to %T and the caller's value has A=%d, want a map[string]any and 0", target[0], mine.A)
+	t.Run("pointer-in-any-is-decoded-into", func(t *testing.T) {
+		// Every slot of an any: a number takes a path that writes the value
+		// without reading the any first, unless the any has your pointer.
+		for _, w := range reuseWires {
+			for _, pos := range parityPositions() {
+				if pos.typed {
+					continue
+				}
+				for _, c := range []struct {
+					schema string
+					v      any
+					mine   func() (any, func() bool)
+				}{
+					{`{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}`, map[string]any{"a": int64(1)}, func() (any, func() bool) {
+						p := &reuseArrayElemP{}
+						return p, func() bool { return p.A == 1 }
+					}},
+					{`"long"`, int64(1), func() (any, func() bool) {
+						p := new(int64)
+						return p, func() bool { return *p == 1 }
+					}},
+				} {
+					t.Run(w.name+"/"+pos.name+"/"+c.schema[:5], func(t *testing.T) {
+						s := avro.MustParse(pos.schema(c.schema))
+						mine, set := c.mine()
+						ptr, get := pos.target(mine)
+						w.mustDecode(t, s, w.encode(t, s, pos.wrap(c.v)), ptr)
+						if got := get(); got != mine || !set() {
+							t.Fatalf("an any with your %T decoded to %#v, want your pointer, set to 1", mine, got)
+						}
+					})
+				}
+			}
+			// A pointer whose type cannot hold the record is an error, not a
+			// fallback to a map.
+			t.Run(w.name+"/type-lacks-a-field", func(t *testing.T) {
+				s := avro.MustParse(`{"type":"array","items":{"type":"record","name":"P2","fields":[{"name":"a","type":"long"},{"name":"b","type":"long"}]}}`)
+				target := []any{&reuseArrayElemP{}}
+				err := w.decode(s, w.encode(t, s, []any{map[string]any{"a": int64(1), "b": int64(2)}}), &target)
+				var se *avro.SemanticError
+				if !errors.As(err, &se) || se.GoType != reflect.TypeFor[reuseArrayElemP]() || se.Err == nil || se.Err.Error() != "missing field b" {
+					t.Fatalf("decode into []any{&P} where P lacks field b: err=%v, element %#v; want a SemanticError for the missing field", err, target[0])
+				}
+			})
 		}
 	})
 	t.Run("typed-map-accumulates", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"map","values":"int"}`)
-		w1, _ := s.AppendEncode(nil, map[string]int32{"a": 1})
-		w2, _ := s.AppendEncode(nil, map[string]int32{"b": 2})
-		var target map[string]int32
-		if _, err := s.Decode(w1, &target); err != nil {
-			t.Fatalf("decode #1: %v", err)
+		for _, w := range reuseWires {
+			var target map[string]int32
+			w.mustDecode(t, s, w.encode(t, s, map[string]int32{"a": 1}), &target)
+			w.mustDecode(t, s, w.encode(t, s, map[string]int32{"b": 2}), &target)
+			// Documented retain semantics: existing keys persist, new keys add.
+			if target["a"] != 1 || target["b"] != 2 {
+				t.Fatalf("%s: typed map reuse: %v", w.name, target)
+			}
 		}
-		if _, err := s.Decode(w2, &target); err != nil {
-			t.Fatalf("decode #2 into used map: %v", err)
+	})
+	t.Run("map-values-are-decoded-into", func(t *testing.T) {
+		// The value for a key the map has is decoded into when the value is
+		// a pointer, a map, or an any: a pointer is written through, and a
+		// map keeps its keys. A struct stored by value is overwritten, so a
+		// field the schema does not map resets.
+		rec := `{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}`
+		s := avro.MustParse(`{"type":"map","values":` + rec + `}`)
+		in := map[string]any{"k": map[string]any{"a": int64(5)}, "new": map[string]any{"a": int64(6)}}
+		for _, w := range reuseWires {
+			wire := w.encode(t, s, in)
+			mine := &reuseArrayElemP{}
+			ptrs := map[string]*reuseArrayElemP{"k": mine}
+			w.mustDecode(t, s, wire, &ptrs)
+			if ptrs["k"] != mine || mine.A != 5 || ptrs["new"].A != 6 {
+				t.Errorf("%s: map[string]*P: the pointer for k reused=%v and reads %d, new reads %d; want your pointer and 5, and 6", w.name, ptrs["k"] == mine, mine.A, ptrs["new"].A)
+			}
+			structs := map[string]reuseMapValueP{"k": {Extra: 9}}
+			w.mustDecode(t, s, wire, &structs)
+			if structs["k"] != (reuseMapValueP{A: 5}) || structs["new"] != (reuseMapValueP{A: 6}) {
+				t.Errorf("%s: map[string]P: got %+v, want k overwritten, with Extra 0", w.name, structs)
+			}
+			arrs := avro.MustParse(`{"type":"map","values":{"type":"array","items":"long"}}`)
+			backing := make([]int64, 1, 4)
+			lists := map[string][]int64{"k": backing}
+			w.mustDecode(t, arrs, w.encode(t, arrs, map[string]any{"k": []any{int64(3), int64(4)}}), &lists)
+			if got := lists["k"]; len(got) != 2 || &got[0] != &backing[0] || got[1] != 4 {
+				t.Errorf("%s: map[string][]int64: got %v, want the slice the map had, decoded into", w.name, got)
+			}
+			anys := map[string]any{"k": map[string]any{"stale": true}}
+			w.mustDecode(t, s, wire, &anys)
+			if !matEqual(anys["k"], map[string]any{"a": int64(5), "stale": true}) || !matEqual(anys["new"], map[string]any{"a": int64(6)}) {
+				t.Errorf("%s: map[string]any: got %#v, want k merged into the map it had", w.name, anys)
+			}
+			// A record decoded into a map[string]any target decodes a field
+			// into the value the map has for it.
+			h := avro.MustParse(`{"type":"record","name":"H","fields":[{"name":"f","type":` + rec + `}]}`)
+			fields := map[string]any{"f": map[string]any{"stale": true}}
+			w.mustDecode(t, h, w.encode(t, h, map[string]any{"f": map[string]any{"a": int64(5)}}), &fields)
+			if !matEqual(fields["f"], map[string]any{"a": int64(5), "stale": true}) {
+				t.Errorf("%s: record into a map[string]any: got %#v, want f merged into the map it had", w.name, fields)
+			}
 		}
-		// Documented retain semantics: existing keys persist, new keys add.
-		if target["a"] != 1 || target["b"] != 2 {
-			t.Fatalf("typed map reuse: %v", target)
+	})
+	t.Run("resolved-record-in-used-map", func(t *testing.T) {
+		// Through Resolve, a field decodes into the value the map has for
+		// it, a field the writer lacks included: a nested map keeps its
+		// keys, and a default is written through your pointer. DecodeJSON
+		// does the same for a field its document lacks.
+		rec := `{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}`
+		writer := avro.MustParse(`{"type":"record","name":"O","fields":[{"name":"inner","type":` + rec + `},{"name":"drop","type":"int"}]}`)
+		reader := avro.MustParse(`{"type":"record","name":"O","fields":[{"name":"inner","type":` + rec + `},{"name":"d","type":"long","default":5}]}`)
+		resolved := avrotest.MustResolve(t, writer, reader)
+		in := map[string]any{"inner": map[string]any{"a": int64(1)}, "drop": int32(0)}
+		used := func(mine *int64) map[string]any {
+			return map[string]any{"inner": map[string]any{"stale": true}, "d": mine}
+		}
+		decodes := map[string]func(ptr any) error{
+			"DecodeJSON of a document without the field": func(ptr any) error { return reader.DecodeJSON([]byte(`{"inner":{"a":1}}`), ptr) },
+		}
+		for _, w := range reuseWires {
+			wire := w.encode(t, writer, in)
+			decodes[w.name] = func(ptr any) error { return w.decode(resolved, wire, ptr) }
+		}
+		for name, decode := range decodes {
+			mineX, mineM := new(int64), new(int64)
+			var x any = used(mineX)
+			m := used(mineM)
+			if err := decode(&x); err != nil {
+				t.Fatalf("%s into an any: %v", name, err)
+			}
+			if err := decode(&m); err != nil {
+				t.Fatalf("%s into a map[string]any: %v", name, err)
+			}
+			for _, c := range []struct {
+				target string
+				got    map[string]any
+				mine   *int64
+			}{{"any", x.(map[string]any), mineX}, {"map[string]any", m, mineM}} {
+				if !matEqual(c.got["inner"], map[string]any{"a": int64(1), "stale": true}) || c.got["d"] != any(c.mine) || *c.mine != 5 {
+					t.Errorf("%s/%s: got %#v, d=%d; want inner merged and the default 5 written through your pointer", name, c.target, c.got, *c.mine)
+				}
+			}
+		}
+	})
+	t.Run("decimal-in-used-any", func(t *testing.T) {
+		// A *big.Rat in an any is what a decimal decodes to there, so only a
+		// decimal decodes into it, and any other value replaces it.
+		u := `["long",{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}]`
+		for _, c := range parityPositions() {
+			if c.typed {
+				continue
+			}
+			s := avro.MustParse(c.schema(u))
+			for _, w := range reuseWires {
+				for _, seq := range []struct {
+					name          string
+					first, second any
+				}{
+					{"decimal then long", big.NewRat(5, 4), int64(7)},
+					{"long then decimal", int64(7), big.NewRat(5, 4)},
+					{"decimal then decimal", big.NewRat(5, 4), big.NewRat(5, 2)},
+				} {
+					t.Run(w.name+"/"+c.name+"/"+seq.name, func(t *testing.T) {
+						ptr, elem := c.target(nil)
+						w.mustDecode(t, s, w.encode(t, s, c.wrap(seq.first)), ptr)
+						first := elem()
+						if err := w.decode(s, w.encode(t, s, c.wrap(seq.second)), ptr); err != nil {
+							t.Fatalf("second decode: %v", err)
+						}
+						got := elem()
+						if want, ok := seq.second.(*big.Rat); ok {
+							r, isRat := got.(*big.Rat)
+							if !isRat || r.Cmp(want) != 0 {
+								t.Fatalf("got %T %v, want *big.Rat %v", got, got, want)
+							}
+							if old, ok := first.(*big.Rat); ok && old != r {
+								t.Errorf("a decimal got a new *big.Rat, want the one from the first decode, decoded into")
+							}
+						} else if got != seq.second {
+							t.Fatalf("got %T %v, want %T %v", got, got, seq.second, seq.second)
+						}
+					})
+				}
+			}
+		}
+		// A big.Rat field is not decoded into in place: a copy of the struct
+		// shares the field's storage, and must keep its value.
+		type priced struct {
+			Price big.Rat `avro:"price"`
+		}
+		ps := avro.MustParse(`{"type":"record","name":"P","fields":[{"name":"price","type":{"type":"bytes","logicalType":"decimal","precision":30,"scale":2}}]}`)
+		for _, w := range reuseWires {
+			var row priced
+			var rows []priced
+			vals := []*big.Rat{big.NewRat(61728394506172839, 50), big.NewRat(-5, 4), big.NewRat(5, 4)}
+			for _, r := range vals {
+				w.mustDecode(t, ps, w.encode(t, ps, map[string]any{"price": r}), &row)
+				rows = append(rows, row)
+			}
+			for i, r := range vals {
+				if rows[i].Price.Cmp(r) != 0 {
+					t.Errorf("%s: the copy kept after decode %d reads %s, want %s", w.name, i, rows[i].Price.String(), r.String())
+				}
+			}
+		}
+		// A decimal decodes into the *big.Rat itself, which makes no new
+		// big.Rat, so a used any takes fewer allocations than a new one.
+		dec := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":18,"scale":2}`)
+		wire := avrotest.MustEncode(t, dec, big.NewRat(1234567, 100))
+		var used any
+		avrotest.MustDecode(t, dec, wire, &used)
+		intoUsed := minAllocsPerRun(20, func() { _, _ = dec.Decode(wire, &used) })
+		intoNew := minAllocsPerRun(20, func() {
+			var x any
+			_, _ = dec.Decode(wire, &x)
+		})
+		if intoUsed >= intoNew {
+			t.Errorf("a decimal into a used any: %v allocations, want fewer than the %v into a new any", intoUsed, intoNew)
+		}
+		// The tagged JSON form of a union value goes where the bare form
+		// goes, so it takes no more allocations.
+		nl := avro.MustParse(`["null","long"]`)
+		taggedJSON, bareJSON := []byte(`{"long":500}`), []byte(`500`)
+		tagged := minAllocsPerRun(20, func() { var x any; _ = nl.DecodeJSON(taggedJSON, &x) })
+		bare := minAllocsPerRun(20, func() { var x any; _ = nl.DecodeJSON(bareJSON, &x) })
+		if tagged > bare {
+			t.Errorf("a tagged union value into a new any: %v allocations, want no more than the %v of the bare form", tagged, bare)
+		}
+		// DecodeJSON takes a decimal as a bare number too.
+		old := big.NewRat(1, 2)
+		var x any = old
+		avrotest.MustDecodeJSON(t, avro.MustParse(u), []byte(`{"bytes":1.25}`), &x)
+		if x != any(old) || old.Cmp(big.NewRat(5, 4)) != 0 {
+			t.Errorf("a bare-number decimal decoded to %v, want the *big.Rat the any had, set to 5/4", x)
+		}
+	})
+	t.Run("value-in-an-any", func(t *testing.T) {
+		// The rules for the value an any already has. A pointer, map, or
+		// slice is a typed target: we decode into it, and a wrong type is an
+		// error. An Avro primitive is replaced, []byte included. In a union,
+		// a value that has another branch's type is replaced, and a union
+		// with two or more records or maps always decodes one of them into
+		// a new map. With TaggedUnions the rules apply to the value inside
+		// the envelope.
+		const (
+			recA = `{"type":"record","name":"A","fields":[{"name":"a","type":"long"}]}`
+			recB = `{"type":"record","name":"B","fields":[{"name":"b","type":"long"}]}`
+			// Records whose one field is a map, which a reused slot would
+			// merge into.
+			recMA = `{"type":"record","name":"MA","fields":[{"name":"a","type":{"type":"map","values":"long"}}]}`
+			recMB = `{"type":"record","name":"MB","fields":[{"name":"b","type":{"type":"map","values":"long"}}]}`
+			arrL  = `{"type":"array","items":"long"}`
+			mapL  = `{"type":"map","values":"long"}`
+		)
+		a := func(n int64) map[string]any { return map[string]any{"a": n} }
+		b := func(n int64) map[string]any { return map[string]any{"b": n} }
+		own := func() any { return map[string]any{"own": "mine", "too": "mine"} }
+		const same, fresh = 1, -1
+		ptrTo := func(x any) *any { return &x }
+		for _, c := range []struct {
+			name   string
+			schema string
+			start  func() any // what the any has before the first decode
+			vals   []any      // decoded in order into the same any
+			opts   []avro.Opt
+			want   any
+			err    string // the last decode fails with this text
+			// reuse says whether the any still has the map, slice, or
+			// pointer it had before the last decode.
+			reuse int
+		}{
+			{"a map of your type is decoded into", mapL, func() any { return map[string]int64{"old": 1} },
+				[]any{map[string]any{"k": int64(2)}}, nil, map[string]int64{"old": 1, "k": 2}, "", same},
+			{"a slice of your type is decoded into", arrL, func() any { return make([]int64, 0, 8) },
+				[]any{[]any{int64(7)}}, nil, []int64{7}, "", same},
+			{"a map of the wrong type", mapL, func() any { return map[string]string{} },
+				[]any{map[string]any{"k": int64(2)}}, nil, nil, "cannot use string with Avro type long", 0},
+			{"a number at a map", `"long"`, func() any { return map[string]int{"old": 1} },
+				[]any{int64(7)}, nil, nil, "cannot use map[string]int with Avro type long", 0},
+			{"a record at a []any", recA, func() any { return []any{int64(1)} },
+				[]any{a(1)}, nil, nil, "cannot use []any with Avro type record", 0},
+			{"an array at a map[string]any", arrL, func() any { return map[string]any{"x": int64(1)} },
+				[]any{[]any{int64(7)}}, nil, nil, "cannot use map[string]any with Avro type array", 0},
+			{"a number replaces a number of another type", `"long"`, func() any { return int32(5) },
+				[]any{int64(7)}, nil, int64(7), "", 0},
+			{"a string replaces a []byte", `"string"`, func() any { return []byte("old") },
+				[]any{"x"}, nil, "x", "", 0},
+			{"a record replaces a struct by value", recA, func() any { return reuseArrayElemP{} },
+				[]any{a(1)}, nil, a(1), "", 0},
+			{"union: a record replaces the array branch's []any", `[` + arrL + `,` + recA + `]`, nil,
+				[]any{[]any{int64(1)}, a(7)}, nil, a(7), "", 0},
+			{"union: an array replaces the record branch's map", `[` + arrL + `,` + recA + `]`, nil,
+				[]any{a(7), []any{int64(1)}}, nil, []any{int64(1)}, "", 0},
+			{"union: a string replaces the bytes branch's []byte", `["bytes","string"]`, nil,
+				[]any{[]byte("b"), "x"}, nil, "x", "", 0},
+			{"union: a number at a map of no branch", `["string","long"]`, func() any { return map[string]int{"old": 1} },
+				[]any{int64(7)}, nil, nil, "cannot use map[string]int with Avro type long", 0},
+			{"union: a number replaces a map of your type", `["long",` + mapL + `]`, func() any { return map[string]int64{"old": 1} },
+				[]any{int64(7)}, nil, int64(7), "", 0},
+			{"union: a number replaces a slice of your type", `["long",` + arrL + `]`, func() any { return []int64{1} },
+				[]any{int64(7)}, nil, int64(7), "", 0},
+			{"union: a number replaces an ArrayRecord", `["long",` + recA + `]`, func() any { return avro.ArrayRecord{int64(1)} },
+				[]any{int64(7)}, nil, int64(7), "", 0},
+			{"union: an array replaces an ArrayRecord", `[` + arrL + `,` + recA + `]`, func() any { return avro.ArrayRecord{int64(1)} },
+				[]any{[]any{int64(7)}}, nil, []any{int64(7)}, "", 0},
+			{"union of one record decodes into its map", `["null",` + recA + `]`, own,
+				[]any{a(1), a(2)}, nil, map[string]any{"own": "mine", "too": "mine", "a": int64(2)}, "", same},
+			{"union of two records: the other record", `[` + recA + `,` + recB + `]`, own,
+				[]any{a(1), b(2)}, nil, b(2), "", fresh},
+			{"union of two records: the same record", `[` + recA + `,` + recB + `]`, own,
+				[]any{a(1), a(2)}, nil, a(2), "", fresh},
+			{"union of a record and a map", `[` + recA + `,` + mapL + `]`, nil,
+				[]any{map[string]any{"k": int64(5)}, a(1)}, nil, a(1), "", fresh},
+			{"TaggedUnions: one record decodes into the map inside the envelope", `["null",` + recA + `]`, nil,
+				[]any{a(1), a(2)}, []avro.Opt{avro.TaggedUnions()}, map[string]any{"A": a(2)}, "", same},
+			{"TaggedUnions: two records", `[` + recA + `,` + recB + `]`, nil,
+				[]any{a(1), b(2)}, []avro.Opt{avro.TaggedUnions()}, map[string]any{"B": b(2)}, "", fresh},
+			{"TaggedUnions: the envelope has the one branch that arrived", `["long","string"]`, nil,
+				[]any{int64(5), "x"}, []avro.Opt{avro.TaggedUnions()}, map[string]any{"string": "x"}, "", 0},
+			{"a null replaces a pointer", `"null"`, func() any { x := int64(5); return &x },
+				[]any{nil}, nil, nil, "", 0},
+			{"a pointer to a map, two records: the pointer is followed and the map is new", `[` + recA + `,` + recB + `]`,
+				func() any { m := map[string]any{"own": "mine"}; return &m },
+				[]any{b(2)}, nil, func() any { m := b(2); return &m }(), "", same},
+			{"TaggedUnions: a pointer to an any is decoded through, and the outer any is wrapped", `["long","string"]`,
+				func() any { var inner any; return &inner },
+				[]any{int64(5)}, []avro.Opt{avro.TaggedUnions()}, map[string]any{"long": ptrTo(any(int64(5)))}, "", same},
+			{"TaggedUnions: a pointer to an any, and then another branch", `["long",` + arrL + `,` + recA + `]`,
+				func() any { var inner any; return &inner },
+				[]any{[]any{int64(1)}, a(7)}, []avro.Opt{avro.TaggedUnions()}, map[string]any{"A": ptrTo(any(a(7)))}, "", same},
+			{"TaggedUnions: your pointer is decoded into inside the envelope", `[` + recA + `,"string"]`,
+				func() any { return &reuseArrayElemP{} },
+				[]any{a(2)}, []avro.Opt{avro.TaggedUnions()}, map[string]any{"A": &reuseArrayElemP{A: 2}}, "", same},
+			{"TaggedUnions: your pointer is decoded into inside an element's envelope", `{"type":"array","items":["null","long"]}`,
+				func() any { x := int64(1); return []any{map[string]any{"long": &x}, map[string]any{"long": int64(2)}} },
+				[]any{[]any{int64(5), int64(6)}}, []avro.Opt{avro.TaggedUnions()},
+				[]any{map[string]any{"long": func() *int64 { x := int64(5); return &x }()}, map[string]any{"long": int64(6)}}, "", same},
+			{"a map decodes into the map[string]any the any has", mapL, own,
+				[]any{map[string]any{"k": int64(2)}}, nil, map[string]any{"own": "mine", "too": "mine", "k": int64(2)}, "", same},
+			{"a record decodes into the map[string]any the any has", recA, own,
+				[]any{a(1)}, nil, map[string]any{"own": "mine", "too": "mine", "a": int64(1)}, "", same},
+			{"an array decodes into the []any the any has", arrL, func() any { return make([]any, 1, 4) },
+				[]any{[]any{int64(7)}}, nil, []any{int64(7)}, "", same},
+			{"union of two records: a map of your own type is replaced", `[` + recA + `,` + recB + `]`, func() any { return map[string]int64{"own": 1} },
+				[]any{a(1)}, nil, a(1), "", fresh},
+			{"union of two records: an ArrayRecord gets new slots", `[` + recMA + `,` + recMB + `]`, func() any { return avro.ArrayRecord{} },
+				[]any{map[string]any{"a": map[string]any{"ka": int64(1)}}, map[string]any{"b": map[string]any{"kb": int64(2)}}}, nil,
+				avro.ArrayRecord{map[string]any{"kb": int64(2)}}, "", fresh},
+			// The kept key shows the map was decoded into.
+			{"TaggedUnions: a one-key map whose key names no branch is not an envelope", `["null",` + mapL + `]`,
+				func() any { return map[string]any{"k": int64(1)} },
+				[]any{map[string]any{"x": int64(2)}}, []avro.Opt{avro.TaggedUnions()}, map[string]any{"map": map[string]any{"k": int64(1), "x": int64(2)}}, "", 0},
+		} {
+			s := avro.MustParse(c.schema)
+			// inside returns the map, slice, or pointer the any has, from
+			// inside a TaggedUnions envelope when there is one.
+			inside := func(x any) uintptr {
+				if w, ok := x.(map[string]any); ok && len(c.opts) > 0 && len(w) == 1 {
+					for _, in := range w {
+						x = in
+					}
+				}
+				switch v := reflect.ValueOf(x); v.Kind() {
+				case reflect.Map, reflect.Slice, reflect.Pointer:
+					return v.Pointer()
+				}
+				return 0
+			}
+			for _, w := range reuseWires {
+				t.Run(w.name+"/"+c.name, func(t *testing.T) {
+					var out any
+					if c.start != nil {
+						out = c.start()
+					}
+					var before uintptr
+					var err error
+					for _, v := range c.vals {
+						before = inside(out)
+						// DecodeJSON picks a record's branch from the
+						// tagged form, which it takes with or without
+						// the option.
+						if err = w.decode(s, w.encode(t, s, v, avro.TaggedUnions()), &out, c.opts...); err != nil {
+							break
+						}
+					}
+					if c.err != "" {
+						if err == nil || !strings.Contains(err.Error(), c.err) {
+							t.Fatalf("got %#v, err %v; want an error with %q", out, err, c.err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(out, c.want) {
+						t.Errorf("got %#v, want %#v", out, c.want)
+					}
+					switch after := inside(out); {
+					case c.reuse == same && after != before:
+						t.Error("the any has a new value, want the one it had, decoded into")
+					case c.reuse == fresh && after == before:
+						t.Error("the any has the value it had, want a new one")
+					}
+				})
+			}
+		}
+		// A custom type on a branch decodes to the Go type it declares, so a
+		// pointer of that type in the any is replaced when another branch
+		// arrives. A pointer of your own type in the same union is decoded
+		// into.
+		type money struct{ cents int64 }
+		ct := avro.NewCustomType[*money, int64]("money",
+			func(v *money, _ *avro.SchemaNode) (int64, error) { return v.cents, nil },
+			func(c int64, _ *avro.SchemaNode) (*money, error) { return &money{c}, nil })
+		cu := avro.MustParse(`{"type":"array","items":["string",{"type":"long","logicalType":"money"}]}`, ct)
+		for _, w := range reuseWires {
+			var rows []any
+			w.mustDecode(t, cu, w.encode(t, cu, []any{&money{500}}, avro.TaggedUnions()), &rows)
+			if err := w.decode(cu, w.encode(t, cu, []any{"x"}, avro.TaggedUnions()), &rows); err != nil || rows[0] != "x" {
+				t.Errorf("%s: a string after a custom type's pointer: %#v, err %v; want the string", w.name, rows, err)
+			}
+			mine := new(string)
+			rows = []any{mine}
+			if err := w.decode(cu, w.encode(t, cu, []any{"y"}, avro.TaggedUnions()), &rows); err != nil || rows[0] != any(mine) || *mine != "y" {
+				t.Errorf("%s: your own pointer in a union with a custom type: %#v, err %v; want it decoded into", w.name, rows, err)
+			}
+		}
+		// A typed ArrayRecord target gets new slots the same way.
+		twoMaps := avro.MustParse(`[` + recMA + `,` + recMB + `]`)
+		for _, w := range reuseWires {
+			var row avro.ArrayRecord
+			w.mustDecode(t, twoMaps, w.encode(t, twoMaps, map[string]any{"a": map[string]any{"ka": int64(1)}}, avro.TaggedUnions()), &row)
+			w.mustDecode(t, twoMaps, w.encode(t, twoMaps, map[string]any{"b": map[string]any{"kb": int64(2)}}, avro.TaggedUnions()), &row)
+			if !matEqual(row, avro.ArrayRecord{map[string]any{"kb": int64(2)}}) {
+				t.Errorf("%s: an ArrayRecord after the other record: %#v, want new slots", w.name, row)
+			}
+		}
+		// The same holds for a branch that names a type defined after the
+		// union.
+		type tag struct{ b []byte }
+		tct := avro.CustomType{LogicalType: "tag", AvroType: "fixed", GoType: reflect.TypeFor[*tag](),
+			Encode: func(v any, _ *avro.SchemaNode) (any, error) { return v.(*tag).b, nil },
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) { return &tag{slices.Clone(v.([]byte))}, nil }}
+		fwd := avro.MustParse(`{"type":"record","name":"O","fields":[{"name":"u","type":["string","T"]},{"name":"t","type":{"type":"fixed","name":"T","size":2,"logicalType":"tag"}}]}`, tct)
+		for _, w := range reuseWires {
+			var row map[string]any
+			w.mustDecode(t, fwd, w.encode(t, fwd, map[string]any{"u": &tag{[]byte("ab")}, "t": &tag{[]byte("cd")}}, avro.TaggedUnions()), &row)
+			if err := w.decode(fwd, w.encode(t, fwd, map[string]any{"u": "x", "t": &tag{[]byte("cd")}}, avro.TaggedUnions()), &row); err != nil || row["u"] != "x" {
+				t.Errorf("%s: a string after a custom type's pointer, at a branch defined later: %#v, err %v; want the string", w.name, row, err)
+			}
+		}
+		// The custom types of one parse on a SchemaCache do not change the
+		// unions of another parse: a union that resolves to the cached fixed,
+		// and a later union of it, decode into your *[]byte, which only the
+		// other parse's custom type declares.
+		var cache avro.SchemaCache
+		skip := func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }
+		mine := avro.CustomType{AvroType: "fixed", GoType: reflect.TypeFor[*int](), Decode: skip}
+		reader, err := cache.Parse(`["null",{"type":"fixed","name":"N","size":2}]`, mine)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cache.Parse(`{"type":"record","name":"W","fields":[{"name":"n","type":"N"}]}`,
+			avro.CustomType{AvroType: "fixed", GoType: reflect.TypeFor[*[]byte](), Decode: skip}); err != nil {
+			t.Fatal(err)
+		}
+		later, err := cache.Parse(`["null","N"]`, mine)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writer := avro.MustParse(`{"type":"fixed","name":"N","size":2}`)
+		resolved, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range reuseWires {
+			for name, c := range map[string]struct{ from, s *avro.Schema }{"resolved": {writer, resolved}, "later": {later, later}} {
+				var buf []byte
+				var x any = &buf
+				w.mustDecode(t, c.s, w.encode(t, c.from, []byte("ab")), &x)
+				if x != any(&buf) || string(buf) != "ab" {
+					t.Errorf("%s: %s: the any has %#v and your []byte %q, want your pointer and ab", w.name, name, x, buf)
+				}
+			}
+		}
+		// A union decode that fails leaves your value in the target.
+		two := avro.MustParse(`[` + recA + `,` + recB + `]`)
+		for _, target := range []func() any{
+			func() any { x := own(); return &x },
+			func() any { x := own().(map[string]any); return &x },
+		} {
+			ptr := target()
+			// Branch 1, and then no record.
+			if _, err := two.Decode([]byte{2}, ptr); err == nil {
+				t.Fatal("a truncated union decoded")
+			}
+			if got := reflect.ValueOf(ptr).Elem().Interface(); !reflect.DeepEqual(got, own()) {
+				t.Errorf("a failed union decode left %#v in a %T, want your value", got, ptr)
+			}
+		}
+		// A field or an item that fails to decode leaves the value its slot
+		// had, on both decoders.
+		pair := avro.MustParse(`{"type":"record","name":"P","fields":[{"name":"a","type":"long"},{"name":"b","type":"long"}]}`)
+		items := avro.MustParse(`{"type":"array","items":["null","long"]}`)
+		for _, w := range reuseWires {
+			badPair := map[string][]byte{"binary": {2}, "json": []byte(`{"a":1,"b":!}`)}[w.name]
+			badItems := map[string][]byte{"binary": {4, 2, 2, 2}, "json": []byte(`[1,!]`)}[w.name]
+			row := avro.ArrayRecord{"keep-a", "keep-b"}
+			var list any = []any{"keep0", "keep1"}
+			if w.decode(pair, badPair, &row) == nil || w.decode(items, badItems, &list) == nil {
+				t.Fatalf("%s: a truncated record or array decoded", w.name)
+			}
+			if row[1] != "keep-b" || list.([]any)[1] != "keep1" {
+				t.Errorf("%s: a failed field left %#v, and a failed item left %#v; want keep-b and keep1 in the slots that failed", w.name, row, list)
+			}
+		}
+		// With TaggedUnions, the envelope in the any and the map behind the
+		// pointer in the envelope both come back.
+		for _, w := range reuseWires {
+			bad := map[string][]byte{"binary": {2}, "json": []byte(`{"B":{"b":"x"}}`)}[w.name]
+			m := map[string]any{"own": "mine"}
+			var x any = &m
+			w.mustDecode(t, two, w.encode(t, two, a(1), avro.TaggedUnions()), &x, avro.TaggedUnions())
+			if err := w.decode(two, bad, &x, avro.TaggedUnions()); err == nil {
+				t.Fatalf("%s: a bad union value decoded", w.name)
+			}
+			if want := (map[string]any{"A": &m}); !reflect.DeepEqual(x, any(want)) || x.(map[string]any)["A"] != any(&m) || !reflect.DeepEqual(m, a(1)) {
+				t.Errorf("%s: a failed union decode left %#v and %#v behind the pointer, want %#v and %#v", w.name, x, m, want, a(1))
+			}
+		}
+		// The same after a ["null", T] union and after a resolved union,
+		// which decode a branch from code of their own.
+		nl := avro.MustParse(`["null","long"]`)
+		res, err := avro.Resolve(avro.MustParse(`"long"`), nl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, c := range map[string]struct {
+			s        *avro.Schema
+			ok, fail []byte
+		}{
+			"null union":     {nl, []byte{2, 10}, []byte{2}},
+			"resolved union": {res, []byte{10}, nil},
+		} {
+			var out any
+			avrotest.MustDecode(t, c.s, c.ok, &out, avro.TaggedUnions())
+			if _, err := c.s.Decode(c.fail, &out, avro.TaggedUnions()); err == nil {
+				t.Fatalf("%s: a truncated value decoded", name)
+			}
+			if want := (map[string]any{"long": int64(5)}); !reflect.DeepEqual(out, want) {
+				t.Errorf("%s: a failed decode left %#v, want %#v", name, out, want)
+			}
+		}
+		// A record field that fails names the field and then the cause, on
+		// both decoders, into an any, a struct, and an ArrayRecord.
+		fieldErr := avro.MustParse(recB)
+		type bOnly struct {
+			B int64 `avro:"b"`
+		}
+		for name, target := range map[string]func() any{
+			"an any":         func() any { return new(any) },
+			"a struct":       func() any { return new(bOnly) },
+			"an ArrayRecord": func() any { return new(avro.ArrayRecord) },
+		} {
+			_, err := fieldErr.Decode(nil, target())
+			errj := fieldErr.DecodeJSON([]byte(`{"b":}`), target())
+			for _, err := range []error{err, errj} {
+				if err == nil || !strings.HasPrefix(err.Error(), "avro: field b: ") || strings.Contains(err.Error(), "cannot use") {
+					t.Errorf("a record with a bad field into %s: %v, want \"avro: field b: \" and the cause", name, err)
+				}
+			}
+		}
+		// A null sets a pointer target and a pointer in an any to nil, on
+		// both decoders and in a union, and leaves the value behind the
+		// pointer.
+		for _, schema := range []string{`"null"`, `["null",` + arrL + `,"string"]`} {
+			null := avro.MustParse(schema)
+			for _, w := range reuseWires {
+				var x any = []any{int64(9)}
+				p, inAny := &x, any(&x)
+				w.mustDecode(t, null, w.encode(t, null, nil), &p)
+				w.mustDecode(t, null, w.encode(t, null, nil), &inAny)
+				if p != nil || inAny != nil || !reflect.DeepEqual(x, any([]any{int64(9)})) {
+					t.Errorf("%s: %s: a null left the pointer target %v, the any %v, and %#v behind the pointer; want nil, nil, and []any{9}", w.name, schema, p, inAny, x)
+				}
+			}
+		}
+		// With TaggedUnions, the any that a *any target points at gets the
+		// envelope on both decoders, on every decode, and so does the any of
+		// a *any field and of each element of a []*any field.
+		for _, c := range []struct {
+			name, schema string
+			val          any
+			want         map[string]any
+		}{
+			{"a long", `["long","string"]`, int64(5), map[string]any{"long": int64(5)}},
+			{"a decimal", `["long",{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}]`, big.NewRat(5, 4), map[string]any{"bytes": big.NewRat(5, 4)}},
+			{"a custom type", `["string",{"type":"long","logicalType":"money"}]`, &money{500}, map[string]any{"long": &money{500}}},
+		} {
+			s := avro.MustParse(c.schema, ct)
+			for _, w := range reuseWires {
+				var x any
+				p := &x
+				for i := range 2 {
+					w.mustDecode(t, s, w.encode(t, s, c.val, avro.TaggedUnions()), &p, avro.TaggedUnions())
+					if !reflect.DeepEqual(x, any(c.want)) {
+						t.Errorf("%s: %s: decode %d into a *any target: %#v, want %#v", w.name, c.name, i, x, c.want)
+					}
+				}
+			}
+		}
+		type anyFields struct {
+			F *any   `avro:"f"`
+			L []*any `avro:"l"`
+		}
+		fields := avro.MustParse(`{"type":"record","name":"H","fields":[{"name":"f","type":["null",` + recA + `]},{"name":"l","type":{"type":"array","items":["null","A"]}}]}`)
+		for _, w := range reuseWires {
+			var h anyFields
+			w.mustDecode(t, fields, w.encode(t, fields, map[string]any{"f": a(1), "l": []any{a(1)}}), &h, avro.TaggedUnions())
+			want := any(map[string]any{"A": a(1)})
+			if h.F == nil || !reflect.DeepEqual(*h.F, want) || len(h.L) != 1 || h.L[0] == nil || !reflect.DeepEqual(*h.L[0], want) {
+				t.Errorf("%s: a *any field and a []*any field: %#v, want %#v in each any", w.name, h, want)
+			}
+		}
+		// A slice of your own type in an any counts once against the depth
+		// limit, as a []any does: both decoders take the same depth.
+		type kids []any
+		deep := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"kids","type":{"type":"array","items":"R"}}]}`)
+		val, target := map[string]any{"kids": []any{}}, any(map[string]any{"kids": kids{}})
+		for range 400 {
+			val = map[string]any{"kids": []any{val}}
+			target = map[string]any{"kids": kids{target}}
+		}
+		for _, w := range reuseWires {
+			out := target
+			if err := w.decode(deep, w.encode(t, deep, val), &out); err != nil {
+				t.Errorf("%s: 400 levels into slices of your own type: %v", w.name, err)
+			}
+		}
+		// The same union gives a map target what it gives an any: a new map.
+		u := avro.MustParse(`[` + recA + `,` + recB + `]`)
+		for _, w := range reuseWires {
+			m := map[string]any{"own": "mine"}
+			kept := m
+			w.mustDecode(t, u, w.encode(t, u, a(1), avro.TaggedUnions()), &m)
+			w.mustDecode(t, u, w.encode(t, u, b(2), avro.TaggedUnions()), &m)
+			if !reflect.DeepEqual(m, b(2)) || len(kept) != 1 {
+				t.Errorf("%s: a union of two records into a map target: %v, and the map it had is now %v; want map[b:2] and an untouched map[own:mine]", w.name, m, kept)
+			}
 		}
 	})
 	t.Run("struct-field-reuse", func(t *testing.T) {
@@ -12577,6 +14563,18 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 		if r.N == nil || *r.N != 5 || r.S != "one" {
 			t.Fatalf("struct re-reuse: %+v", r)
 		}
+		// A field of type any decodes into the map it has.
+		h := avro.MustParse(`{"type":"record","name":"H","fields":[{"name":"f","type":{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}}]}`)
+		for _, w := range reuseWires {
+			stale := map[string]any{"stale": true}
+			x := struct {
+				F any `avro:"f"`
+			}{stale}
+			w.mustDecode(t, h, w.encode(t, h, map[string]any{"f": map[string]any{"a": int64(1)}}), &x)
+			if !matEqual(x.F, map[string]any{"a": int64(1), "stale": true}) || reflect.ValueOf(x.F).UnsafePointer() != reflect.ValueOf(stale).UnsafePointer() {
+				t.Errorf("%s: a field of type any with a map decoded to %#v, want the map it had, merged", w.name, x.F)
+			}
+		}
 	})
 }
 
@@ -12584,6 +14582,11 @@ type reuseEmptyInterface interface{}
 
 type reuseArrayElemP struct {
 	A int64 `avro:"a"`
+}
+
+type reuseMapValueP struct {
+	A     int64 `avro:"a"`
+	Extra int   `avro:"-"`
 }
 
 type reuseArrayElemFast struct {

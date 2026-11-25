@@ -4376,6 +4376,38 @@ func TestSpecJSONDecodeFillsDefaultForMissingField(t *testing.T) {
 			t.Fatalf("defaulted: %v", got["defaulted"])
 		}
 	})
+	t.Run("default_the_target_cannot_hold", func(t *testing.T) {
+		// The error names the field and that the default failed, with the
+		// package named once, into every target and nested in a record.
+		inner := `{"type":"record","name":"R","fields":[{"name":"d","type":"int","default":42}]}`
+		r := avrotest.MustParse(t, inner)
+		o := avrotest.MustParse(t, `{"type":"record","name":"O","fields":[{"name":"r","type":`+inner+`}]}`)
+		var anyMap any = map[string]any{"d": new(string)}
+		for _, c := range []struct {
+			name   string
+			s      *avro.Schema
+			doc    string
+			target any
+			want   string
+		}{
+			{"struct", r, `{}`, &struct {
+				D string `avro:"d"`
+			}{}, "avro: field d: default: "},
+			{"typed map", r, `{}`, &map[string]string{}, "avro: field d: default: "},
+			{"ArrayRecord", r, `{}`, &avro.ArrayRecord{new(string)}, "avro: field d: default: "},
+			{"any map", r, `{}`, &anyMap, "avro: field d: default: "},
+			{"nested struct", o, `{"r":{}}`, &struct {
+				R struct {
+					D string `avro:"d"`
+				} `avro:"r"`
+			}{}, "avro: field r.d: default: "},
+		} {
+			err := c.s.DecodeJSON([]byte(c.doc), c.target)
+			if err == nil || !strings.HasPrefix(err.Error(), c.want) || strings.Count(err.Error(), "avro") != 1 {
+				t.Errorf("%s: %v, want an error starting %q that names avro once", c.name, err, c.want)
+			}
+		}
+	})
 }
 
 // TestRegression_DecodeJSONIntoAnyDefaultFillTypeConsistency locks parity
@@ -9596,6 +9628,9 @@ func TestMatrix_SchemaCacheCustomTypeRefRejected(t *testing.T) {
 		if !strings.Contains(err.Error(), "re-parse") {
 			t.Errorf("error should suggest re-parsing: %v", err)
 		}
+		if strings.Contains(err.Error(), ": avro: ") {
+			t.Errorf("error names the package in the middle: %v", err)
+		}
 	})
 
 	t.Run("re-parse Inner with the CT first → Outer succeeds", func(t *testing.T) {
@@ -9639,10 +9674,11 @@ func TestMatrix_SchemaCacheCustomTypeRefRejected(t *testing.T) {
 		}
 	})
 
-	t.Run("wildcard CT (both empty) does NOT trigger rejection", func(t *testing.T) {
-		// Wildcard CTs use ErrSkipCustomType at runtime to opt out;
-		// they don't suppress built-ins at parse time, so they don't
-		// cause the silent-drop pattern this guard rejects.
+	t.Run("wildcard CT (both empty) with a callback triggers rejection", func(t *testing.T) {
+		// A wildcard's callback runs on every node and converts values
+		// there. A cached subtree keeps those conversions, as it keeps any
+		// other custom type's, in both directions. A wildcard with no
+		// callback changes nothing and is not checked.
 		wildcard := avro.CustomType{
 			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
 				return nil, avro.ErrSkipCustomType
@@ -9652,8 +9688,25 @@ func TestMatrix_SchemaCacheCustomTypeRefRejected(t *testing.T) {
 		if _, err := cache.Parse(innerSchema); err != nil {
 			t.Fatalf("cache.Parse(Inner): %v", err)
 		}
-		if _, err := cache.Parse(outerSchema, avro.WithCustomType(wildcard)); err != nil {
-			t.Errorf("wildcard CT shouldn't trigger rejection: %v", err)
+		if _, err := cache.Parse(outerSchema, avro.WithCustomType(wildcard)); err == nil {
+			t.Error("a wildcard CT with a Decode referencing a clean cached type parsed, want a rejection")
+		}
+		withWildcard := &avro.SchemaCache{}
+		if _, err := withWildcard.Parse(innerSchema, avro.WithCustomType(wildcard)); err != nil {
+			t.Fatalf("cache.Parse(Inner, wildcard): %v", err)
+		}
+		if _, err := withWildcard.Parse(outerSchema); err == nil {
+			t.Error("a clean parse referencing a type cached with a wildcard CT parsed, want a rejection")
+		}
+		if _, err := withWildcard.Parse(outerSchema, avro.WithCustomType(wildcard)); err != nil {
+			t.Errorf("the same wildcard CT on both parses: %v", err)
+		}
+		noCallback := &avro.SchemaCache{}
+		if _, err := noCallback.Parse(innerSchema); err != nil {
+			t.Fatalf("cache.Parse(Inner): %v", err)
+		}
+		if _, err := noCallback.Parse(outerSchema, avro.WithCustomType(avro.CustomType{})); err != nil {
+			t.Errorf("a wildcard CT with no callback: %v", err)
 		}
 	})
 
@@ -22094,68 +22147,206 @@ func TestMatrix_ResolvedDecodeJSONWriterCustomDecodeRawRoundTrip(t *testing.T) {
 }
 
 // A self-/mutually-recursive or forward-referenced named type whose subtree
-// contains a logical a registered CustomType matches must Parse, and both
-// wires must then agree. The cached-named-ref guard is for types inherited
-// from a SchemaCache across Parses. A self-reference resolves mid-build,
-// before the record's fields finish wiring their CTs, so hadCustomType is
-// still false there. Gating on cachedNames is what keeps the guard from
-// rejecting valid recursive schemas.
+// contains a node a registered CustomType matches must Parse, and both wires
+// must then agree, for a custom type on a leaf, on the record itself, and on
+// every node. The cached-named-ref guard is for types inherited from a
+// SchemaCache across Parses. A self-reference resolves mid-build, before the
+// record's fields finish wiring their CTs, so hadCustomType is still false
+// there. Gating on cachedNames is what keeps the guard from rejecting valid
+// recursive schemas. A reference to the record from inside its own fields
+// must see every field, including in a default Parse encodes.
 func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
-	ct := avro.CustomType{LogicalType: "timestamp-millis"}
-	schemas := []struct{ name, schema string }{
+	skip := func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }
+	cts := []struct {
+		name string
+		ct   avro.CustomType
+		// plain says the custom type decodes as the schema without it does.
+		plain bool
+	}{
+		{"timestamp leaf", avro.CustomType{LogicalType: "timestamp-millis"}, false},
+		{"record", avro.CustomType{AvroType: "record", Decode: skip}, true},
+		{"wildcard", avro.CustomType{Decode: skip}, true},
+	}
+	ts := func(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
+	schemas := []struct {
+		name, schema string
+		vals         []any
+	}{
 		{"self-nested", `{"type":"record","name":"Node","fields":[
 			{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
-			{"name":"next","type":["null","Node"]}]}`},
+			{"name":"next","type":["null","Node"]}]}`,
+			[]any{map[string]any{"ts": ts(1), "next": map[string]any{"ts": ts(2), "next": nil}}}},
 		{"self-wrapped", `{"type":"record","name":"Node","fields":[
 			{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
-			{"name":"next","type":["null",{"type":"Node"}]}]}`},
+			{"name":"next","type":["null",{"type":"Node"}]}]}`,
+			[]any{map[string]any{"ts": ts(1), "next": map[string]any{"ts": ts(2), "next": nil}}}},
+		{"self-defaulted", `{"type":"record","name":"Node","fields":[
+			{"name":"v","type":"long"},
+			{"name":"next","type":["Node","null"],"default":{"v":7,"next":null}},
+			{"name":"w","type":"long","default":3}]}`,
+			[]any{
+				map[string]any{"v": int64(1), "next": map[string]any{"v": int64(2), "next": nil, "w": int64(5)}, "w": int64(4)},
+				map[string]any{"v": int64(1), "w": int64(4)}, // next takes its default
+			}},
 		{"mutual", `{"type":"record","name":"A","fields":[
 			{"name":"b","type":["null",{"type":"record","name":"B","fields":[
 				{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
-				{"name":"a","type":["null","A"]}]}]}]}`},
+				{"name":"a","type":["null","A"]}]}]}]}`,
+			[]any{map[string]any{"b": map[string]any{"ts": ts(1), "a": map[string]any{"b": nil}}}}},
 		{"shared-multiref", `{"type":"record","name":"R","fields":[
 			{"name":"x","type":{"type":"record","name":"Pair","fields":[
 				{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}},
-			{"name":"y","type":"Pair"}]}`},
+			{"name":"y","type":"Pair"}]}`,
+			[]any{map[string]any{"x": map[string]any{"ts": ts(1)}, "y": map[string]any{"ts": ts(2)}}}},
+		{"self-array", `{"type":"record","name":"Node","fields":[
+			{"name":"v","type":"long"},
+			{"name":"kids","type":{"type":"array","items":"Node"},"default":[{"v":7,"kids":[]}]}]}`,
+			[]any{
+				map[string]any{"v": int64(1), "kids": []any{map[string]any{"v": int64(2), "kids": []any{}}}},
+				map[string]any{"v": int64(1)}, // kids takes its default
+			}},
+		{"self-map", `{"type":"record","name":"Node","fields":[
+			{"name":"v","type":"long"},
+			{"name":"kids","type":{"type":"map","values":"Node"},"default":{"k":{"v":7,"kids":{}}}}]}`,
+			[]any{
+				map[string]any{"v": int64(1), "kids": map[string]any{"j": map[string]any{"v": int64(2), "kids": map[string]any{}}}},
+				map[string]any{"v": int64(1)}, // kids takes its default
+			}},
+		{"forward", `{"type":"record","name":"R","fields":[
+			{"name":"a","type":["null","N"]},
+			{"name":"n","type":{"type":"record","name":"N","fields":[
+				{"name":"v","type":"long"},
+				{"name":"next","type":["null","N"]}]}}]}`,
+			[]any{map[string]any{"a": map[string]any{"v": int64(1), "next": map[string]any{"v": int64(2), "next": nil}}, "n": map[string]any{"v": int64(3), "next": nil}}}},
 	}
-	for _, sc := range schemas {
-		t.Run(sc.name, func(t *testing.T) {
-			s, err := avro.Parse(sc.schema, ct)
-			if err != nil {
-				t.Fatalf("Parse(recursive + CustomType) failed: %v", err)
-			}
-			// Decode a minimal leaf both ways; suppression -> raw int64 on both.
-			plain := avro.MustParse(sc.schema)
-			// Build a minimal value: just the ts (and nil recursion / required
-			// subrecords).
-			var val any
-			switch sc.name {
-			case "self-nested", "self-wrapped":
-				val = map[string]any{"ts": time.UnixMilli(1700000000000).UTC(), "next": nil}
-			case "mutual":
-				val = map[string]any{"b": nil}
-			case "shared-multiref":
-				val = map[string]any{
-					"x": map[string]any{"ts": time.UnixMilli(1700000000000).UTC()},
-					"y": map[string]any{"ts": time.UnixMilli(1700000001000).UTC()},
+	// check encodes val with the schema without the custom type, plain, and
+	// with s, and decodes it both ways.
+	check := func(t *testing.T, s, plain *avro.Schema, decodesPlain bool, i int, val any) {
+		t.Helper()
+		bin := avrotest.MustEncode(t, plain, val)
+		jsn := avrotest.MustEncodeJSON(t, plain, val)
+		if got := avrotest.MustEncode(t, s, val); !bytes.Equal(got, bin) {
+			t.Errorf("value %d: Encode %x, want %x as without the custom type", i, got, bin)
+		}
+		if got := avrotest.MustEncodeJSON(t, s, val); !bytes.Equal(got, jsn) {
+			t.Errorf("value %d: EncodeJSON %s, want %s as without the custom type", i, got, jsn)
+		}
+		var bv, jv, pv any
+		avrotest.MustDecode(t, s, bin, &bv)
+		avrotest.MustDecodeJSON(t, s, jsn, &jv)
+		avrotest.MustDecode(t, plain, bin, &pv)
+		if !reflect.DeepEqual(bv, jv) {
+			t.Errorf("value %d: recursive custom binary<->JSON divergence:\n  binary=%#v\n  json  =%#v", i, bv, jv)
+		}
+		if decodesPlain && !reflect.DeepEqual(bv, pv) {
+			t.Errorf("value %d: decoded %#v, want %#v as without the custom type", i, bv, pv)
+		}
+	}
+	for _, c := range cts {
+		for _, sc := range schemas {
+			t.Run(c.name+"/"+sc.name, func(t *testing.T) {
+				s, err := avro.Parse(sc.schema, c.ct)
+				if err != nil {
+					t.Fatalf("Parse(recursive + CustomType) failed: %v", err)
 				}
+				plain := avro.MustParse(sc.schema)
+				for i, val := range sc.vals {
+					check(t, s, plain, c.plain, i, val)
+				}
+			})
+		}
+		// A SchemaCache Parse that references the recursive type gets every
+		// field as well.
+		t.Run(c.name+"/cache", func(t *testing.T) {
+			const node = `{"type":"record","name":"Node","fields":[{"name":"v","type":"long"},{"name":"next","type":["Node","null"],"default":{"v":7,"next":null}}]}`
+			var cache avro.SchemaCache
+			if _, err := cache.Parse(node, c.ct); err != nil {
+				t.Fatal(err)
 			}
-			bin, err := plain.Encode(val)
+			s, err := cache.Parse(`{"type":"record","name":"Outer","fields":[{"name":"o","type":"Node"}]}`, c.ct)
 			if err != nil {
-				t.Fatalf("encode: %v", err)
+				t.Fatal(err)
 			}
-			jsn, err := plain.EncodeJSON(val)
-			if err != nil {
-				t.Fatalf("encodeJSON: %v", err)
-			}
-			var bv, jv any
-			avrotest.MustDecode(t, s, bin, &bv)
-			avrotest.MustDecodeJSON(t, s, jsn, &jv)
-			if !reflect.DeepEqual(bv, jv) {
-				t.Errorf("recursive custom binary<->JSON divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
+			plain := avro.MustParse(`{"type":"record","name":"Outer","fields":[{"name":"o","type":` + node + `}]}`)
+			for i, val := range []any{
+				map[string]any{"o": map[string]any{"v": int64(1), "next": map[string]any{"v": int64(2), "next": nil}}},
+				map[string]any{"o": map[string]any{"v": int64(1)}}, // next takes its default
+			} {
+				check(t, s, plain, c.plain, i, val)
 			}
 		})
 	}
+	// A custom type's callback gets a record's props at a reference inside
+	// the record, as at the record itself, and a wrapped reference's own
+	// props only at that reference, as Root gives them.
+	t.Run("props", func(t *testing.T) {
+		var seen []any
+		ct := avro.CustomType{AvroType: "record", Decode: func(v any, sn *avro.SchemaNode) (any, error) {
+			seen = append(seen, sn.Props["foo"])
+			return v, nil
+		}}
+		for _, c := range []struct {
+			name, schema string
+			v            any
+			want         []any // in the order the records finish decoding
+		}{
+			{"inner reference", `{"type":"record","name":"R","foo":"bar","fields":[{"name":"a","type":"long"},{"name":"next","type":["null","R"]}]}`,
+				map[string]any{"a": int64(1), "next": map[string]any{"a": int64(2), "next": nil}}, []any{"bar", "bar"}},
+			{"wrapped reference", `{"type":"record","name":"T","fields":[
+				{"name":"x","type":{"type":"record","name":"S","foo":"def","fields":[{"name":"a","type":"long"}]}},
+				{"name":"y","type":{"type":"S","foo":"ref"}},
+				{"name":"z","type":"S"}]}`,
+				map[string]any{"x": map[string]any{"a": int64(1)}, "y": map[string]any{"a": int64(2)}, "z": map[string]any{"a": int64(3)}},
+				[]any{"def", "ref", "def", nil}},
+			{"wrapped references before the definition", `{"type":"record","name":"T","fields":[
+				{"name":"u","type":["null",{"type":"S","foo":"u"}]},
+				{"name":"f","type":{"type":"S","foo":"f"}},
+				{"name":"a","type":{"type":"array","items":{"type":"S","foo":"a"}}},
+				{"name":"m","type":{"type":"map","values":{"type":"S","foo":"m"}}},
+				{"name":"x","type":{"type":"record","name":"S","foo":"def","fields":[{"name":"a","type":"long"}]}},
+				{"name":"z","type":"S"}]}`,
+				map[string]any{
+					"u": map[string]any{"a": int64(1)}, "f": map[string]any{"a": int64(2)},
+					"a": []any{map[string]any{"a": int64(3)}}, "m": map[string]any{"k": map[string]any{"a": int64(4)}},
+					"x": map[string]any{"a": int64(5)}, "z": map[string]any{"a": int64(6)},
+				},
+				[]any{"u", "f", "a", "m", "def", "def", nil}},
+		} {
+			s := avro.MustParse(c.schema, ct)
+			for name, decode := range map[string]func() error{
+				"Decode":     func() error { var out any; _, err := s.Decode(avrotest.MustEncode(t, s, c.v), &out); return err },
+				"DecodeJSON": func() error { var out any; return s.DecodeJSON(avrotest.MustEncodeJSON(t, s, c.v), &out) },
+			} {
+				seen = nil
+				if err := decode(); err != nil {
+					t.Fatalf("%s/%s: %v", c.name, name, err)
+				}
+				if !reflect.DeepEqual(seen, c.want) {
+					t.Errorf("%s/%s: the callbacks saw props %v, want %v", c.name, name, seen, c.want)
+				}
+			}
+			// An Encode-only custom type sees the same props, in the order
+			// the records start encoding: the outer record moves first.
+			es := avro.MustParse(c.schema, avro.CustomType{AvroType: "record", Encode: func(v any, sn *avro.SchemaNode) (any, error) {
+				seen = append(seen, sn.Props["foo"])
+				return v, nil
+			}})
+			last := len(c.want) - 1
+			wantEnc := append([]any{c.want[last]}, c.want[:last]...)
+			for name, encode := range map[string]func() error{
+				"Encode":     func() error { _, err := es.Encode(c.v); return err },
+				"EncodeJSON": func() error { _, err := es.EncodeJSON(c.v); return err },
+			} {
+				seen = nil
+				if err := encode(); err != nil {
+					t.Fatalf("%s/%s: %v", c.name, name, err)
+				}
+				if !reflect.DeepEqual(seen, wantEnc) {
+					t.Errorf("%s/%s: the callbacks saw props %v, want %v", c.name, name, seen, wantEnc)
+				}
+			}
+		}
+	})
 }
 
 // A forward-referenced named type carrying a CustomType must encode and decode
@@ -22722,7 +22913,7 @@ func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
 	// The path is the wire, and how the caller passes the record, since a
 	// struct by value, a pointer to a struct, a map, and an ArrayRecord
 	// each go through a different serializer. The error names the record's
-	// Go type and the field.
+	// Go type and the field, and no Avro type: a nil is not a type mismatch.
 	three := int32(3)
 	nils := []struct {
 		name, schema string
@@ -22775,8 +22966,8 @@ func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
 					wire string
 					se   *avro.SemanticError
 				}{{"binary", bse}, {"JSON", jse}} {
-					if e.se.GoType != wantGo || e.se.AvroType != "record" || e.se.Field != "f" {
-						t.Errorf("%s: GoType %v, AvroType %q, Field %q; want %v, \"record\", \"f\"", e.wire, e.se.GoType, e.se.AvroType, e.se.Field, wantGo)
+					if e.se.GoType != wantGo || e.se.AvroType != "" || e.se.Field != "f" {
+						t.Errorf("%s: GoType %v, AvroType %q, Field %q; want %v, no Avro type, \"f\"", e.wire, e.se.GoType, e.se.AvroType, e.se.Field, wantGo)
 					}
 				}
 				if berr.Error() != jerr.Error() {
@@ -23375,6 +23566,25 @@ func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 		avrotest.MustDecode(t, sskip, bin, &sb)
 		if !reflect.DeepEqual(nb, sb) {
 			t.Errorf("binary record-into-any: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
+		}
+		// A field's old number is replaced, so a field that a custom type
+		// matches decodes as if the map had no value for it, with no more
+		// allocations.
+		fschema := `{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"long","logicalType":"money"}}]}`
+		fskip := avro.MustParse(fschema, avro.CustomType{LogicalType: "money", Decode: skip.Decode})
+		fbin := avrotest.MustEncode(t, avro.MustParse(fschema), Rw{A: 5})
+		fjson := avrotest.MustEncodeJSON(t, avro.MustParse(fschema), Rw{A: 5})
+		m := map[string]any{"a": int64(1)}
+		var x any = m
+		for name, decode := range map[string]func(){
+			"Decode":     func() { _, _ = fskip.Decode(fbin, &x) },
+			"DecodeJSON": func() { _ = fskip.DecodeJSON(fjson, &x) },
+		} {
+			withOld := minAllocsPerRun(20, decode)
+			without := minAllocsPerRun(20, func() { delete(m, "a"); decode() })
+			if withOld > without {
+				t.Errorf("%s: %v allocations with the field's old number in the map, want no more than the %v without it", name, withOld, without)
+			}
 		}
 	})
 
@@ -24031,48 +24241,155 @@ func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 }
 
 // TestMatrix_JSONUnionFailureKeepsTarget pins that a union value DecodeJSON
-// cannot decode leaves the caller's value in an any target, with and without
-// TaggedUnions: a tagged form whose value decodes but whose object does not
-// close, where the bare fallback then fails too; a record branch that fails
-// partway; and a number no branch holds. The last row decodes, to show the
-// target is written at all.
+// cannot decode leaves the value the caller has in an any target, with and
+// without TaggedUnions: a tagged form whose value decodes but whose object
+// does not close, where the bare fallback then fails too; a record branch
+// that fails partway; and a number no branch holds. The "decodes" row shows
+// the target is written at all. In the rows named "then bare decodes", the
+// tagged form writes into the caller's map or pointer before the bare
+// fallback, and the result must have nothing the tagged form wrote. A union
+// with one record decodes into the caller's map, which keeps the caller's own
+// keys. A union with two records or maps decodes into a new map. A struct
+// keeps the field the schema does not map. A map target, a struct target, an
+// ArrayRecord, and a target of an interface type with methods follow after
+// the table.
 func TestMatrix_JSONUnionFailureKeepsTarget(t *testing.T) {
 	rec := `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int"}]}`
+	// recM has a map field with a default, so a key that a failed tagged
+	// attempt wrote into it could outlive the bare fallback.
+	recM := `{"type":"record","name":"R2","fields":[{"name":"a","type":"int"},{"name":"b","type":"int"},{"name":"m","type":{"type":"map","values":"long"},"default":{}}]}`
+	// mapU is a map whose values can be maps, so one document decodes both
+	// as its tagged form and, with more keys, as its bare form.
+	mapU := `{"type":"map","values":["long",{"type":"map","values":"long"}]}`
 	for _, c := range []struct {
 		name, union, doc string
-		want             any // nil: the decode must fail
+		want             any        // nil: the decode must fail
+		start            func() any // nil: the string "caller"
 	}{
-		{"tagged then bare fails", `["long",{"type":"map","values":"string"}]`, `{"long":42,"x":1}`, nil},
-		{"record fails partway", `["null",` + rec + `]`, `{"a":1,"b":"x"}`, nil},
-		{"no branch holds the number", `["null","int"]`, `9999999999`, nil},
-		{"decodes", `["null","long"]`, `{"long":42}`, int64(42)},
+		{"tagged then bare fails", `["long",{"type":"map","values":"string"}]`, `{"long":42,"x":1}`, nil, nil},
+		{"tagged then bare fails, a nil any", `["long",{"type":"map","values":"string"}]`, `{"long":42,"x":1}`, nil, func() any { return nil }},
+		{"record fails partway", `["null",` + rec + `]`, `{"a":1,"b":"x"}`, nil, nil},
+		{"no branch holds the number", `["null","int"]`, `9999999999`, nil, nil},
+		{"decodes", `["null","long"]`, `{"long":42}`, int64(42), nil},
+		{"tagged record into a map then bare decodes", `[` + recM + `,"string"]`, `{"R2":{"a":1,"b":2,"m":{"x":1}},"a":5,"b":6}`,
+			map[string]any{"own": "mine", "too": "mine", "a": int32(5), "b": int32(6), "m": map[string]any{}},
+			func() any { return map[string]any{"own": "mine", "too": "mine"} }},
+		{"two records or maps then bare decodes", `[` + rec + `,{"type":"map","values":"long"}]`, `{"map":{"x":1},"a":5,"b":6}`,
+			map[string]any{"a": int32(5), "b": int32(6)}, func() any { return map[string]any{"own": "mine", "too": "mine"} }},
+		{"tagged into a pointer then bare decodes", `[` + recM + `,"string"]`, `{"R2":{"a":1,"b":2,"m":{"x":1}},"a":5,"b":6}`,
+			&jsonUnionFallbackR{A: 5, B: 6, M: map[string]int64{}, Extra: "mine"}, func() any { return &jsonUnionFallbackR{Extra: "mine"} }},
+		// A nil any is nil again before the bare form decodes.
+		{"tagged record into a nil any then bare decodes", `["null",` + recM + `]`, `{"R2":{"a":1,"b":2,"m":{"x":1}},"a":5,"b":6}`,
+			map[string]any{"a": int32(5), "b": int32(6), "m": map[string]any{}}, func() any { return nil }},
+		{"tagged record into a map of your type then bare decodes", `[{"type":"record","name":"K","fields":[{"name":"m","type":{"type":"map","values":"long"}}]},"string"]`,
+			`{"K":{"m":{"x":1}},"m":{"y":2}}`,
+			map[string]map[string]int64{"m": {"y": 2}}, func() any { return map[string]map[string]int64{} }},
+		// A key that names a container branch is the tagged form only when
+		// its value can start that branch: this is EncodeJSON's own output
+		// for a map with the key "map".
+		{"a map with the key map", `["null",{"type":"map","values":"string"}]`, `{"map":"x","other":"y"}`,
+			map[string]any{"map": "x", "other": "y"}, func() any { return nil }},
+		{"a record with a field named as its branch", `["null",{"type":"record","name":"R","fields":[{"name":"R","type":"string"}]}]`, `{"R":"x"}`,
+			map[string]any{"R": "x"}, func() any { return nil }},
+		{"a map with the key array", `[{"type":"array","items":"long"},{"type":"map","values":"long"}]`, `{"array":5}`,
+			map[string]any{"array": int64(5)}, func() any { return nil }},
+		// The tagged record decodes into a new map behind the pointer and
+		// its object does not close. The map you had comes back with the
+		// key "a" it had, which is also a field of the record.
+		{"tagged into a new map then bare fails", `[` + recM + `,{"type":"map","values":"long"}]`, `{"R2":{"a":1,"b":2},"zz":1}`,
+			nil, func() any { m := map[string]any{"a": "mine", "own": "x"}; return &m }},
+		// The int branch replaces the array branch's []any before it
+		// decodes, and the []any is back after the int overflows.
+		{"a failed branch gives the value back", `[{"type":"array","items":"long"},"int"]`, `9999999999`, nil, func() any { return []any{int64(1)} }},
 	} {
 		for _, opts := range [][]avro.Opt{nil, {avro.TaggedUnions()}} {
 			t.Run(fmt.Sprintf("%s/options=%d", c.name, len(opts)), func(t *testing.T) {
 				s := avro.MustParse(c.union)
 				var out any = "caller"
+				if c.start != nil {
+					out = c.start()
+				}
 				err := s.DecodeJSON([]byte(c.doc), &out, opts...)
 				if c.want == nil {
 					if err == nil {
 						t.Fatalf("DecodeJSON(%s) = %#v, want an error", c.doc, out)
 					}
-					if out != "caller" {
-						t.Errorf("a failed DecodeJSON(%s) left %#v in the target, want the caller's value", c.doc, out)
+					want := any("caller")
+					if c.start != nil {
+						want = c.start()
+					}
+					if !reflect.DeepEqual(out, want) {
+						t.Errorf("a failed DecodeJSON(%s) left %#v in the target, want the caller's %#v", c.doc, out, want)
 					}
 					return
 				}
 				if err != nil {
 					t.Fatalf("DecodeJSON(%s): %v", c.doc, err)
 				}
-				if m, tagged := out.(map[string]any); tagged {
-					out = m["long"]
+				if m, tagged := out.(map[string]any); tagged && len(opts) > 0 {
+					for _, v := range m {
+						out = v
+					}
 				}
-				if out != c.want {
+				if !reflect.DeepEqual(out, c.want) {
 					t.Errorf("DecodeJSON(%s) = %#v, want %#v", c.doc, out, c.want)
 				}
 			})
 		}
 	}
+	// The same document into a map target and into a struct target.
+	s := avro.MustParse(`[` + recM + `,"string"]`)
+	doc := []byte(`{"R2":{"a":1,"b":2,"m":{"x":1}},"a":5,"b":6}`)
+	m := map[string]any{"own": "mine"}
+	avrotest.MustDecodeJSON(t, s, doc, &m)
+	if want := (map[string]any{"own": "mine", "a": int32(5), "b": int32(6), "m": map[string]any{}}); !reflect.DeepEqual(m, want) {
+		t.Errorf("map target: %#v, want %#v", m, want)
+	}
+	r := jsonUnionFallbackR{Extra: "mine"}
+	avrotest.MustDecodeJSON(t, s, doc, &r)
+	if want := (jsonUnionFallbackR{A: 5, B: 6, M: map[string]int64{}, Extra: "mine"}); !reflect.DeepEqual(r, want) {
+		t.Errorf("struct target: %#v, want %#v", r, want)
+	}
+	var row avro.ArrayRecord
+	avrotest.MustDecodeJSON(t, s, doc, &row)
+	if want := (avro.ArrayRecord{int32(5), int32(6), map[string]any{}}); !reflect.DeepEqual(row, want) {
+		t.Errorf("ArrayRecord target: %#v, want %#v", row, want)
+	}
+	// The tagged form clears the slots of the record's fields only, also
+	// in an ArrayRecord in a TaggedUnions envelope.
+	long := avro.ArrayRecord{"p", "q", nil, "extra4", "extra5"}
+	var env any = map[string]any{"R2": long}
+	if err := s.DecodeJSON([]byte(`{"R2":{"a":1,"b":2,"m":{"x":1}},"a":5,"b":"bad"}`), &env, avro.TaggedUnions()); err == nil || long[3] != "extra4" || long[4] != "extra5" {
+		t.Errorf("an ArrayRecord longer than the record: err %v, and the slots past the fields have %#v; want an error and extra4 and extra5", err, long[3:])
+	}
+	// A map branch: the keys of the tagged map are gone and the caller's
+	// own keys stay, in an any and in a map target.
+	mu := avro.MustParse(`["null",` + mapU + `]`)
+	wantMap := map[string]any{"own": int64(1), "a": int64(5), "map": map[string]any{"x": int64(1)}}
+	var inAny any = map[string]any{"own": int64(1)}
+	avrotest.MustDecodeJSON(t, mu, []byte(`{"map":{"x":1},"a":5}`), &inAny)
+	typed := map[string]any{"own": int64(1)}
+	avrotest.MustDecodeJSON(t, mu, []byte(`{"map":{"x":1},"a":5}`), &typed)
+	if !reflect.DeepEqual(inAny, any(wantMap)) || !reflect.DeepEqual(typed, wantMap) {
+		t.Errorf("a tagged map that does not close: %#v in an any and %#v in a map target, want %#v", inAny, typed, wantMap)
+	}
+	// A tagged form that closes and cannot go into the target leaves the
+	// target as it was.
+	dec := avro.MustParse(`["long",{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}]`)
+	var str fmt.Stringer = big.NewRat(1, 2)
+	if err := dec.DecodeJSON([]byte(`{"long":5}`), &str); err == nil || str == nil {
+		t.Errorf("a long into a fmt.Stringer with a *big.Rat: err %v, and the target has %v; want an error and the *big.Rat", err, str)
+	}
+}
+
+// jsonUnionFallbackR is a record with a map field, so a key that a failed
+// tagged attempt wrote could outlive the bare fallback, and a field the schema
+// does not map.
+type jsonUnionFallbackR struct {
+	A     int32            `avro:"a"`
+	B     int32            `avro:"b"`
+	M     map[string]int64 `avro:"m"`
+	Extra string           `avro:"-"`
 }
 
 // minAllocsPerRun returns the fewest allocations one call of f makes over

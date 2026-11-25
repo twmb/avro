@@ -66,7 +66,7 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 	if writer.customBaked {
 		raw, err := Parse(writer.full, internalReparseNames)
 		if err != nil {
-			return nil, fmt.Errorf("avro: building custom-free writer view for resolved JSON decode: %w", err)
+			return nil, &causeError{"avro: building custom-free writer view for resolved JSON decode", err}
 		}
 		s.resolveWriterRaw = raw
 	}
@@ -425,7 +425,24 @@ func (rr *resolvedRecord) buildDeser() deserfn {
 		k := v.Kind()
 
 		if k == reflect.Interface {
-			return rr.deserInterface(src, v, sl)
+			// A map or slice that v has is a typed target, as in
+			// deserRecord.deser.
+			m, typed, err := anyMap(v, "record")
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case !typed.IsValid():
+				return rr.deserInterface(src, v, m, sl)
+			case typed.Kind() != reflect.Map:
+				row := reuseOrMakeArrayRecord(typed.Interface().(ArrayRecord), len(rr.readerNames))
+				if src, err = rr.deserArrayRecord(src, row, sl); err != nil {
+					return nil, err
+				}
+				v.Set(reflect.ValueOf(row))
+				return src, nil
+			}
+			v, k = typed, reflect.Map
 		}
 		t := v.Type()
 		if t == arrayRecordType && v.CanAddr() {
@@ -450,7 +467,8 @@ func (rr *resolvedRecord) buildDeser() deserfn {
 
 // deserArrayRecord decodes into row by the reader schema's field positions:
 // the writer's fields in wire order, then the reader's defaults for the fields
-// the writer lacks. row has one nil slot per reader field.
+// the writer lacks. row has one slot per reader field, and a field decodes
+// into the value its slot has.
 func (rr *resolvedRecord) deserArrayRecord(src []byte, row ArrayRecord, sl *slab) ([]byte, error) {
 	var err error
 	for _, op := range rr.wireOps {
@@ -472,12 +490,14 @@ func (rr *resolvedRecord) deserArrayRecord(src []byte, row ArrayRecord, sl *slab
 	return src, nil
 }
 
-func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	// Mirror the natural record decoder (deserRecord.deser): when the
-	// interface target already wraps a map[string]any, decode into the
-	// existing map so keys outside the schema are retained: the documented
-	// streaming-decode reuse contract.
-	m := reuseOrMakeStringAnyMap(v, len(rr.readerNames))
+// deserInterface decodes into m, the map[string]any that the interface v has,
+// or into a new map when m is nil. As in deserRecord.deser, m keeps the keys
+// the schema does not name, and a field decodes into the value m has for it.
+func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, m map[string]any, sl *slab) ([]byte, error) {
+	if m == nil {
+		m = make(map[string]any, len(rr.readerNames))
+	}
+	look := len(m) > 0
 	var err error
 	elem := reflect.New(anyType).Elem()
 
@@ -488,28 +508,43 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 			}
 			continue
 		}
-		if src, err = op.read(src, elem, sl); err != nil {
-			return nil, recordFieldError(nil, rr.readerNames[op.readerIdx], err)
+		name := rr.readerNames[op.readerIdx]
+		if look {
+			if x := m[name]; isTarget(x) {
+				setAny(elem, x)
+			}
 		}
-		m[rr.readerNames[op.readerIdx]] = elem.Interface()
+		if src, err = op.read(src, elem, sl); err != nil {
+			return nil, recordFieldError(nil, name, err)
+		}
+		m[name] = elem.Interface()
 		elem.SetZero()
 	}
 
 	for _, d := range rr.defaults {
-		if _, err = d.deser(d.encodedDefault, elem, sl); err != nil {
-			return nil, recordFieldError(nil, rr.readerNames[d.readerIdx], err)
+		name := rr.readerNames[d.readerIdx]
+		if look {
+			if x := m[name]; isTarget(x) {
+				setAny(elem, x)
+			}
 		}
-		m[rr.readerNames[d.readerIdx]] = elem.Interface()
+		if _, err = d.deser(d.encodedDefault, elem, sl); err != nil {
+			return nil, recordFieldError(nil, name, err)
+		}
+		m[name] = elem.Interface()
 		elem.SetZero()
 	}
 
 	return src, setIface(v, reflect.ValueOf(m), "record")
 }
 
-func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
-	if v.IsNil() {
-		v.Set(reflect.MakeMapWithSize(t, len(rr.readerNames)))
+func (rr *resolvedRecord) deserMap(src []byte, target reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
+	// A nil map target gets a new map only from a decode that worked.
+	v := target
+	if target.IsNil() {
+		v = reflect.MakeMapWithSize(t, len(rr.readerNames))
 	}
+	look := v.Len() > 0 && reusesMapValue(t.Elem())
 	var err error
 	elem := reflect.New(t.Elem()).Elem()
 	keyType := t.Key()
@@ -525,10 +560,14 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 		if err := validateJSONNumberMapKey(name, keyType, "record"); err != nil {
 			return nil, err
 		}
+		key := mapKeyAs(t, rr.readerNameVals[op.readerIdx])
+		if look {
+			mapValueInto(v, key, elem)
+		}
 		if src, err = op.read(src, elem, sl); err != nil {
 			return nil, recordFieldError(nil, name, err)
 		}
-		v.SetMapIndex(mapKeyAs(t, rr.readerNameVals[op.readerIdx]), elem)
+		v.SetMapIndex(key, elem)
 		elem.SetZero()
 	}
 
@@ -537,13 +576,19 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 		if err := validateJSONNumberMapKey(name, keyType, "record"); err != nil {
 			return nil, err
 		}
+		key := mapKeyAs(t, rr.readerNameVals[d.readerIdx])
+		if look {
+			mapValueInto(v, key, elem)
+		}
 		if _, err = d.deser(d.encodedDefault, elem, sl); err != nil {
 			return nil, recordFieldError(nil, name, err)
 		}
-		v.SetMapIndex(mapKeyAs(t, rr.readerNameVals[d.readerIdx]), elem)
+		v.SetMapIndex(key, elem)
 		elem.SetZero()
 	}
-
+	if target.IsNil() {
+		target.Set(v)
+	}
 	return src, nil
 }
 
@@ -574,7 +619,12 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 		if ferr != nil {
 			return nil, recordFieldError(t, rr.readerNames[op.readerIdx], ferr)
 		}
+		// A nil pointer field whose value fails stays nil.
+		fresh := nilPointerOnPath(fv)
 		if src, err = op.read(src, fv, sl); err != nil {
+			if fresh.IsValid() {
+				fresh.SetZero()
+			}
 			return nil, recordFieldError(t, rr.readerNames[op.readerIdx], err)
 		}
 	}
@@ -588,7 +638,11 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 		if ferr != nil {
 			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], ferr)
 		}
+		fresh := nilPointerOnPath(fv)
 		if _, err = d.deser(d.encodedDefault, fv, sl); err != nil {
+			if fresh.IsValid() {
+				fresh.SetZero()
+			}
 			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], err)
 		}
 	}
@@ -761,14 +815,10 @@ func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 	// unionEmitTag, resolved against the reader union, whose other branches
 	// may own the logical spelling.
 	bn, _ := unionBranchNames(rb)
-	wrap := &deserUnion{branchNames: []string{bn}, logicalNames: []string{unionEmitTag(r, rb, true)}}
+	wrap := &deserUnion{branchNames: []string{bn}, logicalNames: []string{unionEmitTag(r, rb, true)}, shape: readerShape(r, ctx.custom, rb)}
 	inner := resolved.deser
 	deser := func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-		src, err := inner(src, v, sl)
-		if err == nil {
-			wrap.maybeWrap(v, sl, 0)
-		}
-		return src, err
+		return wrap.branch(src, v, sl, 0, inner)
 	}
 	return &schemaNode{
 		kind:     "union",
@@ -790,8 +840,10 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 	// Built once for the whole loop: this asks per writer branch, and the
 	// answer is a property of the reader union.
 	readerBranches := newReaderBranchLookup(r)
+	matched := make([]*schemaNode, len(w.branches))
 	for i, wb := range w.branches {
 		rb := readerBranches.match(wb)
+		matched[i] = rb
 		if rb == nil {
 			return nil, &CompatibilityError{
 				Path:       pathOrRoot(path),
@@ -814,7 +866,7 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 		bnames[i], _ = unionBranchNames(rb)
 		lnames[i] = unionEmitTag(r, rb, true)
 	}
-	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
+	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames, shape: readerShape(r, ctx.custom, matched...)}
 	deser := du.deser
 	if len(w.branches) == 2 && w.branches[0].kind == "null" {
 		deser = deserNullUnion(du)

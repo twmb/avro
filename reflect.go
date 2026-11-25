@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -67,19 +68,116 @@ func appendByteArray(dst []byte, v reflect.Value) []byte {
 	return dst
 }
 
-// reuseOrMakeStringAnyMap reuses v's existing map[string]any when v is an
-// interface wrapping one, the streaming-decode pattern; otherwise we allocate a
-// fresh map sized to hint. deserRecord's interface arm, the resolved decoder's
-// deserInterface, and decodeRecordAny all use it, so every record-into-*any
-// path agrees on reuse.
-//
-// Reuse keeps keys the schema does not name. If you want a fresh decode, clear
-// or replace the map before each call.
-func reuseOrMakeStringAnyMap(v reflect.Value, hint int) map[string]any {
-	if inner := v.Elem(); inner.IsValid() && inner.Type() == mapStringAnyType {
-		return inner.Interface().(map[string]any)
+// anyMap returns what a record or a map decodes into when the target is the
+// interface v, after indirectAlloc, so v has no pointer to follow. m is the
+// map[string]any that v has. typed is a map of another type that v has, or
+// for a record an [ArrayRecord], which the caller decodes into as a typed
+// target. A slice that v has is an error, as it is for a typed target. When
+// v has nothing to decode into, both are zero and the caller makes a map.
+func anyMap(v reflect.Value, avroType string) (m map[string]any, typed reflect.Value, err error) {
+	if v.IsNil() || !v.CanInterface() {
+		return nil, reflect.Value{}, nil
 	}
-	return make(map[string]any, hint)
+	if m, ok := v.Interface().(map[string]any); ok && m != nil {
+		return m, reflect.Value{}, nil
+	}
+	old := v.Elem()
+	if !isTargetValue(old) {
+		return nil, reflect.Value{}, nil
+	}
+	if old.Kind() == reflect.Map || avroType == "record" && old.Type() == arrayRecordType {
+		return nil, old, nil
+	}
+	return nil, reflect.Value{}, &SemanticError{GoType: old.Type(), AvroType: avroType}
+}
+
+// anySlice is anyMap for an array. It sets *s to the []any that v has, cut
+// to no length. typed is a slice of another type that v has. A map that v
+// has is an error.
+func anySlice(v reflect.Value, s *[]any) (typed reflect.Value, err error) {
+	if v.IsNil() || !v.CanInterface() {
+		return reflect.Value{}, nil
+	}
+	if old, ok := v.Interface().([]any); ok && old != nil {
+		*s = old[:0]
+		return reflect.Value{}, nil
+	}
+	old := v.Elem()
+	if !isTargetValue(old) {
+		return reflect.Value{}, nil
+	}
+	if old.Kind() == reflect.Slice {
+		return old, nil
+	}
+	return reflect.Value{}, &SemanticError{GoType: old.Type(), AvroType: "array"}
+}
+
+// isTarget reports whether x, the value an any has, is something we decode
+// into: a non-nil pointer, map, or slice other than []byte. Every other
+// value is replaced. A decoder that stores into an any without reading it
+// first asks this before it stores.
+func isTarget(x any) bool {
+	switch x.(type) {
+	case nil, int64, int32, string, float64, float32, bool, []byte, time.Time, time.Duration:
+		return false
+	case map[string]any:
+		return x.(map[string]any) != nil
+	case []any:
+		return x.([]any) != nil
+	}
+	return isTargetValue(reflect.ValueOf(x))
+}
+
+// isTargetValue is isTarget for the value inside an interface.
+func isTargetValue(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map:
+		return !v.IsNil()
+	case reflect.Slice:
+		return !v.IsNil() && v.Type().Elem().Kind() != reflect.Uint8
+	}
+	return false
+}
+
+// reusesMapValue reports whether a decode into a map with values of type t
+// reads the value the map has for a key before decoding into it: we decode
+// into an existing pointer, map, slice, or any, and overwrite any other value
+// stored by value, such as a struct. A []byte is replaced with a copy, so the
+// read would find nothing to reuse.
+func reusesMapValue(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Interface:
+		return true
+	case reflect.Slice:
+		return t.Elem().Kind() != reflect.Uint8
+	}
+	return false
+}
+
+// mapValueInto sets elem to the value the map m has for key, if m has one. A
+// map[string]any gives only a value that is a target, since a decode replaces
+// any other. We read a map[string]any as a Go map, since MapIndex copies an
+// interface value to the heap.
+func mapValueInto(m, key, elem reflect.Value) {
+	if m.Type() == mapStringAnyType && m.CanInterface() {
+		if x := m.Interface().(map[string]any)[key.String()]; isTarget(x) {
+			setAny(elem, x)
+		}
+		return
+	}
+	if x := m.MapIndex(key); x.IsValid() {
+		elem.Set(x)
+	}
+}
+
+// setAny sets the interface v to x. A nil x zeros v, where Set would panic on
+// the invalid reflect.ValueOf(nil).
+func setAny(v reflect.Value, x any) {
+	if x == nil {
+		v.SetZero()
+		return
+	}
+	v.Set(reflect.ValueOf(x))
 }
 
 // tryTextUnmarshal calls (*v).UnmarshalText(b) when v is addressable and its
@@ -261,6 +359,46 @@ func sliceOf[T any](v reflect.Value) ([]T, bool) {
 	return v.Interface().([]T), true
 }
 
+// nilPointerOnPath returns the nil pointer that indirectAlloc would allocate
+// at v, or the zero Value when it would allocate none. It inlines, so that a
+// slot that is neither a pointer nor an interface costs one switch.
+func nilPointerOnPath(v reflect.Value) reflect.Value {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		return nilPointerAt(v)
+	}
+	return reflect.Value{}
+}
+
+// nilPointerAt is nilPointerOnPath for a pointer or an interface. indirectAlloc
+// follows an interface only into a non-nil pointer it has.
+func nilPointerAt(v reflect.Value) reflect.Value {
+	if v.Kind() == reflect.Pointer {
+		return nilPointerBelow(v)
+	}
+	if v.IsNil() {
+		return reflect.Value{}
+	}
+	if p := v.Elem(); p.Kind() == reflect.Pointer && !p.IsNil() {
+		return nilPointerBelow(p.Elem())
+	}
+	return reflect.Value{}
+}
+
+// nilPointerBelow follows the non-nil pointers from v to the first nil one.
+func nilPointerBelow(v reflect.Value) reflect.Value {
+	for range maxIndirectDepth {
+		if v.Kind() != reflect.Pointer {
+			return reflect.Value{}
+		}
+		if v.IsNil() {
+			return v
+		}
+		v = v.Elem()
+	}
+	return reflect.Value{}
+}
+
 func indirectAlloc(v reflect.Value) reflect.Value {
 	for range maxIndirectDepth {
 		switch v.Kind() {
@@ -309,6 +447,13 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 func setIface(v, rv reflect.Value, avroType string) error {
 	if v.Kind() != reflect.Interface {
 		return &SemanticError{GoType: v.Type(), AvroType: avroType}
+	}
+	// A map or slice that v has is a typed target, and the decoders of a
+	// record, map, and array decode into one that fits before they get here.
+	// So a value of another type arriving at one is an error, as it is for
+	// a typed target of that type.
+	if old := v.Elem(); old.IsValid() && old.Type() != rv.Type() && isTargetValue(old) {
+		return &SemanticError{GoType: old.Type(), AvroType: avroType}
 	}
 	if v.Type().NumMethod() == 0 || rv.Type().AssignableTo(v.Type()) {
 		v.Set(rv)

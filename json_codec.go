@@ -28,9 +28,11 @@ func (taggedUnions) opt() {}
 //
 // [Schema.EncodeJSON] emits the tagged form. [Schema.Decode] and
 // [Schema.DecodeJSON] wrap union values as map[string]any{branchName: value},
-// but only when your decode target is *any. A typed target (a concrete struct
-// field, *T, or a non-empty interface) cannot hold the wrapper, so a typed
-// target gets the bare branch value.
+// but only when the value decodes into an any, such as your *any target, an
+// any field, element, or map value, or an any that a pointer points at. A
+// typed target (a struct field of a concrete type, a pointer to a concrete
+// type, or a non-empty interface) cannot hold the wrapper, so a typed target
+// gets the bare branch value.
 //
 // [Schema.DecodeJSON] and [Schema.Encode] take both tagged and bare union
 // input either way.
@@ -202,6 +204,8 @@ func (s *Schema) AppendEncodeJSON(dst []byte, v any, opts ...Opt) ([]byte, error
 // convert bytes/fixed strings, and coerce numeric types to match the schema.
 // When v is *any, you get the natural Go value directly.
 //
+// Decoding into v follows the rules of [Schema.Decode].
+//
 // We accept every input format: tagged and bare unions, the Java and goavro
 // NaN/Infinity conventions, and the linkedin/goavro union branch naming
 // ("long.timestamp-millis" instead of "long"). Pass [TaggedUnions] to wrap
@@ -211,6 +215,12 @@ func (s *Schema) AppendEncodeJSON(dst []byte, v any, opts ...Opt) ([]byte, error
 // number against ["long","int"], say) decodes via the first matching branch
 // in declaration order, since the bare form does not name the writer's
 // branch. See [TaggedUnions] for the consequences.
+//
+// A bare record or map whose first key is the name of a union branch, with a
+// value that can start that branch, can decode as the tagged form of that
+// branch: the decode fails, or returns a value other than the one encoded. If
+// a record field or a map key can have a branch's name, pass [TaggedUnions]
+// to [Schema.EncodeJSON]; the tagged form has one reading.
 //
 // On a schema returned by [Resolve], src is JSON in the writer's shape, as a
 // producer using the writer schema would emit it. We apply full
@@ -241,7 +251,13 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 		scanner: jsonScanner{data: src},
 		slab:    sl,
 	}
+	// A nil pointer that v points at, and that the decode allocates before
+	// its value fails, stays nil.
+	fresh := nilPointerOnPath(rv.Elem())
 	err := ctx.decodeValue(rv.Elem(), s.node)
+	if err != nil && fresh.IsValid() {
+		fresh.SetZero()
+	}
 	if err == nil {
 		// One DecodeJSON call decodes exactly one value and returns no
 		// offset, so we reject any trailing non-whitespace content,
@@ -276,7 +292,7 @@ func (s *Schema) decodeJSONResolved(src []byte, rv reflect.Value, opts ...Opt) e
 	}
 	wb, err := w.Encode(inter)
 	if err != nil {
-		return fmt.Errorf("avro: re-encoding resolved JSON intermediate: %w", err)
+		return &causeError{"avro: re-encoding resolved JSON intermediate", err}
 	}
 	_, err = s.Decode(wb, rv.Interface(), dropAliasingOpts(opts)...)
 	return err
@@ -1318,7 +1334,7 @@ tryAll:
 	}
 	e := &SemanticError{GoType: v.Type(), AvroType: "union"}
 	if lastErr != nil {
-		e.Err = fmt.Errorf("avro json: no union branch matched: %w", lastErr)
+		e.Err = &causeError{"avro json: no union branch matched", lastErr}
 	} else {
 		e.Err = errors.New("avro json: no union branch matched")
 	}

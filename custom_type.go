@@ -59,6 +59,12 @@ type CustomType struct {
 	// here instead. If nil, the custom type does not affect schema
 	// generation, but we still use it in the returned [*Schema] for
 	// encode/decode.
+	//
+	// A union with this custom type on a branch knows from GoType which
+	// values in an any your Decode returned, so the next value of the union
+	// replaces such a value, whichever branch it has. If nil, a value your
+	// Decode returned is decoded into like any other pointer, map, or slice
+	// in an any.
 	GoType reflect.Type
 
 	// Schema is the full schema to emit in SchemaFor. You only need it
@@ -108,17 +114,18 @@ type CustomType struct {
 	// Decode converts a raw Avro-native value to your Go value. We call
 	// it after deserialization with the raw Avro-native value (int32 for
 	// int, int64 for long, []byte for bytes/fixed, etc.); return the
-	// type you want. Return [ErrSkipCustomType] to fall through. Any
-	// other non-nil error is fatal.
+	// type you want. Into an any, your result replaces the value the any
+	// has, a pointer included. Return [ErrSkipCustomType] to fall
+	// through. Any other non-nil error is fatal.
 	//
 	// When all matching decoders skip at a node, we re-decode the wire
 	// into the target faithfully (identical to a no-custom decode). A
 	// wildcard custom (empty LogicalType and AvroType) that matches leaf
 	// nodes but skips containers therefore makes decoding into a
-	// deeply-nested *typed* target (struct/slice/map) cost O(depth^2).
-	// For untrusted deeply-nested data, decode into an interface /
-	// map[string]any (single-pass) or register against a specific
-	// LogicalType/AvroType.
+	// deeply-nested *typed* target (struct/slice/map) cost O(depth^2), and
+	// the same for an any that is not nil. For untrusted deeply-nested
+	// data, decode into a nil any (single-pass) or register against a
+	// specific LogicalType/AvroType.
 	//
 	// If nil, we bypass the built-in logical type handler and use the
 	// base Avro type decoder directly, producing raw Avro-native values
@@ -278,6 +285,25 @@ func setCustomResult(v reflect.Value, result any, avroType string) error {
 	return nil
 }
 
+// runDecoders runs the CustomType Decode chain on val, the Avro-native value,
+// and stores the first result in v. A decoder that returns ErrSkipCustomType
+// passes val to the next one. runDecoders reports whether a decoder took
+// val; when every decoder skips, v is left as it is.
+func runDecoders(v reflect.Value, val any, decoders []func(any, *SchemaNode) (any, error), sn *SchemaNode, sl *slab) (bool, error) {
+	for _, dec := range decoders {
+		result, err := dec(val, sn)
+		if errors.Is(err, ErrSkipCustomType) {
+			continue
+		}
+		if err != nil {
+			return true, err
+		}
+		sl.customMatches++
+		return true, setCustomResult(v, result, sn.Type)
+	}
+	return false, nil
+}
+
 // wrapDeserWithCustomDecoders wraps a deserfn with custom decode functions.
 // When every decoder returns ErrSkipCustomType, we re-decode the wire into
 // the real target through inner, the same decode a no-custom schema
@@ -294,26 +320,23 @@ func wrapDeserWithCustomDecoders(inner deserfn, decoders []func(any, *SchemaNode
 			return inner(src, v, sl)
 		}
 		// A nil interface target decodes straight into v and reads it back
-		// for the chain. A non-nil interface would reuse the held value in
-		// place, so it takes the probe and re-decode path.
+		// for the chain. v is nil again while the chain runs, so that a
+		// decoder that fails or panics leaves it nil. A non-nil interface
+		// would reuse the value it has in place, so it takes the probe and
+		// re-decode path.
 		if v.Kind() == reflect.Interface && v.IsNil() {
 			rest, err := inner(src, v, sl)
 			if err != nil {
 				return rest, err
 			}
 			chainVal := v.Interface()
-			for _, dec := range decoders {
-				result, err := dec(chainVal, sn)
-				if err != nil {
-					if errors.Is(err, ErrSkipCustomType) {
-						continue
-					}
-					return nil, err
-				}
-				sl.customMatches++
-				return rest, setCustomResult(v, result, sn.Type)
+			v.SetZero()
+			if took, err := runDecoders(v, chainVal, decoders, sn, sl); err != nil {
+				return nil, err
+			} else if !took {
+				setAny(v, chainVal) // all-skip: the no-custom value
 			}
-			return rest, nil // all-skip: v already holds the no-custom value
+			return rest, nil
 		}
 		// Typed target: probe into a throwaway any for the chain, then re-decode
 		// faithfully into v on the all-skip fall-through.
@@ -323,16 +346,10 @@ func wrapDeserWithCustomDecoders(inner deserfn, decoders []func(any, *SchemaNode
 		if err != nil {
 			return rest, err
 		}
-		for _, dec := range decoders {
-			result, err := dec(tmp, sn)
-			if err != nil {
-				if errors.Is(err, ErrSkipCustomType) {
-					continue
-				}
-				return nil, err
-			}
-			sl.customMatches++
-			return rest, setCustomResult(v, result, sn.Type)
+		if took, err := runDecoders(v, tmp, decoders, sn, sl); err != nil {
+			return nil, err
+		} else if took {
+			return rest, nil
 		}
 		// Every decoder skipped: re-decode the original wire into the typed
 		// target. No nested custom matched, so bypass for a single pass;
