@@ -141,7 +141,7 @@ jobs:
           java-version: "17"
       - name: Fetch avro-tools
         run: |
-          curl -fsSL -o avro-tools.jar \
+          curl -fsSL --retry 5 -o avro-tools.jar \
             "https://repo1.maven.org/maven2/org/apache/avro/avro-tools/${AVRO_TOOLS_VERSION}/avro-tools-${AVRO_TOOLS_VERSION}.jar"
       - name: Build Java oracle
         run: javac -cp avro-tools.jar -d testdata/oracle testdata/oracle/SchemaOracle.java
