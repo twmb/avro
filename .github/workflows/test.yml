@@ -3,7 +3,7 @@ name: Test
 on:
   # push is main-only ON PURPOSE. The concurrency group keys on github.ref,
   # which is refs/heads/<branch> for a push and refs/pull/<n>/merge for a
-  # pull_request — different groups, so neither cancels the other and a push
+  # pull_request -- different groups, so neither cancels the other and a push
   # to a branch with an open PR ran the entire pipeline TWICE on the same
   # commit. The pull_request trigger covers branch work; this covers main
   # after a merge.
@@ -69,10 +69,12 @@ jobs:
   # runs either. Neither takes -race: the race detector does not support 386,
   # and the `test` job above already runs it.
   #
-  # s390x runs under QEMU's user-mode emulation, about twenty times slower
-  # than native. Three tests there are wall-clock watchdogs (a walk must
-  # finish within seconds), and they time out under emulation whatever the
-  # byte order, so the s390x leg skips them.
+  # s390x runs under QEMU's user-mode emulation, which is many times slower
+  # than native, and on a slow runner the whole package came within seconds
+  # of go test's ten-minute timeout. The s390x leg skips the slowest tests,
+  # which check cost bounds, depth limits, source censuses, and target reuse
+  # and which the 386 leg runs, and the wall-clock watchdogs (a walk must
+  # finish within seconds), which time out under emulation.
   test-arch:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -85,7 +87,7 @@ jobs:
           - arch: s390x
             flags: >-
               -exec qemu-s390x
-              -skip 'TestRegression_SchemaNodeDuplicateNamedDefinitionBounded|TestMatrix_SchemaNodeWalkBudgetBattery|TestInvariant_EveryReachingPathBoundIsMeasured'
+              -skip '^(TestMatrix_(UsedTargetParity|ResolvedTargetParity|SchemaJSONDecodeCallSiteParity|SchemaNodeWalkBudgetBattery)|TestDepthUniformityOracle|TestInvariant_(MinBytesContainerCountBounded|SharedSchemaNodeWalkedOnce|EveryCostCellDrivesItsFactor|ForeignBufferDecodeSitesAreRowed|WideCyclicWalkReachesEveryEntryPoint|CyclicWalkCostIsBoundedByWork|MetadataSurfacesBoundedByWidth|EveryReachingPathBoundIsMeasured)|TestDoSBattery_C10(a_UnionTagBreadth|d_SiblingKindSurfaces)|TestGenerative_EmbedShapeWalkerAgreement|TestRegression_SchemaNodeDuplicateNamedDefinitionBounded)$'
     name: test (${{ matrix.arch }})
     env:
       GOARCH: ${{ matrix.arch }}
@@ -104,7 +106,7 @@ jobs:
   # Differential testing against fastavro (an independent reference impl).
   # The fastavro oracle subprocess cross-checks twmb's encode/decode as Avro
   # bytes; without it TestDifferentialFastavro skips, so the `test` job above
-  # stays meaningful on its own. See CORRECTNESS_PLAN.md §Tier 1.
+  # stays meaningful on its own.
   differential:
     runs-on: ubuntu-latest
     steps:
@@ -148,7 +150,7 @@ jobs:
           AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
         run: go test -tags=cisuite -count=1 -run TestDifferentialJavaFingerprint -v .
       # Value-level differentials against live Java via SchemaOracle's RT
-      # round-trip: the matrix sweeps (schema × value) across primitives,
+      # round-trip: the matrix sweeps (schema x value) across primitives,
       # logicals, containers, records, and unions, asserting both wires;
       # the invalid-UTF-8 test asserts the documented U+FFFD-on-JSON /
       # verbatim-on-binary policy stays Java-identical; the wire-leniency
@@ -161,8 +163,8 @@ jobs:
           AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
         run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaValueMatrix|TestDifferentialJavaInvalidUTF8|TestDifferentialJavaWireLeniencies' -v .
       # The combinatorial matrix through the Java oracle: every composed
-      # (fragment × context) cell and every recursive shape — twmb's wire
-      # bytes must survive a Java decode→re-encode byte-identically, and
+      # (fragment x context) cell and every recursive shape -- twmb's wire
+      # bytes must survive a Java decode => re-encode byte-identically, and
       # Java's canonical form + Rabin fingerprint must match twmb's for
       # every composed schema. Java is the one external oracle that accepts
       # forward references, so the fwd-ref recursion shapes (which the
