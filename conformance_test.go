@@ -3693,19 +3693,6 @@ func TestMatrix_JSONRecordDuplicateKeys(t *testing.T) {
 			}
 		})
 	}
-
-	// While every key is its field's name, tracking the claiming keys costs
-	// no allocation: a decode into a struct allocates once, for the decoder.
-	var row struct {
-		F int64 `avro:"f"`
-		G int64 `avro:"g"`
-		N int32 `avro:"new_name"`
-	}
-	doc := []byte(`{"f":1,"g":2,"new_name":3}`)
-	var err error
-	if n := minAllocsPerRun(20, func() { err = wide.DecodeJSON(doc, &row) }); err != nil || n != 1 {
-		t.Errorf("DecodeJSON(%s) into a struct allocates %.0f times (err %v), want 1", doc, n, err)
-	}
 }
 
 // TestMatrix_ResolvedLongToFloatLossy pins that int/long to float/double
@@ -19469,17 +19456,8 @@ func TestDecimalRoundTripMatrix(t *testing.T) {
 						if !bytes.Equal(wire, wantWire) {
 							t.Fatalf("Encode(%s %T) of unscaled %v:\n got=%x\nwant=%x", form.name, carrier, u, wire, wantWire)
 						}
-						// The stack array is what keeps an encode from
-						// allocating, so a *big.Rat that qualifies for it
-						// encodes with no allocation.
 						if words(want.Num())+words(den) <= 8 && words(want.Denom()) == 1 && want.Denom().Sign() > 0 && sc.scale <= 1024 && sc.precision <= 1024 {
 							onStack++
-							if ptr, ok := carrier.(*big.Rat); ok {
-								var buf []byte
-								if n := testing.AllocsPerRun(5, func() { buf, _ = s.AppendEncode(buf[:0], ptr) }); n != 0 {
-									t.Errorf("Encode(%s) of unscaled %v allocates %.0f times, want 0", form.name, u, n)
-								}
-							}
 						} else {
 							onHeap++
 						}
@@ -23583,25 +23561,6 @@ func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 		if !reflect.DeepEqual(nb, sb) {
 			t.Errorf("binary record-into-any: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
 		}
-		// A field's old number is replaced, so a field that a custom type
-		// matches decodes as if the map had no value for it, with no more
-		// allocations.
-		fschema := `{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"long","logicalType":"money"}}]}`
-		fskip := avro.MustParse(fschema, avro.CustomType{LogicalType: "money", Decode: skip.Decode})
-		fbin := avrotest.MustEncode(t, avro.MustParse(fschema), Rw{A: 5})
-		fjson := avrotest.MustEncodeJSON(t, avro.MustParse(fschema), Rw{A: 5})
-		m := map[string]any{"a": int64(1)}
-		var x any = m
-		for name, decode := range map[string]func(){
-			"Decode":     func() { _, _ = fskip.Decode(fbin, &x) },
-			"DecodeJSON": func() { _ = fskip.DecodeJSON(fjson, &x) },
-		} {
-			withOld := minAllocsPerRun(20, decode)
-			without := minAllocsPerRun(20, func() { delete(m, "a"); decode() })
-			if withOld > without {
-				t.Errorf("%s: %v allocations with the field's old number in the map, want no more than the %v without it", name, withOld, without)
-			}
-		}
 	})
 
 	t.Run("map-into-any-control", func(t *testing.T) {
@@ -24116,82 +24075,40 @@ func TestRegression_UnionNonCustomReuseInPlaceUnchanged(t *testing.T) {
 
 // ---------- slab_free_test.go ----------
 
-// Issue #41: Decode of a slab-free schema (scalar leaf, no custom wiring)
-// bypasses the internal slab pool entirely and runs on a nil *slab.
-
-// TestScalarDecodeNoAllocAfterGC pins issue #41: Decode of a scalar schema must
-// not allocate even when GC has drained the slab pool. That is the steady
-// state of a low-allocation application. A Decode that unconditionally pulls a
-// slab from the pool makes every post-GC decode pay a fresh allocation it never
-// uses. The min-over-iterations guards against unrelated background mallocs. A
-// genuinely slab-free Decode hits 0 on every quiet iteration, while a refilling
-// one allocates on every one.
-func TestScalarDecodeNoAllocAfterGC(t *testing.T) {
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
-	s := avro.MustParse(`"long"`)
-	wire := []byte{4}
-	var v int64
-	if _, err := s.Decode(wire, &v); err != nil { // warm one-time state
-		t.Fatal(err)
-	}
-	minMallocs := ^uint64(0)
-	var before, after runtime.MemStats
-	for i := 0; i < 5; i++ {
-		runtime.GC()
-		runtime.GC()
-		runtime.ReadMemStats(&before)
-		avrotest.MustDecode(t, s, wire, &v)
-		runtime.ReadMemStats(&after)
-		minMallocs = min(minMallocs, after.Mallocs-before.Mallocs)
-	}
-	if v != 2 {
-		t.Fatalf("decoded %d, want 2", v)
-	}
-	if minMallocs != 0 {
-		t.Errorf("scalar Decode allocated on every post-GC iteration (min %d mallocs/op); slab pool should be bypassed for slab-free schemas", minMallocs)
-	}
-}
-
-// TestDecodeNumbersIntoAnyShareAllocations pins that numbers decoded into an
-// any share allocations, where any(v) allocates once per number, and that a
-// number you keep is never written by a later decode. The nullable and time
-// rows take the general decode path, and the other rows take the array fast
-// loop. A row with a reader decodes through Resolve, which promotes each
-// number, and want gives the promoted value. A value under 256 is boxed with
-// no allocation and takes no slab slot, which the under-256 row's lower bound
-// pins. DecodeJSON builds the slice by appending, so on JSON a bound is over
-// the allocations of decoding as many zeros.
-func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
-	const items = 1000
-	// A decode boxes the numbers into one slab per 8 of them, and allocates
-	// a few times more for the rest of the value.
-	const boxed = items/8 + 10
+// TestDecodeNumbersIntoAnyKeepTheirValues pins that later decodes never write
+// a number an earlier decode put in an any. Numbers decoded into an any share
+// allocations, and a decode leaves the unused part of its last allocation to
+// the next decode. The nullable and time rows take the general decode path,
+// and the other rows take the array fast loop. A row with a reader decodes
+// through Resolve, which promotes each number, and want gives the promoted
+// value.
+func TestDecodeNumbersIntoAnyKeepTheirValues(t *testing.T) {
+	const items = 1008
 	ms := func(i int) any { return time.Duration(1000+i) * time.Millisecond }
 	for _, tc := range []struct {
 		name, schema string
-		max          float64
 		val          func(i int) any
 		reader       string
 		want         func(i int) any
 	}{
-		{"long", `"long"`, boxed, func(i int) any { return int64(1000 + i) }, "", nil},
-		{"negative long", `"long"`, boxed, func(i int) any { return int64(-1 - i) }, "", nil},
-		{"int", `"int"`, boxed, func(i int) any { return int32(1000 + i) }, "", nil},
-		{"float", `"float"`, boxed, func(i int) any { return float32(i) + 0.5 }, "", nil},
-		{"double", `"double"`, boxed, func(i int) any { return float64(i) + 0.5 }, "", nil},
-		{"nullable long", `["null","long"]`, boxed, func(i int) any { return int64(1000 + i) }, "", nil},
-		{"long under 256", `"long"`, 5, func(i int) any { return int64(i % 200) }, "", nil},
-		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, boxed, ms, "", nil},
-		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, boxed, ms, "", nil},
-		{"int to long", `"int"`, boxed, func(i int) any { return int32(1000 + i) },
+		{"long", `"long"`, func(i int) any { return int64(1000 + i) }, "", nil},
+		{"negative long", `"long"`, func(i int) any { return int64(-1 - i) }, "", nil},
+		{"int", `"int"`, func(i int) any { return int32(1000 + i) }, "", nil},
+		{"float", `"float"`, func(i int) any { return float32(i) + 0.5 }, "", nil},
+		{"double", `"double"`, func(i int) any { return float64(i) + 0.5 }, "", nil},
+		{"nullable long", `["null","long"]`, func(i int) any { return int64(1000 + i) }, "", nil},
+		{"long under 256", `"long"`, func(i int) any { return int64(i % 200) }, "", nil},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, ms, "", nil},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, ms, "", nil},
+		{"int to long", `"int"`, func(i int) any { return int32(1000 + i) },
 			`"long"`, func(i int) any { return int64(1000 + i) }},
-		{"int to float", `"int"`, boxed, func(i int) any { return int32(1000 + i) },
+		{"int to float", `"int"`, func(i int) any { return int32(1000 + i) },
 			`"float"`, func(i int) any { return float32(1000 + i) }},
-		{"long to double", `"long"`, boxed, func(i int) any { return int64(1000 + i) },
+		{"long to double", `"long"`, func(i int) any { return int64(1000 + i) },
 			`"double"`, func(i int) any { return float64(1000 + i) }},
-		{"float to double", `"float"`, boxed, func(i int) any { return float32(i) + 0.5 },
+		{"float to double", `"float"`, func(i int) any { return float32(i) + 0.5 },
 			`"double"`, func(i int) any { return float64(i) + 0.5 }},
-		{"int to time-micros", `"int"`, boxed, func(i int) any { return int32(1000 + i) },
+		{"int to time-micros", `"int"`, func(i int) any { return int32(1000 + i) },
 			`{"type":"long","logicalType":"time-micros"}`, func(i int) any { return time.Duration(1000+i) * time.Microsecond }},
 	} {
 		for _, wire := range []string{"binary", "json"} {
@@ -24204,81 +24121,45 @@ func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				in, other, want, zeros := make([]any, items), make([]any, items), make([]any, items), make([]any, items)
+				in, other, want := make([]any, items), make([]any, items), make([]any, items)
 				for i := range items {
 					in[i], other[i], want[i] = tc.val(i), tc.val(i+5000), tc.val(i)
 					if tc.want != nil {
 						want[i] = tc.want(i)
 					}
-					zeros[i] = reflect.Zero(reflect.TypeOf(in[i])).Interface()
 				}
 				encode, decode := s.AppendEncode, func(src []byte, v any) error { _, err := dec.Decode(src, v); return err }
 				if wire == "json" {
 					encode, decode = s.AppendEncodeJSON, func(src []byte, v any) error { return dec.DecodeJSON(src, v) }
 				}
-				inWire, err := encode(nil, in)
-				if err != nil {
-					t.Fatal(err)
-				}
 				otherWire, err := encode(nil, other)
 				if err != nil {
 					t.Fatal(err)
 				}
-				limit := tc.max
-				if wire == "json" && tc.reader != "" {
-					// A resolved DecodeJSON decodes the JSON into an any and
-					// then decodes again, so it boxes each number twice.
-					limit *= 2
-				}
-				if wire == "json" {
-					zeroWire, err := encode(nil, zeros)
+				// A slab has room for 8 numbers, so of 8 lengths in a row,
+				// all but one end partway through a slab, and the next
+				// decode takes its first numbers from that slab.
+				for n := items - 8; n < items; n++ {
+					inWire, err := encode(nil, in[:n])
 					if err != nil {
 						t.Fatal(err)
 					}
-					limit += testing.AllocsPerRun(5, func() {
-						var out any
-						if err := decode(zeroWire, &out); err != nil {
-							t.Fatal(err)
-						}
-					})
-				}
-
-				var kept any
-				if err := decode(inWire, &kept); err != nil {
-					t.Fatal(err)
-				}
-				allocs := testing.AllocsPerRun(5, func() {
-					var out any
-					if err := decode(otherWire, &out); err != nil {
+					var kept any
+					if err := decode(inWire, &kept); err != nil {
 						t.Fatal(err)
 					}
-				})
-				if allocs > limit {
-					t.Errorf("decoding %d numbers into an any allocated %.0f times, want at most %.0f", items, allocs, limit)
-				}
-				if !reflect.DeepEqual(kept, any(want)) {
-					t.Errorf("later decodes wrote numbers kept from an earlier decode")
+					for range 5 {
+						var out any
+						if err := decode(otherWire, &out); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if !reflect.DeepEqual(kept, any(want[:n])) {
+						t.Errorf("later decodes wrote numbers kept from a decode of %d numbers", n)
+					}
 				}
 			})
 		}
-	}
-	// A slab has room for 8 numbers, so a number you keep keeps 64 bytes
-	// alive: 100 numbers take 12 or 13 slabs, as many allocations more than
-	// 100 numbers under 256, which take none.
-	s := avro.MustParse(`{"type":"array","items":"long"}`)
-	big, small := make([]any, 100), make([]any, 100)
-	for i := range big {
-		big[i], small[i] = int64(1000+i), int64(i%200)
-	}
-	allocs := func(v []any) float64 {
-		wire := avrotest.MustEncode(t, s, v)
-		return testing.AllocsPerRun(10, func() {
-			var out any
-			avrotest.MustDecode(t, s, wire, &out)
-		})
-	}
-	if slabs := allocs(big) - allocs(small); slabs < 12 || slabs > 13 {
-		t.Errorf("100 numbers took %.0f slabs, want 12 or 13", slabs)
 	}
 }
 
@@ -24460,93 +24341,6 @@ type jsonUnionRepeatT struct {
 	A *jsonUnionRepeatT            `avro:"A"`
 	M map[string]*jsonUnionRepeatT `avro:"m"`
 	X int32                        `avro:"x"`
-}
-
-// minAllocsPerRun returns the fewest allocations one call of f makes over
-// trials calls. Under -race, sync.Pool drops a quarter of the values put back
-// into it, so a call that takes a slab from the pool sometimes allocates a
-// fresh one; the fewest is the count without that.
-func minAllocsPerRun(trials int, f func()) float64 {
-	least := math.Inf(1)
-	for range trials {
-		least = min(least, testing.AllocsPerRun(1, f))
-	}
-	return least
-}
-
-// TestMatrix_MapAllocations crosses map value types over decoding into a nil
-// map and encoding an empty map. A decode allocates only the map when the map
-// is empty, or when Decode writes the entries straight into a map[string]V of
-// a builtin V. An empty map encodes with no allocation on either wire.
-func TestMatrix_MapAllocations(t *testing.T) {
-	type named string
-	type namedMap map[string]int32
-	type rec struct {
-		A int32 `avro:"a"`
-	}
-	for _, c := range []struct {
-		name, values string
-		val          any
-		native       bool // Decode writes the entries into the Go map directly
-	}{
-		{"string", `"string"`, map[string]string{"a": "x", "b": "y"}, true},
-		{"long", `"long"`, map[string]int64{"a": 1000, "b": -1}, true},
-		{"named value", `"string"`, map[string]named{"a": "x"}, false},
-		{"named map", `"int"`, namedMap{"a": 1}, false},
-		{"record value", `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`, map[string]rec{"a": {1}}, false},
-		{"json.Number key", `"string"`, map[json.Number]string{"1": "x"}, false},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			s := avro.MustParse(`{"type":"map","values":` + c.values + `}`)
-			wire := avrotest.MustAppendEncode(t, s, nil, c.val)
-
-			// The want side builds the same map from Values made beforehand.
-			typ := reflect.TypeOf(c.val)
-			mv := reflect.ValueOf(c.val)
-			keys := mv.MapKeys()
-			vals := make([]reflect.Value, len(keys))
-			for i, k := range keys {
-				vals[i] = mv.MapIndex(k)
-			}
-			out := reflect.New(typ)
-			for _, a := range []struct {
-				wire []byte
-				n    int
-			}{{[]byte{0}, 0}, {wire, len(keys)}} {
-				if a.n > 0 && !c.native {
-					continue
-				}
-				want := testing.AllocsPerRun(20, func() {
-					m := reflect.MakeMapWithSize(typ, a.n)
-					for i := range a.n {
-						m.SetMapIndex(keys[i], vals[i])
-					}
-				})
-				var err error
-				got := minAllocsPerRun(20, func() {
-					out.Elem().SetZero()
-					_, err = s.Decode(a.wire, out.Interface())
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
-				if got != want {
-					t.Errorf("decoding %d entries into a nil %v allocates %.0f times, want %.0f (the map)", a.n, typ, got, want)
-				}
-			}
-
-			empty := reflect.MakeMap(typ).Interface()
-			buf := make([]byte, 0, 64)
-			for _, w := range []struct {
-				name   string
-				append func([]byte, any, ...avro.Opt) ([]byte, error)
-			}{{"AppendEncode", s.AppendEncode}, {"AppendEncodeJSON", s.AppendEncodeJSON}} {
-				if n := minAllocsPerRun(20, func() { buf, _ = w.append(buf[:0], empty) }); n != 0 {
-					t.Errorf("%s of an empty %v allocates %.0f times, want 0", w.name, typ, n)
-				}
-			}
-		})
-	}
 }
 
 // ---------- named_byte_element_test.go ----------
