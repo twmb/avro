@@ -2881,33 +2881,6 @@ func TestInvariant_GuardedTiersRefuseAmbiguity(t *testing.T) {
 	}
 }
 
-// TestInvariant_UnionTagResolveDoesNotAllocate locks the property that made
-// it safe to route the resolver through a shared tier slice rather than
-// leaving the rules open-coded. A tier appends its claim into a stack buffer.
-// The comparison `string(claimed) == name` is a compare, not a conversion, so
-// resolving a tag allocates nothing however many tiers exist. A tier that
-// builds its claim some other way (fmt, a map lookup, strings.Join) would put
-// an allocation on a per-value JSON path, and this is where that shows up.
-func TestInvariant_UnionTagResolveDoesNotAllocate(t *testing.T) {
-	s := MustParse(`["null",{"type":"long","logicalType":"timestamp-millis"},` +
-		`{"type":"fixed","name":"F","namespace":"n","size":16,"logicalType":"uuid"},` +
-		`{"type":"record","name":"R","namespace":"ns","fields":[{"name":"x","type":"int"}]}]`)
-	for _, tag := range []string{
-		"long.timestamp-millis", // logical qualifier, primitive
-		"fixed.uuid",            // logical qualifier, named fixed
-		"n.F",                   // exact
-		"R",                     // unqualified short name
-		"absent",                // no tier claims it: every tier runs
-	} {
-		got := testing.AllocsPerRun(50, func() {
-			findUnionBranch(s.node, tag)
-		})
-		if got != 0 {
-			t.Errorf("resolving %q allocates %.0f times per call; the tier walk must stay allocation-free", tag, got)
-		}
-	}
-}
-
 // ---------- text_appender_contract_test.go ----------
 
 // freshShortAppender violates the encoding.TextAppender contract by

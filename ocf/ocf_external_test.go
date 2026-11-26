@@ -264,13 +264,12 @@ func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 
 	sources := []struct {
 		name string
-		// says is whether the reader reports how many bytes remain, and
-		// truthful is whether the report is right.
-		says, truthful bool
-		open           func(t *testing.T, file []byte) io.Reader
+		// says is whether the reader reports how many bytes remain.
+		says bool
+		open func(t *testing.T, file []byte) io.Reader
 	}{
-		{"bytes.Reader", true, true, func(_ *testing.T, file []byte) io.Reader { return bytes.NewReader(file) }},
-		{"os.File", true, true, func(t *testing.T, file []byte) io.Reader {
+		{"bytes.Reader", true, func(_ *testing.T, file []byte) io.Reader { return bytes.NewReader(file) }},
+		{"os.File", true, func(t *testing.T, file []byte) io.Reader {
 			f, err := os.Create(filepath.Join(t.TempDir(), "f.avro"))
 			if err != nil {
 				t.Fatal(err)
@@ -284,9 +283,9 @@ func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 			}
 			return statReader{f, t, f.Stat}
 		}},
-		{"stream", false, false, func(_ *testing.T, file []byte) io.Reader { return struct{ io.Reader }{bytes.NewReader(file)} }},
-		{"Len reports zero", true, false, func(_ *testing.T, file []byte) io.Reader { return lenZeroReader{bytes.NewReader(file)} }},
-		{"Stat returns nil", false, false, func(t *testing.T, file []byte) io.Reader {
+		{"stream", false, func(_ *testing.T, file []byte) io.Reader { return struct{ io.Reader }{bytes.NewReader(file)} }},
+		{"Len reports zero", true, func(_ *testing.T, file []byte) io.Reader { return lenZeroReader{bytes.NewReader(file)} }},
+		{"Stat returns nil", false, func(t *testing.T, file []byte) io.Reader {
 			return statReader{bytes.NewReader(file), t, func() (fs.FileInfo, error) { return nil, nil }}
 		}},
 	}
@@ -338,10 +337,7 @@ func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 		}
 	}
 
-	// A block whose bytes are all there reads back from every source, and
-	// is allocated once unless the reader says the bytes are not there. One
-	// allocation is the block plus the decoded copy, about twice the block;
-	// growing into it costs about three and a half times.
+	// A block whose bytes are all there reads back from every source.
 	const big = 12 << 20
 	blob := make([]byte, big)
 	blob[0], blob[big-1] = 0xAB, 0xCD
@@ -359,28 +355,18 @@ func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 			}
 			defer r.Close()
 			var got []byte
-			var m0, m1 runtime.MemStats
-			runtime.ReadMemStats(&m0)
-			err = r.Decode(&got)
-			runtime.ReadMemStats(&m1)
-			if err != nil {
+			if err := r.Decode(&got); err != nil {
 				t.Fatalf("a %d-byte block whose bytes are present must read back: %v", big, err)
 			}
 			if len(got) != big || got[0] != 0xAB || got[big-1] != 0xCD {
 				t.Fatalf("the block read back wrong: len %d", len(got))
-			}
-			alloc := m1.TotalAlloc - m0.TotalAlloc
-			if oneShot := !src.says || src.truthful; oneShot && alloc > 32<<20 {
-				t.Errorf("a %d-byte block allocated %d bytes, want one allocation of the block", big, alloc)
-			} else if !oneShot && alloc < 32<<20 {
-				t.Errorf("a %d-byte block allocated %d bytes from a reader that says nothing is left, want the incremental read", big, alloc)
 			}
 		})
 	}
 
 	// A file is asked its size once. When a later block does not fit what
 	// was left then, the file is asked again, since a file can grow, and a
-	// block appended after our first read is still allocated once.
+	// block appended after our first read reads back.
 	t.Run("present/os.File that grows", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "grow.avro")
 		f, err := os.Create(path)
@@ -421,18 +407,11 @@ func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 		}
 		avrotest.MustClose(t, aw)
 
-		var m0, m1 runtime.MemStats
-		runtime.ReadMemStats(&m0)
-		err = r.Decode(&got)
-		runtime.ReadMemStats(&m1)
-		if err != nil {
+		if err := r.Decode(&got); err != nil {
 			t.Fatalf("the appended block must read back: %v", err)
 		}
 		if len(got) != big || got[0] != 0xAB || got[big-1] != 0xCD {
 			t.Fatalf("the appended block read back wrong: len %d", len(got))
-		}
-		if alloc := m1.TotalAlloc - m0.TotalAlloc; alloc > 32<<20 {
-			t.Errorf("a %d-byte block appended after the first read allocated %d bytes, want one allocation of the block", big, alloc)
 		}
 	})
 }

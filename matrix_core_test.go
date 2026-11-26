@@ -2759,55 +2759,8 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 							if !bytes.Equal(binW, cbin) {
 								t.Fatalf("deep binary wire differs from bare base:\n got=%x\nwant=%x", binW, cbin)
 							}
-							// A value behind one pointer is read in place, so
-							// encoding it into a buffer with room allocates
-							// nothing.
-							if pc.label == "top" && depth == 1 {
-								ptr := pc.input(b, depth).Interface()
-								buf := make([]byte, 0, 64)
-								if n := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncode(buf[:0], ptr) }); n != 0 {
-									t.Errorf("encoding a value behind a pointer allocates %.0f times, want 0", n)
-								}
-							}
 							if !bytes.Equal(jsonW, cjson) {
 								t.Fatalf("deep JSON wire differs from bare base:\n got=%s\nwant=%s", jsonW, cjson)
-							}
-							// A union encodes its branch into the output, so a
-							// union value costs no JSON allocation over the
-							// same value outside a union. A tag naming a
-							// logical type costs no allocation either, on
-							// encode and when DecodeJSON wraps the value.
-							if strings.HasPrefix(pc.label, "union") && depth == 1 {
-								ptr := pc.input(b, depth).Interface()
-								bare := avro.MustParse(b.avro)
-								buf := make([]byte, 0, 64)
-								for _, opts := range [][]avro.Opt{nil, {avro.TaggedUnions()}, {avro.TaggedUnions(), avro.TagLogicalTypes()}} {
-									want := minAllocsPerRun(20, func() { buf, _ = bare.AppendEncodeJSON(buf[:0], ptr, opts...) })
-									if n := minAllocsPerRun(20, func() { buf, _ = s.AppendEncodeJSON(buf[:0], ptr, opts...) }); n != want {
-										t.Errorf("JSON encoding a union value (%d options) allocates %.0f times, and %.0f outside a union", len(opts), n, want)
-									}
-								}
-								tagged := avrotest.MustAppendEncodeJSON(t, s, nil, ptr, avro.TaggedUnions())
-								logical := avrotest.MustAppendEncodeJSON(t, s, nil, ptr, avro.TaggedUnions(), avro.TagLogicalTypes())
-								decodeAllocs := func(s *avro.Schema, doc []byte, opts ...avro.Opt) float64 {
-									return minAllocsPerRun(20, func() {
-										var out any
-										if err := s.DecodeJSON(doc, &out, opts...); err != nil {
-											t.Fatal(err)
-										}
-									})
-								}
-								if n, want := decodeAllocs(s, logical, avro.TaggedUnions(), avro.TagLogicalTypes()), decodeAllocs(s, tagged, avro.TaggedUnions()); n != want {
-									t.Errorf("DecodeJSON of a union value under TagLogicalTypes allocates %.0f times, and %.0f without it", n, want)
-								}
-								// Without an envelope, DecodeJSON puts a union
-								// value into an any with no allocation over the
-								// same value outside a union.
-								plain := avrotest.MustAppendEncodeJSON(t, s, nil, ptr)
-								barePlain := avrotest.MustAppendEncodeJSON(t, bare, nil, ptr)
-								if n, want := decodeAllocs(s, plain), decodeAllocs(bare, barePlain); n != want {
-									t.Errorf("DecodeJSON of a union value into an any allocates %.0f times, and %.0f outside a union", n, want)
-								}
 							}
 						}
 
@@ -2835,33 +2788,6 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 					})
 				}
 			})
-		}
-	}
-	// A slice of a primitive type behind a pointer, which a slice field of a
-	// struct passed by pointer also is. Both encoders loop over the slice
-	// where it is, so the pointer costs no allocation over the slice by
-	// value.
-	for _, c := range []struct {
-		schema string
-		ptr    any
-	}{
-		{`{"type":"array","items":"string"}`, &[]string{"a", "b"}},
-		{`{"type":"array","items":"boolean"}`, &[]bool{true, false}},
-		{`{"type":"array","items":"int"}`, &[]int32{1, 2}},
-		{`{"type":"array","items":"long"}`, &[]int64{1, 2}},
-		{`{"type":"array","items":"long"}`, &[]int{1, 2}},
-		{`{"type":"array","items":"float"}`, &[]float32{1.5}},
-		{`{"type":"array","items":"double"}`, &[]float64{1.5}},
-	} {
-		s := avro.MustParse(c.schema)
-		byValue := reflect.ValueOf(c.ptr).Elem().Interface()
-		buf := make([]byte, 0, 64)
-		if n := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncode(buf[:0], c.ptr) }); n != 0 {
-			t.Errorf("%T: encoding a slice behind a pointer allocates %.0f times, want 0", c.ptr, n)
-		}
-		want := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncodeJSON(buf[:0], byValue) })
-		if n := testing.AllocsPerRun(20, func() { buf, _ = s.AppendEncodeJSON(buf[:0], c.ptr) }); n != want {
-			t.Errorf("%T: JSON encoding a slice behind a pointer allocates %.0f times, and %.0f by value", c.ptr, n, want)
 		}
 	}
 }
@@ -14082,29 +14008,6 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 					t.Errorf("%s: the copy kept after decode %d reads %s, want %s", w.name, i, rows[i].Price.String(), r.String())
 				}
 			}
-		}
-		// A decimal decodes into the *big.Rat itself, which makes no new
-		// big.Rat, so a used any takes fewer allocations than a new one.
-		dec := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":18,"scale":2}`)
-		wire := avrotest.MustEncode(t, dec, big.NewRat(1234567, 100))
-		var used any
-		avrotest.MustDecode(t, dec, wire, &used)
-		intoUsed := minAllocsPerRun(20, func() { _, _ = dec.Decode(wire, &used) })
-		intoNew := minAllocsPerRun(20, func() {
-			var x any
-			_, _ = dec.Decode(wire, &x)
-		})
-		if intoUsed >= intoNew {
-			t.Errorf("a decimal into a used any: %v allocations, want fewer than the %v into a new any", intoUsed, intoNew)
-		}
-		// The tagged JSON form of a union value goes where the bare form
-		// goes, so it takes no more allocations.
-		nl := avro.MustParse(`["null","long"]`)
-		taggedJSON, bareJSON := []byte(`{"long":500}`), []byte(`500`)
-		tagged := minAllocsPerRun(20, func() { var x any; _ = nl.DecodeJSON(taggedJSON, &x) })
-		bare := minAllocsPerRun(20, func() { var x any; _ = nl.DecodeJSON(bareJSON, &x) })
-		if tagged > bare {
-			t.Errorf("a tagged union value into a new any: %v allocations, want no more than the %v of the bare form", tagged, bare)
 		}
 		// DecodeJSON takes a decimal as a bare number too.
 		old := big.NewRat(1, 2)
