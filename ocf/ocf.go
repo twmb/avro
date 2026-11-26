@@ -738,10 +738,12 @@ func (w *Writer) flush() error {
 	if enc := zstdEncoderOf(w.codec); enc != nil {
 		// zstd appends to the slice it is given, so it compresses straight
 		// after the header's room. The capacity is the last block's data
-		// length, or for the first block its uncompressed length; append
-		// grows it when this block compresses worse.
+		// length. A writer's first block has no block before it: under 1 MiB
+		// the capacity is the uncompressed length, and from 1 MiB there is no
+		// room for the data, as zstd sizes its own output. append grows the
+		// slice when a block needs more.
 		hint := w.dataHint
-		if hint == 0 {
+		if hint == 0 && len(w.buf) < 1<<20 {
 			hint = len(w.buf)
 		}
 		block = enc.EncodeAll(w.buf, make([]byte, blockHeaderMax, blockHeaderMax+hint+len(w.sync)))
