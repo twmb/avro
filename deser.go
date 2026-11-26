@@ -70,7 +70,6 @@ func readBlockHeader(src []byte, blockType string, validateByteSize bool) (absCo
 }
 
 var anyType = reflect.TypeFor[any]()
-var sliceAnyType = reflect.SliceOf(anyType)
 
 // slab batches small string allocations into a single backing buffer.
 // Strings are immutable so sharing backing memory is safe. nums does the same
