@@ -163,7 +163,24 @@ type jsonDecoder struct {
 	// value to its leaf decoder rather than the logical-transformed one.
 	// decodeKind captures and clears it on entry so it scopes to one node.
 	suppressLogical bool
+	// lookAhead makes decodeUnionObject look past the value of a container
+	// branch before it decodes the value as that branch. Otherwise, for an
+	// object with more keys, a decode as the branch and then a decode as the
+	// bare form would decode each nested level twice, which compounds with
+	// depth. We set it at the first such value that does not decode as the
+	// branch, or whose object has more keys, so that a valid document in the
+	// tagged form never looks past a value.
+	lookAhead bool
+	// tagging counts the values decodeUnionObject is decoding as a branch.
+	// While `restart` is set, each of those decodes returns errLookAhead, and
+	// the outermost decodes its object again with lookAhead. Every decode
+	// between two of them returns the error, since decodeUnionBare tries no
+	// other branch after a record, map, or array fails.
+	tagging int
+	restart bool
 }
+
+var errLookAhead = errors.New("avro json: union object decoded again with look-ahead")
 
 // decodeValue reads the next JSON value off the scanner, guided by the schema
 // node, and assigns it to v. A node carrying a custom-decoder wrapper
@@ -1537,7 +1554,9 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 				// key "map".
 				colonErr := ctx.scanner.expect(':')
 				fits := colonErr == nil && jsonTokenMatchesBranch(ctx.scanner.peek(), branch)
-				if colonErr == nil && (!unionBranchRecurses(branch.kind) || fits) {
+				container := unionBranchRecurses(branch.kind)
+				bare := ctx.lookAhead && fits && container && !ctx.closesAfterValue()
+				if colonErr == nil && (!container || fits && !bare) {
 					// The value goes where the union rules put it, as in
 					// decodeBranchInto. The tagged form is known only when
 					// its object closes: a malformed `{"long": 42,`
@@ -1551,7 +1570,9 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 						dst = t.cell()
 					}
 					valuePos := ctx.scanner.pos
+					ctx.tagging++
 					err := ctx.decodeValue(dst, branch)
+					ctx.tagging--
 					if err == nil && ctx.scanner.peek() == '}' {
 						ctx.scanner.pos++
 						if !direct {
@@ -1560,18 +1581,49 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 						ctx.wrapBranch(v, node, branch)
 						return nil
 					}
-					if err == nil {
+					// The value did not decode as branch, or the object has
+					// more keys. `under` is whether a decode of a value under
+					// this one set `restart`.
+					under := ctx.restart
+					if container && !ctx.lookAhead && !errors.Is(err, errTooDeep) {
+						ctx.lookAhead, ctx.restart = true, true
+					}
+					again := false
+					if ctx.restart && ctx.tagging == 0 {
+						ctx.restart = false
+						ctx.scanner.pos = valuePos
+						closes := ctx.closesAfterValue()
+						if closes && !under {
+							return err
+						}
+						// The object is the bare form, or it is the tagged
+						// form and a value under it stopped the decode.
+						again, err = closes, nil
+					}
+					// The bare form, and a decode of the object again, read
+					// the target: undoTagged removes what the value wrote,
+					// so that a map it filled does not read as one the
+					// target had.
+					if err == nil || ctx.restart {
 						ctx.undoTagged(dst, branch, valuePos)
 						if direct && t.slot.IsValid() {
 							setAny(t.slot, t.seed)
 						}
 					}
-					// A container branch commits to the tagged form: the
-					// bare retry would re-decode the subtree, 2^depth when a
-					// record field name collides with a branch name. So does
-					// a one-key object whose value decodes as the branch, as
-					// Decode returns the same error for that value.
-					if errors.Is(err, errTooDeep) || err != nil && (unionBranchRecurses(branch.kind) || fits && ctx.isTaggedForm(branch, valuePos)) {
+					if again {
+						ctx.scanner.pos = savedPos
+						return ctx.decodeUnionObject(v, node)
+					}
+					if ctx.restart {
+						return errLookAhead
+					}
+					// A container branch keeps its error, since its object
+					// closes after the value. A bare retry of a one-key object
+					// would decode the value again, 2^depth when a record
+					// field name collides with a branch name. A one-key object
+					// whose value decodes as a scalar branch keeps its error
+					// too, as Decode returns the same error for that value.
+					if errors.Is(err, errTooDeep) || err != nil && (container || fits && ctx.isTaggedForm(branch, valuePos)) {
 						return err
 					}
 					taggedErr = err
@@ -1589,6 +1641,33 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 		return err
 	}
 	return nil
+}
+
+// closesAfterValue reports whether the object closes after the array or object
+// at the scanner. It finds where the value ends by its brackets and strings
+// alone, since the decode that follows reads the value in full. A value that
+// does not end counts as closing, so that the decode of it returns the error.
+func (ctx *jsonDecoder) closesAfterValue() bool {
+	data, depth := ctx.scanner.data, 0
+	for i := ctx.scanner.pos; i < len(data); i++ {
+		switch data[i] {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			if depth--; depth == 0 {
+				for i++; i < len(data) && (data[i] == ' ' || data[i] == '\t' || data[i] == '\n' || data[i] == '\r'); i++ {
+				}
+				return i < len(data) && data[i] == '}'
+			}
+		case '"':
+			for i++; i < len(data) && data[i] != '"'; i++ {
+				if data[i] == '\\' {
+					i++
+				}
+			}
+		}
+	}
+	return true
 }
 
 // isTaggedForm reports whether the object whose value starts at pos is the
@@ -1637,8 +1716,8 @@ func (ctx *jsonDecoder) wrapBranch(v reflect.Value, union, branch *schemaNode) {
 }
 
 // undoTagged removes what the tagged form of branch wrote into the value the
-// target has, after the form decoded and its object did not close, so that
-// the bare form does not decode into it.
+// target has, after its object did not close or a decode under it stopped, so
+// that the bare form, or a decode of the object again, does not decode into it.
 //
 // We decode the tagged form into the map or pointer you have, not into a copy
 // of it, because the tagged form's object closes in every document except one

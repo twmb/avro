@@ -12888,6 +12888,7 @@ func parityCases() []parityCase {
 	}
 	return append(cases, []parityCase{
 		{"u[null,record]", `["null",` + recP + `]`, []any{nil, p(1)}, false},
+		{"u[null,record M{M}]", `["null",{"type":"record","name":"M","fields":[{"name":"M","type":` + mapL + `},{"name":"x","type":"long"}]}]`, []any{nil, map[string]any{"M": map[string]any{"k": int64(1)}, "x": int64(2)}}, false},
 		{"u[array,record]", `[` + arrL + `,` + recP + `]`, []any{[]any{int64(1)}, p(7)}, false},
 		{"u[recP,recQ]", `[` + recP + `,` + recQ + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"Q": map[string]any{"q": int64(2)}}}, false},
 		{"u[recP,map]", `[` + recP + `,` + mapL + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"map": map[string]any{"k": int64(5)}}}, false},

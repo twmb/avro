@@ -22990,10 +22990,10 @@ func TestRegression_BareUnionJSONNoExponentialBacktrack(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
-		// keyed builds the nested object using the given field key. The
-		// innermost value (a bare number) matches no branch, forcing failure at
-		// the bottom: the worst case for container backtracking.
-		key string
+		// The nested object has `key` first at each level, then `more`, and
+		// `leaf` at the bottom. ok is whether the decode succeeds.
+		key, more, leaf string
+		ok              bool
 	}{
 		{
 			// Bare path: the field name ("v") is *not* a branch name, so every
@@ -23003,7 +23003,8 @@ func TestRegression_BareUnionJSONNoExponentialBacktrack(t *testing.T) {
 			schema: `["null",
 				{"type":"record","name":"A","fields":[{"name":"v","type":["null","A","B"]}]},
 				{"type":"record","name":"B","fields":[{"name":"v","type":["null","A","B"]}]}]`,
-			key: "v",
+			key:  "v",
+			leaf: `1`,
 		},
 		{
 			// Tagged-fallback path: the field name ("A") collides with a branch
@@ -23014,6 +23015,19 @@ func TestRegression_BareUnionJSONNoExponentialBacktrack(t *testing.T) {
 			name:   "tagged-fallback-field-name-collides-with-branch",
 			schema: `["null",{"type":"record","name":"A","fields":[{"name":"A","type":["null","A"]}]}]`,
 			key:    "A",
+			leaf:   `1`,
+		},
+		{
+			// EncodeJSON's bare form of the same collision: each object has
+			// a key after "A", so it is a bare record, and a decode of the
+			// value as the branch and then of the object as the bare form
+			// would decode each nested level twice.
+			name:   "bare-form-field-name-collides-with-branch",
+			schema: `["null",{"type":"record","name":"A","fields":[{"name":"A","type":["null","A"]},{"name":"x","type":"int"}]}]`,
+			key:    "A",
+			more:   `,"x":1`,
+			leaf:   `{"A":null,"x":1}`,
+			ok:     true,
 		},
 	}
 
@@ -23027,28 +23041,31 @@ func TestRegression_BareUnionJSONNoExponentialBacktrack(t *testing.T) {
 					b.WriteString(c.key)
 					b.WriteString(`":`)
 				}
-				b.WriteString(`1`)
+				b.WriteString(c.leaf)
 				for range depth {
+					b.WriteString(c.more)
 					b.WriteString(`}`)
 				}
 				return []byte(b.String())
 			}
 
-			// Depth 20 costs ~2^20 full subtree re-decodes if the decoder
-			// backtracks; committing to the first container branch rejects at
-			// the bottom instead.
-			var out any
-			if err := s.DecodeJSON(build(20), &out); err == nil {
-				t.Fatal("expected a decode error (innermost value matches no branch)")
-			}
-
-			// Depth 200 is the arm the backtracking cannot reach at all. 2^200
-			// re-decodes do not return, so a regression here does not produce a
-			// slow answer, it produces no answer. Depth 200 stays within
-			// maxDepth, so the rejection is the bottom mismatch, exercising the
-			// commit-to-first path itself.
-			if err := s.DecodeJSON(build(200), &out); err == nil {
-				t.Fatal("expected a decode error at depth 200")
+			// A decoder that decodes each level twice costs ~2^20 subtree
+			// decodes at depth 20 and does not return at depth 200, so a
+			// regression here produces no answer rather than a slow one.
+			// Depth 200 stays within maxDepth. A success encodes back to
+			// the input.
+			for _, depth := range []int{20, 200} {
+				var out any
+				in := build(depth)
+				err := s.DecodeJSON(in, &out)
+				if (err == nil) != c.ok {
+					t.Fatalf("depth %d: got error %v, want success %v", depth, err, c.ok)
+				}
+				if c.ok {
+					if back, err := s.EncodeJSON(out); err != nil || !bytes.Equal(back, in) {
+						t.Fatalf("depth %d: decoded value encodes to %s (error %v), want the input", depth, back, err)
+					}
+				}
 			}
 		})
 	}
@@ -24261,6 +24278,9 @@ func TestMatrix_JSONUnionFailureKeepsTarget(t *testing.T) {
 	// mapU is a map whose values can be maps, so one document decodes both
 	// as its tagged form and, with more keys, as its bare form.
 	mapU := `{"type":"map","values":["long",{"type":"map","values":"long"}]}`
+	// recA has a field named as its own branch, so its bare form starts
+	// with a key that names the branch.
+	recA := `{"type":"record","name":"A","fields":[{"name":"A","type":["null","A"],"default":null},{"name":"m","type":{"type":"map","values":["null","A"]},"default":{}},{"name":"x","type":"int","default":0}]}`
 	for _, c := range []struct {
 		name, union, doc string
 		want             any        // nil: the decode must fail
@@ -24293,10 +24313,25 @@ func TestMatrix_JSONUnionFailureKeepsTarget(t *testing.T) {
 			map[string]any{"R": "x"}, func() any { return nil }},
 		{"a map with the key array", `[{"type":"array","items":"long"},{"type":"map","values":"long"}]`, `{"array":5}`,
 			map[string]any{"array": int64(5)}, func() any { return nil }},
+		// A newer writer's field named like a branch, first in the object,
+		// is an unknown key of the record, which the bare form skips.
+		{"a record with an unknown first key named as a branch", `[{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]},{"type":"map","values":"long"}]`,
+			`{"map":{"k":"s"},"x":1}`, map[string]any{"x": int32(1)}, func() any { return nil }},
 		// A tagged form has one key: this is EncodeJSON's output for a map
 		// whose first key names a branch.
 		{"a map of two keys, the first a branch name, into your map", `[{"type":"map","values":"long"},"int"]`, `{"int":7,"x":1}`,
 			&map[string]int64{"int": 7, "x": 1}, func() any { m := map[string]int64{}; return &m }},
+		// The bare record under "A" stops the decode of the tagged form
+		// around it, which then decodes again. The map that the stopped
+		// decode filled is not one the target had, so the repeated key
+		// "k" keeps its second value only.
+		{"a tagged form decoded again over a repeated key", `["null",` + recA + `]`,
+			`{"A":{"m":{"k":{"m":{"a":null}},"k":{"m":{"b":null}}},"A":{"A":{"x":2},"x":3}}}`,
+			&jsonUnionRepeatT{
+				A: &jsonUnionRepeatT{A: &jsonUnionRepeatT{M: map[string]*jsonUnionRepeatT{}, X: 2}, M: map[string]*jsonUnionRepeatT{}, X: 3},
+				M: map[string]*jsonUnionRepeatT{"k": {M: map[string]*jsonUnionRepeatT{"b": nil}}},
+			},
+			func() any { return &jsonUnionRepeatT{} }},
 		// The tagged record decodes into a new map behind the pointer and
 		// its object does not close. The map you had comes back with the
 		// key "a" it had, which is also a field of the record.
@@ -24394,6 +24429,12 @@ type jsonUnionFallbackR struct {
 	B     int32            `avro:"b"`
 	M     map[string]int64 `avro:"m"`
 	Extra string           `avro:"-"`
+}
+
+type jsonUnionRepeatT struct {
+	A *jsonUnionRepeatT            `avro:"A"`
+	M map[string]*jsonUnionRepeatT `avro:"m"`
+	X int32                        `avro:"x"`
 }
 
 // minAllocsPerRun returns the fewest allocations one call of f makes over
