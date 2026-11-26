@@ -1818,7 +1818,7 @@ func TestDecodeJSONScannerEdgeCases(t *testing.T) {
 	})
 	t.Run("skipValue EOF", func(t *testing.T) {
 		sc := &jsonScanner{data: []byte{}}
-		if err := sc.skipValue(); err == nil {
+		if err := sc.skipValue(0); err == nil {
 			t.Fatal("expected error")
 		}
 	})

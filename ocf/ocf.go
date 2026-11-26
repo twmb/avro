@@ -900,14 +900,13 @@ type checkedReader struct {
 	r          io.Reader
 	emptyReads int
 
-	// read counts the bytes r has returned. fileLeft is how many bytes a
-	// regular file had left when read was fileAt, so that left asks a file
-	// once and counts down from the answer, not once per block. fileState
-	// is 0 before we ask, 1 when fileLeft is set, and -1 when r is not a
-	// regular file or its Stat or Seek fails.
+	// read counts the bytes r has returned. fileSize is the size Stat
+	// reported for the regular file r reads, and left subtracts `read` from
+	// it, so that left calls Stat again only for a refresh. fileState is 0
+	// before we call Stat, 1 when fileSize is set, and -1 when Stat fails or
+	// returns nil or a file that is not regular.
 	read      int64
-	fileLeft  int64
-	fileAt    int64
+	fileSize  int64
 	fileState int8
 }
 
@@ -934,27 +933,23 @@ func (c *checkedReader) Read(p []byte) (int, error) {
 
 // left reports how many bytes r still has to return, when r can say without
 // being read: one with a Len method, as bytes.Reader, bytes.Buffer, and
-// strings.Reader have, or a regular file. We ask a file with Stat and its
-// current offset, neither of which moves it. refresh asks the file again,
-// since a file can grow.
+// strings.Reader have, or a regular file, which Stat describes. We never Seek
+// r, so we count a file's size from its start: for a file the caller has
+// already read part of, we report more bytes than it has left. refresh calls
+// Stat again, since a file can grow.
 func (c *checkedReader) left(refresh bool) (int64, bool) {
 	switch src := c.r.(type) {
 	case interface{ Len() int }:
 		return int64(src.Len()), true
-	case interface {
-		io.Seeker
-		Stat() (fs.FileInfo, error)
-	}:
+	case interface{ Stat() (fs.FileInfo, error) }:
 		if c.fileState == 0 || refresh && c.fileState > 0 {
 			c.fileState = -1
-			if fi, err := src.Stat(); err == nil && fi.Mode().IsRegular() {
-				if off, err := src.Seek(0, io.SeekCurrent); err == nil {
-					c.fileLeft, c.fileAt, c.fileState = fi.Size()-off, c.read, 1
-				}
+			if fi, err := src.Stat(); err == nil && fi != nil && fi.Mode().IsRegular() {
+				c.fileSize, c.fileState = fi.Size(), 1
 			}
 		}
 		if c.fileState > 0 {
-			return c.fileLeft - (c.read - c.fileAt), true
+			return c.fileSize - c.read, true
 		}
 	}
 	return 0, false

@@ -3960,7 +3960,7 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 	})
 
 	// JSON decode of a deeply-nested matching value. Bound: decodeValue's
-	// sl.depth check + the scanner's skipValueDepth (json_scan.go), both at
+	// sl.depth check + the scanner's skipValue (json_scan.go), both at
 	// maxDepth. Extreme: TestDecodeDeepInputDoesntPanic/json_union_trial.
 	var jsonDeep []byte
 	for range 20000 {
@@ -3975,7 +3975,7 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 		return s.DecodeJSON(jsonDeep, &out)
 	})
 	// Scanner skip of a deeply-nested unknown field value (json_scan.go's
-	// skipValueDepth, a separate recursion from decodeValue).
+	// skipValue, which counts on from decodeValue's depth).
 	jsonUnknownDeep := []byte(`{"value":0,"next":null,"x":` + strings.Repeat("[", 20000) + strings.Repeat("]", 20000) + `}`)
 	wantTerminate(t, "DecodeJSON/skip-unknown-deep", func() error {
 		var out any

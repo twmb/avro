@@ -12667,8 +12667,11 @@ func TestMatrix_UsedTargetParity(t *testing.T) {
 								case pn != nil && (!bad.panics || pn != errParityMoney):
 									fail("%s | value %d then a failure: decoder %d panicked: %v", cell, i, w, pn)
 									continue
-								case pn == nil && err == nil:
+								case pn == nil && err == nil && w == 0:
 									continue // a value of zero bytes decodes from the prefix alone
+								case pn == nil && err == nil:
+									fail("%s | value %d then a failure: %s did not fail on %s, where Decode fails", cell, i, decoders[w], bad.js)
+									continue
 								}
 								got := get()
 								if after := paritySnap(reflect.ValueOf(got), 0); after != before || parityID(got) != parityID(mid) || parityID(parityInside(got)) != parityID(parityInside(mid)) {
@@ -12708,7 +12711,7 @@ func TestMatrix_UsedTargetParity(t *testing.T) {
 			}
 		}
 	}
-	// The bare form runs about 760,000 times; an ambiguity check that
+	// The bare form runs about 870,000 times; an ambiguity check that
 	// grew too wide would skip it.
 	if bareRuns < 500000 {
 		t.Errorf("the bare JSON form decoded %d times, want it on most cells", bareRuns)
@@ -12885,11 +12888,15 @@ func parityCases() []parityCase {
 	}
 	return append(cases, []parityCase{
 		{"u[null,record]", `["null",` + recP + `]`, []any{nil, p(1)}, false},
+		{"u[null,record M{M}]", `["null",{"type":"record","name":"M","fields":[{"name":"M","type":` + mapL + `},{"name":"x","type":"long"}]}]`, []any{nil, map[string]any{"M": map[string]any{"k": int64(1)}, "x": int64(2)}}, false},
 		{"u[array,record]", `[` + arrL + `,` + recP + `]`, []any{[]any{int64(1)}, p(7)}, false},
 		{"u[recP,recQ]", `[` + recP + `,` + recQ + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"Q": map[string]any{"q": int64(2)}}}, false},
 		{"u[recP,map]", `[` + recP + `,` + mapL + `]`, []any{map[string]any{"P": p(1)}, map[string]any{"map": map[string]any{"k": int64(5)}}}, false},
 		{"u[long,decimal]", `["long",` + dec + `]`, []any{int64(7), big.NewRat(5, 4)}, false},
 		{"u[long,map]", `["long",` + mapL + `]`, []any{int64(7), map[string]any{"k": int64(5)}}, false},
+		{"u[map,int]", `[` + mapL + `,"int"]`, []any{int32(7), map[string]any{"int": int64(1) << 40}}, false},
+		{"u[map<double>,long]", `[{"type":"map","values":"double"},"long"]`, []any{int64(7), map[string]any{"long": 1.5}}, false},
+		{"u[money,map]", `[` + mon + `,` + mapL + `]`, []any{&parityMoney{5}, map[string]any{"k": int64(5)}}, true},
 		{"u[null,array,map,string]", `["null",` + arrL + `,` + mapL + `,"string"]`, []any{nil, []any{int64(1)}, map[string]any{"k": int64(5)}, "x"}, false},
 		{"u[bytes,string]", `["bytes","string"]`, []any{map[string]any{"bytes": []byte("b")}, map[string]any{"string": "x"}}, false},
 		{"array<record>", `{"type":"array","items":` + recP + `}`, []any{[]any{p(1)}, []any{p(2), p(3)}}, false},
@@ -13540,9 +13547,8 @@ func parityMultiKey(x any) bool {
 
 // parityBareAmbiguous reports whether the bare JSON js of a value of s can
 // have more than one reading: a union in s has two branches whose JSON starts
-// alike, or js has an object key that names a branch of a union in s.
+// alike.
 func parityBareAmbiguous(s *avro.Schema, js []byte) bool {
-	var names []string
 	ambiguous, quotedFloat := false, false
 	var walk func(n *avro.SchemaNode, depth int)
 	walk = func(n *avro.SchemaNode, depth int) {
@@ -13568,10 +13574,6 @@ func parityBareAmbiguous(s *avro.Schema, js []byte) bool {
 				} else if c == "string" {
 					quotedFloat = quotedFloat || seen["quoted float"]
 				}
-				names = append(names, b.Type, b.Name)
-				if b.LogicalType != "" {
-					names = append(names, b.Type+"."+b.LogicalType)
-				}
 				walk(b, depth+1)
 			}
 		}
@@ -13582,15 +13584,7 @@ func parityBareAmbiguous(s *avro.Schema, js []byte) bool {
 		walk(n.Values, depth+1)
 	}
 	walk(s.Root(), 0)
-	if ambiguous || quotedFloat && (bytes.Contains(js, []byte(`"NaN"`)) || bytes.Contains(js, []byte(`Infinity"`))) {
-		return true
-	}
-	for _, name := range names {
-		if name != "" && bytes.Contains(js, []byte(`"`+name+`":`)) {
-			return true
-		}
-	}
-	return false
+	return ambiguous || quotedFloat && (bytes.Contains(js, []byte(`"NaN"`)) || bytes.Contains(js, []byte(`Infinity"`)))
 }
 
 // checkTakenOut checks the values you took out of a used []any before the next

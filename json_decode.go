@@ -163,7 +163,24 @@ type jsonDecoder struct {
 	// value to its leaf decoder rather than the logical-transformed one.
 	// decodeKind captures and clears it on entry so it scopes to one node.
 	suppressLogical bool
+	// lookAhead makes decodeUnionObject look past the value of a container
+	// branch before it decodes the value as that branch. Otherwise, for an
+	// object with more keys, a decode as the branch and then a decode as the
+	// bare form would decode each nested level twice, which compounds with
+	// depth. We set it at the first such value that does not decode as the
+	// branch, or whose object has more keys, so that a valid document in the
+	// tagged form never looks past a value.
+	lookAhead bool
+	// tagging counts the values decodeUnionObject is decoding as a branch.
+	// While `restart` is set, each of those decodes returns errLookAhead, and
+	// the outermost decodes its object again with lookAhead. Every decode
+	// between two of them returns the error, since decodeUnionBare tries no
+	// other branch after a record, map, or array fails.
+	tagging int
+	restart bool
 }
+
+var errLookAhead = errors.New("avro json: union object decoded again with look-ahead")
 
 // decodeValue reads the next JSON value off the scanner, guided by the schema
 // node, and assigns it to v. A node carrying a custom-decoder wrapper
@@ -1215,7 +1232,7 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 				}
 			}
 			if idx < 0 {
-				if err := ctx.scanner.skipValue(); err != nil {
+				if err := ctx.scanner.skipValue(ctx.slab.depth); err != nil {
 					return err
 				}
 			} else {
@@ -1415,7 +1432,7 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 		func(idx int, key string) error {
 			f := &node.fields[idx]
 			if mapping.unmapped(idx) {
-				return ctx.scanner.skipValue()
+				return ctx.scanner.skipValue(ctx.slab.depth)
 			}
 			fv, err := fieldByIndex(v, mapping.indices[idx])
 			if err != nil {
@@ -1537,7 +1554,9 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 				// key "map".
 				colonErr := ctx.scanner.expect(':')
 				fits := colonErr == nil && jsonTokenMatchesBranch(ctx.scanner.peek(), branch)
-				if colonErr == nil && (!unionBranchRecurses(branch.kind) || fits) {
+				container := unionBranchRecurses(branch.kind)
+				bare := ctx.lookAhead && fits && container && !ctx.closesAfterValue()
+				if colonErr == nil && (!container || fits && !bare) {
 					// The value goes where the union rules put it, as in
 					// decodeBranchInto. The tagged form is known only when
 					// its object closes: a malformed `{"long": 42,`
@@ -1551,7 +1570,9 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 						dst = t.cell()
 					}
 					valuePos := ctx.scanner.pos
+					ctx.tagging++
 					err := ctx.decodeValue(dst, branch)
+					ctx.tagging--
 					if err == nil && ctx.scanner.peek() == '}' {
 						ctx.scanner.pos++
 						if !direct {
@@ -1560,19 +1581,49 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 						ctx.wrapBranch(v, node, branch)
 						return nil
 					}
-					if err == nil {
+					// The value did not decode as branch, or the object has
+					// more keys. `under` is whether a decode of a value under
+					// this one set `restart`.
+					under := ctx.restart
+					if container && !ctx.lookAhead && !errors.Is(err, errTooDeep) {
+						ctx.lookAhead, ctx.restart = true, true
+					}
+					again := false
+					if ctx.restart && ctx.tagging == 0 {
+						ctx.restart = false
+						ctx.scanner.pos = valuePos
+						closes := ctx.closesAfterValue()
+						if closes && !under {
+							return err
+						}
+						// The object is the bare form, or it is the tagged
+						// form and a value under it stopped the decode.
+						again, err = closes, nil
+					}
+					// The bare form, and a decode of the object again, read
+					// the target: undoTagged removes what the value wrote,
+					// so that a map it filled does not read as one the
+					// target had.
+					if err == nil || ctx.restart {
 						ctx.undoTagged(dst, branch, valuePos)
 						if direct && t.slot.IsValid() {
 							setAny(t.slot, t.seed)
 						}
 					}
-					// A value that can start the branch commits to the
-					// tagged form, so its error is the error, as Decode
-					// returns for the same value. For a container branch,
-					// the bare retry would also re-decode the subtree,
-					// 2^depth when a record field name collides with a
-					// branch name.
-					if errors.Is(err, errTooDeep) || err != nil && fits {
+					if again {
+						ctx.scanner.pos = savedPos
+						return ctx.decodeUnionObject(v, node)
+					}
+					if ctx.restart {
+						return errLookAhead
+					}
+					// A container branch keeps its error, since its object
+					// closes after the value. A bare retry of a one-key object
+					// would decode the value again, 2^depth when a record
+					// field name collides with a branch name. A one-key object
+					// whose value decodes as a scalar branch keeps its error
+					// too, as Decode returns the same error for that value.
+					if errors.Is(err, errTooDeep) || err != nil && (container || fits && ctx.isTaggedForm(branch, valuePos)) {
 						return err
 					}
 					taggedErr = err
@@ -1590,6 +1641,50 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 		return err
 	}
 	return nil
+}
+
+// closesAfterValue reports whether the object closes after the array or object
+// at the scanner. It finds where the value ends by its brackets and strings
+// alone, since the decode that follows reads the value in full. A value that
+// does not end counts as closing, so that the decode of it returns the error.
+func (ctx *jsonDecoder) closesAfterValue() bool {
+	data, depth := ctx.scanner.data, 0
+	for i := ctx.scanner.pos; i < len(data); i++ {
+		switch data[i] {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			if depth--; depth == 0 {
+				for i++; i < len(data) && (data[i] == ' ' || data[i] == '\t' || data[i] == '\n' || data[i] == '\r'); i++ {
+				}
+				return i < len(data) && data[i] == '}'
+			}
+		case '"':
+			for i++; i < len(data) && data[i] != '"'; i++ {
+				if data[i] == '\\' {
+					i++
+				}
+			}
+		}
+	}
+	return true
+}
+
+// isTaggedForm reports whether the object whose value starts at pos is the
+// tagged form of branch: the value decodes as branch on its own, into a new any
+// and without custom types, and the object closes after it. EncodeJSON never
+// writes such an object for a map: it encodes a one-key map whose key names a
+// branch, and whose value encodes as that branch, as that branch. A union
+// decode that failed on such an object failed on the target or a custom type,
+// as Decode fails for that value. We call it only after a failed decode.
+func (ctx *jsonDecoder) isTaggedForm(branch *schemaNode, pos int) bool {
+	savedPos, bypass := ctx.scanner.pos, ctx.slab.bypassCustom
+	ctx.scanner.pos, ctx.slab.bypassCustom = pos, true
+	var x any
+	err := ctx.decodeValue(reflect.ValueOf(&x).Elem(), branch)
+	closes := err == nil && ctx.scanner.peek() == '}'
+	ctx.scanner.pos, ctx.slab.bypassCustom = savedPos, bypass
+	return closes
 }
 
 // decodeBranchInto decodes the next JSON value as the given union branch and
@@ -1621,8 +1716,8 @@ func (ctx *jsonDecoder) wrapBranch(v reflect.Value, union, branch *schemaNode) {
 }
 
 // undoTagged removes what the tagged form of branch wrote into the value the
-// target has, after the form decoded and its object did not close, so that
-// the bare form does not decode into it.
+// target has, after its object did not close or a decode under it stopped, so
+// that the bare form, or a decode of the object again, does not decode into it.
 //
 // We decode the tagged form into the map or pointer you have, not into a copy
 // of it, because the tagged form's object closes in every document except one
@@ -1662,7 +1757,7 @@ func (ctx *jsonDecoder) undoTagged(target reflect.Value, branch *schemaNode, val
 		if ctx.scanner.expect('{') == nil && ctx.scanner.peek() != '}' {
 			for {
 				key, err := ctx.consumeSlabString()
-				if err != nil || ctx.scanner.expect(':') != nil || ctx.scanner.skipValue() != nil {
+				if err != nil || ctx.scanner.expect(':') != nil || ctx.scanner.skipValue(ctx.slab.depth) != nil {
 					break
 				}
 				del(key)
