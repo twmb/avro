@@ -3,8 +3,10 @@ package ocf_test
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -199,6 +201,21 @@ type lenZeroReader struct{ io.Reader }
 
 func (lenZeroReader) Len() int { return 0 }
 
+// statReader is a reader whose Stat returns what stat returns, and whose Seek
+// fails the test. Only Read of the embedded reader is promoted.
+type statReader struct {
+	io.Reader
+	t    *testing.T
+	stat func() (fs.FileInfo, error)
+}
+
+func (r statReader) Stat() (fs.FileInfo, error) { return r.stat() }
+
+func (r statReader) Seek(int64, int) (int64, error) {
+	r.t.Error("the reader's Seek was called")
+	return 0, errors.New("Seek")
+}
+
 // TestRegression_OCFDeclaredSizeDoesNotEagerAllocate pins that a reader does
 // not allocate a size the file declares before the bytes arrive. Raising
 // WithMaxBlockBytes to a very large value is the natural way to say "accept big
@@ -214,8 +231,9 @@ func (lenZeroReader) Len() int { return 0 }
 // to the bytes actually present. A reader that cannot say gets one allocation
 // within the default cap, and an incremental read above it. The source
 // axis is how the caller's reader can answer: a Len method, a regular file, a
-// stream that cannot say, and a Len that under-reports. What the reader says
-// picks how we read and never whether we accept, nor what the error says.
+// stream that cannot say, a Len that under-reports, and a Stat that returns
+// nil. What the reader says picks how we read and never whether we accept,
+// nor what the error says, and we never call a file's Seek.
 func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 	// A valid header for "long", reused for its embedded 16-byte sync marker.
 	var hb bytes.Buffer
@@ -264,10 +282,13 @@ func TestRegression_OCFDeclaredSizeDoesNotEagerAllocate(t *testing.T) {
 			if _, err := f.Seek(0, io.SeekStart); err != nil {
 				t.Fatal(err)
 			}
-			return f
+			return statReader{f, t, f.Stat}
 		}},
 		{"stream", false, false, func(_ *testing.T, file []byte) io.Reader { return struct{ io.Reader }{bytes.NewReader(file)} }},
 		{"Len reports zero", true, false, func(_ *testing.T, file []byte) io.Reader { return lenZeroReader{bytes.NewReader(file)} }},
+		{"Stat returns nil", false, false, func(t *testing.T, file []byte) io.Reader {
+			return statReader{bytes.NewReader(file), t, func() (fs.FileInfo, error) { return nil, nil }}
+		}},
 	}
 
 	for _, tc := range []struct {
