@@ -24293,6 +24293,10 @@ func TestMatrix_JSONUnionFailureKeepsTarget(t *testing.T) {
 			map[string]any{"R": "x"}, func() any { return nil }},
 		{"a map with the key array", `[{"type":"array","items":"long"},{"type":"map","values":"long"}]`, `{"array":5}`,
 			map[string]any{"array": int64(5)}, func() any { return nil }},
+		// A tagged form has one key: this is EncodeJSON's output for a map
+		// whose first key names a branch.
+		{"a map of two keys, the first a branch name, into your map", `[{"type":"map","values":"long"},"int"]`, `{"int":7,"x":1}`,
+			&map[string]int64{"int": 7, "x": 1}, func() any { m := map[string]int64{}; return &m }},
 		// The tagged record decodes into a new map behind the pointer and
 		// its object does not close. The map you had comes back with the
 		// key "a" it had, which is also a field of the record.

@@ -1566,13 +1566,12 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 							setAny(t.slot, t.seed)
 						}
 					}
-					// A value that can start the branch commits to the
-					// tagged form, so its error is the error, as Decode
-					// returns for the same value. For a container branch,
-					// the bare retry would also re-decode the subtree,
-					// 2^depth when a record field name collides with a
-					// branch name.
-					if errors.Is(err, errTooDeep) || err != nil && fits {
+					// A container branch commits to the tagged form: the
+					// bare retry would re-decode the subtree, 2^depth when a
+					// record field name collides with a branch name. So does
+					// a one-key object whose value decodes as the branch, as
+					// Decode returns the same error for that value.
+					if errors.Is(err, errTooDeep) || err != nil && (unionBranchRecurses(branch.kind) || fits && ctx.isTaggedForm(branch, valuePos)) {
 						return err
 					}
 					taggedErr = err
@@ -1590,6 +1589,23 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 		return err
 	}
 	return nil
+}
+
+// isTaggedForm reports whether the object whose value starts at pos is the
+// tagged form of branch: the value decodes as branch on its own, into a new any
+// and without custom types, and the object closes after it. EncodeJSON never
+// writes such an object for a map: it encodes a one-key map whose key names a
+// branch, and whose value encodes as that branch, as that branch. A union
+// decode that failed on such an object failed on the target or a custom type,
+// as Decode fails for that value. We call it only after a failed decode.
+func (ctx *jsonDecoder) isTaggedForm(branch *schemaNode, pos int) bool {
+	savedPos, bypass := ctx.scanner.pos, ctx.slab.bypassCustom
+	ctx.scanner.pos, ctx.slab.bypassCustom = pos, true
+	var x any
+	err := ctx.decodeValue(reflect.ValueOf(&x).Elem(), branch)
+	closes := err == nil && ctx.scanner.peek() == '}'
+	ctx.scanner.pos, ctx.slab.bypassCustom = savedPos, bypass
+	return closes
 }
 
 // decodeBranchInto decodes the next JSON value as the given union branch and
