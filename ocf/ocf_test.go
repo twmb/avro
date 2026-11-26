@@ -2936,7 +2936,7 @@ func TestWriterBlockFramingContract(t *testing.T) {
 		// A block costs one allocation: the slice that holds its header,
 		// data, and sync marker. The null codec copies into it and zstd
 		// compresses into it, sized by the block before or, for a writer's
-		// first block, by the uncompressed data.
+		// first block under 1 MiB, by the uncompressed data.
 		datum := append([]byte{0x90, 0x03}, bytes.Repeat([]byte("ab"), 100)...) // a 200-byte "bytes"
 		shared := MustZstdCodec(nil, nil)
 		defer shared.Close()
@@ -2989,6 +2989,16 @@ func TestWriterBlockFramingContract(t *testing.T) {
 				last := dst.parts[len(dst.parts)-1]
 				if uncompressed := 100 * len(datum); cap(last) > uncompressed/2 {
 					t.Errorf("%s: the third block's slice has room for %d bytes, for %d written and %d uncompressed", cm.name, cap(last), len(last), uncompressed)
+				}
+				// A first block of 1 MiB or more is not sized by its
+				// uncompressed data.
+				var big keepWriter
+				bw := mustNewWriter(t, &big, schema, WithCodec(cm.mk(t)), WithBlockCount(6000), WithBlockBytes(1<<26))
+				fill(bw, 6000)
+				mustClose(t, bw)
+				first := big.parts[len(big.parts)-1]
+				if uncompressed := 6000 * len(datum); cap(first) > uncompressed/2 {
+					t.Errorf("%s: a first block's slice has room for %d bytes, for %d written and %d uncompressed", cm.name, cap(first), len(first), uncompressed)
 				}
 			}
 		}

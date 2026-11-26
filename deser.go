@@ -119,9 +119,9 @@ func (s *slab) carve(n int) []byte {
 }
 
 // numSlabLen is how many numbers decoded into an any share one allocation.
-// One number you keep keeps its whole slab alive, so the slab is small: 64
-// numbers is 512 bytes.
-const numSlabLen = 64
+// One number you keep keeps its whole slab alive, so the slab is small: 8
+// numbers is 64 bytes.
+const numSlabLen = 8
 
 // eface is the layout of an interface value with no methods: a type word and
 // a data word.
@@ -1852,7 +1852,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	useFastIface := iface && s.fastIfaceLoop != nil
 	// envNames are the envelope keys of a union of items with TaggedUnions.
 	var envNames []string
-	if useFastIface && sl != nil && sl.taggedUnions && s.items != nil && s.items.kind == "union" {
+	if useFastIface && sl.taggedUnions && s.items != nil && s.items.kind == "union" {
 		envNames = unionShapeOf(s.items).names
 	}
 	// Avro arrays are encoded as a series of blocks. Each block starts
