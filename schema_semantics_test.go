@@ -9606,13 +9606,30 @@ func TestMatrix_JSONSkipUnknownFieldAcceptsValid(t *testing.T) {
 // TestRegression_JSONSkipDepthBounded confirms the strict (now recursive)
 // skip validator keeps the old iterative skipCompound's DoS resistance. A
 // pathologically deep skipped value errors rather than overflowing the stack.
+// A skipped value's nesting counts with the records around it, so one depth
+// limit bounds the document, and a scalar at the limit ends the nesting there.
 func TestRegression_JSONSkipDepthBounded(t *testing.T) {
-	reader := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"known","type":"long"}]}`)
-	deep := strings.Repeat("[", 100000) + strings.Repeat("]", 100000)
-	doc := fmt.Sprintf(`{"known":42,"x":%s}`, deep)
-	var out map[string]any
-	if err := reader.DecodeJSON([]byte(doc), &out); err == nil {
-		t.Fatal("deeply-nested skipped value accepted; expected a depth-limit error")
+	reader := avro.MustParse(`["null",{"type":"record","name":"Leaf","fields":[{"name":"known","type":"long"}]},{"type":"record","name":"R","fields":[{"name":"r","type":["null","Leaf","R"]}]}]`)
+	// nested puts a Leaf with the skipped value x under `records` levels of
+	// R, each a union and a record, so the Leaf is at depth 2+2*records.
+	nested := func(records int, x string) string {
+		return strings.Repeat(`{"R":{"r":`, records) + `{"Leaf":{"known":42,"x":` + x + `}}` + strings.Repeat(`}}`, records)
+	}
+	arrays := func(n int) string { return strings.Repeat("[", n) + strings.Repeat("]", n) }
+	for _, c := range []struct {
+		name string
+		doc  string
+		ok   bool
+	}{
+		{"a deep skipped value", nested(0, arrays(100000)), false},
+		{"a skipped value under records, deeper than the limit together", nested(250, arrays(600)), false},
+		{"the same skipped value under fewer records", nested(150, arrays(600)), true},
+		{"a skipped scalar at the limit", nested(499, `7`), true},
+	} {
+		var out any
+		if err := reader.DecodeJSON([]byte(c.doc), &out); (err == nil) != c.ok {
+			t.Errorf("%s: got error %v, want success %v", c.name, err, c.ok)
+		}
 	}
 }
 

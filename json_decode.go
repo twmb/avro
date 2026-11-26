@@ -1215,7 +1215,7 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 				}
 			}
 			if idx < 0 {
-				if err := ctx.scanner.skipValue(); err != nil {
+				if err := ctx.scanner.skipValue(ctx.slab.depth); err != nil {
 					return err
 				}
 			} else {
@@ -1415,7 +1415,7 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 		func(idx int, key string) error {
 			f := &node.fields[idx]
 			if mapping.unmapped(idx) {
-				return ctx.scanner.skipValue()
+				return ctx.scanner.skipValue(ctx.slab.depth)
 			}
 			fv, err := fieldByIndex(v, mapping.indices[idx])
 			if err != nil {
@@ -1678,7 +1678,7 @@ func (ctx *jsonDecoder) undoTagged(target reflect.Value, branch *schemaNode, val
 		if ctx.scanner.expect('{') == nil && ctx.scanner.peek() != '}' {
 			for {
 				key, err := ctx.consumeSlabString()
-				if err != nil || ctx.scanner.expect(':') != nil || ctx.scanner.skipValue() != nil {
+				if err != nil || ctx.scanner.expect(':') != nil || ctx.scanner.skipValue(ctx.slab.depth) != nil {
 					break
 				}
 				del(key)

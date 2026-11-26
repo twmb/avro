@@ -195,30 +195,29 @@ func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 	return s.data[start:s.pos], nil
 }
 
-// skipValue skips an entire JSON value, for unknown record fields. We accept
+// skipValue skips an entire JSON value, such as the value of an unknown record
+// field. We accept
 // the same bare special-float tokens decodeJSONFloat does (NaN, Infinity,
 // -Infinity and their case variants), since fastavro writes them bare and
 // Java writes the quoted form the string arm already skips. Both paths share
 // isBareSpecialFloatStart and parseSpecialFloat, so they cannot drift.
-func (s *jsonScanner) skipValue() error {
-	return s.skipValueDepth(0)
-}
-
-// skipValueDepth skips one JSON value while validating its full grammar, not
-// merely delimiting it. A delimit-only skip would be a second, lax JSON
-// parser accepting input the value path (and Java, fastavro, encoding/json)
-// rejects: 1.2.3, "\q", or [1,2,]. We recurse where a delimiter could loop,
-// so depth bounds a pathologically deep skipped value.
-func (s *jsonScanner) skipValueDepth(depth int) error {
-	// >= maxDepth like the value path, so the two guards agree. depth
-	// restarts at 0 per skipped value, since a skipped value is a
-	// self-contained sub-parse; the worst case is about 2*maxDepth frames.
-	if depth >= maxDepth {
-		return errTooDeep
-	}
+//
+// We validate the value's full grammar, not merely delimit it. A
+// delimit-only skip would be a second, lax JSON parser accepting input the
+// value path (and Java, fastavro, encoding/json) rejects: 1.2.3, "\q", or
+// [1,2,]. We recurse where a delimiter could loop, so depth bounds a
+// pathologically deep skipped value.
+func (s *jsonScanner) skipValue(depth int) error {
 	s.skipWhitespace()
 	if s.pos >= len(s.data) {
 		return fmt.Errorf("avro json: unexpected EOF")
+	}
+	// An array or object at maxDepth is too deep, as on the value path, where
+	// a scalar at the limit ends the nesting. The decoder passes its own
+	// depth, so that one maxDepth bounds the nesting of a document, skipped
+	// or decoded.
+	if p := s.data[s.pos]; depth >= maxDepth && (p == '[' || p == '{') {
+		return errTooDeep
 	}
 	switch p := s.data[s.pos]; p {
 	case '"':
@@ -286,7 +285,7 @@ func (s *jsonScanner) skipArrayStrict(depth int) error {
 		return nil
 	}
 	for {
-		if err := s.skipValueDepth(depth + 1); err != nil {
+		if err := s.skipValue(depth + 1); err != nil {
 			return err
 		}
 		s.skipWhitespace()
@@ -325,7 +324,7 @@ func (s *jsonScanner) skipObjectStrict(depth int) error {
 			return fmt.Errorf("avro json: expected ':' after object key at offset %d", s.pos)
 		}
 		s.pos++
-		if err := s.skipValueDepth(depth + 1); err != nil {
+		if err := s.skipValue(depth + 1); err != nil {
 			return err
 		}
 		s.skipWhitespace()
