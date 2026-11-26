@@ -18777,8 +18777,7 @@ func equalAvro(a, b any) bool {
 // assert invariants that hold for every generated (schema, value) pair,
 // instead of the author hand-picking example inputs (which miss the
 // intersections where bugs live). The generator is seeded, so a failing
-// case is reproducible: re-run the reported seed. See
-// CORRECTNESS_PLAN.md §T2.
+// case is reproducible: re-run the reported seed.
 
 // genNode is a generated schema node: enough structure to (a) emit the schema
 // JSON and (b) draw arbitrarily many matching Go values.
@@ -19194,9 +19193,9 @@ func TestInvariant_EncodeDecodeTargetParity(t *testing.T) {
 
 // ---------- boundary_test.go ----------
 
-// Tier-2 boundary matrix (CORRECTNESS_PLAN.md §T2d). The recurring class
+// Tier-2 boundary matrix. The recurring class
 // is numeric boundary / overflow handling across paths, where the value
-// is exactly at a representability edge (2^53±1, 2^63, 2^64, 2^24±1).
+// is exactly at a representability edge (2^53+-1, 2^63, 2^64, 2^24+-1).
 // Caught by reverting its fix: float-to-integer decode must bound in
 // *float* space, not via an int64(f) round trip. The conversion is
 // implementation-defined on overflow (arm64 saturates, amd64 wraps), so
@@ -19207,7 +19206,7 @@ func TestInvariant_EncodeDecodeTargetParity(t *testing.T) {
 
 // ---------- crosspath_test.go ----------
 
-// Tier-2 cross-path byte identity (CORRECTNESS_PLAN.md §T2c). We encode
+// Tier-2 cross-path byte identity. We encode
 // an addressable struct through the unsafe fast path and a
 // map[string]any through the reflect path; for the same logical record
 // they must produce byte-identical wire. The recurring class this guards
@@ -19217,7 +19216,7 @@ func TestInvariant_EncodeDecodeTargetParity(t *testing.T) {
 
 // ---------- resolution_test.go ----------
 
-// Tier-2 schema-resolution matrix (CORRECTNESS_PLAN.md resolution gap).
+// Tier-2 schema-resolution matrix.
 // Resolution (reader schema != writer schema) is a belief-heavy path whose
 // numeric promotion arms (int/long -> float/double) must round exactly as
 // a direct Go conversion would, and must single-round. An int64 widens
@@ -19229,7 +19228,7 @@ func TestInvariant_EncodeDecodeTargetParity(t *testing.T) {
 
 // ---------- metadata_test.go ----------
 
-// Tier-2 metadata-API <-> wire consistency (CORRECTNESS_PLAN.md metadata gap).
+// Tier-2 metadata-API <-> wire consistency.
 // The recurring class: Schema.Root().Fields[i].Default (the metadata view)
 // drifting from the value the wire actually materializes for that default --
 // wrong Go type, lost precision, or a different union branch. The invariant
@@ -19301,7 +19300,7 @@ func TestProperty_MetadataDefaultMatchesWire(t *testing.T) {
 
 // ---------- decimal_roundtrip_test.go ----------
 
-// Tier-2 decimal round-trip matrix (CORRECTNESS_PLAN.md decimal gap). Decimal
+// Tier-2 decimal round-trip matrix. Decimal
 // is a recurring hot spot (scale derivation, source-precision, coercion). The
 // generalized invariant: a value exactly representable at a schema's scale
 // must survive Encode -> Decode unchanged, across bytes+decimal / fixed+decimal
@@ -24164,6 +24163,9 @@ func TestScalarDecodeNoAllocAfterGC(t *testing.T) {
 // the allocations of decoding as many zeros.
 func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 	const items = 1000
+	// A decode boxes the numbers into one slab per 8 of them, and allocates
+	// a few times more for the rest of the value.
+	const boxed = items/8 + 10
 	ms := func(i int) any { return time.Duration(1000+i) * time.Millisecond }
 	for _, tc := range []struct {
 		name, schema string
@@ -24172,24 +24174,24 @@ func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 		reader       string
 		want         func(i int) any
 	}{
-		{"long", `"long"`, items / 10, func(i int) any { return int64(1000 + i) }, "", nil},
-		{"negative long", `"long"`, items / 10, func(i int) any { return int64(-1 - i) }, "", nil},
-		{"int", `"int"`, items / 10, func(i int) any { return int32(1000 + i) }, "", nil},
-		{"float", `"float"`, items / 10, func(i int) any { return float32(i) + 0.5 }, "", nil},
-		{"double", `"double"`, items / 10, func(i int) any { return float64(i) + 0.5 }, "", nil},
-		{"nullable long", `["null","long"]`, items / 10, func(i int) any { return int64(1000 + i) }, "", nil},
+		{"long", `"long"`, boxed, func(i int) any { return int64(1000 + i) }, "", nil},
+		{"negative long", `"long"`, boxed, func(i int) any { return int64(-1 - i) }, "", nil},
+		{"int", `"int"`, boxed, func(i int) any { return int32(1000 + i) }, "", nil},
+		{"float", `"float"`, boxed, func(i int) any { return float32(i) + 0.5 }, "", nil},
+		{"double", `"double"`, boxed, func(i int) any { return float64(i) + 0.5 }, "", nil},
+		{"nullable long", `["null","long"]`, boxed, func(i int) any { return int64(1000 + i) }, "", nil},
 		{"long under 256", `"long"`, 5, func(i int) any { return int64(i % 200) }, "", nil},
-		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, items / 10, ms, "", nil},
-		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, items / 10, ms, "", nil},
-		{"int to long", `"int"`, items / 10, func(i int) any { return int32(1000 + i) },
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, boxed, ms, "", nil},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, boxed, ms, "", nil},
+		{"int to long", `"int"`, boxed, func(i int) any { return int32(1000 + i) },
 			`"long"`, func(i int) any { return int64(1000 + i) }},
-		{"int to float", `"int"`, items / 10, func(i int) any { return int32(1000 + i) },
+		{"int to float", `"int"`, boxed, func(i int) any { return int32(1000 + i) },
 			`"float"`, func(i int) any { return float32(1000 + i) }},
-		{"long to double", `"long"`, items / 10, func(i int) any { return int64(1000 + i) },
+		{"long to double", `"long"`, boxed, func(i int) any { return int64(1000 + i) },
 			`"double"`, func(i int) any { return float64(1000 + i) }},
-		{"float to double", `"float"`, items / 10, func(i int) any { return float32(i) + 0.5 },
+		{"float to double", `"float"`, boxed, func(i int) any { return float32(i) + 0.5 },
 			`"double"`, func(i int) any { return float64(i) + 0.5 }},
-		{"int to time-micros", `"int"`, items / 10, func(i int) any { return int32(1000 + i) },
+		{"int to time-micros", `"int"`, boxed, func(i int) any { return int32(1000 + i) },
 			`{"type":"long","logicalType":"time-micros"}`, func(i int) any { return time.Duration(1000+i) * time.Microsecond }},
 	} {
 		for _, wire := range []string{"binary", "json"} {
@@ -24223,6 +24225,11 @@ func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 					t.Fatal(err)
 				}
 				limit := tc.max
+				if wire == "json" && tc.reader != "" {
+					// A resolved DecodeJSON decodes the JSON into an any and
+					// then decodes again, so it boxes each number twice.
+					limit *= 2
+				}
 				if wire == "json" {
 					zeroWire, err := encode(nil, zeros)
 					if err != nil {
@@ -24254,6 +24261,24 @@ func TestDecodeNumbersIntoAnyShareAllocations(t *testing.T) {
 				}
 			})
 		}
+	}
+	// A slab has room for 8 numbers, so a number you keep keeps 64 bytes
+	// alive: 100 numbers take 12 or 13 slabs, as many allocations more than
+	// 100 numbers under 256, which take none.
+	s := avro.MustParse(`{"type":"array","items":"long"}`)
+	big, small := make([]any, 100), make([]any, 100)
+	for i := range big {
+		big[i], small[i] = int64(1000+i), int64(i%200)
+	}
+	allocs := func(v []any) float64 {
+		wire := avrotest.MustEncode(t, s, v)
+		return testing.AllocsPerRun(10, func() {
+			var out any
+			avrotest.MustDecode(t, s, wire, &out)
+		})
+	}
+	if slabs := allocs(big) - allocs(small); slabs < 12 || slabs > 13 {
+		t.Errorf("100 numbers took %.0f slabs, want 12 or 13", slabs)
 	}
 }
 
